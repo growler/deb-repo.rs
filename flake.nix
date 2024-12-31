@@ -26,8 +26,6 @@
             cargo-fuzz
 
             pkg-config 
-            apt
-            crun
             gpgme
             valgrind
             gdb
