@@ -164,22 +164,6 @@ where
     }
 }
 
-//impl<IdType, Value, Src> From<Src> for IdMap<IdType, Value>
-//where
-//    Src: IntoIterator<Item = Value>,
-//    Value: Hash + Eq,
-//    IdType: Copy + ToIndex,
-//    usize: IntoId<IdType>,
-//{
-//    fn from(source: Src) -> Self {
-//        let ret = Self::new();
-//        for item in source.into_iter() {
-//            ret.insert(item);
-//        }
-//        ret
-//    }
-//}
-//
 impl<IdType, Value> IdMap<IdType, Value>
 where
     Value: Hash + Eq,
@@ -250,23 +234,6 @@ where
         }
     }
 }
-
-//impl<IdType, Value> IdMap<IdType, Value>
-//where
-//    Value: Hash + Eq + Sized,
-//    IdType: Copy + ToIndex,
-//    usize: IntoId<IdType>,
-//{
-//    pub(crate) fn intern<V>(&self, value: V) -> InternResult<IdType, &Value>
-//    where
-//        V: IntoBoxed<Value> + AsRef<Value>,
-//    {
-//        let id = self
-//            .get(&value)
-//            .unwrap_or_else(|| self.insert(value));
-//        InternResult { id, val: self[id].as_ref() }
-//    }
-//}
 
 impl<IdType, Value> IdMap<IdType, Box<Value>>
 where
