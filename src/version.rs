@@ -480,20 +480,28 @@ impl<V> AsRef<V> for Version<V> {
 impl<V: Eq + AsRef<str>> PartialOrd for Version<V> {
     #[inline]
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(comparator::compare(
-            self.inner.as_ref().as_bytes(),
-            other.inner.as_ref().as_bytes(),
-        ))
+        Some(self.cmp(other))
     }
 }
 
 impl<V: Eq + AsRef<str>> Ord for Version<V> {
     #[inline]
     fn cmp(&self, other: &Self) -> Ordering {
-        comparator::compare(
+        let k = comparator::compare(
             self.inner.as_ref().as_bytes(),
             other.inner.as_ref().as_bytes(),
-        )
+        );
+        tracing::trace!(
+            "compare versions {} {} {}",
+            self.inner.as_ref(),
+            match k {
+                Ordering::Equal => "=",
+                Ordering::Less => "<",
+                Ordering::Greater => ">",
+            },
+            other.inner.as_ref(),
+        );
+        k
     }
 }
 
@@ -1236,9 +1244,9 @@ mod tests {
 
     #[test]
     fn test_requirements() {
-        satisfies!("1.0.1" "p (>= 1.0.0)");
-        satisfies!("1:1.0" "p (= 1:1.0)");
-        satisfies!("2.0.0~rc1" "p (<< 2.0.0)");
+        satisfies!("1.0.1" "(>= 1.0.0)");
+        satisfies!("1:1.0" "(= 1:1.0)");
+        satisfies!("2.0.0~rc1" "(<< 2.0.0)");
     }
 
     #[test]
