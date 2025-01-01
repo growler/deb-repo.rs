@@ -74,9 +74,21 @@ pub struct Package<'a> {
     multi_arch: MultiArch,
 }
 
+impl<'a> std::fmt::Display for Package<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}:{}={}", self.name, self.arch, self.version)
+    }
+}
+
 impl<'a> Package<'a> {
+    pub fn src(&self) -> &'a str {
+        self.src
+    }
     pub fn name(&self) -> &'a str {
         self.name
+    }
+    pub fn arch(&self) -> &'a str {
+        self.arch
     }
     pub fn full_name(&self) -> ProvidedName<&'a str, Version<&'a str>> {
         ProvidedName::Exact(self.name, Version::from(self.version))

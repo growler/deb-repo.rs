@@ -1,8 +1,5 @@
 use {
-    anyhow::{anyhow, Result},
-    clap::{Parser, Subcommand},
-    debrepo::{DebRepo, Dependency, HttpDebRepo, Packages, Universe},
-    std::{path::PathBuf, process::ExitCode},
+    anyhow::{anyhow, Result}, async_std::io::WriteExt, clap::{Parser, Subcommand}, debrepo::{DebRepo, Dependency, HttpDebRepo, Packages, Universe, Version}, std::{path::PathBuf, pin::Pin, process::ExitCode}
 };
 
 fn arch<'a>(a: &'a str) -> &'a str {
@@ -80,6 +77,73 @@ enum Commands {
         #[arg(value_name = "NAME")]
         name: String,
     },
+    #[command(name = "filter", hide = true)]
+    Filter {
+        /// Packages file
+        #[arg(
+            short = 'i',
+            long = "input",
+            value_name = "FILE",
+            default_value = "Packages"
+        )]
+        input: PathBuf,
+        /// Target file name
+        #[arg(short = 'o', long = "output", value_name = "FILE")]
+        out: Option<PathBuf>,
+        /// ids
+        #[arg(value_name = "ID")]
+        ids: Vec<usize>,
+    }
+}
+
+struct Package<'a> {
+    name: &'a str,
+    arch: &'a str,
+    ver: Version<&'a str>,
+    desc: &'a str,
+}
+
+impl<'a> From<&'a debrepo::Package<'a>> for Package<'a> {
+    fn from(pkg: &'a debrepo::Package<'a>) -> Self {
+        Self {
+            name: pkg.name(),
+            arch: pkg.arch(),
+            ver: pkg.version(),
+            desc: pkg.field("Description").unwrap_or(""),
+        }
+    }
+}
+
+fn pretty_print_packages<'a, W: std::io::Write>(
+    f: &mut W,
+    iter: impl IntoIterator<Item = Package<'a>>,
+) -> std::result::Result<usize, std::io::Error> {
+    let mut w0 = 0usize;
+    let mut w1 = 0usize;
+    let mut w2 = 0usize;
+    let mut w3 = 0usize;
+    let mut packages = iter
+        .into_iter()
+        .map(|pkg| {
+            w0 = std::cmp::max(w0, pkg.arch.len());
+            w1 = std::cmp::max(w1, pkg.name.len());
+            w2 = std::cmp::max(w2, pkg.ver.as_ref().len());
+            w3 = std::cmp::max(w3, pkg.desc.len());
+            pkg
+        })
+        .collect::<Vec<_>>();
+    packages.sort_by(|this, that| match this.name.cmp(that.name) {
+        std::cmp::Ordering::Equal => this.ver.cmp(&that.ver),
+        other => other,
+    });
+    for p in packages.iter() {
+        writeln!(
+            f,
+            "{:>w0$} {:<w1$} {:>w2$} {:<w3$}",
+            p.arch, p.name, p.ver, p.desc
+        )?;
+    }
+    Ok(packages.len())
 }
 
 async fn cmd(cli: Cli) -> Result<ExitCode> {
@@ -122,17 +186,28 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             Ok(ExitCode::SUCCESS)
         }
         Commands::Search { input, name } => {
+            let start = std::time::Instant::now();
             let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
-            let re = regex::RegexBuilder::new(&name).case_insensitive(true).build()?;
-            for p in packages.packages() {
-                let desc = p.field("Description").unwrap_or("");
-                if re.is_match(p.name())
-                    || re.is_match(desc)
-                {
-                    println!("{} {}", p.full_name(), desc);
+            let re = regex::RegexBuilder::new(&name)
+                .case_insensitive(true)
+                .build()?;
+            let mut out = std::io::stdout().lock();
+            match pretty_print_packages(
+                &mut out,
+                packages
+                    .packages()
+                    .map(|p| -> Package { p.into() })
+                    .filter(|p| re.is_match(p.name) || re.is_match(p.desc)),
+            )? {
+                0 => {
+                    println!("not found in {:?}", start.elapsed());
+                    Ok(ExitCode::FAILURE)
+                }
+                n => {
+                    println!("found {} in {:?}", n, start.elapsed());
+                    Ok(ExitCode::SUCCESS)
                 }
             }
-            Ok(ExitCode::SUCCESS)
         }
         Commands::Solve { arch, input, reqs } => {
             let start = std::time::Instant::now();
@@ -146,17 +221,13 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             let problem = solver.provider().problem(requirements?, std::iter::empty());
             match solver.solve(problem) {
                 Ok(solution) => {
-                    let mut solution: Vec<_> = solution
-                        .into_iter()
-                        .map(|s| solver.provider().package(s))
-                        .collect();
-                    solution.sort_by(|&this, &that| match this.name().cmp(&that.name()) {
-                        std::cmp::Ordering::Equal => this.version().cmp(&that.version()),
-                        ord => ord,
-                    });
-                    for item in solution {
-                        println!("{}", item.full_name());
-                    }
+                    let mut out = std::io::stdout().lock();
+                    pretty_print_packages(
+                        &mut out,
+                        solution
+                            .into_iter()
+                            .map(|s| -> Package { solver.provider().package(s).into() }),
+                    )?;
                     println!("solved in {:?}", start.elapsed());
                     Ok(ExitCode::SUCCESS)
                 }
@@ -168,6 +239,22 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                     resolvo::UnsolvableOrCancelled::Cancelled(_) => unreachable!(),
                 },
             }
+        }
+        Commands::Filter { input, out, mut ids } => {
+            let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
+            let mut out: Pin<Box<dyn async_std::io::Write + Send + Unpin>> = match out {
+                None => {
+                    Box::pin(async_std::io::stdout())
+                }
+                Some(out) => {
+                    Box::pin(async_std::fs::File::create(out).await?)
+                }
+            };
+            ids.sort();
+            for id in ids {
+                out.write(packages.get(id).unwrap().src().as_bytes()).await?;
+            }
+            Ok(ExitCode::SUCCESS)
         }
     }
 }
