@@ -502,7 +502,7 @@ impl Interner for Universe {
     }
     fn display_solvable(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
         self.inner
-            .with_index(|i| i.solvables[solvable.to_index()].package.full_name())
+            .with_index(|i| i.solvables[solvable.to_index()].package)
     }
     fn version_set_name(&self, version_set: VersionSetId) -> NameId {
         self.inner.with_index(|i| i.version_sets[version_set].name)
@@ -616,7 +616,8 @@ impl DependencyProvider for Universe {
     async fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         let deps = self.inner.get_dependencies(solvable);
         tracing::trace!(
-            "dependencies for {}: {}",
+            "dependencies for {} {}: {}",
+            solvable.to_index(),
             self.display_solvable(solvable),
             match &deps {
                 Dependencies::Known(deps) => {
@@ -727,7 +728,7 @@ mod tests {
     }
 
     test_solution!(self_dependent
-    [ "alpha" ] => [ "alpha=1.0" ],
+    [ "alpha" ] => [ "alpha:amd64=1.0" ],
 "Package: alpha
 Architecture: amd64
 Version: 1.0
@@ -736,7 +737,7 @@ Breaks: beta
 ");
 
     test_solution!(mutual
-    [ "alpha" ] => [ "alpha=2.6.1" ],
+    [ "alpha" ] => [ "alpha:amd64=2.6.1" ],
 "Package: alpha
 Architecture: amd64
 Version: 2.6.1
@@ -750,7 +751,7 @@ Depends: alpha (>= 1.5~alpha4~)
 ");
 
     test_solution!(dep_break
-    [ "alpha" ] => [ "alpha=2.38.1-5+deb12u2", "beta=2.38.1-5+deb12u2" ],
+    [ "alpha" ] => [ "alpha:amd64=2.38.1-5+deb12u2", "beta:amd64=2.38.1-5+deb12u2" ],
 "Package: alpha
 Architecture: amd64
 Version: 2.38.1-5+deb12u2
@@ -763,7 +764,7 @@ Breaks: alpha (<= 2.38~)
 ");
 
     test_solution!(dep_range
-    [ "keyboard-configuration" ] => [ "keyboard-configuration=1.221", "xkb-data=2.35.1-1" ],
+    [ "keyboard-configuration" ] => [ "keyboard-configuration:all=1.221", "xkb-data:all=2.35.1-1" ],
 "Package: keyboard-configuration
 Version: 1.221
 Architecture: all
@@ -775,10 +776,10 @@ Architecture: all
 ");
 
     #[test]
-    fn test_large() {
+    fn test_solver_issue() {
         init_trace();
         let mut path = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        path.push("benches/Packages");
+        path.push("test/Packages-solver-issue");
         let packages = vec![Packages::try_from(
             fs::read_to_string(&path).expect("Failed to read test Packages"),
         )
@@ -786,7 +787,7 @@ Architecture: all
         let uni = Universe::new("amd64", packages.into_iter()).unwrap();
         let mut solver = resolvo::Solver::new(uni);
         let problem = solver.provider().problem(
-            vec!["exim4"]
+            vec!["wireguard"]
                 .into_iter()
                 .map(|v| Dependency::try_from(v).unwrap())
                 .collect::<Vec<_>>(),
