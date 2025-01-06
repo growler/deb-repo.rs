@@ -3,10 +3,7 @@ pub use async_tar::{
     EntryType as TarballEntryType,
 };
 use {
-    crate::{
-        parse_size,
-        digest::{Digest, Digester},
-    },
+    crate::parse_size,
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
@@ -60,7 +57,7 @@ enum EntryKind {
 }
 
 #[pin_project]
-struct DebReaderInner<R: Read + Unpin + Send, D: Digester + Default + Send> {
+struct DebReaderInner<R: Read + Unpin + Send> {
     // Current state
     state: State,
     // Content padding
@@ -73,14 +70,12 @@ struct DebReaderInner<R: Read + Unpin + Send, D: Digester + Default + Send> {
     total: usize,
     // Deb entry header
     hdr: [u8; AR_HEADER_SIZE],
-    // Package digest
-    digest: D,
     // Source of the data
     #[pin]
     source: R,
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReaderInner<R, D> {
+impl<R: Read + Unpin + Send> DebReaderInner<R> {
     async fn new(mut r: R) -> std::io::Result<Self> {
         let mut hdr = [0u8; AR_MAGIC_SIZE];
         r.read_exact(&mut hdr).await?;
@@ -90,8 +85,6 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReaderInner<R, D> 
                 "invalid deb header",
             ));
         }
-        let mut digester = D::default();
-        digester.update(AR_MAGIC);
         Ok(Self {
             state: State::Header,
             size: AR_HEADER_SIZE,
@@ -99,7 +92,6 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReaderInner<R, D> 
             read: 0,
             total: AR_MAGIC_SIZE,
             hdr: [0u8; AR_HEADER_SIZE],
-            digest: digester,
             source: r,
         })
     }
@@ -122,7 +114,6 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReaderInner<R, D> 
         match ready!(this.source.poll_read(ctx, &mut buf[*this.read..*this.size])) {
             0 => Poll::Ready(Ok(0)),
             n => {
-                this.digest.update(&buf[*this.read..*this.read + n]);
                 *this.read += n;
                 *this.total += n;
                 Poll::Ready(Ok(if n < remain {
@@ -135,7 +126,7 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReaderInner<R, D> 
     }
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> Read for DebReaderInner<R, D> {
+impl<R: Read + Unpin + Send> Read for DebReaderInner<R> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -153,7 +144,6 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> Read for DebReaderInn
                 "unexpected EOF while reading package entry",
             ))),
             n => {
-                this.digest.update(&buf[0..n]);
                 *this.read += n;
                 *this.total += n;
                 Poll::Ready(Ok(if n < remain {
@@ -166,7 +156,7 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> Read for DebReaderInn
     }
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> Stream for DebReaderInner<R, D> {
+impl<R: Read + Unpin + Send> Stream for DebReaderInner<R> {
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -268,11 +258,41 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> Stream for DebReaderI
 ///     }
 /// }
 /// ```
-pub struct DebReader<R: Read + Unpin + Send, D: Digester + Default + Send = sha2::Sha256> {
-    inner: Arc<Mutex<DebReaderInner<R, D>>>,
+pub struct DebReader<
+    'a,
+    R: Read + Unpin + Send + 'a,
+> {
+    inner: Arc<Mutex<DebReaderInner<R>>>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReader<R, D> {
+struct DebEntryReaderInner<
+    'a,
+    R: Read + Unpin + Send + 'a,
+> {
+    inner: Arc<Mutex<DebReaderInner<R>>>,
+    _marker: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a, R: Read + Unpin + Send + 'a> Read
+    for DebEntryReaderInner<'a, R>
+{
+    fn poll_read(
+        self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut reader = self.inner.lock().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("unexpected mutex error {}", err),
+            )
+        })?;
+        Pin::new(&mut *reader).poll_read(ctx, buf)
+    }
+}
+
+impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -300,34 +320,29 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebReader<R, D> {
     pub async fn new(reader: R) -> Result<Self> {
         Ok(DebReader {
             inner: Arc::new(Mutex::new(DebReaderInner::new(reader).await?)),
+            _marker: std::marker::PhantomData,
         })
     }
-    pub fn finalize(self) -> Result<(usize, Digest<D>)> {
-        let inner = Arc::into_inner(self.inner)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("reader has unexpected references"),
-                )
-            })?
-            .into_inner()
-            .unwrap();
-        Ok((inner.total, inner.digest.finalize_fixed().into()))
-    }
-    fn entry_reader_for_ext(&self, ext: &str) -> Result<DebEntryReader<R, D>> {
-        Ok(DebEntryReader {
-            inner: Decoder::for_ext(
-                DebEntryReaderInner {
-                    inner: Arc::clone(&self.inner),
-                },
-                ext,
-            )?,
+    fn entry_reader_for_ext(&self, ext: &str) -> Result<Pin<Box<dyn Read + Unpin + Send + 'a>>> {
+        let r = DebEntryReaderInner {
+            inner: Arc::clone(&self.inner),
+            _marker: std::marker::PhantomData,
+        };
+        Ok(match ext {
+            ".xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
+            ".gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
+            ".bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
+            ".lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
+            ".zstd" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+            _ => Box::pin(r),
         })
     }
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> Stream for DebReader<R, D> {
-    type Item = Result<DebEntry<R, D>>;
+impl<'a, R: Read + Unpin + Send + 'a> Stream
+    for DebReader<'a, R>
+{
+    type Item = Result<DebEntry<'a>>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {
             io::Error::new(
@@ -352,96 +367,32 @@ impl<R: Read + Unpin + Send, D: Digester + Default + Send> Stream for DebReader<
     }
 }
 
-struct DebEntryReaderInner<R: Read + Unpin + Send, D: Digester + Default + Send> {
-    inner: Arc<Mutex<DebReaderInner<R, D>>>,
+pub struct DebEntryReader {
+    inner: Pin<Box<dyn Read + Unpin + Send>>,
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> Read for DebEntryReaderInner<R, D> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        let mut reader = self.inner.lock().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected mutex error {}", err),
-            )
-        })?;
-        Pin::new(&mut *reader).poll_read(ctx, buf)
-    }
-}
-
-#[pin_project(project = _Decoder)]
-enum Decoder<R: Read + Unpin> {
-    Noop(#[pin] R),
-    Xz(#[pin] XzDecoder<BufReader<R>>),
-    Gzip(#[pin] GzipDecoder<BufReader<R>>),
-    Bz(#[pin] BzDecoder<BufReader<R>>),
-    Lzma(#[pin] LzmaDecoder<BufReader<R>>),
-    Zstd(#[pin] ZstdDecoder<BufReader<R>>),
-}
-
-impl<R: Read + Unpin> Decoder<R> {
-    fn for_ext(reader: R, ext: &str) -> Result<Self> {
-        match ext {
-            ".xz" => Ok(Self::Xz(XzDecoder::new(io::BufReader::new(reader)))),
-            ".gz" => Ok(Self::Gzip(GzipDecoder::new(io::BufReader::new(reader)))),
-            ".bz2" => Ok(Self::Bz(BzDecoder::new(io::BufReader::new(reader)))),
-            ".lzma" => Ok(Self::Lzma(LzmaDecoder::new(io::BufReader::new(reader)))),
-            ".zstd" => Ok(Self::Zstd(ZstdDecoder::new(io::BufReader::new(reader)))),
-            "" => Ok(Self::Noop(reader)),
-            _ => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unexpected extension {}", ext),
-            )),
-        }
-    }
-}
-
-impl<R: Read + Unpin> Read for Decoder<R> {
-    fn poll_read(
-        self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        match self.project() {
-            _Decoder::Noop(pinned) => pinned.poll_read(ctx, buf),
-            _Decoder::Xz(pinned) => pinned.poll_read(ctx, buf),
-            _Decoder::Gzip(pinned) => pinned.poll_read(ctx, buf),
-            _Decoder::Bz(pinned) => pinned.poll_read(ctx, buf),
-            _Decoder::Lzma(pinned) => pinned.poll_read(ctx, buf),
-            _Decoder::Zstd(pinned) => pinned.poll_read(ctx, buf),
-        }
-    }
-}
-
-pub struct DebEntryReader<R: Read + Unpin + Send, D: Digester + Default + Send> {
-    inner: Decoder<DebEntryReaderInner<R, D>>,
-}
-
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> Read for DebEntryReader<R, D> {
+impl Read for DebEntryReader {
     fn poll_read(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        Pin::new(&mut self.inner).poll_read(ctx, buf)
+        self.inner.as_mut().poll_read(ctx, buf)
     }
 }
 
-pub enum DebEntry<R: Read + Unpin + Send, D: Digester + Default + Send> {
-    Control(Tarball<DebEntryReader<R, D>>),
-    Data(Tarball<DebEntryReader<R, D>>),
+pub enum DebEntry<'a> {
+    Control(Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>>),
+    Data(Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>>),
 }
 
-impl<R: Read + Unpin + Send, D: Digester + Default + Send> DebEntry<R, D> {
-    pub fn into_inner(self) -> Tarball<DebEntryReader<R, D>> {
+impl<'a> DebEntry<'a> {
+    pub fn into_inner(self) -> Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
         }
     }
-    pub fn entries(self) -> Result<TarballEntries<DebEntryReader<R, D>>> {
+    pub fn entries(self) -> Result<TarballEntries<Pin<Box<dyn Read + Unpin + Send + 'a>>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar.entries(),
         }

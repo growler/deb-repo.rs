@@ -2,7 +2,31 @@
 /// see https://www.debian.org/doc/debian-policy/ch-controlfields.html
 ///
 /// The parser does not process comments
-use crate::error::{Error, Result};
+
+#[derive(Debug, Clone)]
+pub struct ParseError {
+    msg: std::borrow::Cow<'static, str>,
+}
+
+impl std::error::Error for ParseError {}
+
+impl From<&'static str> for ParseError {
+    fn from(msg: &'static str) -> Self {
+        Self { msg: msg.into() }
+    }
+}
+
+impl From<String> for ParseError {
+    fn from(msg: String) -> Self {
+        Self { msg: msg.into() }
+    }
+}
+
+impl std::fmt::Display for ParseError {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "error parsing {}", self.msg)
+    }
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlField<'a> {
@@ -50,10 +74,10 @@ impl<'a> std::fmt::Display for ControlStanza<'a> {
 }
 
 impl<'a> ControlStanza<'a> {
-    pub fn parse(src: &'a str) -> Result<Self> {
-        let fields = ControlParser::new(src).collect::<Result<Vec<ControlField<'a>>>>()?;
+    pub fn parse(src: &'a str) -> Result<Self, ParseError> {
+        let fields = ControlParser::new(src).collect::<Result<Vec<ControlField<'a>>, ParseError>>()?;
         if fields.is_empty() {
-            Err(Error::EmptyControl)
+            Err("Empty control stanza".into())
         } else {
             Ok(ControlStanza { fields })
         }
@@ -101,7 +125,7 @@ impl<'a> ControlFile<'a> {
     pub fn new() -> Self {
         ControlFile { stanzas: vec![] }
     }
-    pub fn parse(src: &'a str) -> Result<Self> {
+    pub fn parse(src: &'a str) -> Result<Self, ParseError> {
         let mut parser = ControlParser::new(src);
         let mut stanzas: Vec<ControlStanza<'a>> = vec![];
         loop {
@@ -190,14 +214,14 @@ impl<'a> ControlParser<'a> {
     fn skip(&mut self, skip: usize) {
         self.src = &self.src[skip..];
     }
-    fn field_name(&mut self) -> Result<Option<&'a str>> {
+    fn field_name(&mut self) -> Result<Option<&'a str>, ParseError> {
         let mut inp = self.src.as_bytes();
         if let [b, rest @ ..] = inp {
             if *b == b'\n' {
                 self.skip(1);
                 return Ok(None);
             } else if !valid_field_name_first_char(*b) {
-                return Err(Error::InvalidFieldName(self.quote_err()));
+                return Err(format!("Invalid field name {}", self.quote_err()).into());
             } else {
                 inp = rest;
             }
@@ -212,12 +236,12 @@ impl<'a> ControlParser<'a> {
             } else if *b == b':' {
                 return Ok(Some(self.advance(pos, 1)));
             } else {
-                return Err(Error::InvalidFieldName(self.quote_err()));
+                return Err(format!("Invalid field name {}", self.quote_err()).into());
             }
         }
-        Err(Error::UnterminatedField(self.quote_err()))
+        Err(format!("Unterminated field name {}", self.quote_err()).into())
     }
-    fn field_value(&mut self) -> Result<&'a str> {
+    fn field_value(&mut self) -> Result<&'a str, ParseError> {
         let mut inp = self.src.as_bytes();
         // skip spaces on first line
         while let [b, rest @ ..] = inp {
@@ -230,7 +254,7 @@ impl<'a> ControlParser<'a> {
         }
         // let start = inp;
         let mut pos = 1 + memchr::memchr(b'\n', inp)
-            .ok_or_else(|| Error::UnterminatedField(self.quote_err()))?;
+            .ok_or_else(|| ParseError::from(format!("Unterminated field {}", self.quote_err())))?;
         inp = &inp[pos..];
         // rest
         loop {
@@ -248,7 +272,7 @@ impl<'a> ControlParser<'a> {
             }
             pos += ws;
             let n = memchr::memchr(b'\n', inp)
-                .ok_or_else(|| Error::UnterminatedField(self.quote_err()))?;
+                .ok_or_else(|| ParseError::from(format!("Unterminated field {}", self.quote_err())))?;
             pos += n + 1;
             inp = &inp[n + 1..];
             if n == 0 {
@@ -257,7 +281,7 @@ impl<'a> ControlParser<'a> {
         }
         Ok(self.advance(pos - 1, 1))
     }
-    pub fn field(&mut self) -> Result<Option<ControlField<'a>>> {
+    pub fn field(&mut self) -> Result<Option<ControlField<'a>>, ParseError> {
         match self.field_name()? {
             None => return Ok(None),
             Some(name) => Ok(Some(ControlField {
@@ -269,7 +293,7 @@ impl<'a> ControlParser<'a> {
 }
 
 impl<'a> Iterator for ControlParser<'a> {
-    type Item = std::result::Result<ControlField<'a>, Error>;
+    type Item = Result<ControlField<'a>, ParseError>;
     fn next(&mut self) -> Option<Self::Item> {
         self.field().transpose()
     }

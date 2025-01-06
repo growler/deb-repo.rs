@@ -6,6 +6,7 @@ use {
         fmt::{self, Debug, Display, Formatter},
         hash::{Hash, Hasher},
     },
+    crate::control::ParseError,
 };
 
 /// Defines a method to check if a given value satisfies a specific requirement.
@@ -152,6 +153,9 @@ impl<A, N, V> Constraint<A, N, V> {
     pub fn name(&self) -> &N {
         &self.name
     }
+    pub fn version(&self) -> Option<&V> {
+        self.range.version()
+    }
     pub fn range(&self) -> &VersionSet<V> {
         &self.range
     }
@@ -251,17 +255,28 @@ impl<A, N, V> Dependency<A, N, V> {
             ),
         }
     }
-    pub fn iter(&self) -> DependencyIterator<'_, A, N, V> {
-        DependencyIterator { dep: self, item: 0 }
+    pub fn iter(&self) -> DependencyRefIterator<'_, A, N, V> {
+        DependencyRefIterator { dep: self, item: 0 }
+    }
+    pub fn into_iter(self) -> impl Iterator<Item = Constraint<A, N, V>> {
+        match self {
+            Self::Single(dep) => {
+                let single: SmallVec<[Constraint<A, N, V>; 2]> = smallvec![dep];
+                single.into_iter()
+            }
+            Self::Union(deps) => {
+                deps.into_iter()
+            }
+        }
     }
 }
 
-pub struct DependencyIterator<'a, A, N, V> {
+pub struct DependencyRefIterator<'a, A, N, V> {
     dep: &'a Dependency<A, N, V>,
     item: usize,
 }
 
-impl<'a, A, N, V> Iterator for DependencyIterator<'a, A, N, V> {
+impl<'a, A, N, V> Iterator for DependencyRefIterator<'a, A, N, V> {
     type Item = &'a Constraint<A, N, V>;
     fn next(&mut self) -> Option<&'a Constraint<A, N, V>> {
         match self.dep {
@@ -613,25 +628,6 @@ impl<F: Fn(&u8) -> bool> ByteMatcher for F {
     #[inline]
     fn matches(&self, byte: &u8) -> bool {
         self(byte)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct ParseError {
-    msg: &'static str,
-}
-
-impl std::error::Error for ParseError {}
-
-impl From<&'static str> for ParseError {
-    fn from(msg: &'static str) -> Self {
-        Self { msg }
-    }
-}
-
-impl fmt::Display for ParseError {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        write!(f, "error parsing {}", self.msg)
     }
 }
 

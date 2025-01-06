@@ -1,11 +1,11 @@
 //! Errors
 
 /// Result wrapper
-pub type Result<T> = std::result::Result<T, Error>;
+type Result<T> = std::result::Result<T, Error>;
 
 /// Crate errors
 #[derive(Debug, thiserror::Error)]
-pub enum Error {
+enum Error {
     #[error("invalid digest `{0}`: {1}")]
     InvalidDigest(String, String),
 
@@ -51,6 +51,9 @@ pub enum Error {
 
     #[error("invalid release line: {0:?}")]
     InvalidReleaseLine(String),
+
+    #[error("release component not found {0:?}")]
+    ReleaseFileNotFound(String),
 
     #[error("{0}")]
     Other(String),

@@ -10,6 +10,8 @@ use {
     std::pin::Pin,
 };
 
+pub type Sha256 = Digest<sha2::Sha256>;
+
 #[derive(Default, Debug)]
 pub struct Digest<D: Digester + Send> {
     inner: DigesterOutput<D>,
@@ -47,27 +49,33 @@ impl<D: Digester + Send> Digest<D> {
 }
 
 impl<D: Digester + Send> TryFrom<&str> for Digest<D> {
-    type Error = crate::error::Error;
-    fn try_from(value: &str) -> crate::error::Result<Self> {
+    type Error = std::io::Error;
+    fn try_from(value: &str) -> std::io::Result<Self> {
         let mut inner = DigesterOutput::<D>::default();
         hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|e| {
-            crate::error::Error::InvalidDigest(value.to_string(), format!("{:?}", e))
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Invalid digest: {}", e),
+            )
         })?;
         Ok(Digest { inner })
     }
 }
 
 impl<D: Digester + Send> TryFrom<&[u8]> for Digest<D> {
-    type Error = crate::error::Error;
-    fn try_from(value: &[u8]) -> crate::error::Result<Self> {
+    type Error = std::io::Error;
+    fn try_from(value: &[u8]) -> std::io::Result<Self> {
         if value.len() == D::output_size() {
             Ok(Digest {
                 inner: DigesterOutput::<D>::from_slice(value).clone(),
             })
         } else {
-            Err(crate::error::Error::InvalidDigest(
-                format!("{:?}", value),
-                format!("expected exactly {} bytes", D::output_size()),
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "Invalid digest, expected exactly {} bytes",
+                    D::output_size()
+                ),
             ))
         }
     }
@@ -179,7 +187,8 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> Read for VerifyingRea
                 } else {
                     Ok(size)
                 }
-            } else if this.read < this.size { // size == 0, EOF
+            } else if this.read < this.size {
+                // size == 0, EOF
                 Err(std::io::Error::new(
                     std::io::ErrorKind::Other,
                     format!(
@@ -187,7 +196,8 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> Read for VerifyingRea
                         this.read, this.size
                     ),
                 ))
-            } else if this.read == this.size { // size == 0, EOF
+            } else if this.read == this.size {
+                // size == 0, EOF
                 *this.read += 1;
                 let digest = this.digester.finalize_fixed_reset();
                 if this.digest == &digest {
@@ -202,7 +212,8 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> Read for VerifyingRea
                         ),
                     ))
                 }
-            } else { // size = 0, EOF
+            } else {
+                // size = 0, EOF
                 Ok(0)
             }),
             st => st,

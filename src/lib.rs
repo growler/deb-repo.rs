@@ -1,9 +1,8 @@
 //! A Debian repository client library
 
-pub mod control;
-mod deb;
 pub mod digest;
-mod error;
+mod control;
+mod deb;
 mod fsrepo;
 mod httprepo;
 mod idmap;
@@ -14,15 +13,13 @@ mod universe;
 mod version;
 
 pub use {
-    control::{ControlField, ControlFile, ControlParser, ControlStanza},
+    control::{ControlField, ControlFile, ControlParser, ControlStanza, ParseError},
     deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
-    digest::{Digest, Digester, DigestingReader, VerifyingReader},
-    error::Error,
     fsrepo::FSDebRepo,
     httprepo::HttpDebRepo,
     packages::{Package, Packages},
     release::Release,
-    repo::DebRepo,
+    repo::{DebRepo, DebRepoProvider, null_provider},
     universe::Universe,
     version::{Dependency, Constraint, Version},
 };
@@ -36,7 +33,7 @@ pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
         if byte < b'0' || byte > b'9' {
             return Err(async_std::io::Error::new(
                 async_std::io::ErrorKind::InvalidData,
-                "size parse error",
+                "not a digit",
             ));
         }
         result = result

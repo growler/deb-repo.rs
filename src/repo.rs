@@ -3,210 +3,199 @@
 use {
     crate::{
         deb::DebReader,
-        digest::{Digest, Digester, DigestingReader, VerifyingReader},
-        error::Result,
+        digest::{Sha256, VerifyingReader},
         release::Release,
     },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     async_std::io::{self, prelude::*, BufReader},
-    std::future::Future,
+    async_trait::async_trait,
+    std::{
+        pin::{pin, Pin},
+        sync::Arc,
+    },
 };
 
-pub trait DebRepo: Sync {
-    type Reader: Read + Unpin + Send;
+#[derive(Clone)]
+pub struct NullProvider {}
 
-    type Digester: Digester + Default + Send; // = sha2::Sha256;
-
-    fn reader(&self, path: &str) -> impl Future<Output = Result<Self::Reader>> + Send;
-
-    fn deb_reader(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<DebReader<Self::Reader, Self::Digester>>> + Send {
-        async move { Ok(DebReader::new(self.reader(path).await?).await?) }
+#[async_trait]
+impl DebRepoProvider for NullProvider {
+    async fn reader(&self, _path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        Err(io::Error::new(io::ErrorKind::NotFound, "dummy provider"))
     }
-
-    fn verifying_reader(
-        &self,
-        path: &str,
-        digest: Digest<Self::Digester>,
-        size: usize,
-    ) -> impl Future<Output = Result<VerifyingReader<Self::Digester, Self::Reader>>> + Send {
-        async move {
-            Ok(VerifyingReader::<Self::Digester, _>::new(
-                self.reader(path).await?,
-                size,
-                digest,
-            ))
-        }
+}
+pub fn null_provider() -> DebRepo {
+    DebRepo {
+        inner: Arc::new(NullProvider {}) as Arc<dyn DebRepoProvider>,
     }
+}
 
-    fn copy<W: Write + Unpin + Send>(
-        &self,
-        path: &str,
-        w: W,
-    ) -> impl Future<Output = Result<(usize, Digest<Self::Digester>)>> + Send {
-        async move {
-            let mut reader = DigestingReader::<Self::Digester, _>::new(self.reader(path).await?);
-            let size = io::copy(&mut reader, w).await?;
-            Ok((size as usize, reader.finalize()))
-        }
-    }
+pub type VerifyingDebReader<'a> =
+    DebReader<'a, VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>>;
 
-    fn copy_verify<W: Write + Unpin + Send>(
-        &self,
-        path: &str,
-        digest: Digest<Self::Digester>,
-        size: usize,
-        w: W,
-    ) -> impl Future<Output = Result<(usize, Digest<Self::Digester>)>> + Send {
-        async move {
-            let mut reader = VerifyingReader::<Self::Digester, _>::new(
-                self.reader(path).await?,
-                size,
-                digest.clone(),
-            );
-            io::copy(&mut reader, w).await?;
-            Ok((size, digest))
-        }
-    }
+pub struct DebRepo {
+    inner: Arc<dyn DebRepoProvider>,
+}
+unsafe impl Sync for DebRepo {} // DebRepoProvider is Sync
 
-    fn copy_unpack<W: Write + Unpin + Send>(
-        &self,
-        path: &str,
-        w: W,
-    ) -> impl Future<Output = Result<(usize, Digest<Self::Digester>)>> + Send {
-        async move {
-            let mut reader = DigestingReader::<Self::Digester, _>::new(self.reader(path).await?);
-            let size = copy_unpack(path, &mut reader, w).await?;
-            Ok((size as usize, reader.finalize()))
-        }
-    }
-
-    fn copy_verify_unpack<W: Write + Unpin + Send>(
-        &self,
-        path: &str,
-        digest: Digest<Self::Digester>,
-        size: usize,
-        w: W,
-    ) -> impl Future<Output = Result<(usize, Digest<Self::Digester>)>> + Send {
-        async move {
-            let mut reader = VerifyingReader::<Self::Digester, _>::new(
-                self.reader(path).await?,
-                size,
-                digest.clone(),
-            );
-            let size = copy_unpack(path, &mut reader, w).await?;
-            Ok((size as usize, digest))
-        }
-    }
-
-    fn fetch_unpack(
-        &self,
-        path: &str,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
-        async move {
-            let mut buffer = vec![0u8; 0];
-            let reader = self.reader(path).await?;
-            fetch_unpack(path, reader, &mut buffer).await?;
-            Ok(buffer)
-        }
-    }
-
-    fn fetch_verify_unpack<W: Write + Unpin + Send>(
-        &self,
-        path: &str,
-        digest: Digest<Self::Digester>,
-        size: usize,
-    ) -> impl Future<Output = Result<Vec<u8>>> + Send {
-        async move {
-            let mut buffer = Vec::<u8>::with_capacity(size);
-            let reader = VerifyingReader::new(self.reader(path).await?, size, digest);
-            fetch_unpack(path, reader, &mut buffer).await?;
-            Ok(buffer)
-        }
-    }
-
-    fn fetch_release(
-        &self,
-        distro: &str
-    ) -> impl Future<Output = Result<Release>> + Send {
-        async move {
-            let path = format!("dists/{}/Release", distro);
-            let release = self.fetch_unpack(&path).await?;
-            let release = Release::try_from(release)?;
-            Ok(release)
+impl Clone for DebRepo {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
         }
     }
 }
 
-async fn copy_unpack<R: Read + Unpin + Send, W: Write + Unpin + Send>(
-    u: &str,
-    r: R,
-    w: W,
-) -> async_std::io::Result<u64> {
+impl DebRepo {
+    pub async fn fetch_release(self: &DebRepo, distr: &str) -> io::Result<Release> {
+        let data = String::from_utf8(self.fetch(&format!("dists/{}/Release", distr)).await?)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{}", err)))?;
+        Release::new(self.clone(), distr, data.into_boxed_str())
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{}", err)))
+    }
+    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<Pin<Box<dyn Read + Send>>>> {
+        DebReader::new(self.inner.reader(path).await?).await
+    }
+    pub async fn verifying_deb_reader(
+        &self,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<VerifyingDebReader<'_>> {
+        DebReader::new(VerifyingReader::<sha2::Sha256, _>::new(
+            self.inner.reader(path).await?,
+            size,
+            digest,
+        ))
+        .await
+    }
+    pub async fn verifying_reader(
+        &self,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>> {
+        Ok(VerifyingReader::<sha2::Sha256, _>::new(
+            self.inner.reader(path).await?,
+            size,
+            digest,
+        ))
+    }
+    pub async fn unpacking_reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        Ok(unpacker(path, self.inner.reader(path).await?))
+    }
+    pub async fn verifying_unpacking_reader(
+        &self,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        Ok(unpacker(
+            path,
+            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+        ))
+    }
+    pub async fn fetch(&self, path: &str) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; 0];
+        self.inner
+            .reader(path)
+            .await?
+            .read_to_end(&mut buffer)
+            .await?;
+        Ok(buffer)
+    }
+    pub async fn fetch_unpack(&self, path: &str) -> io::Result<Vec<u8>> {
+        let mut buffer = vec![0u8; 0];
+        unpacker(path, self.inner.reader(path).await?)
+            .read_to_end(&mut buffer)
+            .await?;
+        Ok(buffer)
+    }
+    pub async fn fetch_verify(
+        &self,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::<u8>::with_capacity(size);
+        VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest)
+            .read_to_end(&mut buffer)
+            .await?;
+        Ok(buffer)
+    }
+    pub async fn fetch_verify_unpack(
+        &self,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::<u8>::with_capacity(size);
+        unpacker(
+            path,
+            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+        )
+        .read_to_end(&mut buffer)
+        .await?;
+        Ok(buffer)
+    }
+    pub async fn copy<W: Write + Send>(&self, path: &str, w: W) -> io::Result<u64> {
+        io::copy(&mut self.inner.reader(path).await?, pin!(w)).await
+    }
+    pub async fn copy_unpack<W: Write + Send>(&self, path: &str, w: W) -> io::Result<u64> {
+        io::copy(&mut unpacker(path, self.inner.reader(path).await?), pin!(w)).await
+    }
+    pub async fn copy_verify<W: Write + Send>(
+        &self,
+        w: W,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<u64> {
+        let mut reader =
+            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest);
+        io::copy(&mut reader, pin!(w)).await
+    }
+    pub async fn copy_verify_unpack<W: Write + Send>(
+        &self,
+        w: W,
+        path: &str,
+        size: usize,
+        digest: Sha256,
+    ) -> io::Result<u64> {
+        let mut reader = unpacker(
+            path,
+            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+        );
+        io::copy(&mut reader, pin!(w)).await
+    }
+}
+
+impl<P: DebRepoProvider + 'static> From<P> for DebRepo {
+    fn from(provider: P) -> Self {
+        Self {
+            inner: Arc::new(provider) as Arc<dyn DebRepoProvider>,
+        }
+    }
+}
+
+#[async_trait]
+pub trait DebRepoProvider: Sync {
+    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>>;
+}
+
+fn unpacker<'a, R: Read + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn Read + Send + 'a>> {
     let ext = match u.rfind('.') {
         Some(n) => &u[n..],
         None => &"",
     };
     match ext {
-        ".xz" => {
-            io::copy(XzDecoder::new(BufReader::new(r)), w).await
-        }
-        ".gz" => {
-            io::copy(GzipDecoder::new(BufReader::new(r)), w).await
-        }
-        ".bz2" => {
-            io::copy(BzDecoder::new(BufReader::new(r)), w).await
-        }
-        ".lzma" => {
-            io::copy(LzmaDecoder::new(BufReader::new(r)), w).await
-        }
-        ".zstd" => {
-            io::copy(ZstdDecoder::new(BufReader::new(r)), w).await
-        }
-        _ => io::copy(r, w).await,
+        ".xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
+        ".gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
+        ".bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
+        ".lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
+        ".zstd" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+        _ => Box::pin(r),
     }
 }
-
-async fn fetch_unpack<R: Read + Unpin + Send>(
-    u: &str,
-    mut r: R,
-    buf: &mut Vec<u8>,
-) -> async_std::io::Result<usize> {
-    let ext = match u.rfind('.') {
-        Some(n) => &u[n..],
-        None => &"",
-    };
-    match ext {
-        ".xz" => {
-            XzDecoder::new(BufReader::new(r))
-                .read_to_end(buf)
-                .await
-        }
-        ".gz" => {
-            GzipDecoder::new(BufReader::new(r))
-                .read_to_end(buf)
-                .await
-        }
-        ".bz2" => {
-            BzDecoder::new(BufReader::new(r))
-                .read_to_end(buf)
-                .await
-        }
-        ".lzma" => {
-            LzmaDecoder::new(BufReader::new(r))
-                .read_to_end(buf)
-                .await
-        }
-        ".zstd" => {
-            ZstdDecoder::new(BufReader::new(r))
-                .read_to_end(buf)
-                .await
-        }
-        _ => r.read_to_end(buf).await,
-    }
-}
-

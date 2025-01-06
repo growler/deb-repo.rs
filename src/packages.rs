@@ -1,13 +1,14 @@
 use {
     crate::{
-        control::{ControlField, ControlParser},
-        error::{Error, Result},
+        control::{ControlField, ControlParser, ParseError},
+        digest::{Digest, Sha256},
+        repo::{DebRepo, VerifyingDebReader},
         version::{
-            Dependency, ParseError, ParsedDependencyIterator, ParsedProvidedNameIterator,
-            ParsedConstraintIterator, ProvidedName, Constraint, Version,
+            Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
+            ParsedProvidedNameIterator, ProvidedName, Version,
         },
     },
-    async_std::io::Read,
+    async_std::io::{self, Read},
     ouroboros::self_referencing,
 };
 
@@ -81,6 +82,22 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
+    pub fn repo_file(&self) -> io::Result<(&'a str, usize, Sha256)> {
+        let (path, size, sha256) = self
+            .fields()
+            .find_fields(("Filename", "Size", "SHA256"))
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("package {} lacks field {}", self, err),
+                )
+            })?;
+        Ok((
+            path,
+            crate::parse_size(size.as_bytes())?,
+            Digest::<sha2::Sha256>::try_from(sha256)?,
+        ))
+    }
     pub fn src(&self) -> &'a str {
         self.src
     }
@@ -175,12 +192,16 @@ impl<'a> Package<'a> {
     pub fn fields(&self) -> impl Iterator<Item = ControlField<'a>> {
         ControlParser::new(self.src).map(|f| f.unwrap())
     }
-    pub fn try_parse_from(parser: &mut ControlParser<'a>) -> Result<Option<Package<'a>>> {
+    pub fn try_parse_from(
+        parser: &mut ControlParser<'a>,
+    ) -> Result<Option<Package<'a>>, ParseError> {
         let mut parsed = false;
         let snap = unsafe { parser.snap() };
         let mut package = parser.try_fold(
             Package::<'a>::default(),
-            |mut pkg, field: Result<ControlField<'a>>| -> Result<Package<'a>> {
+            |mut pkg,
+             field: Result<ControlField<'a>, ParseError>|
+             -> Result<Package<'a>, ParseError> {
                 let field = field?;
                 if !parsed {
                     parsed = true;
@@ -219,11 +240,11 @@ impl<'a> Package<'a> {
             Ok(None)
         } else {
             if package.name.is_empty() {
-                Err(Error::FieldNotFound("Package"))
+                Err(ParseError::from("Field Package not found"))
             } else if package.arch.is_empty() {
-                Err(Error::FieldNotFound("Architecture"))
+                Err(ParseError::from("Field Architecture not found"))
             } else if package.version.is_empty() {
-                Err(Error::FieldNotFound("Version"))
+                Err(ParseError::from("Field Version not found"))
             } else {
                 package.src = unsafe { snap.into_slice(parser) };
                 Ok(Some(package))
@@ -232,13 +253,29 @@ impl<'a> Package<'a> {
     }
 }
 
-pub struct Packages {
-    inner: PackagesInner,
+pub struct Packages<S>
+where
+    S: AsRef<str> + 'static,
+{
+    pub(crate) repo: DebRepo,
+    inner: PackagesInner<S>,
 }
 
-impl Packages {
+impl<S: AsRef<str> + 'static> Packages<S> {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
+    }
+    pub async fn get_deb_reader(&self, index: usize) -> io::Result<VerifyingDebReader> {
+        let (path, size, hash) = self
+            .get(index)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("package index {} is out of range", index),
+                )
+            })
+            .and_then(|p| p.repo_file())?;
+        self.repo.verifying_deb_reader(path, size, hash).await
     }
     pub fn package_by_name(&self, name: &str) -> Option<&Package<'_>> {
         self.inner
@@ -247,29 +284,13 @@ impl Packages {
     pub fn packages(&self) -> impl Iterator<Item = &Package<'_>> {
         self.inner.with_packages(|packages| packages.iter())
     }
-    pub async fn read<R: Read + Unpin>(r: &mut R) -> Result<Self> {
-        use async_std::io::ReadExt;
-        let mut buf = String::new();
-        r.read_to_string(&mut buf).await?;
-        Self::try_from(buf)
-    }
-}
-
-impl TryFrom<Vec<u8>> for Packages {
-    type Error = Error;
-    fn try_from(inp: Vec<u8>) -> Result<Self> {
-        Self::try_from(String::from_utf8(inp).map_err(|err| err.utf8_error())?)
-    }
-}
-
-impl TryFrom<String> for Packages {
-    type Error = Error;
-    fn try_from(inp: String) -> Result<Self> {
+    pub fn new(repo: DebRepo, data: S) -> Result<Self, ParseError> {
         Ok(Packages {
+            repo,
             inner: PackagesInnerTryBuilder {
-                data: inp.into_boxed_str(),
-                packages_builder: |data: &'_ Box<str>| -> Result<Vec<Package<'_>>> {
-                    let mut parser = ControlParser::new(&data);
+                data,
+                packages_builder: |data: &'_ S| -> Result<Vec<Package<'_>>, ParseError> {
+                    let mut parser = ControlParser::new(data.as_ref());
                     let mut packages: Vec<Package<'_>> = vec![];
                     while let Some(package) = Package::try_parse_from(&mut parser)? {
                         packages.push(package)
@@ -280,12 +301,119 @@ impl TryFrom<String> for Packages {
             .try_build()?,
         })
     }
+    pub(crate) fn new_test(data: S) -> Result<Self, ParseError> {
+        Self::new(crate::repo::null_provider(), data)
+    }
+}
+
+impl Packages<Box<str>> {
+    pub async fn read<R: Read + Unpin>(r: &mut R) -> io::Result<Self> {
+        use async_std::io::ReadExt;
+        let mut buf = String::new();
+        r.read_to_string(&mut buf).await?;
+        buf.try_into().map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("Error parsing packages file: {}", err),
+            )
+        })
+    }
+}
+
+impl TryFrom<&str> for Packages<Box<str>> {
+    type Error = ParseError;
+    fn try_from(inp: &str) -> Result<Self, Self::Error> {
+        Self::new_test(inp.to_owned().into_boxed_str())
+    }
+}
+
+impl TryFrom<String> for Packages<Box<str>> {
+    type Error = ParseError;
+    fn try_from(inp: String) -> Result<Self, Self::Error> {
+        Self::new_test(inp.into_boxed_str())
+    }
+}
+
+impl TryFrom<Vec<u8>> for Packages<Box<str>> {
+    type Error = ParseError;
+    fn try_from(inp: Vec<u8>) -> Result<Self, Self::Error> {
+        Self::new_test(
+            String::from_utf8(inp)
+                .map_err(|err| ParseError::from(format!("{}", err)))?
+                .into_boxed_str(),
+        )
+    }
 }
 
 #[self_referencing]
-struct PackagesInner {
-    data: Box<str>,
+struct PackagesInner<S>
+where
+    S: AsRef<str> + 'static,
+{
+    data: S,
     #[borrows(data)]
     #[covariant]
     packages: Vec<Package<'this>>,
+}
+
+trait FindFields<M, R, E> {
+    fn find_fields(self, matches: M) -> std::result::Result<R, E>;
+}
+
+impl<'a, I> FindFields<&'a str, &'a str, &'a str> for I
+where
+    I: Iterator<Item = ControlField<'a>>,
+{
+    fn find_fields(self, m: &'a str) -> std::result::Result<&'a str, &'a str> {
+        self.fold(None, |found, field| {
+            if field.is_a(m) {
+                Some(field.value())
+            } else {
+                found
+            }
+        })
+        .ok_or(m)
+    }
+}
+impl<'a, I> FindFields<(&'a str, &'a str), (&'a str, &'a str), &'a str> for I
+where
+    I: Iterator<Item = ControlField<'a>>,
+{
+    fn find_fields(
+        self,
+        m: (&'a str, &'a str),
+    ) -> std::result::Result<(&'a str, &'a str), &'a str> {
+        let r = self.fold((None, None), |found, field| {
+            if field.is_a(m.0) {
+                (Some(field.value()), found.1)
+            } else if field.is_a(m.1) {
+                (found.0, Some(field.value()))
+            } else {
+                found
+            }
+        });
+        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?))
+    }
+}
+impl<'a, I> FindFields<(&'a str, &'a str, &'a str), (&'a str, &'a str, &'a str), &'a str> for I
+where
+    I: Iterator<Item = ControlField<'a>>,
+{
+    fn find_fields(
+        self,
+        m: (&'a str, &'a str, &'a str),
+    ) -> std::result::Result<(&'a str, &'a str, &'a str), &'a str> {
+        let r = self.fold((None, None, None), |found, field| {
+            if field.is_a(m.0) {
+                (Some(field.value()), found.1, found.2)
+            } else if field.is_a(m.1) {
+                (found.0, Some(field.value()), found.2)
+            } else if field.is_a(m.2) {
+                (found.0, found.1, Some(field.value()))
+            } else {
+                found
+            }
+        });
+        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?, r.2.ok_or(m.2)?))
+    }
 }

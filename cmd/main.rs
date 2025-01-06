@@ -1,5 +1,9 @@
 use {
-    anyhow::{anyhow, Result}, async_std::io::WriteExt, clap::{Parser, Subcommand}, debrepo::{DebRepo, Dependency, HttpDebRepo, Packages, Universe, Version}, std::{path::PathBuf, pin::Pin, process::ExitCode}
+    anyhow::{anyhow, Result},
+    async_std::io::WriteExt,
+    clap::{Parser, Subcommand},
+    debrepo::{DebRepo, Dependency, HttpDebRepo, Packages, Universe, Version},
+    std::{path::PathBuf, pin::Pin, process::ExitCode},
 };
 
 fn arch<'a>(a: &'a str) -> &'a str {
@@ -93,7 +97,7 @@ enum Commands {
         /// ids
         #[arg(value_name = "ID")]
         ids: Vec<usize>,
-    }
+    },
 }
 
 struct Package<'a> {
@@ -156,30 +160,19 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             comp,
         } => {
             let start = std::time::Instant::now();
-            let repo = HttpDebRepo::new(&origin).await?;
+            let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
             let release = repo.fetch_release(&distr).await?;
-            let file = release
-                .packages_file_for(&comp, arch(&a), Some(".xz"))
+            let (path, size, hash) = release
+                .packages_file(&comp, arch(&a))
                 .ok_or_else(|| anyhow!("Packages file for {} {} not found", &a, &comp))?;
             match out {
                 None => {
-                    repo.copy_verify_unpack(
-                        &format!("dists/{}/{}", &distr, file.path()),
-                        file.digest().clone(),
-                        file.size(),
-                        async_std::io::stdout(),
-                    )
-                    .await
+                    repo.copy_verify_unpack(async_std::io::stdout(), &path, size, hash)
+                        .await
                 }
                 Some(out) => {
                     let out = async_std::fs::File::create(out).await?;
-                    repo.copy_verify_unpack(
-                        &format!("dists/{}/{}", &distr, file.path()),
-                        file.digest().clone(),
-                        file.size(),
-                        out,
-                    )
-                    .await
+                    repo.copy_verify_unpack(out, &path, size, hash).await
                 }
             }?;
             println!("fetched in {:?}", start.elapsed());
@@ -216,43 +209,43 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                 .map(|s| Dependency::try_from(s.as_ref()).map_err(|err| err.into()))
                 .collect();
             let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
-            let universe = Universe::new(&arch, [packages])?;
-            let mut solver = resolvo::Solver::new(universe);
-            let problem = solver.provider().problem(requirements?, std::iter::empty());
-            match solver.solve(problem) {
+            let mut universe = Universe::new(&arch, [packages])?;
+            let problem = universe.problem(requirements?, std::iter::empty());
+            match universe.solve(problem) {
                 Ok(solution) => {
                     let mut out = std::io::stdout().lock();
                     pretty_print_packages(
                         &mut out,
                         solution
                             .into_iter()
-                            .map(|s| -> Package { solver.provider().package(s).into() }),
+                            .map(|s| -> Package { universe.package(s).into() }),
                     )?;
                     println!("solved in {:?}", start.elapsed());
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(unsolvable) => match unsolvable {
                     resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
-                        println!("{}", conflict.display_user_friendly(&solver));
+                        println!("{}", universe.display_conflict(conflict));
                         Ok(ExitCode::FAILURE)
                     }
                     resolvo::UnsolvableOrCancelled::Cancelled(_) => unreachable!(),
                 },
             }
         }
-        Commands::Filter { input, out, mut ids } => {
+        Commands::Filter {
+            input,
+            out,
+            mut ids,
+        } => {
             let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
             let mut out: Pin<Box<dyn async_std::io::Write + Send + Unpin>> = match out {
-                None => {
-                    Box::pin(async_std::io::stdout())
-                }
-                Some(out) => {
-                    Box::pin(async_std::fs::File::create(out).await?)
-                }
+                None => Box::pin(async_std::io::stdout()),
+                Some(out) => Box::pin(async_std::fs::File::create(out).await?),
             };
             ids.sort();
             for id in ids {
-                out.write(packages.get(id).unwrap().src().as_bytes()).await?;
+                out.write(packages.get(id).unwrap().src().as_bytes())
+                    .await?;
             }
             Ok(ExitCode::SUCCESS)
         }

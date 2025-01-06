@@ -1,27 +1,25 @@
 //! Debian repository client
 
 use {
-    isahc::{
-        config::RedirectPolicy,
-        prelude::*,
-        HttpClient,
-        AsyncBody,
-    }, 
-    crate::{
-        repo::DebRepo,
-        error::{Error, Result},
-    },
+    crate::repo::DebRepoProvider,
+    async_std::io::{self, Read},
+    async_trait::async_trait,
+    isahc::{config::RedirectPolicy, prelude::*, HttpClient},
+    std::pin::Pin,
 };
 
+#[derive(Clone)]
 pub struct HttpDebRepo {
     base: url::Url,
     client: HttpClient,
 }
 
 impl HttpDebRepo {
-    pub async fn new(url: &str) -> Result<Self> {
+    pub async fn new(url: &str) -> io::Result<Self> {
         Ok(Self {
-            base: url::Url::parse(url)?,
+            base: url::Url::parse(url).map_err(|err| 
+                io::Error::new(io::ErrorKind::InvalidInput, format!("{}", err))
+            )?,
             client: HttpClient::builder()
                 .redirect_policy(RedirectPolicy::Limit(10))
                 .timeout(std::time::Duration::from_secs(30))
@@ -30,17 +28,23 @@ impl HttpDebRepo {
     }
 }
 
-impl DebRepo for HttpDebRepo {
-    type Reader = AsyncBody;
-    type Digester = sha2::Sha256;
-    async fn reader(&self, path: &str) -> Result<Self::Reader> {
-        let uri = self.base.join(path)?.to_string();
+#[async_trait]
+impl DebRepoProvider for HttpDebRepo {
+    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        let uri = self
+            .base
+            .join(path)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .to_string();
         let rsp = self.client.get_async(&uri).await?;
         use isahc::http::StatusCode;
         match rsp.status() {
-            StatusCode::OK => Ok(rsp.into_body()),
-            StatusCode::NOT_FOUND => Err(Error::NotFound(uri.clone())),
-            code => Err(Error::Other(format!("unexpected HTTP response {}", code))),
+            StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
+            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
+            code => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("unexpected HTTP response {}", code),
+            )),
         }
     }
 }
