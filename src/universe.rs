@@ -3,7 +3,7 @@ use {
         control::ParseError,
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::VerifyingDebReader,
+        repo::{VerifyingReader, VerifyingDebReader},
         version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
     },
     iterator_ext::IteratorExt,
@@ -13,11 +13,11 @@ use {
         VersionSetUnionId,
     },
     smallvec::{smallvec, SmallVec},
+    async_std::io::{self, Write},
     std::{
+        pin::pin,
         borrow::Borrow,
-        fmt::Write,
         hash::{Hash, Hasher},
-        io,
     },
 };
 
@@ -446,6 +446,9 @@ impl<S: AsRef<str> + 'static> Universe<S> {
     ) -> impl std::fmt::Display + '_ {
         conflict.display_user_friendly(&self.inner)
     }
+    pub fn packages(&self) -> impl Iterator<Item = &'_ Package<'_>> {
+        self.inner.provider().with_index(|i| i.solvables.iter().map(|s| s.package))
+    }
     pub async fn deb_reader<'a>(&'a self, id: SolvableId) -> io::Result<VerifyingDebReader<'a>> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
@@ -453,6 +456,22 @@ impl<S: AsRef<str> + 'static> Universe<S> {
             Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
         })?;
         repo.verifying_deb_reader(path, size, hash).await
+    }
+    pub async fn deb_file_reader(&self, id: SolvableId) -> io::Result<VerifyingReader> {
+        let (repo, path, size, hash) = self.inner.provider().with(|u| {
+            let s = &u.index.solvables[id.to_index()];
+            let (path, size, hash) = s.package.repo_file()?;
+            Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
+        })?;
+        repo.verifying_reader(path, size, hash).await
+    }
+    pub async fn copy_deb_file<W: Write + Send>(&self, w: W, id: SolvableId) -> io::Result<u64> {
+        let (repo, path, size, hash) = self.inner.provider().with(|u| {
+            let s = &u.index.solvables[id.to_index()];
+            let (path, size, hash) = s.package.repo_file()?;
+            Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
+        })?;
+        io::copy(repo.verifying_reader(path, size, hash).await?, pin!(w)).await
     }
 }
 
@@ -584,6 +603,7 @@ impl<S: AsRef<str> + 'static> Interner for InnerUniverse<S> {
         self.with_index(|i| i.version_set_unions[version_set_union].iter().map(|v| *v))
     }
     fn display_merged_solvables(&self, solvables: &[SolvableId]) -> impl std::fmt::Display + '_ {
+        use std::fmt::Write;
         self.with_index(|i| {
             let mut buf = String::new();
             let mut first = true;

@@ -1,9 +1,20 @@
 use {
     anyhow::{anyhow, Result},
-    async_std::io::WriteExt,
+    async_std::{
+        fs,
+        io::{self, prelude::*},
+        path::{Path, PathBuf},
+    },
     clap::{Parser, Subcommand},
-    debrepo::{DebRepo, Dependency, HttpDebRepo, Packages, Universe, Version},
-    std::{path::PathBuf, pin::Pin, process::ExitCode},
+    debrepo::{
+        DebRepo, Dependency, DeploymentFileSystem, HttpDebRepo, MutableControlStanza, Universe,
+        Version,
+    },
+    futures::{
+        future::join_all,
+        stream::{FuturesUnordered, StreamExt},
+    },
+    std::process::ExitCode,
 };
 
 fn arch<'a>(a: &'a str) -> &'a str {
@@ -55,48 +66,78 @@ enum Commands {
         /// Architecture
         #[arg(short, long, value_name = "ARCH", default_value = arch(std::env::consts::ARCH))]
         arch: String,
-        /// Packages file
+        /// Origin repository URL
         #[arg(
-            short = 'i',
-            long = "input",
-            value_name = "FILE",
-            default_value = "Packages"
+            short = 'u',
+            long = "url",
+            value_name = "URL",
+            default_value = "https://ftp.debian.org/debian/"
         )]
-        input: PathBuf,
+        origin: String,
+        /// Distribution name
+        #[arg(
+            short = 'd',
+            long = "distr",
+            value_name = "DISTR",
+            default_value = "sid"
+        )]
+        distr: String,
+        /// Component
+        #[arg(
+            short = 'c',
+            long = "component",
+            value_name = "COMPONENT",
+            default_value = "all"
+        )]
+        comp: String,
+        /// Number of concurrent downloads
+        #[arg(short = 'l', long = "limit", value_name = "NUM", default_value = "5")]
+        limit: usize,
+        /// Fetch packages
+        #[arg(short = 'f', long = "fetch-packages", action)]
+        fetch: bool,
+        /// Extract packages into target directory
+        #[arg(short = 'e', long = "extract-packages", action)]
+        extract: bool,
+        /// Target directory
+        #[arg(short = 't', long = "target", value_name = "DIR", default_value = ".")]
+        target: PathBuf,
         /// Requirements
         #[arg(value_name = "REQUIREMENT")]
         reqs: Vec<String>,
     },
     #[command(name = "search")]
     Search {
-        /// Packages file
+        /// Architecture
+        #[arg(short, long, value_name = "ARCH", default_value = arch(std::env::consts::ARCH))]
+        arch: String,
+        /// Origin repository URL
         #[arg(
-            short = 'i',
-            long = "input",
-            value_name = "FILE",
-            default_value = "Packages"
+            short = 'u',
+            long = "url",
+            value_name = "URL",
+            default_value = "https://ftp.debian.org/debian/"
         )]
-        input: PathBuf,
+        origin: String,
+        /// Distribution name
+        #[arg(
+            short = 'd',
+            long = "distr",
+            value_name = "DISTR",
+            default_value = "sid"
+        )]
+        distr: String,
+        /// Component
+        #[arg(
+            short = 'c',
+            long = "component",
+            value_name = "COMPONENT",
+            default_value = "all"
+        )]
+        comp: String,
         /// name
         #[arg(value_name = "NAME")]
         name: String,
-    },
-    #[command(name = "filter", hide = true)]
-    Filter {
-        /// Packages file
-        #[arg(
-            short = 'i',
-            long = "input",
-            value_name = "FILE",
-            default_value = "Packages"
-        )]
-        input: PathBuf,
-        /// Target file name
-        #[arg(short = 'o', long = "output", value_name = "FILE")]
-        out: Option<PathBuf>,
-        /// ids
-        #[arg(value_name = "ID")]
-        ids: Vec<usize>,
     },
 }
 
@@ -150,6 +191,30 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     Ok(packages.len())
 }
 
+async fn copy_repo_package<'a, S: AsRef<str>>(
+    universe: &'a Universe<S>,
+    id: debrepo::SolvableId,
+    target: &Path,
+) -> Result<(debrepo::SolvableId, impl std::fmt::Display + 'a, u64)> {
+    let pkg = universe.package(id);
+    let path: PathBuf = pkg.ensure_field("Filename")?.into();
+    let mut out = PathBuf::from(target);
+    out.push(path.file_name().unwrap());
+    let out = fs::File::create(out).await?;
+    let size = universe.copy_deb_file(out, id).await?;
+    Ok((id, pkg, size))
+}
+
+async fn extract_repo_package<'a, S: AsRef<str>, F: DeploymentFileSystem>(
+    universe: &'a Universe<S>,
+    id: debrepo::SolvableId,
+    target: F,
+) -> Result<MutableControlStanza> {
+    let reader = universe.deb_reader(id).await?;
+    let desc = reader.extract_to(target).await?;
+    Ok(desc)
+}
+
 async fn cmd(cli: Cli) -> Result<ExitCode> {
     match cli.cmd {
         Commands::Fetch {
@@ -178,16 +243,37 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             println!("fetched in {:?}", start.elapsed());
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Search { input, name } => {
+        Commands::Search {
+            arch,
+            origin,
+            distr,
+            comp,
+            name,
+        } => {
             let start = std::time::Instant::now();
-            let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
+            let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
+            let release = repo.fetch_release(&distr).await?;
+            let components = if &comp == "all" {
+                release.components().collect::<Vec<&'_ str>>()
+            } else {
+                comp.split(',').map(|s| s.trim()).collect::<Vec<&'_ str>>()
+            };
+            let packages = join_all(
+                components
+                    .iter()
+                    .map(|comp| release.fetch_packages(comp, &arch)),
+            )
+            .await
+            .into_iter()
+            .collect::<io::Result<Vec<_>>>()?;
+            let universe = Universe::new(&arch, packages)?;
             let re = regex::RegexBuilder::new(&name)
                 .case_insensitive(true)
                 .build()?;
             let mut out = std::io::stdout().lock();
             match pretty_print_packages(
                 &mut out,
-                packages
+                universe
                     .packages()
                     .map(|p| -> Package { p.into() })
                     .filter(|p| re.is_match(p.name) || re.is_match(p.desc)),
@@ -202,25 +288,107 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                 }
             }
         }
-        Commands::Solve { arch, input, reqs } => {
+        Commands::Solve {
+            arch,
+            origin,
+            distr,
+            comp,
+            fetch,
+            extract,
+            target,
+            limit,
+            reqs,
+        } => {
             let start = std::time::Instant::now();
             let requirements: Result<Vec<_>> = reqs
                 .iter()
                 .map(|s| Dependency::try_from(s.as_ref()).map_err(|err| err.into()))
                 .collect();
-            let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
-            let mut universe = Universe::new(&arch, [packages])?;
+            let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
+            let release = repo.fetch_release(&distr).await?;
+            let components = if &comp == "all" {
+                release.components().collect::<Vec<&'_ str>>()
+            } else {
+                comp.split(',').map(|s| s.trim()).collect::<Vec<&'_ str>>()
+            };
+            let packages = join_all(
+                components
+                    .iter()
+                    .map(|comp| release.fetch_packages(comp, &arch)),
+            )
+            .await
+            .into_iter()
+            .collect::<io::Result<Vec<_>>>()?;
+            let mut universe = Universe::new(&arch, packages)?;
             let problem = universe.problem(requirements?, std::iter::empty());
             match universe.solve(problem) {
                 Ok(solution) => {
-                    let mut out = std::io::stdout().lock();
-                    pretty_print_packages(
-                        &mut out,
-                        solution
-                            .into_iter()
-                            .map(|s| -> Package { universe.package(s).into() }),
-                    )?;
-                    println!("solved in {:?}", start.elapsed());
+                    if extract {
+                        let fs = debrepo::LocalFileSystem::new(&target).await?;
+                        let mut control_file: Vec<MutableControlStanza> = vec![];
+                        let mut stream = FuturesUnordered::new();
+                        let mut pending = solution.into_iter();
+                        for _ in 0..limit {
+                            if let Some(id) = pending.next() {
+                                stream.push(extract_repo_package(&universe, id, &fs));
+                            }
+                        }
+                        while let Some(result) = stream.next().await {
+                            match result {
+                                Ok(mut stanza) => {
+                                    stanza.set("Status", "install ok unpacked");
+                                    control_file.push(stanza)
+                                }
+                                Err(err) => return Err(err),
+                            }
+                            if let Some(id) = pending.next() {
+                                stream.push(extract_repo_package(&universe, id, &fs));
+                            }
+                        }
+                        control_file.sort_by(|a, b| {
+                            a.field("Package").unwrap().cmp(b.field("Package").unwrap())
+                        });
+                        {
+                            let mut target = PathBuf::from(&target);
+                            target.push("var/lib/dpkg");
+                            fs::create_dir_all(&target).await?;
+                            target.push("status");
+                            let mut out = fs::File::create(target).await?;
+                            for i in control_file.into_iter() {
+                                out.write_all(format!("{}", &i).as_bytes()).await?;
+                                out.write_all(&[b'\n']).await?;
+                            }
+                        };
+
+                        println!("solved and fetched in {:?}", start.elapsed());
+                    } else if fetch {
+                        let mut stream = FuturesUnordered::new();
+                        let mut pending = solution.into_iter();
+                        for _ in 0..limit {
+                            if let Some(id) = pending.next() {
+                                stream.push(copy_repo_package(&universe, id, &target));
+                            }
+                        }
+                        while let Some(result) = stream.next().await {
+                            match result {
+                                Ok((_, name, size)) => println!("{} {}", name, size),
+                                Err(err) => println!("Failed to download: {}", err),
+                            }
+                            if let Some(id) = pending.next() {
+                                stream.push(copy_repo_package(&universe, id, &target));
+                            }
+                        }
+                        println!("solved and fetched in {:?}", start.elapsed());
+                    } else {
+                        let mut out = std::io::stdout().lock();
+                        pretty_print_packages(
+                            &mut out,
+                            solution
+                                .into_iter()
+                                .map(|s| -> Package { universe.package(s).into() }),
+                        )?;
+                        println!("solved in {:?}", start.elapsed());
+                    };
                     Ok(ExitCode::SUCCESS)
                 }
                 Err(unsolvable) => match unsolvable {
@@ -231,23 +399,6 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                     resolvo::UnsolvableOrCancelled::Cancelled(_) => unreachable!(),
                 },
             }
-        }
-        Commands::Filter {
-            input,
-            out,
-            mut ids,
-        } => {
-            let packages = Packages::read(&mut async_std::fs::File::open(&input).await?).await?;
-            let mut out: Pin<Box<dyn async_std::io::Write + Send + Unpin>> = match out {
-                None => Box::pin(async_std::io::stdout()),
-                Some(out) => Box::pin(async_std::fs::File::create(out).await?),
-            };
-            ids.sort();
-            for id in ids {
-                out.write(packages.get(id).unwrap().src().as_bytes())
-                    .await?;
-            }
-            Ok(ExitCode::SUCCESS)
         }
     }
 }

@@ -1,11 +1,7 @@
 //! Debian repository client
 
 use {
-    crate::{
-        deb::DebReader,
-        digest::{Sha256, VerifyingReader},
-        release::Release,
-    },
+    crate::{deb::DebReader, digest::Sha256, release::Release},
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
@@ -32,8 +28,8 @@ pub fn null_provider() -> DebRepo {
     }
 }
 
-pub type VerifyingDebReader<'a> =
-    DebReader<'a, VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>>;
+pub type VerifyingReader = crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>;
+pub type VerifyingDebReader<'a> = DebReader<'a, VerifyingReader>;
 
 pub struct DebRepo {
     inner: Arc<dyn DebRepoProvider>,
@@ -64,7 +60,7 @@ impl DebRepo {
         size: usize,
         digest: Sha256,
     ) -> io::Result<VerifyingDebReader<'_>> {
-        DebReader::new(VerifyingReader::<sha2::Sha256, _>::new(
+        DebReader::new(VerifyingReader::new(
             self.inner.reader(path).await?,
             size,
             digest,
@@ -76,8 +72,8 @@ impl DebRepo {
         path: &str,
         size: usize,
         digest: Sha256,
-    ) -> io::Result<VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>> {
-        Ok(VerifyingReader::<sha2::Sha256, _>::new(
+    ) -> io::Result<VerifyingReader> {
+        Ok(VerifyingReader::new(
             self.inner.reader(path).await?,
             size,
             digest,
@@ -94,7 +90,7 @@ impl DebRepo {
     ) -> io::Result<Pin<Box<dyn Read + Send>>> {
         Ok(unpacker(
             path,
-            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
         ))
     }
     pub async fn fetch(&self, path: &str) -> io::Result<Vec<u8>> {
@@ -120,7 +116,7 @@ impl DebRepo {
         digest: Sha256,
     ) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::<u8>::with_capacity(size);
-        VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest)
+        VerifyingReader::new(self.inner.reader(path).await?, size, digest)
             .read_to_end(&mut buffer)
             .await?;
         Ok(buffer)
@@ -134,7 +130,7 @@ impl DebRepo {
         let mut buffer = Vec::<u8>::with_capacity(size);
         unpacker(
             path,
-            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
         )
         .read_to_end(&mut buffer)
         .await?;
@@ -154,7 +150,7 @@ impl DebRepo {
         digest: Sha256,
     ) -> io::Result<u64> {
         let mut reader =
-            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest);
+            VerifyingReader::new(self.inner.reader(path).await?, size, digest);
         io::copy(&mut reader, pin!(w)).await
     }
     pub async fn copy_verify_unpack<W: Write + Send>(
@@ -166,7 +162,7 @@ impl DebRepo {
     ) -> io::Result<u64> {
         let mut reader = unpacker(
             path,
-            VerifyingReader::<sha2::Sha256, _>::new(self.inner.reader(path).await?, size, digest),
+            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
         );
         io::copy(&mut reader, pin!(w)).await
     }

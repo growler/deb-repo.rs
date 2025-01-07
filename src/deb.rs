@@ -3,20 +3,22 @@ pub use async_tar::{
     EntryType as TarballEntryType,
 };
 use {
-    crate::parse_size,
+    crate::{control::MutableControlStanza, parse_size},
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     async_std::{
         io::{self, prelude::*, BufReader, Result},
-        stream::Stream,
+        path::PathBuf,
+        stream::{Stream, StreamExt},
         task::{self, Context, Poll},
     },
     pin_project::pin_project,
     std::{
         ops::Range,
-        pin::Pin,
+        pin::{pin, Pin},
         sync::{Arc, Mutex},
+        time::{Duration, UNIX_EPOCH},
     },
 };
 
@@ -228,7 +230,7 @@ impl<R: Read + Unpin + Send> Stream for DebReaderInner<R> {
                     } else {
                         return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("unexpected debian package entry {:?}", &name),
+                            format!("unexpecteddebian package entry {:?}", &name),
                         ))));
                     }
                 }
@@ -258,25 +260,17 @@ impl<R: Read + Unpin + Send> Stream for DebReaderInner<R> {
 ///     }
 /// }
 /// ```
-pub struct DebReader<
-    'a,
-    R: Read + Unpin + Send + 'a,
-> {
+pub struct DebReader<'a, R: Read + Unpin + Send + 'a> {
     inner: Arc<Mutex<DebReaderInner<R>>>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-struct DebEntryReaderInner<
-    'a,
-    R: Read + Unpin + Send + 'a,
-> {
+struct DebEntryReaderInner<'a, R: Read + Unpin + Send + 'a> {
     inner: Arc<Mutex<DebReaderInner<R>>>,
     _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl<'a, R: Read + Unpin + Send + 'a> Read
-    for DebEntryReaderInner<'a, R>
-{
+impl<'a, R: Read + Unpin + Send + 'a> Read for DebEntryReaderInner<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -337,11 +331,196 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
             _ => Box::pin(r),
         })
     }
+    pub async fn extract_to<FS: crate::DeploymentFileSystem>(
+        mut self,
+        fs: FS,
+    ) -> Result<MutableControlStanza> {
+        let mut installed_files: Vec<PathBuf> = vec![];
+        let ctrl: MutableControlStanza;
+        let mut ctrl_files: Vec<(PathBuf, PathBuf)> = vec![];
+        let multiarch: Option<&str>;
+        let pkg: &str;
+        let ctrl_base = PathBuf::from("var/lib/dpkg/info");
+        fs.create_dir_all(&ctrl_base, None).await?;
+        {
+            let mut control_entries = self
+                .next()
+                .await
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "no control.tar entry".to_owned(),
+                    )
+                })?
+                .and_then(|f| match f {
+                    DebEntry::Control(f) => Ok(f),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected entry",
+                    )),
+                })?
+                .entries()?;
+            let mut maybe_ctrl: Option<MutableControlStanza> = None;
+            while let Some(entry) = control_entries.next().await {
+                let mut entry = entry?;
+                match entry.header().entry_type() {
+                    TarballEntryType::Regular => {
+                        let filename = entry
+                            .header()
+                            .path()?
+                            .file_name()
+                            .ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid entry in control.tar: {:?}", &entry),
+                                )
+                            })?
+                            .to_owned();
+                        if filename.eq("control") {
+                            let mut buf = String::new();
+                            entry.read_to_string(&mut buf).await?;
+                            maybe_ctrl.replace(MutableControlStanza::parse(buf).map_err(
+                                |err| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("error parsing control file: {}", err),
+                                    )
+                                },
+                            )?);
+                            continue;
+                        }
+                        let (tmpname, file) = fs
+                            .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
+                            .await?;
+                        io::copy(entry, file).await?;
+                        ctrl_files.push((filename.into(), tmpname));
+                    }
+                    TarballEntryType::Directory
+                        if entry.header().path()?.as_ref().to_str() == Some("./") => {}
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("invalid entry in control.tar: {:?}", &entry),
+                        ));
+                    }
+                }
+            }
+            ctrl = maybe_ctrl
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))?;
+            multiarch = ctrl.field("Multi-Arch").and_then(|v| {
+                if v.eq_ignore_ascii_case("same") {
+                    ctrl.field("Architecture")
+                } else {
+                    None
+                }
+            });
+            pkg = ctrl.field("Package").ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no Package field in package description",
+                )
+            })?;
+            for (name, tmpname) in ctrl_files.into_iter() {
+                let mut target_name = std::ffi::OsString::from(pkg);
+                if let Some(arch) = multiarch {
+                    target_name.push(":");
+                    target_name.push(arch);
+                }
+                target_name.push(".");
+                target_name.push(name);
+                fs.rename(tmpname, ctrl_base.join(target_name)).await?;
+            }
+        }
+        {
+            let mut data_entries = self
+                .next()
+                .await
+                .ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "no data.tar entry".to_owned())
+                })?
+                .and_then(|f| match f {
+                    DebEntry::Data(f) => Ok(f),
+                    _ => Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "unexpected entry",
+                    )),
+                })?
+                .entries()?;
+            while let Some(entry) = data_entries.next().await {
+                let entry = entry?;
+                let filename = entry.header().path()?.into_owned();
+                installed_files.push(filename.clone());
+                match entry.header().entry_type() {
+                    TarballEntryType::Directory => {
+                        fs.create_dir_all(filename, Some(entry.header().mode()?))
+                            .await?;
+                    }
+                    TarballEntryType::Regular => {
+                        let mut sink = fs
+                            .create_file(&filename, Some(entry.header().mode()?))
+                            .await?;
+                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
+                        io::copy(entry, &mut sink).await?;
+                        sink.flush().await?;
+                        fs.set_mtime(&filename, mtime).await?;
+                    }
+                    TarballEntryType::Link => {
+                        fs.hardlink(
+                            entry.header().link_name()?.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid link entry in data.tar: {:?}", &entry),
+                                )
+                            })?,
+                            filename,
+                        )
+                        .await?;
+                    }
+                    TarballEntryType::Symlink => {
+                        fs.symlink(
+                            entry.header().link_name()?.ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!("invalid symlink entry in data.tar: {:?}", &entry),
+                                )
+                            })?,
+                            filename,
+                        )
+                        .await?;
+                    }
+                    _ => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid entry in data.tar: kind {:?} {:?}",
+                                entry.header().entry_type().as_byte(),
+                                &entry
+                            ),
+                        ))
+                    }
+                }
+            }
+        }
+        {
+            let mut target_name = std::ffi::OsString::from(pkg);
+            if let Some(arch) = multiarch {
+                target_name.push(":");
+                target_name.push(arch);
+            }
+            target_name.push(".list");
+            let mut out = fs
+                .create_file(ctrl_base.join(target_name), Some(0o644u32))
+                .await?;
+            for i in installed_files.into_iter() {
+                out.write_all(i.as_os_str().as_encoded_bytes()).await?;
+                out.write_all(&[b'\n']).await?;
+            }
+        }
+        Ok(ctrl)
+    }
 }
 
-impl<'a, R: Read + Unpin + Send + 'a> Stream
-    for DebReader<'a, R>
-{
+impl<'a, R: Read + Unpin + Send + 'a> Stream for DebReader<'a, R> {
     type Item = Result<DebEntry<'a>>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {

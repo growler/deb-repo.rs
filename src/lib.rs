@@ -1,8 +1,8 @@
 //! A Debian repository client library
 
-pub mod digest;
 mod control;
 mod deb;
+pub mod digest;
 mod fsrepo;
 mod httprepo;
 mod idmap;
@@ -11,17 +11,23 @@ mod release;
 mod repo;
 mod universe;
 mod version;
+mod deployfs;
 
 pub use {
-    control::{ControlField, ControlFile, ControlParser, ControlStanza, ParseError},
+    control::{
+        ControlField, ControlFile, ControlParser, ControlStanza, MutableControlField,
+        MutableControlFile, MutableControlStanza, ParseError,
+    },
     deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
     fsrepo::FSDebRepo,
     httprepo::HttpDebRepo,
     packages::{Package, Packages},
     release::Release,
-    repo::{DebRepo, DebRepoProvider, null_provider},
+    repo::{null_provider, DebRepo, DebRepoProvider},
+    resolvo::{NameId, SolvableId, StringId},
     universe::Universe,
-    version::{Dependency, Constraint, Version},
+    version::{Constraint, Dependency, Version},
+    deployfs::{DeploymentFileSystem, LocalFileSystem},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
@@ -46,3 +52,4 @@ pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
     }
     Ok(result)
 }
+

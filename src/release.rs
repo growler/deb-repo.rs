@@ -130,7 +130,7 @@ impl Release {
         )
     }
     fn field(&self, name: &str) -> Option<&str> {
-        self.inner.with_control(|ctrl| ctrl.field(name))
+        self.inner.with_control(|ctrl| ctrl.field(name).map(|s| s.as_ref()))
     }
     pub fn codename(&self) -> Option<&str> {
         self.field("Codename")
@@ -142,7 +142,7 @@ impl Release {
         self.field("Label")
     }
     pub fn components(&self) -> impl Iterator<Item = &str> {
-        self.field("Componments").map_or_else(
+        self.field("Components").map_or_else(
             || "".split_ascii_whitespace(),
             |line| line.split_ascii_whitespace(),
         )

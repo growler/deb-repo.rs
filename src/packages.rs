@@ -1,6 +1,6 @@
 use {
     crate::{
-        control::{ControlField, ControlParser, ParseError},
+        control::{ControlField, ControlParser, ControlStanza, ParseError, MutableControlStanza},
         digest::{Digest, Sha256},
         repo::{DebRepo, VerifyingDebReader},
         version::{
@@ -183,11 +183,21 @@ impl<'a> Package<'a> {
     > {
         ParsedConstraintIterator::new(self.conflicts.unwrap_or(""), false)
     }
+    pub fn control(&self) -> Result<ControlStanza<'a>, ParseError> {
+        ControlStanza::parse(self.src)
+    }
     pub fn field(&self, name: &str) -> Option<&'a str> {
         ControlParser::new(self.src)
             .map(|f| f.unwrap())
             .find(|f| f.is_a(name))
             .map(|f| f.value())
+    }
+    pub fn ensure_field(&self, name: &str) -> Result<&'a str, ParseError> {
+        ControlParser::new(self.src)
+            .map(|f| f.unwrap())
+            .find(|f| f.is_a(name))
+            .map(|f| f.value())
+            .ok_or_else(|| ParseError::from(format!("Package {} description lacks field {}", &self, name)))
     }
     pub fn fields(&self) -> impl Iterator<Item = ControlField<'a>> {
         ControlParser::new(self.src).map(|f| f.unwrap())
@@ -250,6 +260,12 @@ impl<'a> Package<'a> {
                 Ok(Some(package))
             }
         }
+    }
+}
+
+impl<'a> From<&Package<'a>> for MutableControlStanza {
+    fn from(stanza: &Package<'a>) -> Self {
+        MutableControlStanza::parse(stanza.src).unwrap()
     }
 }
 

@@ -282,7 +282,7 @@ impl<IdType, Value> InternResult<IdType, Value> {
     }
 }
 
-pub(crate) trait IntoBoxed<Value> 
+pub trait IntoBoxed<Value> 
 where
     Value: Hash + Eq + ?Sized,
 {
@@ -310,6 +310,12 @@ impl IntoBoxed<str> for &str {
 impl IntoBoxed<str> for String {
     fn into_boxed(self) -> Box<str> {
         self.into_boxed_str()
+    }
+}
+
+impl IntoBoxed<str> for Box<str> {
+    fn into_boxed(self) -> Box<str> {
+        self
     }
 }
 
