@@ -3,7 +3,10 @@
 ///
 /// The parser does not process comments and is suitable only
 /// for parsing then binary packages descriptions.
-use {crate::idmap::IntoBoxed, std::borrow::Cow};
+use {
+    crate::idmap::IntoBoxed,
+    std::{borrow::Cow, usize},
+};
 
 /// Parsing error
 #[derive(Debug, Clone)]
@@ -253,18 +256,89 @@ impl MutableControlStanza {
             for (i, f) in fields.iter().enumerate() {
                 if f.is_a(name.as_ref()) {
                     fields.remove(i);
-                    return
+                    return;
                 }
             }
         });
         self
     }
     pub fn retain<F: FnMut(&MutableControlField) -> bool>(&mut self, f: F) -> &mut Self {
-        self.inner.with_fields_mut(|fields| {
-            fields.retain(f)
-        });
+        self.inner.with_fields_mut(|fields| fields.retain(f));
         self
     }
+    pub fn sort_fields_by_name<F: FnMut(&str, &str) -> std::cmp::Ordering>(
+        &mut self,
+        mut compare: F,
+    ) {
+        self.inner.with_fields_mut(|fields| {
+            fields.sort_by(|left, right| compare(left.name(), right.name()));
+        });
+    }
+    pub fn sort_fields_deb_order(&mut self) {
+        self.sort_fields_by_name(|left, right| {
+            match deb_sort_order(left).cmp(&deb_sort_order(right)) {
+                std::cmp::Ordering::Equal => cmp_ascii_ignore_case(left, right),
+                ne => ne,
+            }
+        })
+    }
+}
+
+fn cmp_ascii_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
+    let mut left = left.as_bytes().iter();
+    let mut right = right.as_bytes().iter();
+    loop {
+        if let Some(l) = left.next() {
+            if let Some(r) = right.next() {
+                match l.to_ascii_lowercase().cmp(&r.to_ascii_lowercase()) {
+                    std::cmp::Ordering::Equal => continue,
+                    ne => break ne,
+                }
+            } else {
+                break std::cmp::Ordering::Greater;
+            }
+        } else {
+            if right.next().is_some() {
+                break std::cmp::Ordering::Less;
+            } else {
+                break std::cmp::Ordering::Equal;
+            }
+        }
+    }
+}
+
+const DEB_SORT_ORDER: [&str; 23] = [
+    "Package",
+    "Status",
+    "Version",
+    "Provides",
+    "Architecture",
+    "Multi-Arch",
+    "Priority",
+    "Essential",
+    "Section",
+    "Pre-Depends",
+    "Depends",
+    "Section",
+    "Breaks",
+    "Conflicts",
+    "Replaces",
+    "Recommends",
+    "Suggests",
+    "Installed-Size",
+    "Homepage",
+    "Maintainer",
+    "Source",
+    "Description",
+    "Conffiles",
+];
+
+fn deb_sort_order(name: &str) -> usize {
+    DEB_SORT_ORDER
+        .iter()
+        .enumerate()
+        .find(|(_, &s)| s.eq_ignore_ascii_case(name))
+        .map_or(usize::MAX, |(i, _)| i)
 }
 
 impl<'a> From<&ControlStanza<'a>> for MutableControlStanza {

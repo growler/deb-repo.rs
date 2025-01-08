@@ -335,9 +335,10 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
         mut self,
         fs: FS,
     ) -> Result<MutableControlStanza> {
-        let mut installed_files: Vec<PathBuf> = vec![];
-        let ctrl: MutableControlStanza;
+        let mut installed_files: Vec<String> = vec![];
+        let mut ctrl: MutableControlStanza;
         let mut ctrl_files: Vec<(PathBuf, PathBuf)> = vec![];
+        let mut conf_files: Vec<(String, Option<String>)> = vec![];
         let multiarch: Option<&str>;
         let pkg: &str;
         let ctrl_base = PathBuf::from("var/lib/dpkg/info");
@@ -388,12 +389,22 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                                 },
                             )?);
                             continue;
+                        } else if filename.eq("conffiles") {
+                            let mut buf = String::with_capacity(entry.header().size()? as usize);
+                            entry.read_to_string(&mut buf).await?;
+                            conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
+                            let (tmpname, mut file) = fs
+                                .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
+                                .await?;
+                            file.write_all(buf.as_bytes()).await?;
+                            ctrl_files.push((filename.into(), tmpname));
+                        } else {
+                            let (tmpname, file) = fs
+                                .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
+                                .await?;
+                            io::copy(entry, file).await?;
+                            ctrl_files.push((filename.into(), tmpname));
                         }
-                        let (tmpname, file) = fs
-                            .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
-                            .await?;
-                        io::copy(entry, file).await?;
-                        ctrl_files.push((filename.into(), tmpname));
                     }
                     TarballEntryType::Directory
                         if entry.header().path()?.as_ref().to_str() == Some("./") => {}
@@ -448,21 +459,39 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 .entries()?;
             while let Some(entry) = data_entries.next().await {
                 let entry = entry?;
-                let filename = entry.header().path()?.into_owned();
-                installed_files.push(filename.clone());
+                let path = entry.header().path()?.to_path_buf();
+                let path_str = path
+                    .to_str()
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("package file name {:?} is not a valid UTF-8", path),
+                        )
+                    })
+                    .map(|p| if p.starts_with('.') { &p[1..] } else { p })?;
+                installed_files.push(path_str.to_owned());
                 match entry.header().entry_type() {
                     TarballEntryType::Directory => {
-                        fs.create_dir_all(filename, Some(entry.header().mode()?))
+                        fs.create_dir_all(&path, Some(entry.header().mode()?))
                             .await?;
                     }
                     TarballEntryType::Regular => {
-                        let mut sink = fs
-                            .create_file(&filename, Some(entry.header().mode()?))
-                            .await?;
                         let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
-                        io::copy(entry, &mut sink).await?;
+                        let mut sink = fs.create_file(&path, Some(entry.header().mode()?)).await?;
+                        match conf_files.iter_mut().find(|(name, _)| name == path_str) {
+                            None => {
+                                io::copy(entry, &mut sink).await?;
+                            }
+                            Some((_, sum)) => {
+                                let mut digester =
+                                    crate::digest::DigestingReader::<md5::Md5, _>::new(entry);
+                                io::copy(&mut digester, &mut sink).await?;
+                                let hash = digester.finalize();
+                                sum.replace(hash.into());
+                            }
+                        }
                         sink.flush().await?;
-                        fs.set_mtime(&filename, mtime).await?;
+                        fs.set_mtime(&path, mtime).await?;
                     }
                     TarballEntryType::Link => {
                         fs.hardlink(
@@ -472,7 +501,7 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                                     format!("invalid link entry in data.tar: {:?}", &entry),
                                 )
                             })?,
-                            filename,
+                            &path,
                         )
                         .await?;
                     }
@@ -484,7 +513,7 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                                     format!("invalid symlink entry in data.tar: {:?}", &entry),
                                 )
                             })?,
-                            filename,
+                            &path,
                         )
                         .await?;
                     }
@@ -512,8 +541,22 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 .create_file(ctrl_base.join(target_name), Some(0o644u32))
                 .await?;
             for i in installed_files.into_iter() {
-                out.write_all(i.as_os_str().as_encoded_bytes()).await?;
+                out.write_all(i.as_bytes()).await?;
                 out.write_all(&[b'\n']).await?;
+            }
+        }
+        if conf_files.len() > 0 {
+            let mut buf = String::new();
+            for (name, hash) in conf_files.into_iter() {
+                if let Some(hash) = hash {
+                    buf.push_str("\n ");
+                    buf.push_str(&name);
+                    buf.push(' ');
+                    buf.push_str(&hash);
+                }
+            }
+            if buf.len() > 0 {
+                ctrl.set("Conffiles", buf);
             }
         }
         Ok(ctrl)

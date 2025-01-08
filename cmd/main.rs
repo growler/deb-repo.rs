@@ -337,6 +337,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                             match result {
                                 Ok(mut stanza) => {
                                     stanza.set("Status", "install ok unpacked");
+                                    stanza.sort_fields_deb_order();
                                     control_file.push(stanza)
                                 }
                                 Err(err) => return Err(err),
