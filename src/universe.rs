@@ -3,9 +3,10 @@ use {
         control::ParseError,
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::{VerifyingReader, VerifyingDebReader},
+        repo::{VerifyingDebReader, VerifyingReader},
         version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
     },
+    async_std::io::{self, Write},
     iterator_ext::IteratorExt,
     resolvo::{
         Candidates, Dependencies, DependencyProvider, Interner, KnownDependencies, NameId,
@@ -13,11 +14,10 @@ use {
         VersionSetUnionId,
     },
     smallvec::{smallvec, SmallVec},
-    async_std::io::{self, Write},
     std::{
-        pin::pin,
         borrow::Borrow,
         hash::{Hash, Hasher},
+        pin::pin,
     },
 };
 
@@ -224,7 +224,7 @@ impl<'a> UniverseIndex<'a> {
         package: &'a Package<'a>,
     ) -> Result<(), ParseError> {
         let solvable_id: SolvableId = self.solvables.len().into_id();
-        let is_required = package.essential_or_required();
+        let is_required = package.essential() || package.required();
         let arch = self.get_arch_id(package.architecture());
         let name =
             match self.insert_or_update_name(package.name(), Some((solvable_id, is_required))) {
@@ -435,6 +435,15 @@ impl<S: AsRef<str> + 'static> Universe<S> {
     ) -> Result<Vec<SolvableId>, UnsolvableOrCancelled> {
         self.inner.solve(problem)
     }
+    pub fn dependency_graph(
+        &self,
+        solution: &mut [SolvableId],
+    ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
+        self.inner.provider().dependency_graph(solution)
+    }
+    pub fn sort_solution(&self, solution: &mut [SolvableId]) -> impl Iterator<Item = SolvableId> {
+        self.inner.provider().sort_solution(solution)
+    }
     pub fn package(&self, solvable: SolvableId) -> &Package<'_> {
         self.inner
             .provider()
@@ -446,8 +455,13 @@ impl<S: AsRef<str> + 'static> Universe<S> {
     ) -> impl std::fmt::Display + '_ {
         conflict.display_user_friendly(&self.inner)
     }
+    pub fn display_solvable(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
+        self.inner.provider().display_solvable(solvable)
+    }
     pub fn packages(&self) -> impl Iterator<Item = &'_ Package<'_>> {
-        self.inner.provider().with_index(|i| i.solvables.iter().map(|s| s.package))
+        self.inner
+            .provider()
+            .with_index(|i| i.solvables.iter().map(|s| s.package))
     }
     pub async fn deb_reader<'a>(&'a self, id: SolvableId) -> io::Result<VerifyingDebReader<'a>> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
@@ -529,6 +543,45 @@ impl<S: AsRef<str> + 'static> InnerUniverse<S> {
     }
     fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         self.with(|u| u.index.add_package_dependencies(solvable, &u.interned))
+    }
+    fn dependency_graph(
+        &self,
+        solution: &mut [SolvableId],
+    ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
+        solution.sort();
+        petgraph::graphmap::DiGraphMap::<SolvableId, ()>::from_edges(solution.iter().flat_map(
+            |package| {
+                match self.get_dependencies(*package) {
+                    Dependencies::Known(deps) => deps,
+                    _ => unreachable!(
+                        "by this point the solvables in the solution have only known dependencies"
+                    ),
+                }
+                .requirements
+                .into_iter()
+                .flat_map(|dep| match dep {
+                    Requirement::Single(dep) => itertools::Either::Left(std::iter::once(dep)),
+                    Requirement::Union(deps) => {
+                        itertools::Either::Right(self.version_sets_in_union(deps))
+                    }
+                })
+                .flat_map(|vs| {
+                    self.get_candidates(self.version_set_name(vs))
+                        .into_iter()
+                        .flat_map(|vs| vs.candidates.into_iter())
+                        .filter(|sid| {
+                            *sid != *package
+                                && solution.binary_search_by(|probe| probe.cmp(sid)).is_ok()
+                        })
+                })
+                .map(|dependency| (*package, dependency))
+            },
+        ))
+    }
+    fn sort_solution(&self, solution: &mut [SolvableId]) -> impl Iterator<Item = SolvableId> {
+        petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
+            .into_iter()
+            .flat_map(|g| g.into_iter())
     }
 }
 
@@ -865,5 +918,4 @@ Package: xkb-data
 Version: 2.35.1-1
 Architecture: all
 ");
-
 }

@@ -131,11 +131,11 @@ impl<'a> Package<'a> {
     pub fn priority(&self) -> Priority {
         self.priority
     }
+    pub fn required(&self) -> bool {
+        self.priority == Priority::Required
+    }
     pub fn multi_arch(&self) -> MultiArch {
         self.multi_arch
-    }
-    pub fn essential_or_required(&self) -> bool {
-        self.essential || self.priority == Priority::Required
     }
     pub fn architecture(&self) -> &'a str {
         self.arch

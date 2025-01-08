@@ -90,6 +90,9 @@ enum Commands {
             default_value = "all"
         )]
         comp: String,
+        /// Fetch packages
+        #[arg(short = 'g', long = "print-graph", value_name = "dot|text")]
+        print_graph: Option<String>,
         /// Number of concurrent downloads
         #[arg(short = 'l', long = "limit", value_name = "NUM", default_value = "5")]
         limit: usize,
@@ -162,6 +165,7 @@ impl<'a> From<&'a debrepo::Package<'a>> for Package<'a> {
 fn pretty_print_packages<'a, W: std::io::Write>(
     f: &mut W,
     iter: impl IntoIterator<Item = Package<'a>>,
+    sort: bool,
 ) -> std::result::Result<usize, std::io::Error> {
     let mut w0 = 0usize;
     let mut w1 = 0usize;
@@ -177,10 +181,12 @@ fn pretty_print_packages<'a, W: std::io::Write>(
             pkg
         })
         .collect::<Vec<_>>();
-    packages.sort_by(|this, that| match this.name.cmp(that.name) {
-        std::cmp::Ordering::Equal => this.ver.cmp(&that.ver),
-        other => other,
-    });
+    if sort {
+        packages.sort_by(|this, that| match this.name.cmp(that.name) {
+            std::cmp::Ordering::Equal => this.ver.cmp(&that.ver),
+            other => other,
+        });
+    }
     for p in packages.iter() {
         writeln!(
             f,
@@ -277,6 +283,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                     .packages()
                     .map(|p| -> Package { p.into() })
                     .filter(|p| re.is_match(p.name) || re.is_match(p.desc)),
+                true,
             )? {
                 0 => {
                     println!("not found in {:?}", start.elapsed());
@@ -293,6 +300,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             origin,
             distr,
             comp,
+            print_graph,
             fetch,
             extract,
             target,
@@ -322,7 +330,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             let mut universe = Universe::new(&arch, packages)?;
             let problem = universe.problem(requirements?, std::iter::empty());
             match universe.solve(problem) {
-                Ok(solution) => {
+                Ok(mut solution) => {
                     if extract {
                         let fs = debrepo::LocalFileSystem::new(&target).await?;
                         let mut control_file: Vec<MutableControlStanza> = vec![];
@@ -381,14 +389,53 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                         }
                         println!("solved and fetched in {:?}", start.elapsed());
                     } else {
+                        use petgraph::dot::{Config, Dot};
                         let mut out = std::io::stdout().lock();
-                        pretty_print_packages(
-                            &mut out,
-                            solution
-                                .into_iter()
-                                .map(|s| -> Package { universe.package(s).into() }),
-                        )?;
-                        println!("solved in {:?}", start.elapsed());
+                        if let Some(format) = print_graph {
+                            let graph = universe.dependency_graph(&mut solution);
+                            if format.eq_ignore_ascii_case("dot") {
+                                println!(
+                                    "{:?}",
+                                    Dot::with_attr_getters(
+                                        &graph,
+                                        &[Config::EdgeNoLabel, Config::NodeNoLabel],
+                                        &|_, _| "".to_owned(),
+                                        &|_, id| format!(
+                                            "label = \"{}\"",
+                                            universe.display_solvable(id.0)
+                                        )
+                                    )
+                                );
+                            } else {
+                                let ordered = petgraph::algo::kosaraju_scc(&graph)
+                                    .into_iter()
+                                    .flat_map(|g| g.into_iter());
+                                for id in ordered {
+                                    println!("{}", universe.display_solvable(id));
+                                    let mut has_deps = false;
+                                    for (i, dep) in graph.neighbors(id).enumerate() {
+                                        if i == 0 {
+                                            print!(" {}", universe.display_solvable(dep));
+                                            has_deps = true;
+                                        } else {
+                                            print!(", {}", universe.display_solvable(dep));
+                                        }
+                                    }
+                                    if has_deps {
+                                        println!("");
+                                    }
+                                }
+                            }
+                        } else {
+                            pretty_print_packages(
+                                &mut out,
+                                universe
+                                    .sort_solution(&mut solution)
+                                    .map(|s| -> Package { universe.package(s).into() }),
+                                false,
+                            )?;
+                            println!("solved in {:?}", start.elapsed());
+                        }
                     };
                     Ok(ExitCode::SUCCESS)
                 }
@@ -406,7 +453,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
 
 #[async_std::main]
 async fn main() -> ExitCode {
-    tracing_subscriber::fmt::init();
+    //tracing_subscriber::fmt::init();
     let cli = Cli::parse();
     match cmd(cli).await {
         Ok(code) => code,
