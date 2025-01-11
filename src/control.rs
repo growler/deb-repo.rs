@@ -1,14 +1,14 @@
-/// Provides interface to work with Debian Control files
-/// see <https://www.debian.org/doc/debian-policy/ch-controlfields.html>
+/// Provides an interface to work with Debian Control files.
+/// See <https://www.debian.org/doc/debian-policy/ch-controlfields.html>.
 ///
-/// The parser does not process comments and is suitable only
-/// for parsing then binary packages descriptions.
+/// The parser does not process comments and is only suitable
+/// for parsing binary package descriptions.
 use {
     crate::idmap::IntoBoxed,
     std::{borrow::Cow, usize},
 };
 
-/// Parsing error
+/// Represents parsing error
 #[derive(Debug, Clone)]
 pub struct ParseError {
     msg: Cow<'static, str>,
@@ -30,13 +30,19 @@ impl From<String> for ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "error parsing {}", self.msg)
+        write!(f, "{}", self.msg)
     }
 }
 
-/// Represents the Debian Control File field.
-/// Internally ControlField contains references to a slice of
-/// parsed Control File.
+impl From<ParseError> for std::io::Error {
+    fn from(err: ParseError) -> Self {
+        std::io::Error::new(std::io::ErrorKind::InvalidData, err.msg.into_owned())
+    }
+}
+
+/// Represents an immutable field in the Debian Control File.
+/// Internally, ControlField holds references to a slice of
+/// parsed block.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlField<'a> {
     name: &'a str,
@@ -68,9 +74,7 @@ impl<'a> ControlField<'a> {
     }
 }
 
-/// Represents the Debian Control File field.
-/// Internally ControlField contains references to a slice of
-/// parsed Control File.
+/// Represents the Debian Control File mutable field.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MutableControlField<'a> {
     name: Cow<'a, str>,
@@ -96,11 +100,11 @@ impl<'a> MutableControlField<'a> {
     pub fn name(&self) -> &str {
         &self.name
     }
-    /// Returns field's value
+    /// Returns reference to the field's value
     pub fn value(&self) -> &str {
         &self.value
     }
-    ///
+    /// Sets the field value
     pub fn set<S: Into<Cow<'a, str>>>(&mut self, value: S) {
         self.value = value.into()
     }
@@ -124,7 +128,7 @@ impl<'a> From<&ControlField<'a>> for MutableControlField<'a> {
     }
 }
 
-/// Represents the single Debian Control Stanza (a.k.a. Paragraph)
+/// Represents the single immutable Debian Control Stanza (a.k.a. Paragraph)
 #[derive(Debug, Clone, PartialEq)]
 pub struct ControlStanza<'a> {
     src: &'a str,
@@ -141,7 +145,7 @@ impl<'a> std::fmt::Display for ControlStanza<'a> {
 }
 
 impl<'a> ControlStanza<'a> {
-    /// Parses a string into a ControlStanza. Requires that the `src` is completely parsed.
+    /// Parses a string into a ControlStanza, ensuring that the entire `src` is fully parsed.
     pub fn parse(src: &'a str) -> Result<Self, ParseError> {
         let fields =
             ControlParser::new(src).collect::<Result<Vec<ControlField<'a>>, ParseError>>()?;
@@ -151,20 +155,20 @@ impl<'a> ControlStanza<'a> {
             Ok(ControlStanza { src, fields })
         }
     }
-    /// Returns the value of the field `name` if present in the stanza
+    /// Returns the value of the `name` field if it is present in the stanza
     pub fn field(&self, name: &str) -> Option<&str> {
         self.fields
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name))
             .map(|f| f.value.as_ref())
     }
-    /// Returns an iterator over the ControlStanza fields.
+    /// Provides an iterator over the fields of a ControlStanza.
     pub fn fields(&self) -> impl Iterator<Item = &'_ ControlField<'a>> {
         self.fields.iter()
     }
 }
 
-/// Represents the single Debian Control Stanza (a.k.a. Paragraph)
+/// Represents the single mutable Debian Control Stanza (a.k.a. Paragraph)
 pub struct MutableControlStanza {
     inner: MutableControlStanzaInner,
 }
@@ -187,6 +191,7 @@ impl std::fmt::Display for MutableControlStanza {
 }
 
 impl MutableControlStanza {
+    /// Creates new empty Stanza
     pub fn new() -> Self {
         MutableControlStanza {
             inner: MutableControlStanzaInnerBuilder {
@@ -196,7 +201,7 @@ impl MutableControlStanza {
             .build(),
         }
     }
-    /// Parses a string into a ControlStanza. Requires that the `src` is completely parsed.
+    /// Parses a string into a ControlStanza, ensuring that the entire `src` string is consumed.
     pub fn parse<S: IntoBoxed<str>>(src: S) -> Result<Self, ParseError> {
         Ok(MutableControlStanza {
             inner: MutableControlStanzaInnerTryBuilder {
@@ -218,7 +223,7 @@ impl MutableControlStanza {
             .try_build()?,
         })
     }
-    /// Returns the value of the field `name` if present in the stanza
+    /// Returns the value of the `name` field if it is present in the stanza
     pub fn field(&self, name: &str) -> Option<&str> {
         self.inner.with_fields(|fields| {
             fields
@@ -227,11 +232,11 @@ impl MutableControlStanza {
                 .map(|f| f.value.as_ref())
         })
     }
-    /// Returns an iterator over the ControlStanza fields.
+    /// Provides an iterator over the fields of ControlStanza.
     pub fn fields(&self) -> impl Iterator<Item = &'_ MutableControlField> {
         self.inner.with_fields(|fields| fields.iter())
     }
-    /// Sets a field.
+    /// Sets the value of a field, adding the field if it does not already exist.
     pub fn set<N: Into<Cow<'static, str>> + AsRef<str>, V: Into<Cow<'static, str>>>(
         &mut self,
         name: N,
@@ -251,6 +256,7 @@ impl MutableControlStanza {
         });
         self
     }
+    /// Removes field from the Stanza.
     pub fn remove<S: AsRef<str>>(&mut self, name: S) -> &mut Self {
         self.inner.with_fields_mut(|fields| {
             for (i, f) in fields.iter().enumerate() {
@@ -262,10 +268,12 @@ impl MutableControlStanza {
         });
         self
     }
+    /// Retains fields matching filter `f`, while removing others.
     pub fn retain<F: FnMut(&MutableControlField) -> bool>(&mut self, f: F) -> &mut Self {
         self.inner.with_fields_mut(|fields| fields.retain(f));
         self
     }
+    /// Sorts fields by name using provided comparator.
     pub fn sort_fields_by_name<F: FnMut(&str, &str) -> std::cmp::Ordering>(
         &mut self,
         mut compare: F,
@@ -274,6 +282,7 @@ impl MutableControlStanza {
             fields.sort_by(|left, right| compare(left.name(), right.name()));
         });
     }
+    /// Sorts fields by name in the order usually present on dpkg's status file.
     pub fn sort_fields_deb_order(&mut self) {
         self.sort_fields_by_name(|left, right| {
             match deb_sort_order(left).cmp(&deb_sort_order(right)) {
@@ -347,6 +356,7 @@ impl<'a> From<&ControlStanza<'a>> for MutableControlStanza {
     }
 }
 
+/// Represents a mutable Control File consisting of multiple Stanzas
 pub struct MutableControlFile {
     stanzas: Vec<MutableControlStanza>,
 }
@@ -361,15 +371,19 @@ impl std::fmt::Display for MutableControlFile {
 }
 
 impl MutableControlFile {
+    /// Creats a new Control File
     pub fn new() -> Self {
         Self { stanzas: vec![] }
     }
+    /// Returns an iterator over stanzas
     pub fn stanzas(&self) -> impl Iterator<Item = &'_ MutableControlStanza> {
         self.stanzas.iter()
     }
+    /// Adds a new stanza
     pub fn add(&mut self, stanza: MutableControlStanza) {
         self.stanzas.push(stanza)
     }
+    /// Creates a new stanza and returns a mutable reference to it.
     pub fn new_stanza(&mut self) -> &'_ mut MutableControlStanza {
         let l = self.stanzas.len();
         self.stanzas.push(MutableControlStanza::new());
@@ -377,7 +391,7 @@ impl MutableControlFile {
     }
 }
 
-/// Represents the Debian Control File, containing a number of Stanzas
+/// Represents an immutable Debian Control File consisting of multiple Stanzas
 pub struct ControlFile<'a> {
     pub stanzas: Vec<ControlStanza<'a>>,
 }
@@ -392,8 +406,9 @@ impl<'a> std::fmt::Display for ControlFile<'a> {
 }
 
 impl<'a> ControlFile<'a> {
-    pub fn parse(src: &'a str) -> Result<Self, ParseError> {
-        let mut parser = ControlParser::new(src);
+    /// Parses a string into ControlFile 
+    pub fn parse<S: ?Sized + AsRef<str>>(src: &'a S) -> Result<Self, ParseError> {
+        let mut parser = ControlParser::new(src.as_ref());
         let mut stanzas: Vec<ControlStanza<'a>> = vec![];
         loop {
             let snap = unsafe { parser.snap() };
@@ -412,11 +427,13 @@ impl<'a> ControlFile<'a> {
         }
         Ok(Self { stanzas })
     }
+    /// Returns an interator over stanzas
     pub fn stanzas(&self) -> impl Iterator<Item = &'_ ControlStanza<'a>> {
         self.stanzas.iter()
     }
 }
 
+/// Provides a Debian Control format parser.
 pub struct ControlParser<'a> {
     src: &'a str,
 }
@@ -453,8 +470,9 @@ fn is_ws(c: &u8) -> bool {
 }
 
 impl<'a> ControlParser<'a> {
-    pub fn new(src: &'a str) -> Self {
-        Self { src }
+    /// Creates a new parser from the `src`
+    pub fn new<S: ?Sized + AsRef<str>>(src: &'a S) -> Self {
+        Self { src: src.as_ref() }
     }
     fn quote_err(&self) -> String {
         match self.src.char_indices().nth(20) {
@@ -542,6 +560,8 @@ impl<'a> ControlParser<'a> {
         }
         Ok(self.advance(pos - 1, 1))
     }
+    /// Returns the next parsed field, or None if at the end of the stanza.
+    /// The next call either returns None at the end of the file or the first field of the next stanza.
     pub fn field(&mut self) -> Result<Option<ControlField<'a>>, ParseError> {
         match self.field_name()? {
             None => return Ok(None),
@@ -555,6 +575,7 @@ impl<'a> ControlParser<'a> {
 
 impl<'a> Iterator for ControlParser<'a> {
     type Item = Result<ControlField<'a>, ParseError>;
+    /// Implements iterator interface over fields.
     fn next(&mut self) -> Option<Self::Item> {
         self.field().transpose()
     }

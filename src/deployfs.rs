@@ -9,11 +9,15 @@ use async_std::{
 };
 use std::os::unix::{fs::PermissionsExt, io::IntoRawFd};
 
+/// Defines a file system interface to deploy packages.
 #[async_trait::async_trait]
 pub trait DeploymentFileSystem {
+    type File: io::Write + Unpin + Send;
+    /// Create a directory at `path` using mode bits `mode`
     async fn create_dir<P>(&self, path: P, mode: Option<u32>) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
+    /// Create a directory at `path`, including all the parent directories if necessary, using mode bits `mode`
     async fn create_dir_all<P>(&self, path: P, mode: Option<u32>) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
@@ -25,25 +29,28 @@ pub trait DeploymentFileSystem {
     where
         P: AsRef<Path> + Send,
         Q: AsRef<Path> + Send;
-    async fn create_file<P>(
-        &self,
-        target: P,
-        mode: Option<u32>,
-    ) -> io::Result<impl io::Write + Unpin + Send>
+    async fn rename<P, Q>(&self, from: P, to: Q) -> io::Result<()>
+    where
+        P: AsRef<Path> + Send,
+        Q: AsRef<Path> + Send;
+    async fn create_file<P>(&self, target: P, mode: Option<u32>) -> io::Result<Self::File>
     where
         P: AsRef<Path> + Send;
     async fn create_tmp_file<P: AsRef<Path> + Send>(
         &self,
         dir: P,
         mode: Option<u32>,
-    ) -> io::Result<(PathBuf, impl io::Write + Unpin + Send)>;
-    async fn rename<P, Q>(&self, from: P, to: Q) -> io::Result<()>
-    where
-        P: AsRef<Path> + Send,
-        Q: AsRef<Path> + Send;
+    ) -> io::Result<(PathBuf, Self::File)>;
+    async fn fallocate(&self, fd: &mut Self::File, size: u64) -> io::Result<()>;
     async fn chown<P>(&self, path: P, uid: Option<u32>, gid: Option<u32>) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
+    async fn fchown(
+        &self,
+        fd: &mut Self::File,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> io::Result<()>;
     async fn set_permissions<P>(&self, path: P, perm: fs::Permissions) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
@@ -55,13 +62,17 @@ pub trait DeploymentFileSystem {
 #[derive(Clone, Debug)]
 pub struct LocalFileSystem {
     root: Box<Path>,
+    chown_allowed: bool,
 }
 unsafe impl Sync for LocalFileSystem {}
 
 impl LocalFileSystem {
-    pub async fn new<P: AsRef<Path>>(root: P) -> io::Result<Self> {
+    pub async fn new<P: AsRef<Path>>(root: P, allow_chown: bool) -> io::Result<Self> {
         let root = root.as_ref().to_owned().canonicalize().await?;
-        Ok(Self { root: root.into() })
+        Ok(Self {
+            root: root.into(),
+            chown_allowed: allow_chown,
+        })
     }
     fn target_path(&self, target: &Path) -> io::Result<PathBuf> {
         let target = if target.has_root() {
@@ -88,6 +99,7 @@ impl LocalFileSystem {
 
 #[async_trait::async_trait]
 impl DeploymentFileSystem for &LocalFileSystem {
+    type File = async_std::fs::File;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -134,7 +146,7 @@ impl DeploymentFileSystem for &LocalFileSystem {
         &self,
         path: P,
         mode: Option<u32>,
-    ) -> io::Result<impl io::Write + Unpin + Send> {
+    ) -> io::Result<Self::File> {
         let target = self.target_path(path.as_ref())?;
         let mut open = fs::OpenOptions::new();
         open.write(true).create_new(true);
@@ -147,7 +159,7 @@ impl DeploymentFileSystem for &LocalFileSystem {
         &self,
         dir: P,
         mode: Option<u32>,
-    ) -> io::Result<(PathBuf, impl io::Write + Unpin + Send)> {
+    ) -> io::Result<(PathBuf, Self::File)> {
         let dir = self.target_path(dir.as_ref())?;
         let mut builder = tempfile::Builder::new();
         if let Some(mode) = mode {
@@ -191,8 +203,27 @@ impl DeploymentFileSystem for &LocalFileSystem {
         uid: Option<u32>,
         gid: Option<u32>,
     ) -> io::Result<()> {
-        let file = self.target_path(path.as_ref())?;
-        async_std::task::spawn_blocking(move || std::os::unix::fs::chown(file, uid, gid)).await
+        if self.chown_allowed {
+            let file = self.target_path(path.as_ref())?;
+            async_std::task::spawn_blocking(move || std::os::unix::fs::chown(file, uid, gid)).await
+        } else {
+            Ok(())
+        }
+    }
+    async fn fchown(
+        &self,
+        fd: &mut Self::File,
+        uid: Option<u32>,
+        gid: Option<u32>,
+    ) -> io::Result<()> {
+        if self.chown_allowed {
+            use async_std::os::unix::io::AsRawFd;
+            let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(fd.as_raw_fd()) };
+            async_std::task::spawn_blocking(move || std::os::unix::fs::fchown(raw_fd, uid, gid))
+                .await
+        } else {
+            Ok(())
+        }
     }
     async fn set_mtime<P: AsRef<Path> + Send>(
         &self,
@@ -201,5 +232,19 @@ impl DeploymentFileSystem for &LocalFileSystem {
     ) -> io::Result<()> {
         let file = self.target_path(path.as_ref())?;
         async_std::task::spawn_blocking(move || filetime::set_file_mtime(file, mtime.into())).await
+    }
+    async fn fallocate(&self, fd: &mut Self::File, size: u64) -> io::Result<()> {
+        use async_std::os::unix::io::AsRawFd;
+        let raw_fd = fd.as_raw_fd();
+        async_std::task::spawn_blocking(move || {
+            nix::fcntl::fallocate(
+                raw_fd,
+                nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                0,
+                size as i64,
+            )
+            .map_err(|err| io::Error::from_raw_os_error(err as i32))
+        })
+        .await
     }
 }

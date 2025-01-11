@@ -23,7 +23,7 @@ pub use {
     httprepo::HttpDebRepo,
     packages::{Package, Packages},
     release::Release,
-    repo::{null_provider, DebRepo, DebRepoProvider},
+    repo::{null_provider, DebRepo, DebRepoProvider, DEBIAN_KEYRING},
     resolvo::{NameId, SolvableId, StringId},
     universe::Universe,
     version::{Constraint, Dependency, Version},

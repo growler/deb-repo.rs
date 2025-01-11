@@ -258,7 +258,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
         } => {
             let start = std::time::Instant::now();
             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
-            let release = repo.fetch_release(&distr).await?;
+            let release = repo.fetch_verify_release_with_keys(&distr, [debrepo::DEBIAN_KEYRING]).await?;
             let components = if &comp == "all" {
                 release.components().collect::<Vec<&'_ str>>()
             } else {
@@ -332,7 +332,11 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             match universe.solve(problem) {
                 Ok(mut solution) => {
                     if extract {
-                        let fs = debrepo::LocalFileSystem::new(&target).await?;
+                        let fs = debrepo::LocalFileSystem::new(
+                            &target,
+                            nix::unistd::Uid::effective().is_root(),
+                        )
+                        .await?;
                         let mut control_file: Vec<MutableControlStanza> = vec![];
                         let mut stream = FuturesUnordered::new();
                         let mut pending = solution.into_iter();
@@ -451,11 +455,9 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
     }
 }
 
-#[async_std::main]
-async fn main() -> ExitCode {
-    //tracing_subscriber::fmt::init();
+fn main() -> ExitCode {
     let cli = Cli::parse();
-    match cmd(cli).await {
+    match async_std::task::block_on(cmd(cli)) {
         Ok(code) => code,
         Err(err) => {
             println!("{}", err);

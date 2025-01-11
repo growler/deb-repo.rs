@@ -41,10 +41,16 @@ tempfile = "3.15.0"
 filetime = "0.2.25"
 petgraph = { version = "0.7.1", default-features = false, features = [ "graphmap" ] }
 itertools = "0.14.0"
+nix = { version = "0.29.0", features = [ "sched", "mount", "process", "fs", "signal", "user" ] }
 
 [dependencies.async-compression]
 version = "0.4"
 features = [ "futures-io", "bzip2", "gzip", "zstd", "lzma", "xz" ]
+
+[build-dependencies]
+isahc = { version = "1", default-features = false, features = [ "http2" ] }
+tempfile = "3"
+gpgme = "0.11"
 
 [lib]
 name = "debrepo"
@@ -65,3 +71,7 @@ harness = false
 [[bin]]
 name = "deb-repo"
 path = "cmd/main.rs"
+
+[[bin]]
+name = "nrun"
+path = "cmd/nrun.rs"

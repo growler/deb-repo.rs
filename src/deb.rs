@@ -286,6 +286,19 @@ impl<'a, R: Read + Unpin + Send + 'a> Read for DebEntryReaderInner<'a, R> {
     }
 }
 
+trait AsUid {
+    fn as_uid(self) -> Option<u32>;
+}
+
+impl AsUid for u64 {
+    fn as_uid(self) -> Option<u32> {
+        match self {
+            0 => None,
+            n => Some(n as u32),
+        }
+    }
+}
+
 impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
@@ -396,12 +409,14 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                             let (tmpname, mut file) = fs
                                 .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
                                 .await?;
+                            fs.fallocate(&mut file, entry.header().size()?).await.ok();
                             file.write_all(buf.as_bytes()).await?;
                             ctrl_files.push((filename.into(), tmpname));
                         } else {
-                            let (tmpname, file) = fs
+                            let (tmpname, mut file) = fs
                                 .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
                                 .await?;
+                            fs.fallocate(&mut file, entry.header().size()?).await.ok();
                             io::copy(entry, file).await?;
                             ctrl_files.push((filename.into(), tmpname));
                         }
@@ -474,10 +489,23 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                     TarballEntryType::Directory => {
                         fs.create_dir_all(&path, Some(entry.header().mode()?))
                             .await?;
+                        let uid = entry.header().uid()?.as_uid();
+                        let gid = entry.header().gid()?.as_uid();
+                        if uid.is_some() || gid.is_some() {
+                            fs.chown(path, uid, gid).await?;
+                        }
                     }
                     TarballEntryType::Regular => {
                         let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
                         let mut sink = fs.create_file(&path, Some(entry.header().mode()?)).await?;
+                        // ignore fallocate error as the target underlaying filesystem may not
+                        // support it
+                        fs.fallocate(&mut sink, entry.header().size()?).await.ok();
+                        let uid = entry.header().uid()?.as_uid();
+                        let gid = entry.header().gid()?.as_uid();
+                        if uid.is_some() || gid.is_some() {
+                            fs.fchown(&mut sink, uid, gid).await?;
+                        }
                         match conf_files.iter_mut().find(|(name, _)| name == path_str) {
                             None => {
                                 io::copy(entry, &mut sink).await?;
@@ -516,6 +544,11 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                             &path,
                         )
                         .await?;
+                        let uid = entry.header().uid()?.as_uid();
+                        let gid = entry.header().gid()?.as_uid();
+                        if uid.is_some() || gid.is_some() {
+                            fs.chown(path, uid, gid).await?;
+                        }
                     }
                     _ => {
                         return Err(io::Error::new(
