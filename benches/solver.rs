@@ -44,17 +44,13 @@ pub fn parse_benchmark(c: &mut Criterion) {
             let packages = vec![Packages::new(debrepo::null_provider(), data.clone())
                 .expect("failed to parse packages")];
             let mut uni = Universe::new("amd64", packages.into_iter()).expect("universe");
-            let problem = uni.problem(
+            let _ = match uni.solve(
                 vec![Dependency::try_from("task-gnome-desktop | task-kde-desktop").unwrap()],
                 vec![],
-            );
-            let _ = match uni.solve(problem) {
+            ) {
                 Ok(solution) => solution,
-                Err(resolvo::UnsolvableOrCancelled::Unsolvable(conflict)) => {
-                    panic!("{}", uni.display_conflict(conflict))
-                }
                 Err(err) => {
-                    panic!("{:?}", err)
+                    panic!("{}", uni.display_conflict(err))
                 }
             };
         })

@@ -1,4 +1,6 @@
+mod exec;
 use {
+    crate::exec::{unshare_root, unshare_user_ns},
     anyhow::{anyhow, Result},
     async_std::{
         fs,
@@ -17,31 +19,38 @@ use {
     std::process::ExitCode,
 };
 
-fn arch<'a>(a: &'a str) -> &'a str {
-    match a {
+fn default_arch() -> &'static str {
+    match std::env::consts::ARCH {
         "x86" => "i386",
         "x86_64" => "amd64",
-        "arm" => "armel",
         "aarch64" => "arm64",
-        "mips64" => "mips64el",
         "powerpc64" => "ppc64el",
         "riscv64" => "riscv64",
+        "mips32" | "mips32r6" => "mipsel",
+        "mips64" | "mips64r6" => "mips64el",
+        "arm" => {
+            if cfg!(target_feature = "vfp2") {
+                "armhf"
+            } else {
+                "armel"
+            }
+        }
         a => a,
     }
 }
 
 #[derive(Parser, Debug)]
-struct Cli {
+struct App {
     #[command(subcommand)]
-    cmd: Commands,
+    cmd: Command,
 }
 
 #[derive(Subcommand, Debug, Clone)]
-enum Commands {
+enum Command {
     #[command(name = "fetch")]
     Fetch {
         /// Architecture
-        #[arg(short, long, value_name = "ARCH", default_value = arch(std::env::consts::ARCH))]
+        #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
         arch: String,
         /// Origin repository URL
         #[arg(
@@ -64,7 +73,7 @@ enum Commands {
     #[command(name = "solve")]
     Solve {
         /// Architecture
-        #[arg(short, long, value_name = "ARCH", default_value = arch(std::env::consts::ARCH))]
+        #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
         arch: String,
         /// Origin repository URL
         #[arg(
@@ -112,7 +121,7 @@ enum Commands {
     #[command(name = "search")]
     Search {
         /// Architecture
-        #[arg(short, long, value_name = "ARCH", default_value = arch(std::env::consts::ARCH))]
+        #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
         arch: String,
         /// Origin repository URL
         #[arg(
@@ -197,12 +206,14 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     Ok(packages.len())
 }
 
-async fn copy_repo_package<'a, S: AsRef<str>>(
-    universe: &'a Universe<S>,
-    id: debrepo::SolvableId,
+async fn copy_repo_package<'a>(
+    universe: &'a Universe,
+    id: debrepo::PackageId,
     target: &Path,
-) -> Result<(debrepo::SolvableId, impl std::fmt::Display + 'a, u64)> {
-    let pkg = universe.package(id);
+) -> Result<(debrepo::PackageId, impl std::fmt::Display + 'a, u64)> {
+    let pkg = universe
+        .package(id)
+        .ok_or_else(|| anyhow!("package id {:?} not found", id))?;
     let path: PathBuf = pkg.ensure_field("Filename")?.into();
     let mut out = PathBuf::from(target);
     out.push(path.file_name().unwrap());
@@ -211,19 +222,19 @@ async fn copy_repo_package<'a, S: AsRef<str>>(
     Ok((id, pkg, size))
 }
 
-async fn extract_repo_package<'a, S: AsRef<str>, F: DeploymentFileSystem>(
-    universe: &'a Universe<S>,
-    id: debrepo::SolvableId,
+async fn extract_repo_package<'a, F: DeploymentFileSystem>(
+    universe: &'a Universe,
+    id: debrepo::PackageId,
     target: F,
 ) -> Result<MutableControlStanza> {
     let reader = universe.deb_reader(id).await?;
-    let desc = reader.extract_to(target).await?;
+    let desc = reader.extract_to(&target).await?;
     Ok(desc)
 }
 
-async fn cmd(cli: Cli) -> Result<ExitCode> {
+async fn cmd(cli: App) -> Result<ExitCode> {
     match cli.cmd {
-        Commands::Fetch {
+        Command::Fetch {
             arch: a,
             origin,
             out,
@@ -234,7 +245,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
             let release = repo.fetch_release(&distr).await?;
             let (path, size, hash) = release
-                .packages_file(&comp, arch(&a))
+                .packages_file(&comp, &a)
                 .ok_or_else(|| anyhow!("Packages file for {} {} not found", &a, &comp))?;
             match out {
                 None => {
@@ -249,7 +260,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             println!("fetched in {:?}", start.elapsed());
             Ok(ExitCode::SUCCESS)
         }
-        Commands::Search {
+        Command::Search {
             arch,
             origin,
             distr,
@@ -258,7 +269,9 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
         } => {
             let start = std::time::Instant::now();
             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
-            let release = repo.fetch_verify_release_with_keys(&distr, [debrepo::DEBIAN_KEYRING]).await?;
+            let release = repo
+                .fetch_verify_release_with_keys(&distr, [debrepo::DEBIAN_KEYRING])
+                .await?;
             let components = if &comp == "all" {
                 release.components().collect::<Vec<&'_ str>>()
             } else {
@@ -295,7 +308,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                 }
             }
         }
-        Commands::Solve {
+        Command::Solve {
             arch,
             origin,
             distr,
@@ -308,10 +321,10 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             reqs,
         } => {
             let start = std::time::Instant::now();
-            let requirements: Result<Vec<_>> = reqs
+            let requirements = reqs
                 .iter()
                 .map(|s| Dependency::try_from(s.as_ref()).map_err(|err| err.into()))
-                .collect();
+                .collect::<Result<Vec<_>>>()?;
             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
             let release = repo.fetch_release(&distr).await?;
             let components = if &comp == "all" {
@@ -328,8 +341,7 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
             .into_iter()
             .collect::<io::Result<Vec<_>>>()?;
             let mut universe = Universe::new(&arch, packages)?;
-            let problem = universe.problem(requirements?, std::iter::empty());
-            match universe.solve(problem) {
+            match universe.solve(requirements, std::iter::empty()) {
                 Ok(mut solution) => {
                     if extract {
                         let fs = debrepo::LocalFileSystem::new(
@@ -434,8 +446,9 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                             pretty_print_packages(
                                 &mut out,
                                 universe
-                                    .sort_solution(&mut solution)
-                                    .map(|s| -> Package { universe.package(s).into() }),
+                                    .sorted_solution(&mut solution)
+                                    .into_iter()
+                                    .map(|s| -> Package { universe.package(s).unwrap().into() }),
                                 false,
                             )?;
                             println!("solved in {:?}", start.elapsed());
@@ -443,20 +456,32 @@ async fn cmd(cli: Cli) -> Result<ExitCode> {
                     };
                     Ok(ExitCode::SUCCESS)
                 }
-                Err(unsolvable) => match unsolvable {
-                    resolvo::UnsolvableOrCancelled::Unsolvable(conflict) => {
-                        println!("{}", universe.display_conflict(conflict));
-                        Ok(ExitCode::FAILURE)
-                    }
-                    resolvo::UnsolvableOrCancelled::Cancelled(_) => unreachable!(),
-                },
+                Err(conflict) => {
+                    println!("{}", universe.display_conflict(conflict));
+                    Ok(ExitCode::FAILURE)
+                }
             }
         }
     }
 }
 
+fn init(_opts: &App) -> Result<()> {
+    if !nix::unistd::Uid::effective().is_root() {
+        unshare_user_ns()?;
+    }
+    unshare_root()?;
+    Ok(())
+}
+
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = App::parse();
+    match init(&cli) {
+        Err(err) => {
+            eprintln!("{}", err);
+            return ExitCode::FAILURE;
+        }
+        Ok(_) => {}
+    }
     match async_std::task::block_on(cmd(cli)) {
         Ok(code) => code,
         Err(err) => {

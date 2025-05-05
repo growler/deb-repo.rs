@@ -1,14 +1,18 @@
 use {
     crate::{
-        control::{ControlField, ControlParser, ControlStanza, ParseError, MutableControlStanza},
+        control::{Field, ControlField, ControlParser, ControlStanza, ParseError, FindFields, MutableControlStanza},
         digest::{Digest, Sha256},
-        repo::{DebRepo, VerifyingDebReader},
+        repo::{DebRepo, null_provider},
+        deb::DebReader,
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
         },
     },
-    async_std::io::{self, Read},
+    std::sync::Arc,
+    std::io,
+    futures::io::AsyncRead,
+    //async_std::io::{self, Read},
     ouroboros::self_referencing,
 };
 
@@ -269,24 +273,21 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
     }
 }
 
-pub struct Packages<S>
-where
-    S: AsRef<str> + 'static,
-{
+pub struct Packages {
     pub(crate) repo: DebRepo,
-    inner: PackagesInner<S>,
+    inner: PackagesInner,
 }
 
-impl<S: AsRef<str> + 'static> Packages<S> {
+impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
     }
-    pub async fn get_deb_reader(&self, index: usize) -> io::Result<VerifyingDebReader> {
+    pub async fn get_deb_reader(&self, index: usize) -> std::io::Result<DebReader> {
         let (path, size, hash) = self
             .get(index)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
                     format!("package index {} is out of range", index),
                 )
             })
@@ -300,12 +301,15 @@ impl<S: AsRef<str> + 'static> Packages<S> {
     pub fn packages(&self) -> impl Iterator<Item = &Package<'_>> {
         self.inner.with_packages(|packages| packages.iter())
     }
-    pub fn new(repo: DebRepo, data: S) -> Result<Self, ParseError> {
+    pub fn new<S>(repo: DebRepo, data: S) -> Result<Self, ParseError> 
+    where
+        Arc<str>: From<S>,
+    {
         Ok(Packages {
             repo,
             inner: PackagesInnerTryBuilder {
-                data,
-                packages_builder: |data: &'_ S| -> Result<Vec<Package<'_>>, ParseError> {
+                data: Arc::<str>::from(data),
+                packages_builder: |data: &'_ Arc<str>| -> Result<Vec<Package<'_>>, ParseError> {
                     let mut parser = ControlParser::new(data.as_ref());
                     let mut packages: Vec<Package<'_>> = vec![];
                     while let Some(package) = Package::try_parse_from(&mut parser)? {
@@ -317,13 +321,10 @@ impl<S: AsRef<str> + 'static> Packages<S> {
             .try_build()?,
         })
     }
-    pub(crate) fn new_test(data: S) -> Result<Self, ParseError> {
-        Self::new(crate::repo::null_provider(), data)
-    }
 }
 
-impl Packages<Box<str>> {
-    pub async fn read<R: Read + Unpin>(r: &mut R) -> io::Result<Self> {
+impl Packages {
+    pub async fn read<R: AsyncRead + Unpin + Send>(r: &mut R) -> io::Result<Self> {
         use async_std::io::ReadExt;
         let mut buf = String::new();
         r.read_to_string(&mut buf).await?;
@@ -336,24 +337,25 @@ impl Packages<Box<str>> {
     }
 }
 
-impl TryFrom<&str> for Packages<Box<str>> {
+impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new_test(inp.to_owned().into_boxed_str())
+        Self::new(null_provider(), inp.to_owned().into_boxed_str())
     }
 }
 
-impl TryFrom<String> for Packages<Box<str>> {
+impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new_test(inp.into_boxed_str())
+        Self::new(null_provider(), inp.into_boxed_str())
     }
 }
 
-impl TryFrom<Vec<u8>> for Packages<Box<str>> {
+impl TryFrom<Vec<u8>> for Packages {
     type Error = ParseError;
     fn try_from(inp: Vec<u8>) -> Result<Self, Self::Error> {
-        Self::new_test(
+        Self::new(
+            null_provider(),
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into_boxed_str(),
@@ -362,74 +364,10 @@ impl TryFrom<Vec<u8>> for Packages<Box<str>> {
 }
 
 #[self_referencing]
-struct PackagesInner<S>
-where
-    S: AsRef<str> + 'static,
-{
-    data: S,
+struct PackagesInner {
+    data: Arc<str>,
     #[borrows(data)]
     #[covariant]
     packages: Vec<Package<'this>>,
 }
 
-trait FindFields<M, R, E> {
-    fn find_fields(self, matches: M) -> std::result::Result<R, E>;
-}
-
-impl<'a, I> FindFields<&'a str, &'a str, &'a str> for I
-where
-    I: Iterator<Item = ControlField<'a>>,
-{
-    fn find_fields(self, m: &'a str) -> std::result::Result<&'a str, &'a str> {
-        self.fold(None, |found, field| {
-            if field.is_a(m) {
-                Some(field.value())
-            } else {
-                found
-            }
-        })
-        .ok_or(m)
-    }
-}
-impl<'a, I> FindFields<(&'a str, &'a str), (&'a str, &'a str), &'a str> for I
-where
-    I: Iterator<Item = ControlField<'a>>,
-{
-    fn find_fields(
-        self,
-        m: (&'a str, &'a str),
-    ) -> std::result::Result<(&'a str, &'a str), &'a str> {
-        let r = self.fold((None, None), |found, field| {
-            if field.is_a(m.0) {
-                (Some(field.value()), found.1)
-            } else if field.is_a(m.1) {
-                (found.0, Some(field.value()))
-            } else {
-                found
-            }
-        });
-        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?))
-    }
-}
-impl<'a, I> FindFields<(&'a str, &'a str, &'a str), (&'a str, &'a str, &'a str), &'a str> for I
-where
-    I: Iterator<Item = ControlField<'a>>,
-{
-    fn find_fields(
-        self,
-        m: (&'a str, &'a str, &'a str),
-    ) -> std::result::Result<(&'a str, &'a str, &'a str), &'a str> {
-        let r = self.fold((None, None, None), |found, field| {
-            if field.is_a(m.0) {
-                (Some(field.value()), found.1, found.2)
-            } else if field.is_a(m.1) {
-                (found.0, Some(field.value()), found.2)
-            } else if field.is_a(m.2) {
-                (found.0, found.1, Some(field.value()))
-            } else {
-                found
-            }
-        });
-        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?, r.2.ok_or(m.2)?))
-    }
-}

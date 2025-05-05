@@ -70,6 +70,12 @@ impl<'a> Ord for ReleaseFile<'a> {
 }
 
 impl Release {
+    pub fn as_bytes(&self) -> &[u8] {
+        self.inner.with_data(|d| d.as_bytes())
+    }
+    pub fn len(&self) -> usize {
+        self.inner.with_data(|d| d.len())
+    }
     pub fn file(&self, path: &str) -> Option<&ReleaseFile<'_>> {
         self.inner
             .with_files(|files| files.iter().find(|file| file.path == path))
@@ -103,7 +109,7 @@ impl Release {
         &self,
         component: &str,
         arch: &str,
-    ) -> io::Result<Packages<Box<str>>> {
+    ) -> io::Result<Packages> {
         let (path, size, hash) = self.packages_file(component, arch).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -249,7 +255,7 @@ SHA256:
                 .unwrap()
         );
         assert_eq!(size, 24088);
-        assert_eq!(path, "sid/contrib/binary-all/Packages.xz");
+        assert_eq!(path, "dists/sid/contrib/binary-all/Packages.xz");
         let (path, size, hash) = release.packages_file("contrib", "arm64").unwrap();
         assert_eq!(
             hash,
@@ -257,6 +263,6 @@ SHA256:
                 .unwrap()
         );
         assert_eq!(size, 45652);
-        assert_eq!(path, "sid/contrib/binary-arm64/Packages.xz");
+        assert_eq!(path, "dists/sid/contrib/binary-arm64/Packages.xz");
     }
 }

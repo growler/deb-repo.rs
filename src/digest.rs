@@ -2,12 +2,19 @@
 
 pub use digest::{FixedOutputReset as Digester, Output as DigesterOutput};
 use {
+    serde::{
+        Deserialize, Deserializer, Serialize, Serializer,
+        de::{self, Visitor},
+    },
     async_std::{
         io::prelude::*,
         task::{ready, Context, Poll},
     },
     pin_project::pin_project,
-    std::pin::Pin,
+    std::{
+        fmt,
+        pin::Pin,
+    },
 };
 
 pub type Sha256 = Digest<sha2::Sha256>;
@@ -15,6 +22,56 @@ pub type Sha256 = Digest<sha2::Sha256>;
 #[derive(Default, Debug)]
 pub struct Digest<D: Digester + Send> {
     inner: DigesterOutput<D>,
+}
+
+impl<D: Digester + Send> Serialize for Digest<D> {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let hex_str = hex::encode(&self.inner);
+        serializer.serialize_str(&hex_str)
+    }
+}
+
+impl<'de, D: Digester + Send> Deserialize<'de> for Digest<D> {
+    fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
+    where
+        DE: Deserializer<'de>,
+    {
+        struct DigestVisitor<T>(std::marker::PhantomData<T>);
+
+        impl<'de, T: Digester + Send> Visitor<'de> for DigestVisitor<T> {
+            type Value = Digest<T>;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a hex encoded string representing the digest")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                let mut inner = DigesterOutput::<T>::default();
+                hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|e| de::Error::custom(
+                    format!("error decoding hash: {}", e)
+                ))?;
+                Ok(Digest { inner })
+            }
+        }
+        deserializer.deserialize_str(DigestVisitor(std::marker::PhantomData))
+    }
+}
+
+impl<D: Digester + Send> std::ops::Deref for Digest<D> {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
+pub(crate) trait GetDigest<D: Digester + Send> {
+    fn get_digest(&mut self) -> Digest<D>;
 }
 
 impl<D: Digester + Send> Clone for Digest<D> {
@@ -111,6 +168,7 @@ pub struct DigestingReader<D: Digester + Send, R: Read + Unpin + Send> {
     #[pin]
     inner: R,
 }
+
 impl<D: Digester + Default + Send, R: Read + Unpin + Send> DigestingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
@@ -118,9 +176,12 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> DigestingReader<D, R>
             inner: reader,
         }
     }
-    pub fn finalize(self) -> Digest<D> {
+}
+
+impl<D: Digester + Send, R: Read + Unpin + Send> GetDigest<D> for DigestingReader<D, R> {
+    fn get_digest(&mut self) -> Digest<D> {
         Digest {
-            inner: self.digester.finalize_fixed(),
+            inner: self.digester.finalize_fixed_reset(),
         }
     }
 }
@@ -151,6 +212,12 @@ pub struct VerifyingReader<D: Digester + Default + Send, R: Read + Unpin + Send>
     read: usize,
     #[pin]
     inner: R,
+}
+
+impl<D: Digester + Default + Send, R: Read + Unpin + Send> GetDigest<D> for VerifyingReader<D, R> {
+    fn get_digest(&mut self) -> Digest<D> {
+        Digest { inner: self.digest.clone() }
+    }
 }
 
 impl<D: Digester + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {

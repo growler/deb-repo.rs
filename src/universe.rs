@@ -1,12 +1,15 @@
 use {
     crate::{
+        recipe,
         control::ParseError,
+        deb::DebReader,
+        digest::Digest,
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::{VerifyingDebReader, VerifyingReader},
+        repo::VerifyingReader,
         version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
     },
-    async_std::io::{self, Write},
+    futures::io::{copy, AsyncWrite},
     iterator_ext::IteratorExt,
     resolvo::{
         Candidates, Dependencies, DependencyProvider, Interner, KnownDependencies, NameId,
@@ -15,11 +18,14 @@ use {
     },
     smallvec::{smallvec, SmallVec},
     std::{
+        io,
         borrow::Borrow,
         hash::{Hash, Hasher},
         pin::pin,
     },
 };
+
+pub type PackageId = SolvableId;
 
 #[derive(Default, Clone, Copy, Debug, PartialEq, Eq, Hash)]
 enum ArchId {
@@ -130,8 +136,8 @@ struct UniverseIndex<'a> {
 }
 
 #[ouroboros::self_referencing]
-struct InnerUniverse<S: AsRef<str> + 'static> {
-    packages: Vec<Packages<S>>,
+struct InnerUniverse {
+    packages: Vec<Packages>,
     interned: IdMap<StringId, Box<str>>,
     #[borrows(packages, interned)]
     #[not_covariant]
@@ -333,21 +339,21 @@ impl<'a> UniverseIndex<'a> {
     }
 }
 
-pub struct Universe<S: AsRef<str> + 'static> {
-    inner: resolvo::Solver<InnerUniverse<S>>,
+pub struct Universe {
+    inner: resolvo::Solver<InnerUniverse>,
 }
 
-impl<S: AsRef<str> + 'static> Universe<S> {
+impl Universe {
     pub fn new(
         arch: impl AsRef<str>,
-        from: impl IntoIterator<Item = Packages<S>>,
+        from: impl IntoIterator<Item = Packages>,
     ) -> Result<Self, ParseError> {
         Ok(Self {
             inner: resolvo::Solver::new(
                 InnerUniverseTryBuilder {
                     packages: from.into_iter().collect(),
                     interned: IdMap::from([arch.as_ref()]),
-                    index_builder: |list: &'_ Vec<Packages<S>>,
+                    index_builder: |list: &'_ Vec<Packages>,
                                     interned: &'_ IdMap<StringId, Box<str>>|
                      -> Result<UniverseIndex<'_>, ParseError> {
                         let mut index = UniverseIndex::default();
@@ -390,11 +396,11 @@ impl<S: AsRef<str> + 'static> Universe<S> {
             ),
         })
     }
-    pub fn problem<A, N, V, Id, Ic>(
-        &self,
+    pub fn solve<A, N, V, Id, Ic>(
+        &mut self,
         requirements: Id,
         constraints: Ic,
-    ) -> resolvo::Problem<std::iter::Empty<SolvableId>>
+    ) -> std::result::Result<Vec<PackageId>, resolvo::conflict::Conflict>
     where
         A: AsRef<str>,
         N: AsRef<str>,
@@ -402,7 +408,7 @@ impl<S: AsRef<str> + 'static> Universe<S> {
         Id: IntoIterator<Item = Dependency<Option<A>, N, Version<V>>>,
         Ic: IntoIterator<Item = Constraint<Option<A>, N, Version<V>>>,
     {
-        resolvo::Problem::new()
+        let problem = resolvo::Problem::new()
             .requirements(
                 requirements
                     .into_iter()
@@ -427,27 +433,25 @@ impl<S: AsRef<str> + 'static> Universe<S> {
                     .into_iter()
                     .map(|dep| self.inner.provider().intern_single_dependency(dep))
                     .collect(),
-            )
-    }
-    pub fn solve(
-        &mut self,
-        problem: resolvo::Problem<std::iter::Empty<SolvableId>>,
-    ) -> Result<Vec<SolvableId>, UnsolvableOrCancelled> {
-        self.inner.solve(problem)
+            );
+        self.inner.solve(problem).map_err(|err| match err {
+            UnsolvableOrCancelled::Unsolvable(conflict) => conflict,
+            _ => unreachable!(),
+        })
     }
     pub fn dependency_graph(
         &self,
-        solution: &mut [SolvableId],
-    ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
+        solution: &mut [PackageId],
+    ) -> petgraph::graphmap::DiGraphMap<PackageId, ()> {
         self.inner.provider().dependency_graph(solution)
     }
-    pub fn sort_solution(&self, solution: &mut [SolvableId]) -> impl Iterator<Item = SolvableId> {
-        self.inner.provider().sort_solution(solution)
+    pub fn sorted_solution(&self, solution: &[PackageId]) -> Vec<PackageId> {
+        self.inner.provider().sorted_solution(solution)
     }
-    pub fn package(&self, solvable: SolvableId) -> &Package<'_> {
+    pub fn package(&self, solvable: PackageId) -> Option<&Package<'_>> {
         self.inner
             .provider()
-            .with_index(|i| i.solvables[solvable.to_index()].package)
+            .with_index(|i| i.solvables.get(solvable.to_index()).map(|s| s.package))
     }
     pub fn display_conflict(
         &self,
@@ -455,7 +459,7 @@ impl<S: AsRef<str> + 'static> Universe<S> {
     ) -> impl std::fmt::Display + '_ {
         conflict.display_user_friendly(&self.inner)
     }
-    pub fn display_solvable(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
+    pub fn display_solvable(&self, solvable: PackageId) -> impl std::fmt::Display + '_ {
         self.inner.provider().display_solvable(solvable)
     }
     pub fn packages(&self) -> impl Iterator<Item = &'_ Package<'_>> {
@@ -463,7 +467,7 @@ impl<S: AsRef<str> + 'static> Universe<S> {
             .provider()
             .with_index(|i| i.solvables.iter().map(|s| s.package))
     }
-    pub async fn deb_reader<'a>(&'a self, id: SolvableId) -> io::Result<VerifyingDebReader<'a>> {
+    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -471,7 +475,7 @@ impl<S: AsRef<str> + 'static> Universe<S> {
         })?;
         repo.verifying_deb_reader(path, size, hash).await
     }
-    pub async fn deb_file_reader(&self, id: SolvableId) -> io::Result<VerifyingReader> {
+    pub async fn deb_file_reader(&self, id: PackageId) -> io::Result<VerifyingReader> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -479,23 +483,81 @@ impl<S: AsRef<str> + 'static> Universe<S> {
         })?;
         repo.verifying_reader(path, size, hash).await
     }
-    pub async fn copy_deb_file<W: Write + Send>(&self, w: W, id: SolvableId) -> io::Result<u64> {
+    pub async fn copy_deb_file<W: AsyncWrite + Send>(&self, w: W, id: PackageId) -> io::Result<u64> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
             Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
         })?;
-        io::copy(repo.verifying_reader(path, size, hash).await?, pin!(w)).await
+        copy(repo.verifying_reader(path, size, hash).await?, &mut pin!(w)).await
     }
 }
 
-impl<S: AsRef<str> + 'static> std::fmt::Debug for Universe<S> {
+pub struct DebFetcher<'a> {
+    u: &'a Universe,
+    i: PackageId,
+}
+
+impl<'a> DebFetcher<'a> {
+    pub fn hash(&self) -> io::Result<Digest<sha2::Sha256>> {
+        self.u
+            .package(self.i)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("package id {} not found", self.i.to_index()),
+                )
+            })
+            .and_then(|pkg| {
+                pkg.field("SHA256").ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "package id {} has no SHA256 field\n{}",
+                            self.i.to_index(),
+                            &pkg
+                        ),
+                    )
+                })
+            })
+            .and_then(|hash| hash.try_into())
+    }
+    pub async fn deb(&self) -> io::Result<DebReader<'a>> {
+        self.u.deb_reader(self.i).await
+    }
+}
+
+pub struct FetcherIterator<'a, I: Iterator<Item = PackageId>> {
+    u: &'a Universe,
+    i: I,
+}
+
+impl<'a, I: Iterator<Item = PackageId>> Iterator for FetcherIterator<'a, I> {
+    type Item = DebFetcher<'a>;
+    fn next(&mut self) -> Option<DebFetcher<'a>> {
+        self.i.next().map(|id| DebFetcher { u: self.u, i: id })
+    }
+}
+
+impl Universe {
+    pub fn fetch<I: IntoIterator<Item = PackageId>>(
+        &self,
+        it: I,
+    ) -> FetcherIterator<'_, <I as IntoIterator>::IntoIter> {
+        FetcherIterator {
+            u: self,
+            i: it.into_iter(),
+        }
+    }
+}
+
+impl std::fmt::Debug for Universe {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         self.inner.provider().with_index(|i| write!(f, "{:?}", i))
     }
 }
 
-impl<S: AsRef<str> + 'static> InnerUniverse<S> {
+impl InnerUniverse {
     fn intern_single_dependency<A, N, V>(
         &self,
         dep: Constraint<Option<A>, N, Version<V>>,
@@ -546,9 +608,8 @@ impl<S: AsRef<str> + 'static> InnerUniverse<S> {
     }
     fn dependency_graph(
         &self,
-        solution: &mut [SolvableId],
+        solution: &[SolvableId],
     ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
-        solution.sort();
         petgraph::graphmap::DiGraphMap::<SolvableId, ()>::from_edges(solution.iter().flat_map(
             |package| {
                 match self.get_dependencies(*package) {
@@ -578,14 +639,15 @@ impl<S: AsRef<str> + 'static> InnerUniverse<S> {
             },
         ))
     }
-    fn sort_solution(&self, solution: &mut [SolvableId]) -> impl Iterator<Item = SolvableId> {
+    fn sorted_solution(&self, solution: &[PackageId]) -> Vec<PackageId> {
         petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
             .into_iter()
             .flat_map(|g| g.into_iter())
+            .collect()
     }
 }
 
-impl<S: AsRef<str> + 'static> Interner for Universe<S> {
+impl Interner for Universe {
     fn display_name(&self, name: NameId) -> impl std::fmt::Display + '_ {
         self.inner.provider().display_name(name)
     }
@@ -620,7 +682,7 @@ impl<S: AsRef<str> + 'static> Interner for Universe<S> {
     }
 }
 
-impl<S: AsRef<str> + 'static> Interner for InnerUniverse<S> {
+impl Interner for InnerUniverse {
     fn display_name(&self, name: NameId) -> impl std::fmt::Display + '_ {
         self.with_index(|i| i.names[name].name)
     }
@@ -673,7 +735,7 @@ impl<S: AsRef<str> + 'static> Interner for InnerUniverse<S> {
     }
 }
 
-impl<S: AsRef<str> + 'static> DependencyProvider for InnerUniverse<S> {
+impl DependencyProvider for InnerUniverse {
     async fn filter_candidates(
         &self,
         candidates: &[SolvableId],
@@ -822,23 +884,20 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new_test($src).expect("failed to parse test source")]
-                        .into_iter(),
+                    vec![Packages::new(crate::repo::null_provider(), $src)
+                        .expect("failed to parse test source")]
+                    .into_iter(),
                 )
                 .unwrap();
-                let problem = uni.problem(
+                let solution = match uni.solve(
                     $problem
                         .into_iter()
                         .map(|dep| Dependency::try_from(dep).expect("failed to parse dependency")),
                     vec![],
-                );
-                let solution = match uni.solve(problem) {
+                ) {
                     Ok(solution) => solution,
-                    Err(resolvo::UnsolvableOrCancelled::Unsolvable(conflict)) => {
-                        panic!("{}", uni.display_conflict(conflict))
-                    }
                     Err(err) => {
-                        panic!("{:?}", err)
+                        panic!("{}", uni.display_conflict(err))
                     }
                 };
                 let mut solution: Vec<_> = solution

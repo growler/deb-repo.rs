@@ -5,9 +5,10 @@ use {
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
-    async_std::io::{self, prelude::*, BufReader},
+    futures::io::{copy, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
     async_trait::async_trait,
     std::{
+        io,
         pin::{pin, Pin},
         sync::Arc,
     },
@@ -20,7 +21,7 @@ pub struct NullProvider {}
 
 #[async_trait]
 impl DebRepoProvider for NullProvider {
-    async fn reader(&self, _path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    async fn reader(&self, _path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Err(io::Error::new(io::ErrorKind::NotFound, "dummy provider"))
     }
 }
@@ -30,8 +31,8 @@ pub fn null_provider() -> DebRepo {
     }
 }
 
-pub type VerifyingReader = crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn Read + Send>>>;
-pub type VerifyingDebReader<'a> = DebReader<'a, VerifyingReader>;
+pub type DigestingReader = crate::digest::DigestingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
+pub type VerifyingReader = crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
 
 /// Represents interface for a Debian Repository
 pub struct DebRepo {
@@ -59,10 +60,7 @@ impl DebRepo {
     ///    let repo: DebRepo = HttpDebRepo::new("https://archive.ubuntu.com/ubuntu/").await?.into();
     ///    let release = repo.fetch_verify_release("bionic", None::<&[u8]>).await?;
     /// ```
-    pub async fn fetch_verify_release(
-        &self,
-        distr: &str,
-    ) -> io::Result<Release> {
+    pub async fn fetch_verify_release(&self, distr: &str) -> io::Result<Release> {
         let data = self.fetch(&format!("dists/{}/InRelease", distr)).await?;
         let ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
         self.verify_release(distr, data, ctx).await
@@ -120,7 +118,7 @@ impl DebRepo {
         Release::new(self.clone(), distr, data.into_boxed_str()).map_err(|err| err.into())
     }
     /// Returns a debian package reader.
-    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<Pin<Box<dyn Read + Send>>>> {
+    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader> {
         DebReader::new(self.inner.reader(path).await?).await
     }
     /// Returns a verifying Debian package reader that generates an error
@@ -130,12 +128,12 @@ impl DebRepo {
         path: &str,
         size: usize,
         digest: Sha256,
-    ) -> io::Result<VerifyingDebReader<'_>> {
-        DebReader::new(VerifyingReader::new(
+    ) -> io::Result<DebReader> {
+        DebReader::new_verifying(
             self.inner.reader(path).await?,
             size,
             digest,
-        ))
+        )
         .await
     }
     pub async fn verifying_reader(
@@ -150,7 +148,7 @@ impl DebRepo {
             digest,
         ))
     }
-    pub async fn unpacking_reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    pub async fn unpacking_reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(path, self.inner.reader(path).await?))
     }
     pub async fn verifying_unpacking_reader(
@@ -158,7 +156,7 @@ impl DebRepo {
         path: &str,
         size: usize,
         digest: Sha256,
-    ) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(
             path,
             VerifyingReader::new(self.inner.reader(path).await?, size, digest),
@@ -207,13 +205,13 @@ impl DebRepo {
         .await?;
         Ok(buffer)
     }
-    pub async fn copy<W: Write + Send>(&self, path: &str, w: W) -> io::Result<u64> {
-        io::copy(&mut self.inner.reader(path).await?, pin!(w)).await
+    pub async fn copy<W: AsyncWrite + Send>(&self, path: &str, w: W) -> io::Result<u64> {
+        copy(&mut self.inner.reader(path).await?, &mut pin!(w)).await
     }
-    pub async fn copy_unpack<W: Write + Send>(&self, path: &str, w: W) -> io::Result<u64> {
-        io::copy(&mut unpacker(path, self.inner.reader(path).await?), pin!(w)).await
+    pub async fn copy_unpack<W: AsyncWrite + Send>(&self, path: &str, w: W) -> io::Result<u64> {
+        copy(&mut unpacker(path, self.inner.reader(path).await?), &mut pin!(w)).await
     }
-    pub async fn copy_verify<W: Write + Send>(
+    pub async fn copy_verify<W: AsyncWrite + Send>(
         &self,
         w: W,
         path: &str,
@@ -221,9 +219,9 @@ impl DebRepo {
         digest: Sha256,
     ) -> io::Result<u64> {
         let mut reader = VerifyingReader::new(self.inner.reader(path).await?, size, digest);
-        io::copy(&mut reader, pin!(w)).await
+        copy(&mut reader, &mut pin!(w)).await
     }
-    pub async fn copy_verify_unpack<W: Write + Send>(
+    pub async fn copy_verify_unpack<W: AsyncWrite + Send>(
         &self,
         w: W,
         path: &str,
@@ -234,7 +232,7 @@ impl DebRepo {
             path,
             VerifyingReader::new(self.inner.reader(path).await?, size, digest),
         );
-        io::copy(&mut reader, pin!(w)).await
+        copy(&mut reader, &mut pin!(w)).await
     }
 }
 
@@ -250,10 +248,10 @@ impl<P: DebRepoProvider + 'static> From<P> for DebRepo {
 #[async_trait]
 pub trait DebRepoProvider: Sync {
     /// Provides a reader for accessing the specified path within the repository.
-    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>>;
+    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>>;
 }
 
-fn unpacker<'a, R: Read + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn Read + Send + 'a>> {
+fn unpacker<'a, R: AsyncRead + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
     let ext = match u.rfind('.') {
         Some(n) => &u[n..],
         None => &"",

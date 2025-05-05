@@ -3,19 +3,22 @@ pub use async_tar::{
     EntryType as TarballEntryType,
 };
 use {
-    crate::{control::MutableControlStanza, parse_size},
+    crate::{
+        control::MutableControlStanza,
+        deployfs::DeploymentFile,
+        digest::{Digest, DigestingReader, GetDigest, VerifyingReader},
+        parse_size,
+    },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
-    async_std::{
-        io::{self, prelude::*, BufReader, Result},
-        path::PathBuf,
-        stream::{Stream, StreamExt},
-        task::{self, Context, Poll},
-    },
+    core::task::{self, Context, Poll},
+    futures::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
     pin_project::pin_project,
     std::{
+        io::{self, Result},
         ops::Range,
+        path::PathBuf,
         pin::{pin, Pin},
         sync::{Arc, Mutex},
         time::{Duration, UNIX_EPOCH},
@@ -25,20 +28,18 @@ use {
 macro_rules! ready_opt {
     ($e:expr $(,)?) => {
         match $e {
-            async_std::task::Poll::Ready(Ok(t)) => t,
-            async_std::task::Poll::Ready(Err(err)) => {
-                return async_std::task::Poll::Ready(Some(Err(err)))
-            }
-            async_std::task::Poll::Pending => return async_std::task::Poll::Pending,
+            task::Poll::Ready(Ok(t)) => t,
+            task::Poll::Ready(Err(err)) => return task::Poll::Ready(Some(Err(err))),
+            task::Poll::Pending => return task::Poll::Pending,
         }
     };
 }
 macro_rules! ready {
     ($e:expr $(,)?) => {
         match $e {
-            async_std::task::Poll::Ready(Ok(t)) => t,
-            async_std::task::Poll::Ready(Err(err)) => return async_std::task::Poll::Ready(Err(err)),
-            async_std::task::Poll::Pending => return async_std::task::Poll::Pending,
+            task::Poll::Ready(Ok(t)) => t,
+            task::Poll::Ready(Err(err)) => return task::Poll::Ready(Err(err)),
+            task::Poll::Pending => return task::Poll::Pending,
         }
     };
 }
@@ -58,8 +59,12 @@ enum EntryKind {
     Data,
 }
 
+trait DebReaderSource: AsyncRead + Unpin + Send + GetDigest<sha2::Sha256> {}
+impl<R: AsyncRead + Unpin + Send> DebReaderSource for VerifyingReader<sha2::Sha256, R> {}
+impl<R: AsyncRead + Unpin + Send> DebReaderSource for DigestingReader<sha2::Sha256, R> {}
+
 #[pin_project]
-struct DebReaderInner<R: Read + Unpin + Send> {
+struct DebReaderInner<'a> {
     // Current state
     state: State,
     // Content padding
@@ -74,12 +79,37 @@ struct DebReaderInner<R: Read + Unpin + Send> {
     hdr: [u8; AR_HEADER_SIZE],
     // Source of the data
     #[pin]
-    source: R,
+    source: Box<dyn DebReaderSource + 'a>,
 }
 
-impl<R: Read + Unpin + Send> DebReaderInner<R> {
-    async fn new(mut r: R) -> std::io::Result<Self> {
+impl<'a> DebReaderInner<'a> {
+    async fn new<R: AsyncRead + Send + Unpin + 'a>(r: R) -> std::io::Result<Self> {
         let mut hdr = [0u8; AR_MAGIC_SIZE];
+        let mut r = Box::new(DigestingReader::<sha2::Sha256, _>::new(r));
+        r.read_exact(&mut hdr).await?;
+        if &hdr != AR_MAGIC {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "invalid deb header",
+            ));
+        }
+        Ok(Self {
+            state: State::Header,
+            size: AR_HEADER_SIZE,
+            padding: 0,
+            read: 0,
+            total: AR_MAGIC_SIZE,
+            hdr: [0u8; AR_HEADER_SIZE],
+            source: r,
+        })
+    }
+    async fn new_verifying<R: AsyncRead + Send + Unpin + 'a>(
+        r: R,
+        size: usize,
+        hash: Digest<sha2::Sha256>,
+    ) -> std::io::Result<Self> {
+        let mut hdr = [0u8; AR_MAGIC_SIZE];
+        let mut r = Box::new(VerifyingReader::<sha2::Sha256, _>::new(r, size, hash));
         r.read_exact(&mut hdr).await?;
         if &hdr != AR_MAGIC {
             return Err(std::io::Error::new(
@@ -128,7 +158,7 @@ impl<R: Read + Unpin + Send> DebReaderInner<R> {
     }
 }
 
-impl<R: Read + Unpin + Send> Read for DebReaderInner<R> {
+impl<'a> AsyncRead for DebReaderInner<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -158,7 +188,7 @@ impl<R: Read + Unpin + Send> Read for DebReaderInner<R> {
     }
 }
 
-impl<R: Read + Unpin + Send> Stream for DebReaderInner<R> {
+impl<'a> Stream for DebReaderInner<'a> {
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -260,17 +290,15 @@ impl<R: Read + Unpin + Send> Stream for DebReaderInner<R> {
 ///     }
 /// }
 /// ```
-pub struct DebReader<'a, R: Read + Unpin + Send + 'a> {
-    inner: Arc<Mutex<DebReaderInner<R>>>,
-    _marker: std::marker::PhantomData<&'a ()>,
+pub struct DebReader<'a> {
+    inner: Arc<Mutex<DebReaderInner<'a>>>,
 }
 
-struct DebEntryReaderInner<'a, R: Read + Unpin + Send + 'a> {
-    inner: Arc<Mutex<DebReaderInner<R>>>,
-    _marker: std::marker::PhantomData<&'a ()>,
+struct DebEntryReaderInner<'a> {
+    inner: Arc<Mutex<DebReaderInner<'a>>>,
 }
 
-impl<'a, R: Read + Unpin + Send + 'a> Read for DebEntryReaderInner<'a, R> {
+impl<'a> AsyncRead for DebEntryReaderInner<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -286,20 +314,7 @@ impl<'a, R: Read + Unpin + Send + 'a> Read for DebEntryReaderInner<'a, R> {
     }
 }
 
-trait AsUid {
-    fn as_uid(self) -> Option<u32>;
-}
-
-impl AsUid for u64 {
-    fn as_uid(self) -> Option<u32> {
-        match self {
-            0 => None,
-            n => Some(n as u32),
-        }
-    }
-}
-
-impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
+impl<'a> DebReader<'a> {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -324,16 +339,28 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn new(reader: R) -> Result<Self> {
+    pub async fn new<R: AsyncRead + Unpin + Send + 'a>(reader: R) -> Result<Self> {
         Ok(DebReader {
             inner: Arc::new(Mutex::new(DebReaderInner::new(reader).await?)),
-            _marker: std::marker::PhantomData,
         })
     }
-    fn entry_reader_for_ext(&self, ext: &str) -> Result<Pin<Box<dyn Read + Unpin + Send + 'a>>> {
+    pub async fn new_verifying<R: AsyncRead + Unpin + Send + 'a>(
+        reader: R,
+        size: usize,
+        hash: Digest<sha2::Sha256>,
+    ) -> Result<Self> {
+        Ok(DebReader {
+            inner: Arc::new(Mutex::new(
+                DebReaderInner::new_verifying(reader, size, hash).await?,
+            )),
+        })
+    }
+    fn entry_reader_for_ext(
+        &self,
+        ext: &str,
+    ) -> Result<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>> {
         let r = DebEntryReaderInner {
             inner: Arc::clone(&self.inner),
-            _marker: std::marker::PhantomData,
         };
         Ok(match ext {
             ".xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
@@ -344,18 +371,38 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
             _ => Box::pin(r),
         })
     }
+    pub async fn finalize(self) -> io::Result<String> {
+        let mut reader = Arc::into_inner(self.inner)
+            .ok_or_else(||
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    "unexpected references to debian package inned reader"
+                )
+            )?
+            .into_inner()
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unexpected mutex error {}", err),
+                )
+            })?;
+        let mut buf = vec![0u8; 512];
+        while reader.source.read(&mut buf).await? > 0 {}
+        Ok(reader.source.get_digest().into())
+    }
     pub async fn extract_to<FS: crate::DeploymentFileSystem>(
         mut self,
-        fs: FS,
+        fs: &FS,
     ) -> Result<MutableControlStanza> {
         let mut installed_files: Vec<String> = vec![];
         let mut ctrl: MutableControlStanza;
-        let mut ctrl_files: Vec<(PathBuf, PathBuf)> = vec![];
+        let mut ctrl_files: Vec<(String, FS::File)> = vec![];
+        let mut ctrl_files_list = String::new();
         let mut conf_files: Vec<(String, Option<String>)> = vec![];
         let multiarch: Option<&str>;
         let pkg: &str;
         let ctrl_base = PathBuf::from("var/lib/dpkg/info");
-        fs.create_dir_all(&ctrl_base, None).await?;
+        fs.create_dir_all(&ctrl_base, 0, 0, 0o755).await?;
         {
             let mut control_entries = self
                 .next()
@@ -379,6 +426,11 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 let mut entry = entry?;
                 match entry.header().entry_type() {
                     TarballEntryType::Regular => {
+                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
+                        let uid = entry.header().uid()? as u32;
+                        let gid = entry.header().gid()? as u32;
+                        let mode = entry.header().mode()?;
+                        let size = entry.header().size()? as usize;
                         let filename = entry
                             .header()
                             .path()?
@@ -388,6 +440,14 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                                     io::ErrorKind::InvalidData,
                                     format!("invalid entry in control.tar: {:?}", &entry),
                                 )
+                            })
+                            .and_then(|name| {
+                                name.to_str().ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!("path is not a valid UTF-8 string: {:?}", name),
+                                    )
+                                })
                             })?
                             .to_owned();
                         if filename.eq("control") {
@@ -406,19 +466,31 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                             let mut buf = String::with_capacity(entry.header().size()? as usize);
                             entry.read_to_string(&mut buf).await?;
                             conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
-                            let (tmpname, mut file) = fs
-                                .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
+                            let file = fs
+                                .create_file(
+                                    buf.as_bytes(),
+                                    None::<PathBuf>,
+                                    uid,
+                                    gid,
+                                    mode,
+                                    Some(mtime),
+                                    Some(size),
+                                )
                                 .await?;
-                            fs.fallocate(&mut file, entry.header().size()?).await.ok();
-                            file.write_all(buf.as_bytes()).await?;
-                            ctrl_files.push((filename.into(), tmpname));
+                            ctrl_files.push((filename.into(), file));
                         } else {
-                            let (tmpname, mut file) = fs
-                                .create_tmp_file("/var/lib/dpkg/info", Some(entry.header().mode()?))
+                            let file = fs
+                                .create_file(
+                                    entry,
+                                    None::<PathBuf>,
+                                    uid,
+                                    gid,
+                                    mode,
+                                    Some(mtime),
+                                    Some(size),
+                                )
                                 .await?;
-                            fs.fallocate(&mut file, entry.header().size()?).await.ok();
-                            io::copy(entry, file).await?;
-                            ctrl_files.push((filename.into(), tmpname));
+                            ctrl_files.push((filename.into(), file));
                         }
                     }
                     TarballEntryType::Directory
@@ -446,7 +518,9 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                     "no Package field in package description",
                 )
             })?;
-            for (name, tmpname) in ctrl_files.into_iter() {
+            for (name, file) in ctrl_files.into_iter() {
+                ctrl_files_list.push_str("\n ");
+                ctrl_files_list.push_str(&name);
                 let mut target_name = std::ffi::OsString::from(pkg);
                 if let Some(arch) = multiarch {
                     target_name.push(":");
@@ -454,7 +528,7 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 }
                 target_name.push(".");
                 target_name.push(name);
-                fs.rename(tmpname, ctrl_base.join(target_name)).await?;
+                file.persist(ctrl_base.join(target_name)).await?;
             }
         }
         {
@@ -487,39 +561,54 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 installed_files.push(path_str.to_owned());
                 match entry.header().entry_type() {
                     TarballEntryType::Directory => {
-                        fs.create_dir_all(&path, Some(entry.header().mode()?))
-                            .await?;
-                        let uid = entry.header().uid()?.as_uid();
-                        let gid = entry.header().gid()?.as_uid();
-                        if uid.is_some() || gid.is_some() {
-                            fs.chown(path, uid, gid).await?;
-                        }
+                        fs.create_dir_all(
+                            &path,
+                            entry.header().uid()? as u32,
+                            entry.header().gid()? as u32,
+                            entry.header().mode()?,
+                        )
+                        .await?;
                     }
                     TarballEntryType::Regular => {
                         let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
-                        let mut sink = fs.create_file(&path, Some(entry.header().mode()?)).await?;
-                        // ignore fallocate error as the target underlaying filesystem may not
-                        // support it
-                        fs.fallocate(&mut sink, entry.header().size()?).await.ok();
-                        let uid = entry.header().uid()?.as_uid();
-                        let gid = entry.header().gid()?.as_uid();
-                        if uid.is_some() || gid.is_some() {
-                            fs.fchown(&mut sink, uid, gid).await?;
-                        }
+                        let uid = entry.header().uid()? as u32;
+                        let gid = entry.header().gid()? as u32;
+                        let mode = entry.header().mode()?;
+                        let size = entry.header().size()? as usize;
                         match conf_files.iter_mut().find(|(name, _)| name == path_str) {
                             None => {
-                                io::copy(entry, &mut sink).await?;
+                                fs.create_file(
+                                    entry,
+                                    Some(&path),
+                                    uid,
+                                    gid,
+                                    mode,
+                                    Some(mtime),
+                                    Some(size),
+                                )
+                                .await?
                             }
                             Some((_, sum)) => {
                                 let mut digester =
                                     crate::digest::DigestingReader::<md5::Md5, _>::new(entry);
-                                io::copy(&mut digester, &mut sink).await?;
-                                let hash = digester.finalize();
+                                let file = fs
+                                    .create_file(
+                                        &mut digester,
+                                        Some(&path),
+                                        uid,
+                                        gid,
+                                        mode,
+                                        Some(mtime),
+                                        Some(size),
+                                    )
+                                    .await?;
+                                let hash = digester.get_digest();
                                 sum.replace(hash.into());
+                                file
                             }
                         }
-                        sink.flush().await?;
-                        fs.set_mtime(&path, mtime).await?;
+                        .persist(&path)
+                        .await?;
                     }
                     TarballEntryType::Link => {
                         fs.hardlink(
@@ -534,6 +623,9 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                         .await?;
                     }
                     TarballEntryType::Symlink => {
+                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
+                        let uid = entry.header().uid()? as u32;
+                        let gid = entry.header().gid()? as u32;
                         fs.symlink(
                             entry.header().link_name()?.ok_or_else(|| {
                                 io::Error::new(
@@ -542,13 +634,11 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                                 )
                             })?,
                             &path,
+                            uid,
+                            gid,
+                            Some(mtime),
                         )
                         .await?;
-                        let uid = entry.header().uid()?.as_uid();
-                        let gid = entry.header().gid()?.as_uid();
-                        if uid.is_some() || gid.is_some() {
-                            fs.chown(path, uid, gid).await?;
-                        }
                     }
                     _ => {
                         return Err(io::Error::new(
@@ -570,13 +660,25 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 target_name.push(arch);
             }
             target_name.push(".list");
-            let mut out = fs
-                .create_file(ctrl_base.join(target_name), Some(0o644u32))
-                .await?;
-            for i in installed_files.into_iter() {
-                out.write_all(i.as_bytes()).await?;
-                out.write_all(&[b'\n']).await?;
+            let mut buf =
+                String::with_capacity(installed_files.iter().fold(0, |a, s| a + 1 + s.len()));
+            for i in installed_files {
+                buf.push_str(&i);
+                buf.push('\n');
             }
+            let target_name = ctrl_base.join(target_name);
+            fs.create_file(
+                buf.as_bytes(),
+                Some(&target_name),
+                0,
+                0,
+                0o644,
+                None,
+                Some(buf.len()),
+            )
+            .await?
+            .persist(target_name)
+            .await?;
         }
         if conf_files.len() > 0 {
             let mut buf = String::new();
@@ -592,11 +694,15 @@ impl<'a, R: Read + Unpin + Send + 'a> DebReader<'a, R> {
                 ctrl.set("Conffiles", buf);
             }
         }
+        ctrl.set("SHA256", self.finalize().await?);
+        if ctrl_files_list.len() > 0 {
+            ctrl.set("Controlfiles", ctrl_files_list);
+        }
         Ok(ctrl)
     }
 }
 
-impl<'a, R: Read + Unpin + Send + 'a> Stream for DebReader<'a, R> {
+impl<'a> Stream for DebReader<'a> {
     type Item = Result<DebEntry<'a>>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {
@@ -622,11 +728,12 @@ impl<'a, R: Read + Unpin + Send + 'a> Stream for DebReader<'a, R> {
     }
 }
 
-pub struct DebEntryReader {
-    inner: Pin<Box<dyn Read + Unpin + Send>>,
+pub struct DebEntryReader<'a> {
+    inner: Pin<Box<dyn AsyncRead + Unpin + Send>>,
+    _marker: std::marker::PhantomData<&'a ()>,
 }
 
-impl Read for DebEntryReader {
+impl<'a> AsyncRead for DebEntryReader<'a> {
     fn poll_read(
         mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -637,17 +744,17 @@ impl Read for DebEntryReader {
 }
 
 pub enum DebEntry<'a> {
-    Control(Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>>),
-    Data(Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>>),
+    Control(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>),
+    Data(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>),
 }
 
 impl<'a> DebEntry<'a> {
-    pub fn into_inner(self) -> Tarball<Pin<Box<dyn Read + Unpin + Send + 'a>>> {
+    pub fn into_inner(self) -> Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
         }
     }
-    pub fn entries(self) -> Result<TarballEntries<Pin<Box<dyn Read + Unpin + Send + 'a>>>> {
+    pub fn entries(self) -> Result<TarballEntries<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar.entries(),
         }

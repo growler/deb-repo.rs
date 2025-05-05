@@ -30,7 +30,7 @@ impl From<String> for ParseError {
 
 impl std::fmt::Display for ParseError {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "{}", self.msg)
+        std::fmt::Display::fmt(&self.msg, f)
     }
 }
 
@@ -39,6 +39,7 @@ impl From<ParseError> for std::io::Error {
         std::io::Error::new(std::io::ErrorKind::InvalidData, err.msg.into_owned())
     }
 }
+
 
 /// Represents an immutable field in the Debian Control File.
 /// Internally, ControlField holds references to a slice of
@@ -56,21 +57,6 @@ impl<'a> std::fmt::Display for ControlField<'a> {
         } else {
             writeln!(f, "{}: {}", &self.name, &self.value)
         }
-    }
-}
-
-impl<'a> ControlField<'a> {
-    /// True if this is field is a `name`
-    pub fn is_a(&self, name: &str) -> bool {
-        self.name.eq_ignore_ascii_case(name)
-    }
-    /// Returns field's name
-    pub fn name(&self) -> &'a str {
-        self.name
-    }
-    /// Returns field's value
-    pub fn value(&self) -> &'a str {
-        self.value
     }
 }
 
@@ -92,18 +78,6 @@ impl<'a> std::fmt::Display for MutableControlField<'a> {
 }
 
 impl<'a> MutableControlField<'a> {
-    /// True if this is field is a `name`
-    pub fn is_a(&self, name: &str) -> bool {
-        self.name.eq_ignore_ascii_case(name)
-    }
-    /// Returns field's name
-    pub fn name(&self) -> &str {
-        &self.name
-    }
-    /// Returns reference to the field's value
-    pub fn value(&self) -> &str {
-        &self.value
-    }
     /// Sets the field value
     pub fn set<S: Into<Cow<'a, str>>>(&mut self, value: S) {
         self.value = value.into()
@@ -279,7 +253,7 @@ impl MutableControlStanza {
         mut compare: F,
     ) {
         self.inner.with_fields_mut(|fields| {
-            fields.sort_by(|left, right| compare(left.name(), right.name()));
+            fields.sort_by(|left, right| compare(left.name().as_ref(), right.name().as_ref()));
         });
     }
     /// Sorts fields by name in the order usually present on dpkg's status file.
@@ -290,6 +264,128 @@ impl MutableControlStanza {
                 ne => ne,
             }
         })
+    }
+    pub fn package_name(&self) -> std::result::Result<String, ParseError> {
+        let (arch, name, ver) = self.fields().find_fields(("Architecture", "Package", "Version"))?;
+        Ok(format!("{}_{}_{}", &name, &ver, &arch))
+    }
+}
+
+pub trait Field<R> {
+    fn is_a<N: AsRef<str>>(&self, name: N) -> bool;
+    fn name(&self) -> R;
+    fn value(&self) -> R;
+}
+
+impl<'a> Field<&'a str> for ControlField<'a> {
+    /// True if this is field is a `name`
+    fn is_a<N: AsRef<str>>(&self, name: N) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_ref())
+    }
+    /// Returns field's name
+    fn name(&self) -> &'a str {
+        self.name
+    }
+    /// Returns field's value
+    fn value(&self) -> &'a str {
+        self.value
+    }
+}
+
+impl<'a> Field<Cow<'a, str>> for &MutableControlField<'a> {
+    /// True if this is field is a `name`
+    fn is_a<N: AsRef<str>>(&self, name: N) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_ref())
+    }
+    /// Returns field's name
+    fn name(&self) -> Cow<'a, str> {
+        self.name.clone()
+    }
+    /// Returns field's value
+    fn value(&self) -> Cow<'a, str> {
+        self.value.clone()
+    }
+}
+
+impl<'a> Field<Cow<'a, str>> for MutableControlField<'a> {
+    /// True if this is field is a `name`
+    fn is_a<N: AsRef<str>>(&self, name: N) -> bool {
+        self.name.eq_ignore_ascii_case(name.as_ref())
+    }
+    /// Returns field's name
+    fn name(&self) -> Cow<'a, str> {
+        self.name.clone()
+    }
+    /// Returns field's value
+    fn value(&self) -> Cow<'a, str> {
+        self.value.clone()
+    }
+}
+
+pub trait FindFields<M, R, E> {
+    fn find_fields(self, matches: M) -> std::result::Result<R, E>;
+}
+
+impl<'m, I, F, R> FindFields<&'m str, R, &'m str> for I
+where
+    F: Field<R>,
+    I: Iterator<Item = F>,
+{
+    fn find_fields(self, m: &'m str) -> std::result::Result<R, &'m str> {
+        self.fold(None, |found, field| {
+            if field.is_a(m) {
+                Some(field.value())
+            } else {
+                found
+            }
+        })
+        .ok_or(m)
+    }
+}
+
+impl<'m, I, F, R> FindFields<(&'m str, &'m str), (R, R), &'m str> for I
+where
+    F: Field<R>,
+    I: Iterator<Item = F>,
+{
+    fn find_fields(
+        self,
+        m: (&'m str, &'m str),
+    ) -> std::result::Result<(R, R), &'m str> {
+        let r = self.fold((None, None), |found, field| {
+            if field.is_a(m.0) {
+                (Some(field.value()), found.1)
+            } else if field.is_a(m.1) {
+                (found.0, Some(field.value()))
+            } else {
+                found
+            }
+        });
+        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?))
+    }
+}
+
+impl<'m, I, F, R> FindFields<(&'m str, &'m str, &'m str), (R, R, R), &'m str> for I
+where
+    F: Field<R>,
+    I: Iterator<Item = F>,
+{
+    fn find_fields(
+        self,
+        m: (&'m str, &'m str, &'m str),
+    ) -> std::result::Result<(R, R, R), &'m str> {
+        let r = self.fold((None, None, None), |found, field| {
+            if field.is_a(m.0) {
+                (Some(field.value()), found.1, found.2)
+            } else if field.is_a(m.1) {
+                (found.0, Some(field.value()), found.2)
+            } else if field.is_a(m.2) {
+                (found.0, found.1, Some(field.value()))
+            } else {
+                found
+            }
+        });
+        Ok((r.0.ok_or(m.0)?, r.1.ok_or(m.1)?, r.2.ok_or(m.2)?))
     }
 }
 

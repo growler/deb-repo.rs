@@ -7,6 +7,7 @@ use {
         hash::{Hash, Hasher},
     },
     crate::control::ParseError,
+    serde::{Serialize, Deserialize},
 };
 
 /// Defines a method to check if a given value satisfies a specific requirement.
@@ -132,7 +133,7 @@ impl<V: Clone> From<Option<&Version<V>>> for VersionSet<Version<V>> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub struct Constraint<A, N, V> {
     name: N,
     arch: A,
@@ -185,22 +186,68 @@ impl<A: DisplayName, N: Display, V: Display> Display for Constraint<A, N, V> {
     }
 }
 
-#[derive(Clone)]
+impl<A: DisplayName, N: Display, V: Display> Debug for Constraint<A, N, V> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("Constraint(")?;
+        self.range().fmt_name(self.arch.fmt_name(&self.name)).fmt(f)?;
+        f.write_str(")")
+    }
+}
+
+#[derive(Serialize, Deserialize, Clone)]
 pub enum Dependency<A, N, V> {
     Single(Constraint<A, N, V>),
     Union(SmallVec<[Constraint<A, N, V>; 2]>),
+}
+impl<A: Eq, N: Eq, V: Eq> Eq for Dependency<A, N, V> {}
+impl<A: Eq, N: Eq, V: Eq> PartialEq for Dependency<A, N, V> {
+    fn eq(&self, other: &Self) -> bool {
+        match self {
+            Self::Single(a) => match other {
+                Self::Single(b) => a.eq(b),
+                _ => false,
+            }
+            Self::Union(a) => match other {
+                Self::Union(b) => a.eq(b),
+                _ => false,
+            }
+        }
+    }
+}
+
+impl<A: DisplayName, N: Display, V: Display> fmt::Debug for Dependency<A, N, V> {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Self::Single(dep) => {
+                f.write_str("SingleDependency(")?;
+                fmt::Debug::fmt(&dep, f)?;
+                f.write_str(")")
+            }
+            Self::Union(deps) => {
+                f.write_str("UnionDependency(")?;
+                for (i, dep) in deps.iter().enumerate() {
+                    if i != 0 {
+                        f.write_str(", ")?;
+                    }
+                    fmt::Debug::fmt(&dep, f)?;
+                }
+                f.write_str(")")
+            }
+        }
+    }
+
 }
 
 impl<A: DisplayName, N: Display, V: Display> fmt::Display for Dependency<A, N, V> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Self::Single(dep) => dep.fmt(f),
+            Self::Single(dep) => fmt::Display::fmt(&dep, f),
             Self::Union(deps) => {
                 for (i, dep) in deps.iter().enumerate() {
                     if i != 0 {
                         f.write_str(" | ")?;
                     }
-                    dep.fmt(f)?;
+                    fmt::Display::fmt(&dep, f)?;
                 }
                 Ok(())
             }
@@ -301,7 +348,7 @@ impl<'a, A, N, V> Iterator for DependencyRefIterator<'a, A, N, V> {
     }
 }
 
-#[derive(Clone)]
+#[derive(Serialize, Deserialize, Clone)]
 pub enum VersionSet<V> {
     Any,
     StrictlyEarlierThan(V),
@@ -431,7 +478,7 @@ impl<V> VersionSet<V> {
 }
 
 /// Version represents a single version number
-#[derive(Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Version<V> {
     inner: V,
 }

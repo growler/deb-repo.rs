@@ -30,7 +30,7 @@ hex = "0.4"
 memchr = "2"
 criterion = "0.4"
 resolvo = "0.8.5"
-smallvec = "1.13"
+smallvec = { version = "1.13", features = ["serde", "union"] }
 iterator-ext = "0.2.1"
 log = "0.4.22"
 tracing = "0.1"
@@ -42,6 +42,10 @@ filetime = "0.2.25"
 petgraph = { version = "0.7.1", default-features = false, features = [ "graphmap" ] }
 itertools = "0.14.0"
 nix = { version = "0.29.0", features = [ "sched", "mount", "process", "fs", "signal", "user" ] }
+serde = { version = "1.0.219", features = ["derive"] }
+serde_json = "1.0.140"
+serde_yaml = "0.9.34"
+generic-array = "1.1.1"
 
 [dependencies.async-compression]
 version = "0.4"

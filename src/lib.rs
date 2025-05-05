@@ -2,6 +2,7 @@
 
 mod control;
 mod deb;
+mod deployfs;
 pub mod digest;
 mod fsrepo;
 mod httprepo;
@@ -11,23 +12,26 @@ mod release;
 mod repo;
 mod universe;
 mod version;
-mod deployfs;
+mod recipe;
 
 pub use {
     control::{
-        ControlField, ControlFile, ControlParser, ControlStanza, MutableControlField,
+        ControlField, ControlFile, ControlParser, ControlStanza, Field, MutableControlField,
         MutableControlFile, MutableControlStanza, ParseError,
     },
     deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
+    deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSDebRepo,
     httprepo::HttpDebRepo,
     packages::{Package, Packages},
     release::Release,
-    repo::{null_provider, DebRepo, DebRepoProvider, DEBIAN_KEYRING},
-    resolvo::{NameId, SolvableId, StringId},
-    universe::Universe,
+    repo::{
+        null_provider, DebRepo, DebRepoProvider, DigestingReader, VerifyingReader, DEBIAN_KEYRING,
+    },
+    resolvo::{NameId, StringId},
+    universe::{PackageId, Universe, DebFetcher},
     version::{Constraint, Dependency, Version},
-    deployfs::{DeploymentFileSystem, LocalFileSystem},
+    recipe::{Recipe, LockedRecipe},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
@@ -52,4 +56,3 @@ pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
     }
     Ok(result)
 }
-
