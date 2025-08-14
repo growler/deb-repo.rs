@@ -7,12 +7,12 @@ pub mod digest;
 mod fsrepo;
 mod httprepo;
 mod idmap;
+mod manifest;
 mod packages;
 mod release;
 mod repo;
 mod universe;
 mod version;
-mod recipe;
 
 pub use {
     control::{
@@ -22,16 +22,16 @@ pub use {
     deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
     deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSDebRepo,
-    httprepo::HttpDebRepo,
-    packages::{Package, Packages},
+    httprepo::{HttpDebRepo, HttpRepoBuilder},
+    manifest::{LockedManifest, Manifest},
+    packages::{Package, Packages, InstallPriority},
     release::Release,
     repo::{
         null_provider, DebRepo, DebRepoProvider, DigestingReader, VerifyingReader, DEBIAN_KEYRING,
     },
     resolvo::{NameId, StringId},
-    universe::{PackageId, Universe, DebFetcher},
+    universe::{DebFetcher, PackageId, Universe},
     version::{Constraint, Dependency, Version},
-    recipe::{Recipe, LockedRecipe},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {

@@ -1,30 +1,51 @@
 //! Debian repository client
 
 use {
-    crate::repo::DebRepoProvider,
+    crate::repo::{DebRepo, DebRepoBuilder, DebRepoProvider},
     async_std::io::{self, Read},
     async_trait::async_trait,
     isahc::{config::RedirectPolicy, prelude::*, HttpClient},
+    once_cell::sync::Lazy,
     std::pin::Pin,
 };
 
 #[derive(Clone)]
 pub struct HttpDebRepo {
     base: url::Url,
-    client: HttpClient,
+}
+
+pub struct HttpRepoBuilder;
+impl HttpRepoBuilder {
+    pub fn new() -> Self {
+        Self {}
+    }
+}
+
+#[async_trait]
+impl DebRepoBuilder for HttpRepoBuilder {
+    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo> {
+        let repo: DebRepo = HttpDebRepo::new(url.as_ref()).await?.into();
+        Ok(repo)
+    }
+}
+
+fn client() -> &'static HttpClient {
+    static SHARED: Lazy<HttpClient> = Lazy::new(|| {
+        HttpClient::builder()
+            .redirect_policy(RedirectPolicy::Limit(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client")
+    });
+    &SHARED
 }
 
 impl HttpDebRepo {
     pub async fn new(url: &str) -> io::Result<Self> {
         Ok(Self {
-            base: url::Url::parse(url).map_err(|err| 
-                io::Error::new(io::ErrorKind::InvalidInput, format!("{}", err))
-            )?,
-            client: HttpClient::builder()
-                .redirect_policy(RedirectPolicy::Limit(10))
-                .timeout(std::time::Duration::from_secs(30))
-                .build()?,
-        })
+            base: url::Url::parse(url)
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", err)))?,
+       })
     }
 }
 
@@ -36,7 +57,7 @@ impl DebRepoProvider for HttpDebRepo {
             .join(path)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .to_string();
-        let rsp = self.client.get_async(&uri).await?;
+        let rsp = client().get_async(&uri).await?;
         use isahc::http::StatusCode;
         match rsp.status() {
             StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),

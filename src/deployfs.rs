@@ -284,6 +284,7 @@ impl DeploymentFileSystem for &LocalFileSystem {
         use async_std::os::unix::io::AsRawFd;
         let raw_fd = file.as_raw_fd();
         if let Some(size) = size {
+            let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
             async_std::task::spawn_blocking(move || {
                 nix::fcntl::fallocate(
                     raw_fd,

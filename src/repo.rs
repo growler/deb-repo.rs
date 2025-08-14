@@ -38,7 +38,6 @@ pub type VerifyingReader = crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<
 pub struct DebRepo {
     inner: Arc<dyn DebRepoProvider>,
 }
-unsafe impl Sync for DebRepo {} // DebRepoProvider is Sync
 
 impl Clone for DebRepo {
     fn clone(&self) -> Self {
@@ -46,6 +45,11 @@ impl Clone for DebRepo {
             inner: Arc::clone(&self.inner),
         }
     }
+}
+
+#[async_trait]
+pub trait DebRepoBuilder: Send + Sync {
+    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo>; 
 }
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/debian-keys.bin");
@@ -118,7 +122,7 @@ impl DebRepo {
         Release::new(self.clone(), distr, data.into_boxed_str()).map_err(|err| err.into())
     }
     /// Returns a debian package reader.
-    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader> {
+    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<'_>> {
         DebReader::new(self.inner.reader(path).await?).await
     }
     /// Returns a verifying Debian package reader that generates an error
@@ -128,7 +132,7 @@ impl DebRepo {
         path: &str,
         size: usize,
         digest: Sha256,
-    ) -> io::Result<DebReader> {
+    ) -> io::Result<DebReader<'_>> {
         DebReader::new_verifying(
             self.inner.reader(path).await?,
             size,
@@ -246,7 +250,7 @@ impl<P: DebRepoProvider + 'static> From<P> for DebRepo {
 
 /// Defines a Debian Repository Provider.
 #[async_trait]
-pub trait DebRepoProvider: Sync {
+pub trait DebRepoProvider: Sync + Send {
     /// Provides a reader for accessing the specified path within the repository.
     async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>>;
 }

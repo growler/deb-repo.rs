@@ -24,6 +24,7 @@
             cargo-expand
             cargo-bloat
             cargo-fuzz
+            cargo-outdated
 
             pkg-config 
             gpgme

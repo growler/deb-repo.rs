@@ -1,13 +1,13 @@
 ///
 use {
+    crate::control::ParseError,
+    serde::{Deserialize, Serialize},
     smallvec::{smallvec, SmallVec},
     std::{
         cmp::Ordering,
         fmt::{self, Debug, Display, Formatter},
         hash::{Hash, Hasher},
     },
-    crate::control::ParseError,
-    serde::{Serialize, Deserialize},
 };
 
 /// Defines a method to check if a given value satisfies a specific requirement.
@@ -140,6 +140,18 @@ pub struct Constraint<A, N, V> {
     range: VersionSet<V>,
 }
 
+
+impl<A, N, V> std::ops::Not for Constraint<A, N, Version<V>> {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        Constraint {
+            name: self.name,
+            arch: self.arch,
+            range: !self.range,
+        }
+    }
+}
+
 impl<A, N, V> Constraint<A, N, V> {
     pub fn new(arch: A, name: N, version_set: VersionSet<V>) -> Self {
         Self {
@@ -189,7 +201,9 @@ impl<A: DisplayName, N: Display, V: Display> Display for Constraint<A, N, V> {
 impl<A: DisplayName, N: Display, V: Display> Debug for Constraint<A, N, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Constraint(")?;
-        self.range().fmt_name(self.arch.fmt_name(&self.name)).fmt(f)?;
+        self.range()
+            .fmt_name(self.arch.fmt_name(&self.name))
+            .fmt(f)?;
         f.write_str(")")
     }
 }
@@ -206,11 +220,11 @@ impl<A: Eq, N: Eq, V: Eq> PartialEq for Dependency<A, N, V> {
             Self::Single(a) => match other {
                 Self::Single(b) => a.eq(b),
                 _ => false,
-            }
+            },
             Self::Union(a) => match other {
                 Self::Union(b) => a.eq(b),
                 _ => false,
-            }
+            },
         }
     }
 }
@@ -235,7 +249,6 @@ impl<A: DisplayName, N: Display, V: Display> fmt::Debug for Dependency<A, N, V> 
             }
         }
     }
-
 }
 
 impl<A: DisplayName, N: Display, V: Display> fmt::Display for Dependency<A, N, V> {
@@ -311,9 +324,7 @@ impl<A, N, V> Dependency<A, N, V> {
                 let single: SmallVec<[Constraint<A, N, V>; 2]> = smallvec![dep];
                 single.into_iter()
             }
-            Self::Union(deps) => {
-                deps.into_iter()
-            }
+            Self::Union(deps) => deps.into_iter(),
         }
     }
 }
@@ -373,6 +384,22 @@ impl<V: Hash> Hash for VersionSet<V> {
             | Self::StrictlyLaterThan(ver) => {
                 ver.hash(state);
             }
+        }
+    }
+}
+
+impl<V> std::ops::Not for VersionSet<V> {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        match self {
+            Self::Any => Self::None,
+            Self::StrictlyEarlierThan(v) => Self::LaterOrEqualThan(v),
+            Self::EarlierOrEqualThan(v) => Self::StrictlyLaterThan(v),
+            Self::Exactly(v) => Self::Except(v),
+            Self::Except(v) => Self::Exactly(v),
+            Self::LaterOrEqualThan(v) => Self::StrictlyEarlierThan(v),
+            Self::StrictlyLaterThan(v) => Self::EarlierOrEqualThan(v),
+            Self::None => Self::Any,
         }
     }
 }
@@ -442,6 +469,12 @@ impl<V: Display> Debug for VersionSet<V> {
 }
 
 impl<V> VersionSet<V> {
+    pub fn is_any(&self) -> bool {
+        matches!(self, Self::Any)
+    }
+    pub fn is_exactly(&self) -> bool {
+        matches!(self, Self::Exactly(_))
+    }
     pub fn version(&self) -> Option<&V> {
         match self {
             Self::Any | Self::None => None,
@@ -491,6 +524,16 @@ impl<V> Version<V> {
         let mut tv = tv;
         Version {
             inner: tv(&self.inner),
+        }
+    }
+}
+
+impl<V> std::ops::Not for Version<V>
+where V: std::ops::Not<Output = V> {
+    type Output = Self;
+    fn not(self) -> Self::Output {
+        Version {
+            inner: !self.inner,
         }
     }
 }
@@ -856,6 +899,25 @@ impl<'a> Iterator for ParsedDependencyIterator<'a> {
     }
 }
 
+impl std::str::FromStr for Dependency<Option<String>, String, Version<String>> {
+    type Err = ParseError;
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let dep = Dependency::parse(&mut parser)?;
+        if parser.is_empty() {
+            Ok(dep.translate(
+                |a| a.map(|s| s.to_string()),
+                |n| n.to_string(),
+                |v| v.translate(|s| s.to_string()),
+            ))
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
+}
+
 impl<'a> TryFrom<&'a str> for Dependency<Option<&'a str>, &'a str, Version<&'a str>> {
     type Error = ParseError;
     fn try_from(src: &'a str) -> Result<Self, Self::Error> {
@@ -919,6 +981,17 @@ impl<'a> ProvidedName<&'a str, Version<&'a str>> {
 }
 
 impl<'a> Constraint<Option<&'a str>, &'a str, Version<&'a str>> {
+    pub fn parse_inverse(src: &'a str) -> Result<Self, ParseError> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let dep = Constraint::parse_internal(&mut parser, false)?;
+        if parser.is_empty() {
+            Ok(dep)
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
     pub fn parse(src: &'a str) -> Result<Self, ParseError> {
         let mut parser = Parser {
             inp: src.as_bytes(),

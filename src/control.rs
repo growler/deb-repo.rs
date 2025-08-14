@@ -207,7 +207,7 @@ impl MutableControlStanza {
         })
     }
     /// Provides an iterator over the fields of ControlStanza.
-    pub fn fields(&self) -> impl Iterator<Item = &'_ MutableControlField> {
+    pub fn fields(&self) -> impl Iterator<Item = &'_ MutableControlField<'_>> {
         self.inner.with_fields(|fields| fields.iter())
     }
     /// Sets the value of a field, adding the field if it does not already exist.

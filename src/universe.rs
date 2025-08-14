@@ -1,6 +1,5 @@
 use {
     crate::{
-        recipe,
         control::ParseError,
         deb::DebReader,
         digest::Digest,
@@ -12,8 +11,9 @@ use {
     futures::io::{copy, AsyncWrite},
     iterator_ext::IteratorExt,
     resolvo::{
-        Candidates, Dependencies, DependencyProvider, Interner, KnownDependencies, NameId,
-        Requirement, SolvableId, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
+        Candidates, Dependencies, Condition, ConditionId, ConditionalRequirement, 
+        DependencyProvider, Interner, KnownDependencies, NameId, Requirement, 
+        SolvableId, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
         VersionSetUnionId,
     },
     smallvec::{smallvec, SmallVec},
@@ -297,6 +297,10 @@ impl<'a> UniverseIndex<'a> {
                     ),
                 )),
             })
+            .and_then(|req| Ok(ConditionalRequirement {
+                condition: None, // TODO: handle conditions
+                requirement: req,
+            }))
             .collect::<Result<Vec<_>, ParseError>>()
         {
             Ok(reqs) => reqs,
@@ -426,6 +430,13 @@ impl Universe {
                             .with_index(|i| i.required.iter())
                             .map(|v: &Requirement| v.clone()),
                     )
+                    // the new resolvo 0.10 API added conditions. until 
+                    // I figure out where and if it might be useful, I just
+                    // wrap all requirements in a condition-less ConditionalRequirement
+                    .map(|req| ConditionalRequirement{
+                        condition: None,
+                        requirement: req,
+                    })
                     .collect(),
             )
             .constraints(
@@ -467,7 +478,12 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables.iter().map(|s| s.package))
     }
-    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader> {
+    pub fn package_source(&self, solvable: PackageId) -> usize {
+        self.inner
+            .provider()
+            .with_index(|i| i.solvables[solvable.to_index()].pkgs as usize)
+    }
+    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader<'_>> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -596,7 +612,7 @@ impl InnerUniverse {
             match candidates.len() {
                 0 => None,
                 _ => Some(Candidates {
-                    hint_dependencies_available: candidates.to_vec(),
+                    hint_dependencies_available: resolvo::HintDependenciesAvailable::All,
                     candidates: candidates.to_vec(),
                     ..Candidates::default()
                 }),
@@ -610,34 +626,30 @@ impl InnerUniverse {
         &self,
         solution: &[SolvableId],
     ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
-        petgraph::graphmap::DiGraphMap::<SolvableId, ()>::from_edges(solution.iter().flat_map(
-            |package| {
-                match self.get_dependencies(*package) {
-                    Dependencies::Known(deps) => deps,
-                    _ => unreachable!(
-                        "by this point the solvables in the solution have only known dependencies"
-                    ),
-                }
-                .requirements
-                .into_iter()
-                .flat_map(|dep| match dep {
-                    Requirement::Single(dep) => itertools::Either::Left(std::iter::once(dep)),
-                    Requirement::Union(deps) => {
-                        itertools::Either::Right(self.version_sets_in_union(deps))
+        let mut g = petgraph::graphmap::DiGraphMap::<SolvableId, ()>::new();
+        for &pkg in solution { g.add_node(pkg); }
+        for &pkg in solution {
+            let deps = match self.get_dependencies(pkg) {
+                Dependencies::Known(d) => d,
+                _ => unreachable!("solution contains only known dependencies"),
+            };
+            for req in deps.requirements {
+                let candidates = match req.requirement {
+                    Requirement::Single(vs) => itertools::Either::Left(std::iter::once(vs)),
+                    Requirement::Union(v)   => itertools::Either::Right(self.version_sets_in_union(v)),
+                };
+                for vs in candidates {
+                    if let Some(set) = self.get_candidates(self.version_set_name(vs)) {
+                        for dep in set.candidates {
+                            if dep != pkg && solution.iter().any(|&s| s == dep) {
+                                g.add_edge(dep, pkg, ());
+                            }
+                        }
                     }
-                })
-                .flat_map(|vs| {
-                    self.get_candidates(self.version_set_name(vs))
-                        .into_iter()
-                        .flat_map(|vs| vs.candidates.into_iter())
-                        .filter(|sid| {
-                            *sid != *package
-                                && solution.binary_search_by(|probe| probe.cmp(sid)).is_ok()
-                        })
-                })
-                .map(|dependency| (*package, dependency))
-            },
-        ))
+                }
+            }
+        }
+        g
     }
     fn sorted_solution(&self, solution: &[PackageId]) -> Vec<PackageId> {
         petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
@@ -665,6 +677,9 @@ impl Interner for Universe {
     }
     fn display_version_set(&self, version_set: VersionSetId) -> impl std::fmt::Display + '_ {
         self.inner.provider().display_version_set(version_set)
+    }
+    fn resolve_condition(&self, condition: ConditionId) -> Condition {
+       self.inner.provider().resolve_condition(condition)
     }
     fn display_solvable_name(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
         self.inner.provider().display_solvable_name(solvable)
@@ -707,6 +722,9 @@ impl Interner for InnerUniverse {
                 vs.range.clone(),
             )
         })
+    }
+    fn resolve_condition(&self, _condition: ConditionId) -> Condition {
+        unimplemented!("Condition resolution is not implemented yet")
     }
     fn display_solvable_name(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
         self.with_index(|i| i.solvables[solvable.to_index()].package.name())
@@ -812,11 +830,11 @@ impl DependencyProvider for InnerUniverse {
                         "Requirements({}) Constrains({})",
                         deps.requirements
                             .iter()
-                            .map(|r| match r {
+                            .map(|r| match r.requirement {
                                 Requirement::Single(c) =>
-                                    format!("{}", self.display_version_set(*c)),
+                                    format!("{}", self.display_version_set(c.clone())),
                                 Requirement::Union(u) => self
-                                    .version_sets_in_union(*u)
+                                    .version_sets_in_union(u.clone())
                                     .map(|v| format!("{}", self.display_version_set(v)))
                                     .collect::<Vec<_>>()
                                     .join(" | "),

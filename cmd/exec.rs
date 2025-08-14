@@ -7,7 +7,7 @@ use {
     },
     std::{
         fmt, io,
-        os::{fd::AsRawFd, unix::process::CommandExt},
+        os::{fd::AsFd, unix::process::CommandExt},
     },
 };
 
@@ -156,7 +156,7 @@ pub(crate) fn unshare_user_ns() -> io::Result<()> {
         ForkResult::Child => {
             drop(write_fd);
             let mut buf = [0u8; 1];
-            _ = read(read_fd.as_raw_fd(), &mut buf);
+            _ = read(read_fd.as_fd(), &mut buf);
             drop(read_fd);
             match newuid.status() {
                 Ok(code) if code.success() => {}

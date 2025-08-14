@@ -42,6 +42,34 @@ impl From<&str> for Priority {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InstallPriority {
+    Essential,
+    Required,
+    Other,
+}
+
+impl AsRef<str> for InstallPriority {
+    fn as_ref(&self) -> &str {
+        match self {
+            InstallPriority::Essential => "essential",
+            InstallPriority::Required => "required",
+            InstallPriority::Other => "other",
+        }
+    }
+}
+
+impl std::fmt::Display for InstallPriority {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            InstallPriority::Essential => write!(f, "essential"),
+            InstallPriority::Required => write!(f, "required"),
+            InstallPriority::Other => write!(f, "other"),
+        }
+    }
+}
+
+
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiArch {
     #[default]
@@ -137,6 +165,15 @@ impl<'a> Package<'a> {
     }
     pub fn required(&self) -> bool {
         self.priority == Priority::Required
+    }
+    pub fn install_priority(&self) -> InstallPriority {
+        if self.essential {
+            InstallPriority::Essential
+        } else if self.priority == Priority::Required {
+            InstallPriority::Required
+        } else {
+            InstallPriority::Other
+        }
     }
     pub fn multi_arch(&self) -> MultiArch {
         self.multi_arch
@@ -282,7 +319,7 @@ impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
     }
-    pub async fn get_deb_reader(&self, index: usize) -> std::io::Result<DebReader> {
+    pub async fn get_deb_reader(&self, index: usize) -> std::io::Result<DebReader<'_>> {
         let (path, size, hash) = self
             .get(index)
             .ok_or_else(|| {
