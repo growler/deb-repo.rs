@@ -1,12 +1,12 @@
 //! Debian repository client
 
 use {
-    crate::{deb::DebReader, digest::Sha256, release::Release},
+    crate::{deb::DebReader, digest::{DigestOf, DigesterOf, DigestUser}, release::Release},
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
-    futures::io::{copy, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
     async_trait::async_trait,
+    futures::io::{copy, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
     std::{
         io,
         pin::{pin, Pin},
@@ -17,22 +17,40 @@ use {
 /// A test Provider returning `Not Found` to any request.
 /// Used for tests and benchmarks.
 #[derive(Clone)]
-pub struct NullProvider {}
+pub struct NullProvider {
+}
+
+impl NullProvider {
+    pub fn new() -> Self {
+        NullProvider {
+        }
+    }
+}
 
 #[async_trait]
 impl DebRepoProvider for NullProvider {
     async fn reader(&self, _path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Err(io::Error::new(io::ErrorKind::NotFound, "dummy provider"))
     }
+    async fn verifying_reader(
+        &self,
+        _path: &str,
+        _size: u64,
+        _hash: &[u8],
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        Err(io::Error::new(io::ErrorKind::NotFound, "dummy provider"))
+    }
 }
 pub fn null_provider() -> DebRepo {
     DebRepo {
-        inner: Arc::new(NullProvider {}) as Arc<dyn DebRepoProvider>,
+        inner: Arc::new(NullProvider::new()) as Arc<dyn DebRepoProvider>,
     }
 }
 
-pub type DigestingReader = crate::digest::DigestingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
-pub type VerifyingReader = crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
+pub type DigestingReader =
+    crate::digest::DigestingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
+pub type VerifyingReader =
+    crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
 
 /// Represents interface for a Debian Repository
 pub struct DebRepo {
@@ -49,10 +67,14 @@ impl Clone for DebRepo {
 
 #[async_trait]
 pub trait DebRepoBuilder: Send + Sync {
-    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo>; 
+    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo>;
 }
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/debian-keys.bin");
+
+impl DigestUser for DebRepo {
+    type Digester = sha2::Sha256;
+}
 
 impl DebRepo {
     /// Fetches, verifies and parses the InRelease file. Uses the default GPG keyring, that
@@ -122,7 +144,7 @@ impl DebRepo {
         Release::new(self.clone(), distr, data.into_boxed_str()).map_err(|err| err.into())
     }
     /// Returns a debian package reader.
-    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<'_>> {
+    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<'_, DigesterOf<Self>>> {
         DebReader::new(self.inner.reader(path).await?).await
     }
     /// Returns a verifying Debian package reader that generates an error
@@ -130,21 +152,16 @@ impl DebRepo {
     pub async fn verifying_deb_reader(
         &self,
         path: &str,
-        size: usize,
-        digest: Sha256,
-    ) -> io::Result<DebReader<'_>> {
-        DebReader::new_verifying(
-            self.inner.reader(path).await?,
-            size,
-            digest,
-        )
-        .await
+        size: u64,
+        digest: DigestOf<Self>,
+    ) -> io::Result<DebReader<'_, DigesterOf<Self>>> {
+        DebReader::<DigesterOf<Self>>::new_verifying(self.inner.reader(path).await?, size, digest).await
     }
     pub async fn verifying_reader(
         &self,
         path: &str,
-        size: usize,
-        digest: Sha256,
+        size: u64,
+        digest: DigestOf<Self>,
     ) -> io::Result<VerifyingReader> {
         Ok(VerifyingReader::new(
             self.inner.reader(path).await?,
@@ -158,8 +175,8 @@ impl DebRepo {
     pub async fn verifying_unpacking_reader(
         &self,
         path: &str,
-        size: usize,
-        digest: Sha256,
+        size: u64,
+        digest: DigestOf<Self>,
     ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(
             path,
@@ -182,13 +199,11 @@ impl DebRepo {
             .await?;
         Ok(buffer)
     }
-    pub async fn fetch_verify(
-        &self,
-        path: &str,
-        size: usize,
-        digest: Sha256,
-    ) -> io::Result<Vec<u8>> {
-        let mut buffer = Vec::<u8>::with_capacity(size);
+    pub async fn fetch_verify(&self, path: &str, size: u64, digest: DigestOf<Self>) -> io::Result<Vec<u8>> {
+        let mut buffer = Vec::<u8>::with_capacity(
+            size.try_into()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+        );
         VerifyingReader::new(self.inner.reader(path).await?, size, digest)
             .read_to_end(&mut buffer)
             .await?;
@@ -197,10 +212,13 @@ impl DebRepo {
     pub async fn fetch_verify_unpack(
         &self,
         path: &str,
-        size: usize,
-        digest: Sha256,
+        size: u64,
+        digest: DigestOf<Self>,
     ) -> io::Result<Vec<u8>> {
-        let mut buffer = Vec::<u8>::with_capacity(size);
+        let mut buffer = Vec::<u8>::with_capacity(
+            size.try_into()
+                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
+        );
         unpacker(
             path,
             VerifyingReader::new(self.inner.reader(path).await?, size, digest),
@@ -213,14 +231,18 @@ impl DebRepo {
         copy(&mut self.inner.reader(path).await?, &mut pin!(w)).await
     }
     pub async fn copy_unpack<W: AsyncWrite + Send>(&self, path: &str, w: W) -> io::Result<u64> {
-        copy(&mut unpacker(path, self.inner.reader(path).await?), &mut pin!(w)).await
+        copy(
+            &mut unpacker(path, self.inner.reader(path).await?),
+            &mut pin!(w),
+        )
+        .await
     }
     pub async fn copy_verify<W: AsyncWrite + Send>(
         &self,
         w: W,
         path: &str,
-        size: usize,
-        digest: Sha256,
+        size: u64,
+        digest: DigestOf<Self>,
     ) -> io::Result<u64> {
         let mut reader = VerifyingReader::new(self.inner.reader(path).await?, size, digest);
         copy(&mut reader, &mut pin!(w)).await
@@ -229,8 +251,8 @@ impl DebRepo {
         &self,
         w: W,
         path: &str,
-        size: usize,
-        digest: Sha256,
+        size: u64,
+        digest: DigestOf<Self>,
     ) -> io::Result<u64> {
         let mut reader = unpacker(
             path,
@@ -248,11 +270,52 @@ impl<P: DebRepoProvider + 'static> From<P> for DebRepo {
     }
 }
 
-/// Defines a Debian Repository Provider.
+impl<T: DebRepoProvider> DigestUser for T {
+    type Digester = DigesterOf<DebRepo>;
+}
+
+/// Debian repository provider abstraction.
+///
+/// This trait exposes asynchronous readers for content stored in a Debian
+/// repository-like backend. Callers can obtain readers by repository-relative
+/// path or by a combination of path and content hash. Implementations must be
+/// thread-safe and suitable for concurrent use.
 #[async_trait]
 pub trait DebRepoProvider: Sync + Send {
-    /// Provides a reader for accessing the specified path within the repository.
+    /// Returns an asynchronous reader for the object at the given repository-relative path.
+    ///
+    /// - path: Repository-relative path (e.g., "dists/stable/Release" or
+    ///         "pool/main/f/foo/foo_1.0_amd64.deb").
+    ///
+    /// Returns: A pinned, boxed [`AsyncRead`] implementor positioned at the start
+    /// of the requested object.
+    ///
+    /// Errors: If the path does not exist, is not readable, or an underlying
+    /// transport/storage error occurs.
     async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>>;
+
+    /// Returns an asynchronous reader for the object at `path` whose content hash matches `hash`.
+    ///
+    /// This can be used to enforce content integrity or to address content in a
+    /// content-addressable store. Implementations MAY use `hash` as the primary
+    /// lookup key and ignore `path` for addressing, but they should ensure that
+    /// the returned content matches `hash`.
+    ///
+    /// - path: Logical or human-readable path associated with the object. It may
+    ///         be used for namespacing, auditing, or metadata.
+    /// - hash: Raw bytes of the content hash.
+    ///
+    /// Returns: A pinned, boxed [`AsyncRead`] implementor for the validated content.
+    ///
+    /// Errors: If the object cannot be found, storage access fails, or the
+    /// content does not match `hash` (implementations should return an
+    /// appropriate `io::Error`, such as `InvalidData`, on mismatch).
+    async fn verifying_reader(
+        &self,
+        path: &str,
+        _size: u64,
+        hash: &[u8],
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>>;
 }
 
 fn unpacker<'a, R: AsyncRead + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn AsyncRead + Send + 'a>> {

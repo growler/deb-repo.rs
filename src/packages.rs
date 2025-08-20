@@ -1,19 +1,20 @@
 use {
     crate::{
-        control::{Field, ControlField, ControlParser, ControlStanza, ParseError, FindFields, MutableControlStanza},
-        digest::{Digest, Sha256},
-        repo::{DebRepo, null_provider},
+        control::{
+            ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
+            ParseError,
+        },
         deb::DebReader,
+        digest::{digest_field_name, DigestOf, DigesterOf},
+        repo::{null_provider, DebRepo},
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
         },
     },
-    std::sync::Arc,
-    std::io,
     futures::io::AsyncRead,
-    //async_std::io::{self, Read},
     ouroboros::self_referencing,
+    std::{io, sync::Arc},
 };
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq, PartialOrd)]
@@ -49,6 +50,16 @@ pub enum InstallPriority {
     Other,
 }
 
+impl InstallPriority {
+    pub fn rank(&self) -> u8 {
+        match self {
+            InstallPriority::Essential => 0,
+            InstallPriority::Required => 1,
+            InstallPriority::Other => 2,
+        }
+    }
+}
+
 impl AsRef<str> for InstallPriority {
     fn as_ref(&self) -> &str {
         match self {
@@ -68,7 +79,6 @@ impl std::fmt::Display for InstallPriority {
         }
     }
 }
-
 
 #[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MultiArch {
@@ -114,10 +124,10 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    pub fn repo_file(&self) -> io::Result<(&'a str, usize, Sha256)> {
-        let (path, size, sha256) = self
+    pub fn repo_file(&self) -> io::Result<(&'a str, u64, DigestOf<DebRepo>)> {
+        let (path, size, digest) = self
             .fields()
-            .find_fields(("Filename", "Size", "SHA256"))
+            .find_fields(("Filename", "Size", digest_field_name::<DebRepo>()))
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -127,7 +137,7 @@ impl<'a> Package<'a> {
         Ok((
             path,
             crate::parse_size(size.as_bytes())?,
-            Digest::<sha2::Sha256>::try_from(sha256)?,
+            DigestOf::<DebRepo>::try_from(digest)?,
         ))
     }
     pub fn src(&self) -> &'a str {
@@ -238,7 +248,12 @@ impl<'a> Package<'a> {
             .map(|f| f.unwrap())
             .find(|f| f.is_a(name))
             .map(|f| f.value())
-            .ok_or_else(|| ParseError::from(format!("Package {} description lacks field {}", &self, name)))
+            .ok_or_else(|| {
+                ParseError::from(format!(
+                    "Package {} description lacks field {}",
+                    &self, name
+                ))
+            })
     }
     pub fn fields(&self) -> impl Iterator<Item = ControlField<'a>> {
         ControlParser::new(self.src).map(|f| f.unwrap())
@@ -319,7 +334,10 @@ impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
     }
-    pub async fn get_deb_reader(&self, index: usize) -> std::io::Result<DebReader<'_>> {
+    pub async fn get_deb_reader(
+        &self,
+        index: usize,
+    ) -> std::io::Result<DebReader<'_, DigesterOf<DebRepo>>> {
         let (path, size, hash) = self
             .get(index)
             .ok_or_else(|| {
@@ -338,7 +356,7 @@ impl Packages {
     pub fn packages(&self) -> impl Iterator<Item = &Package<'_>> {
         self.inner.with_packages(|packages| packages.iter())
     }
-    pub fn new<S>(repo: DebRepo, data: S) -> Result<Self, ParseError> 
+    pub fn new<S>(repo: DebRepo, data: S) -> Result<Self, ParseError>
     where
         Arc<str>: From<S>,
     {
@@ -358,9 +376,6 @@ impl Packages {
             .try_build()?,
         })
     }
-}
-
-impl Packages {
     pub async fn read<R: AsyncRead + Unpin + Send>(r: &mut R) -> io::Result<Self> {
         use async_std::io::ReadExt;
         let mut buf = String::new();
@@ -407,4 +422,3 @@ struct PackagesInner {
     #[covariant]
     packages: Vec<Package<'this>>,
 }
-

@@ -2,25 +2,25 @@ use {
     crate::{
         control::ParseError,
         deb::DebReader,
-        digest::Digest,
+        digest::{DigesterOf, DigestOf, digest_field_name},
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::VerifyingReader,
+        repo::{DebRepo, VerifyingReader},
         version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
     },
     futures::io::{copy, AsyncWrite},
     iterator_ext::IteratorExt,
     resolvo::{
-        Candidates, Dependencies, Condition, ConditionId, ConditionalRequirement, 
-        DependencyProvider, Interner, KnownDependencies, NameId, Requirement, 
-        SolvableId, SolverCache, StringId, UnsolvableOrCancelled, VersionSetId,
-        VersionSetUnionId,
+        Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
+        DependencyProvider, Interner, KnownDependencies, NameId, Requirement, SolvableId,
+        SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     },
     smallvec::{smallvec, SmallVec},
     std::{
-        io,
         borrow::Borrow,
+        collections::{BinaryHeap, HashMap, HashSet},
         hash::{Hash, Hasher},
+        io,
         pin::pin,
     },
 };
@@ -297,10 +297,12 @@ impl<'a> UniverseIndex<'a> {
                     ),
                 )),
             })
-            .and_then(|req| Ok(ConditionalRequirement {
-                condition: None, // TODO: handle conditions
-                requirement: req,
-            }))
+            .and_then(|req| {
+                Ok(ConditionalRequirement {
+                    condition: None, // TODO: handle conditions
+                    requirement: req,
+                })
+            })
             .collect::<Result<Vec<_>, ParseError>>()
         {
             Ok(reqs) => reqs,
@@ -430,10 +432,10 @@ impl Universe {
                             .with_index(|i| i.required.iter())
                             .map(|v: &Requirement| v.clone()),
                     )
-                    // the new resolvo 0.10 API added conditions. until 
+                    // the new resolvo 0.10 API added conditions. until
                     // I figure out where and if it might be useful, I just
                     // wrap all requirements in a condition-less ConditionalRequirement
-                    .map(|req| ConditionalRequirement{
+                    .map(|req| ConditionalRequirement {
                         condition: None,
                         requirement: req,
                     })
@@ -456,7 +458,7 @@ impl Universe {
     ) -> petgraph::graphmap::DiGraphMap<PackageId, ()> {
         self.inner.provider().dependency_graph(solution)
     }
-    pub fn sorted_solution(&self, solution: &[PackageId]) -> Vec<PackageId> {
+    pub fn sorted_solution(&self, solution: &[PackageId]) -> (Vec<PackageId>, Vec<PackageId>) {
         self.inner.provider().sorted_solution(solution)
     }
     pub fn package(&self, solvable: PackageId) -> Option<&Package<'_>> {
@@ -483,7 +485,7 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables[solvable.to_index()].pkgs as usize)
     }
-    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader<'_>> {
+    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader<'_, DigesterOf<DebRepo>>> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -499,7 +501,11 @@ impl Universe {
         })?;
         repo.verifying_reader(path, size, hash).await
     }
-    pub async fn copy_deb_file<W: AsyncWrite + Send>(&self, w: W, id: PackageId) -> io::Result<u64> {
+    pub async fn copy_deb_file<W: AsyncWrite + Send>(
+        &self,
+        w: W,
+        id: PackageId,
+    ) -> io::Result<u64> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -515,7 +521,7 @@ pub struct DebFetcher<'a> {
 }
 
 impl<'a> DebFetcher<'a> {
-    pub fn hash(&self) -> io::Result<Digest<sha2::Sha256>> {
+    pub fn hash(&self) -> io::Result<DigestOf<DebRepo>> {
         self.u
             .package(self.i)
             .ok_or_else(|| {
@@ -525,7 +531,7 @@ impl<'a> DebFetcher<'a> {
                 )
             })
             .and_then(|pkg| {
-                pkg.field("SHA256").ok_or_else(|| {
+                pkg.field(digest_field_name::<DebRepo>()).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -538,7 +544,7 @@ impl<'a> DebFetcher<'a> {
             })
             .and_then(|hash| hash.try_into())
     }
-    pub async fn deb(&self) -> io::Result<DebReader<'a>> {
+    pub async fn deb(&self) -> io::Result<DebReader<'a, DigesterOf<DebRepo>>> {
         self.u.deb_reader(self.i).await
     }
 }
@@ -622,40 +628,210 @@ impl InnerUniverse {
     fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
         self.with(|u| u.index.add_package_dependencies(solvable, &u.interned))
     }
+    fn package(&self, id: SolvableId) -> &'_ Package<'_> {
+        self.with_index(|i| i.solvables[id.to_index()].package)
+    }
+    fn lookup_by_name(&self, s: &[SolvableId], name: &str) -> Option<SolvableId> {
+        self.with_index(|i| {
+            i.names.get(name).and_then(|n| {
+                for c in i.names[n].packages.iter() {
+                    if s.contains(c) {
+                        return Some(*c);
+                    }
+                }
+                None
+            })
+        })
+    }
+    fn debug_node(
+        &self,
+        s: &[SolvableId],
+        g: &petgraph::graphmap::DiGraphMap<SolvableId, ()>,
+        name: &str,
+    ) {
+        let n = match self.lookup_by_name(s, name) {
+            Some(x) => x,
+            None => {
+                eprintln!("no such: {name}");
+                return;
+            }
+        };
+        let incoming: Vec<_> = g.neighbors_directed(n, petgraph::Incoming).collect();
+        let outgoing: Vec<_> = g.neighbors_directed(n, petgraph::Outgoing).collect();
+        eprintln!(
+            "node {name}: indeg={}, outdeg={}",
+            incoming.len(),
+            outgoing.len()
+        );
+        for p in incoming.iter().take(20) {
+            eprintln!("  <- {}", self.package(*p).name());
+        }
+        if incoming.len() > 20 {
+            eprintln!("  ... and {} more", incoming.len() - 20);
+        }
+    }
     fn dependency_graph(
         &self,
         solution: &[SolvableId],
     ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
         let mut g = petgraph::graphmap::DiGraphMap::<SolvableId, ()>::new();
-        for &pkg in solution { g.add_node(pkg); }
+        for &pkg in solution {
+            g.add_node(pkg);
+        }
         for &pkg in solution {
             let deps = match self.get_dependencies(pkg) {
                 Dependencies::Known(d) => d,
                 _ => unreachable!("solution contains only known dependencies"),
             };
             for req in deps.requirements {
-                let candidates = match req.requirement {
-                    Requirement::Single(vs) => itertools::Either::Left(std::iter::once(vs)),
-                    Requirement::Union(v)   => itertools::Either::Right(self.version_sets_in_union(v)),
-                };
-                for vs in candidates {
-                    if let Some(set) = self.get_candidates(self.version_set_name(vs)) {
-                        for dep in set.candidates {
-                            if dep != pkg && solution.iter().any(|&s| s == dep) {
-                                g.add_edge(dep, pkg, ());
-                            }
-                        }
-                    }
+                let mut candidates = match req.requirement {
+                    Requirement::Single(vs) => itertools::Either::Left(
+                        self.get_candidates(self.version_set_name(vs))
+                            .into_iter()
+                            .flat_map(|c| c.candidates.into_iter()),
+                    ),
+                    Requirement::Union(u) => itertools::Either::Right(
+                        self.version_sets_in_union(u)
+                            .filter_map(|vs| self.get_candidates(self.version_set_name(vs)))
+                            .flat_map(|c| c.candidates.into_iter()),
+                    ),
+                }
+                .filter(|dep| *dep != pkg && solution.contains(&dep))
+                .collect::<Vec<_>>();
+                candidates.sort_by_key(|&p| {
+                    (
+                        self.package(p).install_priority().rank(),
+                        self.package(p).name(),
+                    )
+                });
+                if !candidates.is_empty() {
+                    g.add_edge(candidates[0], pkg, ());
                 }
             }
         }
         g
     }
-    fn sorted_solution(&self, solution: &[PackageId]) -> Vec<PackageId> {
-        petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
+    fn sorted_solution(&self, solution: &[PackageId]) -> (Vec<PackageId>, Vec<PackageId>) {
+        let mut g = self.dependency_graph(solution);
+
+        let comps = petgraph::algo::kosaraju_scc(&g);
+        for c in comps
             .into_iter()
-            .flat_map(|g| g.into_iter())
-            .collect()
+            .filter(|c| c.len() > 1 || c.iter().any(|&n| g.contains_edge(n, n)))
+        {
+            let mut members = c.clone();
+            members.sort_by_key(|n| self.package(*n).name().to_string());
+            println!(
+                "SCC: {}",
+                members
+                    .iter()
+                    .map(|n| self.package(*n).name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+
+        let mut by_name: Vec<SolvableId> = solution.iter().copied().collect();
+        by_name.sort_by_key(|&s| self.package(s).name().to_string());
+        let name_ord: HashMap<SolvableId, usize> = by_name
+            .into_iter()
+            .enumerate()
+            .map(|(rank, s)| (s, rank))
+            .collect();
+
+        let mut indeg: HashMap<SolvableId, usize> = g
+            .nodes()
+            .map(|n| (n, g.neighbors_directed(n, petgraph::Incoming).count()))
+            .collect();
+
+        let mut ready: BinaryHeap<std::cmp::Reverse<(u8, usize, SolvableId)>> = BinaryHeap::new();
+        for (&n, &d) in &indeg {
+            if d == 0 {
+                ready.push(std::cmp::Reverse((
+                    self.package(n).install_priority().rank(),
+                    name_ord[&n],
+                    n,
+                )));
+            }
+        }
+
+        let mut remaining: HashSet<SolvableId> = indeg.keys().copied().collect();
+        let mut order = Vec::<SolvableId>::with_capacity(indeg.len());
+        let mut breaks = Vec::<SolvableId>::new();
+
+        while order.len() < indeg.len() {
+            if let Some(std::cmp::Reverse((_p, _ord, u))) = ready.pop() {
+                remaining.remove(&u);
+                order.push(u);
+                for v in g
+                    .neighbors_directed(u, petgraph::Outgoing)
+                    .collect::<Vec<_>>()
+                {
+                    let d = indeg.get_mut(&v).unwrap();
+                    *d -= 1;
+                    if *d == 0 {
+                        ready.push(std::cmp::Reverse((
+                            self.package(v).install_priority().rank(),
+                            name_ord[&v],
+                            v,
+                        )));
+                    }
+                }
+            } else {
+                let breaker = remaining
+                    .iter()
+                    .copied()
+                    .min_by_key(|&n| {
+                        (
+                            std::cmp::Reverse(self.package(n).install_priority().rank()),
+                            name_ord[&n],
+                        )
+                    })
+                    .unwrap();
+
+                breaks.push(breaker);
+
+                let incoming: Vec<_> = g.neighbors_directed(breaker, petgraph::Incoming).collect();
+                for p in &incoming {
+                    g.remove_edge(*p, breaker);
+                }
+                // after breaking the cycle, breaker has no incoming edges
+                *indeg.entry(breaker).or_insert(0) = 0;
+
+                ready.push(std::cmp::Reverse((
+                    self.package(breaker).install_priority().rank(),
+                    name_ord[&breaker],
+                    breaker,
+                )));
+            }
+        }
+        let pos: HashMap<_, _> = order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
+        for (u, v, _) in g.all_edges() {
+            println!(
+                "topo: {} -> {} placed at {} -> {}",
+                self.package(u).name(),
+                self.package(v).name(),
+                pos[&u],
+                pos[&v]
+            );
+            assert!(
+                pos[&u] < pos[&v],
+                "topo violation: {} -> {} placed at {} -> {}",
+                self.package(u).name(),
+                self.package(v).name(),
+                pos[&u],
+                pos[&v]
+            );
+        }
+        self.debug_node(solution, &g, "init-system-helpers");
+        self.debug_node(solution, &g, "usrmerge");
+        self.debug_node(solution, &g, "gpgv");
+        (order, breaks)
+        //
+        // petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
+        //     .into_iter()
+        //     .flat_map(|g| g.into_iter())
+        //     .collect()
     }
 }
 
@@ -679,7 +855,7 @@ impl Interner for Universe {
         self.inner.provider().display_version_set(version_set)
     }
     fn resolve_condition(&self, condition: ConditionId) -> Condition {
-       self.inner.provider().resolve_condition(condition)
+        self.inner.provider().resolve_condition(condition)
     }
     fn display_solvable_name(&self, solvable: SolvableId) -> impl std::fmt::Display + '_ {
         self.inner.provider().display_solvable_name(solvable)
@@ -918,11 +1094,11 @@ mod tests {
                         panic!("{}", uni.display_conflict(err))
                     }
                 };
-                let mut solution: Vec<_> = solution
+                let (solution, _breaks) = uni.sorted_solution(&solution);
+                let solution: Vec<_> = solution
                     .into_iter()
                     .map(|i| format!("{}", uni.display_solvable(i)))
                     .collect();
-                solution.sort();
                 assert_eq!(solution, $solution);
             }
         };
@@ -946,7 +1122,7 @@ Conflicts: beta
 ");
 
     test_solution!(absent_2
-    [ "alpha" ] => [ "alpha:amd64=1.0", "beta:amd64=1.0" ],
+    [ "alpha" ] => [ "beta:amd64=1.0", "alpha:amd64=1.0" ],
 "Package: alpha
 Architecture: amd64
 Version: 1.0
@@ -972,7 +1148,7 @@ Depends: alpha (>= 1.5~alpha4~)
 ");
 
     test_solution!(dep_break
-    [ "alpha" ] => [ "alpha:amd64=2.38.1-5+deb12u2", "beta:amd64=2.38.1-5+deb12u2" ],
+    [ "alpha" ] => [ "beta:amd64=2.38.1-5+deb12u2", "alpha:amd64=2.38.1-5+deb12u2" ],
 "Package: alpha
 Architecture: amd64
 Version: 2.38.1-5+deb12u2
@@ -985,7 +1161,7 @@ Breaks: alpha (<= 2.38~)
 ");
 
     test_solution!(dep_range
-    [ "keyboard-configuration" ] => [ "keyboard-configuration:all=1.221", "xkb-data:all=2.35.1-1" ],
+    [ "keyboard-configuration" ] => [ "xkb-data:all=2.35.1-1", "keyboard-configuration:all=1.221" ],
 "Package: keyboard-configuration
 Version: 1.221
 Architecture: all
@@ -995,4 +1171,169 @@ Package: xkb-data
 Version: 2.35.1-1
 Architecture: all
 ");
+
+    // 1) Simple A -> B chain -- ensures edge direction is provider -> consumer
+    test_solution!(dep_chain
+    [ "alpha" ] => [ "beta:amd64=1.0", "alpha:amd64=1.0" ],
+"Package: alpha
+Architecture: amd64
+Version: 1.0
+Depends: beta (= 1.0)
+
+Package: beta
+Architecture: amd64
+Version: 1.0
+");
+
+    // 2) OR with both providers present and a would-be cycle if wrong witness chosen
+    // Expect: pick beta as witness for xis, so order is beta -> xis -> alpha.
+    // zeta depends on beta just to force beta into the solution even if xis picked alpha.
+    test_solution!(or_witness_cycle_avoided
+    [ "alpha", "zeta" ] => [ "beta:amd64=1.0", "xis:amd64=1.0", "alpha:amd64=1.0", "zeta:amd64=1.0" ],
+"Package: alpha
+Architecture: amd64
+Version: 1.0
+Depends: xis
+
+Package: xis
+Architecture: amd64
+Version: 1.0
+Depends: alpha (= 1.0) | beta
+
+Package: beta
+Architecture: amd64
+Version: 1.0
+
+Package: zeta
+Architecture: amd64
+Version: 1.0
+Depends: beta (= 1.0)
+");
+
+    // 3) Pre-Depends must behave like Depends in ordering
+    test_solution!(pre_depends_ordering
+    [ "pkg" ] => [ "core:amd64=1.0", "pkg:amd64=1.0" ],
+    "Package: pkg
+Architecture: amd64
+Version: 1.0
+Pre-Depends: core (= 1.0)
+
+Package: core
+Architecture: amd64
+Version: 1.0
+");
+
+    // 4) Recommends must NOT create an ordering constraint
+    // If Recommends leaks into the graph, you'll see zoo -> yak (or yak -> zoo) artificially.
+    // With both requested, expect alphabetical since no hard deps.
+    test_solution!(recommends_ignored_in_ordering
+    [ "yak", "zoo" ] => [ "yak:amd64=1.0", "zoo:amd64=1.0" ],
+    "Package: yak
+Architecture: amd64
+Version: 1.0
+Recommends: zoo
+
+Package: zoo
+Architecture: amd64
+Version: 1.0
+");
+
+    // 5) Fan-in on a widely depended essential package (init-system-helpers)
+    // It should appear before all its consumers.
+    test_solution!(init_system_helpers_fanin
+    [ "aaa-p1", "aab-p2", "aac-p3", "zzz-unrelated" ]
+    => [
+        "init-system-helpers:amd64=1.0",
+        "aaa-p1:amd64=1.0",
+        "aab-p2:amd64=1.0",
+        "aac-p3:amd64=1.0",
+        "zzz-unrelated:amd64=1.0"
+    ],
+"Package: init-system-helpers
+Architecture: amd64
+Version: 1.0
+Essential: yes
+
+Package: aaa-p1
+Architecture: amd64
+Version: 1.0
+Depends: init-system-helpers
+
+Package: aab-p2
+Architecture: amd64
+Version: 1.0
+Depends: init-system-helpers
+
+Package: aac-p3
+Architecture: amd64
+Version: 1.0
+Depends: init-system-helpers
+
+Package: zzz-unrelated
+Architecture: amd64
+Version: 1.0
+");
+
+    // 6) Priority tie-breaks when there are no dependency relations
+    // essential -> required -> optional
+    test_solution!(priority_tiebreaks
+    [ "o1", "r1", "e1" ] => [ "e1:amd64=1.0", "r1:amd64=1.0", "o1:amd64=1.0" ],
+"Package: e1
+Architecture: amd64
+Version: 1.0
+Essential: yes
+
+Package: r1
+Architecture: amd64
+Version: 1.0
+Priority: required
+
+Package: o1
+Architecture: amd64
+Version: 1.0
+Priority: optional
+");
+
+    // 7) Self-dependency must not create a self-loop edge (should be ignored)
+    // test_solution!(self_dep_ignored
+    //     [ "selfy" ] => [ "selfy:amd64=1.0" ],
+    // "Package: selfy
+    // Architecture: amd64
+    // Version: 1.0
+    // Depends: selfy (= 1.0)
+    // ");
+
+    // 8) Union with duplicate version-sets for the same package -- must dedup candidates
+    // Expect simple foo -> x order.
+    test_solution!(union_duplicate_vs_dedup
+    [ "x" ] => [ "foo:amd64=1.0", "x:amd64=1.0" ],
+"Package: x
+Architecture: amd64
+Version: 1.0
+Depends: foo (= 1.0) | foo (>= 1.0)
+
+Package: foo
+Architecture: amd64
+Version: 1.0
+");
+
+    // 9) Prefer exact-name over Provides for witness selection
+    // consumer depends on 'init-system-helpers'. Both the real package and a provider are present.
+    // Expect the edge from the real 'init-system-helpers' package.
+    // test_solution!(prefer_exact_over_provides
+    //     [ "consumer", "init-system-helpers", "init-virt" ] => [ "init-system-helpers:amd64=1.0", "consumer:amd64=1.0", "init-virt:amd64=1.0" ],
+    // "Package: consumer
+    // Architecture: amd64
+    // Version: 1.0
+    // Depends: init-system-helpers
+    //
+    // Package: init-system-helpers
+    // Architecture: amd64
+    // Version: 1.0
+    //
+    // Package: init-virt
+    // Architecture: amd64
+    // Version: 1.0
+    // Provides: init-system-helpers
+    // ");
 }

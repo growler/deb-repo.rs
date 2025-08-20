@@ -1,10 +1,13 @@
 //! Debian repository client
 
 use {
-    crate::repo::{DebRepo, DebRepoBuilder, DebRepoProvider},
+    crate::{
+        digest::{DigestOf, DigesterOf, VerifyingReader},
+        repo::{DebRepo, DebRepoBuilder, DebRepoProvider},
+    },
     async_std::io::{self, Read},
     async_trait::async_trait,
-    isahc::{config::RedirectPolicy, prelude::*, HttpClient},
+    isahc::{config::RedirectPolicy, prelude::*, HttpClient, http::StatusCode},
     once_cell::sync::Lazy,
     std::pin::Pin,
 };
@@ -58,9 +61,45 @@ impl DebRepoProvider for HttpDebRepo {
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .to_string();
         let rsp = client().get_async(&uri).await?;
-        use isahc::http::StatusCode;
         match rsp.status() {
             StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
+            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
+            code => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("unexpected HTTP response {}", code),
+            )),
+        }
+    }
+    async fn verifying_reader(
+        &self,
+        path: &str,
+        size: u64,
+        hash: &[u8],
+    ) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        let uri = self
+            .base
+            .join(path)
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
+            .to_string();
+        let rsp = client().get_async(&uri).await?;
+        match rsp.status() {
+            StatusCode::OK => {
+                Ok(Box::pin(VerifyingReader::<DigesterOf<Self>, _>::new(
+                    match rsp.body().len() {
+                        Some(l) if l != size => Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "size mismatch: expected {}, got {}",
+                                size,
+                                l
+                            ),
+                        )),
+                        _ => Ok(rsp.into_body()),
+                    }?,
+                    size, 
+                    DigestOf::<Self>::try_from(hash)?,
+                )))
+            },
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
             code => Err(io::Error::new(
                 io::ErrorKind::Other,

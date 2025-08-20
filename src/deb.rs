@@ -6,7 +6,7 @@ use {
     crate::{
         control::MutableControlStanza,
         deployfs::DeploymentFile,
-        digest::{Digest, DigestingReader, GetDigest, VerifyingReader},
+        digest::{Digest, DigestFieldName, Digester, DigestingReader, GetDigest, VerifyingReader},
         parse_size,
     },
     async_compression::futures::bufread::{
@@ -45,8 +45,8 @@ macro_rules! ready {
 }
 
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
-const AR_MAGIC_SIZE: usize = AR_MAGIC.len();
-const AR_HEADER_SIZE: usize = 60;
+const AR_MAGIC_SIZE: u64 = AR_MAGIC.len() as u64;
+const AR_HEADER_SIZE: u64 = 60;
 
 enum State {
     Header,
@@ -59,33 +59,33 @@ enum EntryKind {
     Data,
 }
 
-trait DebReaderSource: AsyncRead + Unpin + Send + GetDigest<sha2::Sha256> {}
-impl<R: AsyncRead + Unpin + Send> DebReaderSource for VerifyingReader<sha2::Sha256, R> {}
-impl<R: AsyncRead + Unpin + Send> DebReaderSource for DigestingReader<sha2::Sha256, R> {}
+trait DebReaderSource<D: Digester>: AsyncRead + Unpin + Send + GetDigest<D> {}
+impl<D: Digester, R: AsyncRead + Unpin + Send> DebReaderSource<D> for VerifyingReader<D, R> {}
+impl<D: Digester, R: AsyncRead + Unpin + Send> DebReaderSource<D> for DigestingReader<D, R> {}
 
 #[pin_project]
-struct DebReaderInner<'a> {
+struct DebReaderInner<'a, D: Digester> {
     // Current state
     state: State,
     // Content padding
     padding: u8,
     // Size of the current entry
-    size: usize,
+    size: u64,
     // Total bytes read for the current entry
-    read: usize,
+    read: u64,
     // Total bytes read for the whole file
-    total: usize,
+    total: u64,
     // Deb entry header
-    hdr: [u8; AR_HEADER_SIZE],
+    hdr: [u8; AR_HEADER_SIZE as usize],
     // Source of the data
     #[pin]
-    source: Box<dyn DebReaderSource + 'a>,
+    source: Box<dyn DebReaderSource<D> + 'a>,
 }
 
-impl<'a> DebReaderInner<'a> {
+impl<'a, D: Digester + 'static> DebReaderInner<'a, D> {
     async fn new<R: AsyncRead + Send + Unpin + 'a>(r: R) -> std::io::Result<Self> {
-        let mut hdr = [0u8; AR_MAGIC_SIZE];
-        let mut r = Box::new(DigestingReader::<sha2::Sha256, _>::new(r));
+        let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
+        let mut r = Box::new(DigestingReader::<D, _>::new(r));
         r.read_exact(&mut hdr).await?;
         if &hdr != AR_MAGIC {
             return Err(std::io::Error::new(
@@ -99,17 +99,17 @@ impl<'a> DebReaderInner<'a> {
             padding: 0,
             read: 0,
             total: AR_MAGIC_SIZE,
-            hdr: [0u8; AR_HEADER_SIZE],
+            hdr: [0u8; AR_HEADER_SIZE as usize],
             source: r,
         })
     }
     async fn new_verifying<R: AsyncRead + Send + Unpin + 'a>(
         r: R,
-        size: usize,
-        hash: Digest<sha2::Sha256>,
+        size: u64,
+        hash: Digest<D>,
     ) -> std::io::Result<Self> {
-        let mut hdr = [0u8; AR_MAGIC_SIZE];
-        let mut r = Box::new(VerifyingReader::<sha2::Sha256, _>::new(r, size, hash));
+        let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
+        let mut r = Box::new(VerifyingReader::<D, _>::new(r, size, hash));
         r.read_exact(&mut hdr).await?;
         if &hdr != AR_MAGIC {
             return Err(std::io::Error::new(
@@ -123,32 +123,35 @@ impl<'a> DebReaderInner<'a> {
             padding: 0,
             read: 0,
             total: AR_MAGIC_SIZE,
-            hdr: [0u8; AR_HEADER_SIZE],
+            hdr: [0u8; AR_HEADER_SIZE as usize],
             source: r,
         })
     }
-    fn reset_for_next_chunk(&mut self, state: State, size: usize) {
+    fn reset_for_next_chunk(&mut self, state: State, size: u64) {
         self.state = state;
         self.size = size;
         self.padding = (size & 1) as u8;
         self.read = 0;
     }
-    fn size_with_padding(&self) -> usize {
-        self.size + (self.padding as usize)
+    fn size_with_padding(&self) -> u64 {
+        self.size + (self.padding as u64)
     }
     fn poll_read_header(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<usize>> {
         let this = self.project();
         let buf = this.hdr.as_mut();
-        let remain = (*this.size + *this.padding as usize) - *this.read;
+        let remain = (*this.size + *this.padding as u64) - *this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         }
-        match ready!(this.source.poll_read(ctx, &mut buf[*this.read..*this.size])) {
+        match ready!(this
+            .source
+            .poll_read(ctx, &mut buf[*this.read as usize..*this.size as usize]))
+        {
             0 => Poll::Ready(Ok(0)),
             n => {
-                *this.read += n;
-                *this.total += n;
-                Poll::Ready(Ok(if n < remain {
+                *this.read += n as u64;
+                *this.total += n as u64;
+                Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
                     n - *this.padding as usize
@@ -158,27 +161,31 @@ impl<'a> DebReaderInner<'a> {
     }
 }
 
-impl<'a> AsyncRead for DebReaderInner<'a> {
+impl<'a, D: Digester + 'a> AsyncRead for DebReaderInner<'a, D> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut this = self.project();
-        let remain = (*this.size + *this.padding as usize) - *this.read;
+        let remain = (*this.size + *this.padding as u64) - *this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         };
-        let size = std::cmp::min(remain, buf.len());
-        match ready!(this.source.as_mut().poll_read(ctx, &mut buf[0..size])) {
+        let size = std::cmp::min(remain, buf.len() as u64);
+        match ready!(this
+            .source
+            .as_mut()
+            .poll_read(ctx, &mut buf[0..size as usize]))
+        {
             0 => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected EOF while reading package entry",
             ))),
             n => {
-                *this.read += n;
-                *this.total += n;
-                Poll::Ready(Ok(if n < remain {
+                *this.read += n as u64;
+                *this.total += n as u64;
+                Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
                     n - *this.padding as usize
@@ -188,7 +195,7 @@ impl<'a> AsyncRead for DebReaderInner<'a> {
     }
 }
 
-impl<'a> Stream for DebReaderInner<'a> {
+impl<'a, D: Digester + 'static> Stream for DebReaderInner<'a, D> {
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -244,7 +251,7 @@ impl<'a> Stream for DebReaderInner<'a> {
                                         "unexpected EOF while reading entry content",
                                     ))))
                                 }
-                                n if n == size => {
+                                n if (n as u64) == size => {
                                     self.reset_for_next_chunk(State::Header, AR_HEADER_SIZE);
                                 }
                                 _ => {} // skip as content
@@ -290,15 +297,15 @@ impl<'a> Stream for DebReaderInner<'a> {
 ///     }
 /// }
 /// ```
-pub struct DebReader<'a> {
-    inner: Arc<Mutex<DebReaderInner<'a>>>,
+pub struct DebReader<'a, D: Digester> {
+    inner: Arc<Mutex<DebReaderInner<'a, D>>>,
 }
 
-struct DebEntryReaderInner<'a> {
-    inner: Arc<Mutex<DebReaderInner<'a>>>,
+struct DebEntryReaderInner<'a, D: Digester> {
+    inner: Arc<Mutex<DebReaderInner<'a, D>>>,
 }
 
-impl<'a> AsyncRead for DebEntryReaderInner<'a> {
+impl<'a, D: Digester + 'static> AsyncRead for DebEntryReaderInner<'a, D> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -314,7 +321,7 @@ impl<'a> AsyncRead for DebEntryReaderInner<'a> {
     }
 }
 
-impl<'a> DebReader<'a> {
+impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -346,8 +353,8 @@ impl<'a> DebReader<'a> {
     }
     pub async fn new_verifying<R: AsyncRead + Unpin + Send + 'a>(
         reader: R,
-        size: usize,
-        hash: Digest<sha2::Sha256>,
+        size: u64,
+        hash: Digest<D>,
     ) -> Result<Self> {
         Ok(DebReader {
             inner: Arc::new(Mutex::new(
@@ -373,12 +380,12 @@ impl<'a> DebReader<'a> {
     }
     pub async fn finalize(self) -> io::Result<String> {
         let mut reader = Arc::into_inner(self.inner)
-            .ok_or_else(||
+            .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    "unexpected references to debian package inned reader"
+                    "unexpected references to debian package inned reader",
                 )
-            )?
+            })?
             .into_inner()
             .map_err(|err| {
                 io::Error::new(
@@ -694,7 +701,7 @@ impl<'a> DebReader<'a> {
                 ctrl.set("Conffiles", buf);
             }
         }
-        ctrl.set("SHA256", self.finalize().await?);
+        ctrl.set(D::DIGEST_FIELD_NAME, self.finalize().await?);
         if ctrl_files_list.len() > 0 {
             ctrl.set("Controlfiles", ctrl_files_list);
         }
@@ -702,7 +709,7 @@ impl<'a> DebReader<'a> {
     }
 }
 
-impl<'a> Stream for DebReader<'a> {
+impl<'a, D: Digester + DigestFieldName + 'static> Stream for DebReader<'a, D> {
     type Item = Result<DebEntry<'a>>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {
@@ -728,20 +735,21 @@ impl<'a> Stream for DebReader<'a> {
     }
 }
 
-pub struct DebEntryReader<'a> {
-    inner: Pin<Box<dyn AsyncRead + Unpin + Send>>,
-    _marker: std::marker::PhantomData<&'a ()>,
-}
-
-impl<'a> AsyncRead for DebEntryReader<'a> {
-    fn poll_read(
-        mut self: Pin<&mut Self>,
-        ctx: &mut Context<'_>,
-        buf: &mut [u8],
-    ) -> Poll<std::io::Result<usize>> {
-        self.inner.as_mut().poll_read(ctx, buf)
-    }
-}
+// TODO: remove
+// pub struct DebEntryReader<'a> {
+//     inner: Pin<Box<dyn AsyncRead + Unpin + Send>>,
+//     _marker: std::marker::PhantomData<&'a ()>,
+// }
+//
+// impl<'a> AsyncRead for DebEntryReader<'a> {
+//     fn poll_read(
+//         mut self: Pin<&mut Self>,
+//         ctx: &mut Context<'_>,
+//         buf: &mut [u8],
+//     ) -> Poll<std::io::Result<usize>> {
+//         self.inner.as_mut().poll_read(ctx, buf)
+//     }
+// }
 
 pub enum DebEntry<'a> {
     Control(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>),

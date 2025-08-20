@@ -1,47 +1,66 @@
 //! Digest verification
 
-pub use digest::{FixedOutputReset as Digester, Output as DigesterOutput};
+pub use digest::{FixedOutputReset, Output as DigesterOutput};
 use {
-    serde::{
-        Deserialize, Deserializer, Serialize, Serializer,
+    ::serde::{
         de::{self, Visitor},
+        Deserialize, Deserializer, Serialize, Serializer,
     },
     async_std::{
         io::prelude::*,
         task::{ready, Context, Poll},
     },
     pin_project::pin_project,
-    std::{
-        fmt,
-        pin::Pin,
-    },
+    std::{fmt, pin::Pin},
 };
 
-pub type Sha256 = Digest<sha2::Sha256>;
+pub trait Digester: FixedOutputReset + Default + Send {}
+impl<T: FixedOutputReset + Default + Send> Digester for T {}
+
+pub trait DigestFieldName {
+    const DIGEST_FIELD_NAME: &'static str;
+}
+impl DigestFieldName for sha2::Sha256 {
+    const DIGEST_FIELD_NAME: &'static str = "SHA256";
+}
+impl DigestFieldName for md5::Md5 {
+    const DIGEST_FIELD_NAME: &'static str = "MD5sum";
+}
 
 #[derive(Default, Debug)]
-pub struct Digest<D: Digester + Send> {
+pub struct Digest<D: Digester> {
     inner: DigesterOutput<D>,
 }
 
-impl<D: Digester + Send> Serialize for Digest<D> {
+pub trait DigestUser {
+    type Digester;
+}
+pub(crate) type DigestOf<T> = Digest<<T as DigestUser>::Digester>;
+pub(crate) type DigesterOf<T> = <T as DigestUser>::Digester;
+pub(crate) const fn digest_field_name<T: DigestUser>() -> &'static str 
+where 
+    T::Digester: DigestFieldName,
+{
+    <T::Digester as DigestFieldName>::DIGEST_FIELD_NAME
+}
+
+impl<D: Digester> Serialize for Digest<D> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let hex_str = hex::encode(&self.inner);
-        serializer.serialize_str(&hex_str)
+        self::serde::hex::serialize(self, serializer)
     }
 }
 
-impl<'de, D: Digester + Send> Deserialize<'de> for Digest<D> {
+impl<'de, D: Digester> Deserialize<'de> for Digest<D> {
     fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
     where
         DE: Deserializer<'de>,
     {
         struct DigestVisitor<T>(std::marker::PhantomData<T>);
 
-        impl<'de, T: Digester + Send> Visitor<'de> for DigestVisitor<T> {
+        impl<'de, T: Digester> Visitor<'de> for DigestVisitor<T> {
             type Value = Digest<T>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
@@ -53,9 +72,8 @@ impl<'de, D: Digester + Send> Deserialize<'de> for Digest<D> {
                 E: de::Error,
             {
                 let mut inner = DigesterOutput::<T>::default();
-                hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|e| de::Error::custom(
-                    format!("error decoding hash: {}", e)
-                ))?;
+                hex::decode_to_slice(value, inner.as_mut_slice())
+                    .map_err(|e| de::Error::custom(format!("error decoding hash: {}", e)))?;
                 Ok(Digest { inner })
             }
         }
@@ -63,18 +81,132 @@ impl<'de, D: Digester + Send> Deserialize<'de> for Digest<D> {
     }
 }
 
-impl<D: Digester + Send> std::ops::Deref for Digest<D> {
+pub mod serde {
+    // Hexadecimal encoding (default). Accepts mixed case, outputs only lowercase.
+    pub mod hex {
+        use crate::digest::{Digest, Digester, DigesterOutput};
+        use serde::{
+            de::{self, Visitor},
+            Deserializer, Serializer,
+        };
+        use std::{fmt, marker::PhantomData};
+
+        pub fn serialize<D, S>(value: &Digest<D>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            D: Digester,
+            S: Serializer,
+        {
+            let s = ::hex::encode(value.inner.as_slice());
+            serializer.serialize_str(&s)
+        }
+
+        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Digest<D>, DE::Error>
+        where
+            D: Digester,
+            DE: Deserializer<'de>,
+        {
+            struct HexVisitor<T>(PhantomData<T>);
+
+            impl<'de, T: Digester> Visitor<'de> for HexVisitor<T> {
+                type Value = Digest<T>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(
+                        f,
+                        "a string with hex-encoded digest ({} hex chars)",
+                        T::output_size() * 2
+                    )
+                }
+
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    let mut inner = DigesterOutput::<T>::default();
+                    ::hex::decode_to_slice(v, inner.as_mut_slice())
+                        .map_err(|e| E::custom(format!("error decoding hex digest: {}", e)))?;
+                    Ok(Digest { inner })
+                }
+            }
+
+            deserializer.deserialize_str(HexVisitor::<D>(PhantomData))
+        }
+    }
+
+    // base64 URL-safe encoding
+    pub mod base64 {
+        use crate::digest::{Digest, Digester, DigesterOutput};
+        use ::base64::prelude::*;
+        use serde::{
+            de::{self, Visitor},
+            Deserializer, Serializer,
+        };
+        use std::{fmt, marker::PhantomData};
+
+        pub fn serialize<D, S>(value: &Digest<D>, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            D: Digester,
+            S: Serializer,
+        {
+            let s = ::base64::engine::general_purpose::URL_SAFE.encode(value.inner.as_slice());
+            serializer.serialize_str(&s)
+        }
+
+        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Digest<D>, DE::Error>
+        where
+            D: Digester,
+            DE: Deserializer<'de>,
+        {
+            struct B64Visitor<T>(PhantomData<T>);
+
+            impl<'de, T: Digester> Visitor<'de> for B64Visitor<T> {
+                type Value = Digest<T>;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "a base64url encoded digest")
+                }
+
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    let bytes = ::base64::engine::general_purpose::URL_SAFE
+                        .decode(v.as_bytes())
+                        .map_err(|e| {
+                            E::custom(format!("error decoding base64-url digest: {}", e))
+                        })?;
+
+                    if bytes.len() != T::output_size() {
+                        return Err(E::custom(format!(
+                            "invalid digest length {} (expected {})",
+                            bytes.len(),
+                            T::output_size()
+                        )));
+                    }
+
+                    let mut inner = DigesterOutput::<T>::default();
+                    inner.as_mut_slice().copy_from_slice(&bytes);
+                    Ok(Digest { inner })
+                }
+            }
+
+            deserializer.deserialize_str(B64Visitor::<D>(PhantomData))
+        }
+    }
+}
+
+impl<D: Digester> std::ops::Deref for Digest<D> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-pub(crate) trait GetDigest<D: Digester + Send> {
+pub(crate) trait GetDigest<D: Digester> {
     fn get_digest(&mut self) -> Digest<D>;
 }
 
-impl<D: Digester + Send> Clone for Digest<D> {
+impl<D: Digester> Clone for Digest<D> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -82,14 +214,14 @@ impl<D: Digester + Send> Clone for Digest<D> {
     }
 }
 
-impl<This: Digester + Send, That: Digester + Send> PartialEq<Digest<That>> for Digest<This> {
+impl<This: Digester, That: Digester> PartialEq<Digest<That>> for Digest<This> {
     fn eq(&self, other: &Digest<That>) -> bool {
         This::output_size() == That::output_size()
             && self.inner.as_slice() == other.inner.as_slice()
     }
 }
 
-impl<D: Digester + Send> PartialEq<str> for Digest<D> {
+impl<D: Digester> PartialEq<str> for Digest<D> {
     fn eq(&self, other: &str) -> bool {
         let mut digest = DigesterOutput::<D>::default();
         match hex::decode_to_slice(other, digest.as_mut_slice()) {
@@ -99,13 +231,13 @@ impl<D: Digester + Send> PartialEq<str> for Digest<D> {
     }
 }
 
-impl<D: Digester + Send> Digest<D> {
+impl<D: Digester> Digest<D> {
     pub fn into_inner(self) -> DigesterOutput<D> {
         self.inner
     }
 }
 
-impl<D: Digester + Send> TryFrom<&str> for Digest<D> {
+impl<D: Digester> TryFrom<&str> for Digest<D> {
     type Error = std::io::Error;
     fn try_from(value: &str) -> std::io::Result<Self> {
         let mut inner = DigesterOutput::<D>::default();
@@ -119,7 +251,7 @@ impl<D: Digester + Send> TryFrom<&str> for Digest<D> {
     }
 }
 
-impl<D: Digester + Send> TryFrom<&[u8]> for Digest<D> {
+impl<D: Digester> TryFrom<&[u8]> for Digest<D> {
     type Error = std::io::Error;
     fn try_from(value: &[u8]) -> std::io::Result<Self> {
         if value.len() == D::output_size() {
@@ -138,32 +270,32 @@ impl<D: Digester + Send> TryFrom<&[u8]> for Digest<D> {
     }
 }
 
-impl<D: Digester + Send> From<Digest<D>> for String {
+impl<D: Digester> From<Digest<D>> for String {
     fn from(value: Digest<D>) -> Self {
         hex::encode(&value.inner)
     }
 }
 
-impl<D: Digester + Send> From<Digest<D>> for DigesterOutput<D> {
+impl<D: Digester> From<Digest<D>> for DigesterOutput<D> {
     fn from(value: Digest<D>) -> Self {
         value.inner
     }
 }
 
-impl<D: Digester + Send> From<DigesterOutput<D>> for Digest<D> {
+impl<D: Digester> From<DigesterOutput<D>> for Digest<D> {
     fn from(value: DigesterOutput<D>) -> Self {
         Self { inner: value }
     }
 }
 
-impl<D: Digester + Send> std::fmt::LowerHex for Digest<D> {
+impl<D: Digester> std::fmt::LowerHex for Digest<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(f, "{}", hex::encode(&self.inner))
     }
 }
 
 #[pin_project]
-pub struct DigestingReader<D: Digester + Send, R: Read + Unpin + Send> {
+pub struct DigestingReader<D: Digester, R: Read + Unpin + Send> {
     digester: D,
     #[pin]
     inner: R,
@@ -178,7 +310,7 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> DigestingReader<D, R>
     }
 }
 
-impl<D: Digester + Send, R: Read + Unpin + Send> GetDigest<D> for DigestingReader<D, R> {
+impl<D: Digester, R: Read + Unpin + Send> GetDigest<D> for DigestingReader<D, R> {
     fn get_digest(&mut self) -> Digest<D> {
         Digest {
             inner: self.digester.finalize_fixed_reset(),
@@ -186,7 +318,7 @@ impl<D: Digester + Send, R: Read + Unpin + Send> GetDigest<D> for DigestingReade
     }
 }
 
-impl<D: Digester + Send, R: Read + Unpin + Send> Read for DigestingReader<D, R> {
+impl<D: Digester, R: Read + Unpin + Send> Read for DigestingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -205,23 +337,25 @@ impl<D: Digester + Send, R: Read + Unpin + Send> Read for DigestingReader<D, R> 
 }
 
 #[pin_project]
-pub struct VerifyingReader<D: Digester + Default + Send, R: Read + Unpin + Send> {
+pub struct VerifyingReader<D: Digester, R: Read + Unpin + Send> {
     digester: D,
     digest: DigesterOutput<D>,
-    size: usize,
-    read: usize,
+    size: u64,
+    read: u64,
     #[pin]
     inner: R,
 }
 
 impl<D: Digester + Default + Send, R: Read + Unpin + Send> GetDigest<D> for VerifyingReader<D, R> {
     fn get_digest(&mut self) -> Digest<D> {
-        Digest { inner: self.digest.clone() }
+        Digest {
+            inner: self.digest.clone(),
+        }
     }
 }
 
 impl<D: Digester + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {
-    pub fn new(reader: R, size: usize, digest: Digest<D>) -> Self {
+    pub fn new(reader: R, size: u64, digest: Digest<D>) -> Self {
         Self {
             digester: D::default(),
             digest: digest.into(),
@@ -242,7 +376,7 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> Read for VerifyingRea
         match this.inner.as_mut().poll_read(cx, buf) {
             Poll::Ready(Ok(size)) => Poll::Ready(if size > 0 {
                 this.digester.update(&buf[0..size]);
-                *this.read += size;
+                *this.read += size as u64;
                 if this.read > this.size {
                     Err(std::io::Error::new(
                         std::io::ErrorKind::Other,
@@ -297,7 +431,7 @@ mod tests {
     #[async_std::test]
     async fn test_verifying_reader() {
         let data = b"hello world";
-        let size = data.len();
+        let size = data.len() as u64;
         let mut hasher = Sha256::new();
         hasher.update(data);
         let expected_digest = hasher.finalize();
@@ -315,8 +449,8 @@ mod tests {
         let mut reader =
             VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.clone().into());
 
-        let mut buf = vec![0; size];
-        let n = reader.read(&mut buf).await.unwrap();
+        let mut buf = vec![0; size.try_into().unwrap()];
+        let n = reader.read(&mut buf).await.unwrap() as u64;
         assert_eq!(n, size);
         assert_eq!(&buf, data);
 
@@ -332,15 +466,15 @@ mod tests {
     #[async_std::test]
     async fn test_verifying_reader_incorrect_digest() {
         let data = b"hello world";
-        let size = data.len();
+        let size = data.len() as u64;
         let incorrect_digest = Sha256::digest(b"incorrect");
 
         let cursor = Cursor::new(data);
         let mut reader =
             VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest.clone().into());
 
-        let mut buf = vec![0; size];
-        let n = reader.read(&mut buf).await.unwrap();
+        let mut buf = vec![0; size.try_into().unwrap()];
+        let n = reader.read(&mut buf).await.unwrap() as u64;
         assert_eq!(n, size);
         assert_eq!(&buf, data);
 
@@ -353,7 +487,7 @@ mod tests {
     #[async_std::test]
     async fn test_verifying_reader_incorrect_size() {
         let data = b"hello world";
-        let size = data.len() + 1; // incorrect size
+        let size = data.len() as u64 + 1; // incorrect size
         let mut hasher = Sha256::new();
         hasher.update(data);
         let expected_digest = hasher.finalize();

@@ -1,20 +1,16 @@
 use {
     crate::{
-        digest::Digest,
+        digest::{self, Digest},
         httprepo::HttpDebRepo,
-        packages::Package,
-        release::Release,
         repo::{DebRepo, DebRepoBuilder},
         universe::Universe,
         version::{Constraint, Dependency, Version},
     },
     async_std::{io, path::Path},
-    futures::{
-        future::join_all,
-        stream::{self, StreamExt, TryStreamExt},
-    },
-    serde::{de::DeserializeOwned, Deserialize, Serialize},
-    std::{future::Future, pin::pin},
+    chrono::{DateTime, Utc},
+    futures::stream::{self, StreamExt, TryStreamExt},
+    serde::{Deserialize, Serialize},
+    std::pin::pin,
 };
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -97,7 +93,12 @@ impl Manifest {
             self.constraints.push(con)
         }
     }
-    pub fn into_requirements(self) -> (Vec<Dependency<Option<String>, String, Version<String>>>, Vec<Constraint<Option<String>, String, Version<String>>>) {
+    pub fn into_requirements(
+        self,
+    ) -> (
+        Vec<Dependency<Option<String>, String, Version<String>>>,
+        Vec<Constraint<Option<String>, String, Version<String>>>,
+    ) {
         (self.requirements, self.constraints)
     }
     pub async fn read<R: io::Read + Send>(r: R) -> io::Result<Self> {
@@ -132,77 +133,103 @@ impl Manifest {
         Ok(())
     }
 
-    pub async fn fetch_universe(&self, arch: &str, limit: usize) -> io::Result<Universe> {
+    pub async fn fetch_universe<B: DebRepoBuilder>(
+        &self,
+        arch: &str,
+        repo_builder: &B,
+        limit: usize,
+    ) -> io::Result<Universe> {
         let sources = self.sources().cloned().collect::<Vec<_>>();
         let releases = stream::iter(sources.into_iter().enumerate())
             .map(|(id, src)| async move {
-                let repo: DebRepo = HttpDebRepo::new(&src.url).await?.into();
+                let repo: DebRepo = repo_builder.build(&src.url).await?.into();
                 let rel = repo.fetch_release(&src.distr).await?;
                 Ok::<_, io::Error>((src, id, rel))
             })
             .buffer_unordered(limit)
-            .try_filter_map(move |(src, id, rel)| {
-                async move {
-                    if !src.should_include_arch(arch) {
-                        Ok(None)
+            .try_filter_map(move |(src, id, rel)| async move {
+                if !src.should_include_arch(arch) {
+                    Ok(None)
+                } else {
+                    let components = if src.comp.is_empty() {
+                        rel.components().map(String::from).collect::<Vec<_>>()
                     } else {
-                        let components = if src.comp.is_empty() {
-                            rel.components().map(String::from).collect::<Vec<_>>()
-                        } else {
-                            src.comp.iter().map(|s| s.clone()).collect::<Vec<_>>()
-                        };
-                        Ok(Some((rel, id, components)))
-                    }
+                        src.comp.iter().map(|s| s.clone()).collect::<Vec<_>>()
+                    };
+                    Ok(Some((rel, id, components)))
                 }
             })
             .try_collect::<Vec<_>>()
             .await?;
-        let tasks: Vec<_> = releases.iter().flat_map(|(rel, id, components)| {
-            components.iter().map(move |comp| async move {
-                Ok::<_, io::Error>((id, rel.fetch_packages(comp, arch).await?))
+        let tasks: Vec<_> = releases
+            .iter()
+            .flat_map(|(rel, id, components)| {
+                components.iter().map(move |comp| async move {
+                    Ok::<_, io::Error>((id, rel.fetch_packages(comp, arch).await?))
+                })
             })
-        }).collect();
+            .collect();
         let mut packages = stream::iter(tasks)
             .buffer_unordered(limit)
             .try_collect::<Vec<_>>()
             .await?;
         packages.sort_by_key(|(id, _)| *id);
-        Ok(Universe::new(&arch, packages.into_iter().map(|(_, pkg)| pkg))?)
+        Ok(Universe::new(
+            &arch,
+            packages.into_iter().map(|(_, pkg)| pkg),
+        )?)
     }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound = "A: Serialize + DeserializeOwned")]
-pub struct LockedIndex<A: Serialize + DeserializeOwned + std::fmt::Debug> {
-    path: String,
+pub struct LockedIndex {
+    uri: String,
+    #[serde(with = "digest::serde::base64")]
     hash: Digest<sha2::Sha256>,
-    asset: A,
+}
+
+impl LockedIndex {
+    pub fn new(uri: String, hash: Digest<sha2::Sha256>) -> Self {
+        LockedIndex { uri, hash }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound = "A: Serialize + DeserializeOwned")]
-pub struct LockedPackage<A: Serialize + DeserializeOwned + std::fmt::Debug> {
+pub struct LockedPackage {
     source: u32,
-    path: String,
+    uri: String,
+    #[serde(with = "digest::serde::base64")]
     hash: Digest<sha2::Sha256>,
-    asset: A,
+}
+
+impl LockedPackage {
+    pub fn new(source: u32, uri: String, hash: Digest<sha2::Sha256>) -> Self {
+        LockedPackage { source, uri, hash }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound = "A: Serialize + DeserializeOwned")]
-pub struct LockedSource<A: Serialize + DeserializeOwned + std::fmt::Debug> {
+pub struct LockedSource {
     source: Source,
-    assets: Vec<LockedIndex<A>>,
+    assets: Vec<LockedIndex>,
+}
+
+impl LockedSource {
+    pub fn new(source: Source, assets: Vec<LockedIndex>) -> Self {
+        LockedSource { source, assets }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-#[serde(bound = "A: Serialize + DeserializeOwned")]
-pub struct LockedManifest<A: Serialize + DeserializeOwned + std::fmt::Debug> {
-    sources: Vec<LockedSource<A>>,
-    packages: Vec<LockedPackage<A>>,
+pub struct LockFile {
+    timestamp: DateTime<Utc>,
+    #[serde(with = "digest::serde::base64")]
+    hash: Digest<sha2::Sha256>,
+    sources: Vec<LockedSource>,
+    packages: Vec<LockedPackage>,
 }
 
-impl<A: Serialize + DeserializeOwned + std::fmt::Debug> LockedManifest<A> {
+impl LockFile {
     const MAX_SIZE: u64 = 8 * 1024 * 1024;
     pub async fn read_file<P: AsRef<Path>>(path: P) -> io::Result<Self> {
         Self::read(async_std::fs::File::open(path.as_ref()).await?).await
@@ -212,7 +239,7 @@ impl<A: Serialize + DeserializeOwned + std::fmt::Debug> LockedManifest<A> {
         let mut r = pin!(r.take(Self::MAX_SIZE));
         let mut buf = Vec::<u8>::new();
         r.read_to_end(&mut buf).await?;
-        let result: LockedManifest<A> = serde_json::from_slice(&buf).map_err(|err| {
+        let result: LockFile = serde_json::from_slice(&buf).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
                 format!("failed to parse locked recipe: {}", err),
@@ -223,8 +250,8 @@ impl<A: Serialize + DeserializeOwned + std::fmt::Debug> LockedManifest<A> {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!(
-                        "package {} source index {} out of bounds (max {})",
-                        pkg.path,
+                        "package {:?} source index {} out of bounds (max {})",
+                        pkg.uri,
                         pkg.source,
                         result.sources.len() - 1
                     ),

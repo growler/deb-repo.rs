@@ -23,19 +23,20 @@ pub use {
     deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSDebRepo,
     httprepo::{HttpDebRepo, HttpRepoBuilder},
-    manifest::{LockedManifest, Manifest},
-    packages::{Package, Packages, InstallPriority},
+    manifest::{LockFile, Manifest},
+    packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::{
-        null_provider, DebRepo, DebRepoProvider, DigestingReader, VerifyingReader, DEBIAN_KEYRING,
+        null_provider, DebRepo, DebRepoBuilder, DebRepoProvider, DigestingReader, VerifyingReader,
+        DEBIAN_KEYRING,
     },
     resolvo::{NameId, StringId},
     universe::{DebFetcher, PackageId, Universe},
     version::{Constraint, Dependency, Version},
 };
 
-pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
-    let mut result: usize = 0;
+pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<u64> {
+    let mut result: u64 = 0;
     for &byte in str {
         if byte == b' ' {
             break;
@@ -48,7 +49,7 @@ pub(crate) fn parse_size(str: &[u8]) -> async_std::io::Result<usize> {
         }
         result = result
             .checked_mul(10)
-            .and_then(|res| res.checked_add((byte - b'0') as usize))
+            .and_then(|res| res.checked_add((byte - b'0') as u64))
             .ok_or(async_std::io::Error::new(
                 async_std::io::ErrorKind::InvalidData,
                 "size overflow",

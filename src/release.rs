@@ -15,7 +15,7 @@
 use {
     crate::{
         control::{ControlStanza, ParseError},
-        digest::{Digest, Sha256},
+        digest::{digest_field_name, DigestOf},
         packages::Packages,
         parse_size,
         repo::DebRepo,
@@ -46,8 +46,8 @@ macro_rules! matches {
 #[derive(Clone)]
 pub struct ReleaseFile<'a> {
     pub path: Cow<'a, str>,
-    pub digest: Digest<sha2::Sha256>,
-    pub size: usize,
+    pub digest: DigestOf<DebRepo>,
+    pub size: u64,
 }
 
 impl<'a> Eq for ReleaseFile<'a> {}
@@ -80,7 +80,7 @@ impl Release {
         self.inner
             .with_files(|files| files.iter().find(|file| file.path == path))
     }
-    pub fn packages_file(&self, component: &str, arch: &str) -> Option<(String, usize, Sha256)> {
+    pub fn packages_file(&self, component: &str, arch: &str) -> Option<(String, u64, DigestOf<DebRepo>)> {
         self.inner
             .with_files(|files| {
                 files
@@ -179,7 +179,7 @@ impl Release {
                 control_builder: |data: &'_ Box<str>| ControlStanza::parse(data.as_ref()),
                 files_builder: |control: &'_ ControlStanza| {
                     control
-                        .field("SHA256")
+                        .field(digest_field_name::<DebRepo>())
                         .ok_or_else(|| {
                             ParseError::from("Field SHA256 not found in the release file")
                         })?
@@ -189,7 +189,7 @@ impl Release {
                         .map(|line| {
                             let parts: Vec<&'_ str> = line.split_ascii_whitespace().collect();
                             if let [digest, size, path] = parts[..] {
-                                let digest: Sha256 = digest.try_into().map_err(|err| {
+                                let digest: DigestOf<DebRepo> = digest.try_into().map_err(|err| {
                                     ParseError::from(format!(
                                         "Invalid digest: {:?} {}",
                                         digest, err
@@ -229,7 +229,9 @@ struct ReleaseInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::digest::Sha256;
+    use crate::{digest::DigestOf, repo::DebRepo};
+
+    type Digest = DigestOf<DebRepo>;
 
     #[test]
     fn test_find_release_entry() {
@@ -251,7 +253,7 @@ SHA256:
         let (path, size, hash) = release.packages_file("contrib", "all").unwrap();
         assert_eq!(
             hash,
-            Sha256::try_from("9b6ce8e2bcccc2a0e9d3e5f7864d89ac1dc2ec6335419dd6cc0e6bdd96697325")
+            Digest::try_from("9b6ce8e2bcccc2a0e9d3e5f7864d89ac1dc2ec6335419dd6cc0e6bdd96697325")
                 .unwrap()
         );
         assert_eq!(size, 24088);
@@ -259,7 +261,7 @@ SHA256:
         let (path, size, hash) = release.packages_file("contrib", "arm64").unwrap();
         assert_eq!(
             hash,
-            Sha256::try_from("0601d762ab26a93dcf066d78b4d34f789ca34155929a5dd069a5c50ac58a627e")
+            Digest::try_from("0601d762ab26a93dcf066d78b4d34f789ca34155929a5dd069a5c50ac58a627e")
                 .unwrap()
         );
         assert_eq!(size, 45652);

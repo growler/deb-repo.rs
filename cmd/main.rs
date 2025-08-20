@@ -6,17 +6,13 @@ use {
     anyhow::{anyhow, Result},
     async_std::{
         fs,
-        io::{self, prelude::*},
         path::{Path, PathBuf},
     },
     clap::{Parser, Subcommand},
     debrepo::{
-        DebRepo, Dependency, DeploymentFileSystem, HttpDebRepo, Manifest, MutableControlStanza,
+        DebRepo, Dependency, DeploymentFileSystem, 
+        HttpDebRepo, HttpRepoBuilder, Manifest, MutableControlStanza,
         Universe, Version,
-    },
-    futures::{
-        future::join_all,
-        stream::{self, StreamExt, TryStreamExt},
     },
     std::{process::ExitCode, str::FromStr},
 };
@@ -234,17 +230,16 @@ struct Update {}
 impl AsyncCommand for Update {
     async fn exec(&self, conf: &Config) -> Result<()> {
         let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
-        let mut universe = manifest.fetch_universe(&conf.arch, conf.limit).await?;
+        let repo_builder = HttpRepoBuilder::new();
+        let mut universe = manifest.fetch_universe(&conf.arch, &repo_builder, conf.limit).await?;
         let (requirements, constraints) = manifest.into_requirements();
         match universe.solve(requirements, constraints) {
             Ok(mut solution) => {
-                // println!("solved {} packages", solution.len());
-                let sorted_solution = universe.sorted_solution(&mut solution);
-                // println!("sorted {} packages", sorted_solution.len());
+                solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name()); 
                 let mut out = std::io::stdout().lock();
                 pretty_print_packages(
                     &mut out,
-                    sorted_solution
+                    solution
                         .into_iter()
                         .map(|s| -> Package { universe.package(s).unwrap().into() }),
                     false,
@@ -357,9 +352,9 @@ fn pretty_print_packages<'a, W: std::io::Write>(
         .into_iter()
         .map(|pkg| {
             w0 = std::cmp::max(w0, pkg.arch.len());
-            w1 = std::cmp::max(w1, pkg.name.len());
-            w2 = std::cmp::max(w2, pkg.ver.as_ref().len());
-            w3 = std::cmp::max(w3, pkg.prio.as_ref().len());
+            w1 = std::cmp::max(w1, pkg.prio.as_ref().len());
+            w2 = std::cmp::max(w2, pkg.name.len());
+            w3 = std::cmp::max(w3, pkg.ver.as_ref().len());
             w4 = std::cmp::max(w4, pkg.desc.len());
             pkg
         })
@@ -373,8 +368,8 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     for p in packages.iter() {
         writeln!(
             f,
-            "{:>w0$} {:<w1$} {:>w2$} {:>w3$} {:<w4$}",
-            p.arch, p.name, p.ver, p.prio.as_ref(), p.desc
+            "{:>w0$} {:<w1$} {:<w2$} {:>w3$} {:<w4$}",
+            p.arch, p.prio.as_ref(),p.name, p.ver, p.desc
         )?;
     }
     Ok(packages.len())
