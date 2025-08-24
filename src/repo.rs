@@ -1,29 +1,162 @@
 //! Debian repository client
 
 use {
-    crate::{deb::DebReader, digest::{DigestOf, DigesterOf, DigestUser}, release::Release},
+    crate::{
+        deb::DebReader,
+        digest::{HashAlgoOf, HashOf, HashPolicy},
+        release::Release,
+    },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
+    async_std::{io, path::Path},
     async_trait::async_trait,
     futures::io::{copy, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
+    sequoia_openpgp::{
+        self as openpgp,
+        cert::prelude::*,
+        parse::{
+            stream::{
+                GoodChecksum, MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
+            },
+            Parse,
+        },
+        Cert, KeyHandle,
+    },
     std::{
-        io,
+        ffi::OsStr,
+        io::Read,
         pin::{pin, Pin},
         sync::Arc,
     },
+    tracing::{info, trace, warn},
 };
+
+struct ReleaseVerifier {
+    keyrings: Vec<async_std::path::PathBuf>,
+}
+
+impl ReleaseVerifier {
+    fn new<P>(keyrings: P) -> Self
+    where
+        P: IntoIterator,
+        P::Item: AsRef<Path>,
+    {
+        Self { keyrings: keyrings.into_iter().map(|p| p.as_ref().to_path_buf()).collect() }
+    }
+    fn verify(self, release: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let policy = openpgp::policy::StandardPolicy::new();
+        let mut verifier =
+            VerifierBuilder::from_bytes(release)?.with_policy(&policy, None, self)?;
+        let mut sink = Vec::<u8>::with_capacity(release.len());
+        verifier.read_to_end(&mut sink)?;
+        Ok(sink)
+    }
+}
+
+impl VerificationHelper for ReleaseVerifier {
+    fn get_certs(&mut self, ids: &[KeyHandle]) -> anyhow::Result<Vec<Cert>> {
+        let mut certs = std::iter::once((
+            OsStr::new("<builtin>"),
+            CertParser::from_bytes(DEBIAN_KEYRING),
+        ))
+        .chain(
+            self.keyrings
+                .iter()
+                .map(|filename| (filename.as_os_str(), CertParser::from_file(filename))),
+        )
+        .filter_map(|(name, parser)| match parser {
+            Ok(p) => Some((name, p)),
+            Err(err) => {
+                warn!("Failed to read keyring {:#?}: {}", name, err);
+                None
+            }
+        })
+        .flat_map(|(name, parser)| {
+            parser
+                .unvalidated_cert_filter(|cert, _| {
+                    cert.keys().key_handles(ids.iter()).next().is_some()
+                })
+                .filter_map(move |cert| match cert {
+                    Ok(c) => Some(c),
+                    Err(err) => {
+                        warn!("Malformed certificate in keyring {:#?}: {}", name, err);
+                        None
+                    }
+                })
+        })
+        .collect::<Vec<_>>();
+        certs.sort_by(|a, b| a.fingerprint().cmp(&b.fingerprint()));
+        let count = certs.len();
+        let (certs, errs) = certs.into_iter().fold(
+            (Vec::with_capacity(count), Vec::new()),
+            |(mut certs, mut errs), a| {
+                if certs.is_empty() {
+                    certs.push(a);
+                } else if certs[certs.len() - 1].fingerprint() == a.fingerprint() {
+                    match certs
+                        .pop()
+                        .expect("non-empty signatures vec")
+                        .merge_public(a)
+                    {
+                        Ok(cert) => certs.push(cert),
+                        Err(err) => errs.push(err),
+                    }
+                } else {
+                    certs.push(a);
+                }
+                (certs, errs)
+            },
+        );
+        if !errs.is_empty() {
+            warn!("Error merging duplicate keys:");
+            for err in errs.iter() {
+                warn!("  {}", err);
+            }
+        }
+        trace!("Using {} keys for verification", certs.len());
+        Ok(certs)
+    }
+
+    fn check(&mut self, structure: MessageStructure) -> anyhow::Result<()> {
+        for (i, layer) in structure.into_iter().enumerate() {
+            match layer {
+                MessageLayer::Encryption { .. } if i == 0 => (),
+                MessageLayer::Compression { .. } if i == 1 => (),
+                MessageLayer::SignatureGroup { ref results } => {
+                    if results
+                        .iter()
+                        .filter_map(|res| match res {
+                            Ok(GoodChecksum { sig, ka, .. }) => {
+                                info!("Verified signature by key {:X}", ka.cert().fingerprint());
+                                Some(sig)
+                            }
+                            Err(err) => {
+                                warn!("Signature verification error: {}", err);
+                                None
+                            }
+                        })
+                        .count()
+                        == 0
+                    {
+                        return Err(anyhow::anyhow!("No valid signature"));
+                    }
+                }
+                _ => return Err(anyhow::anyhow!("Unexpected message structure")),
+            }
+        }
+        Ok(())
+    }
+}
 
 /// A test Provider returning `Not Found` to any request.
 /// Used for tests and benchmarks.
 #[derive(Clone)]
-pub struct NullProvider {
-}
+pub struct NullProvider {}
 
 impl NullProvider {
     pub fn new() -> Self {
-        NullProvider {
-        }
+        NullProvider {}
     }
 }
 
@@ -47,11 +180,6 @@ pub fn null_provider() -> DebRepo {
     }
 }
 
-pub type DigestingReader =
-    crate::digest::DigestingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
-pub type VerifyingReader =
-    crate::digest::VerifyingReader<sha2::Sha256, Pin<Box<dyn AsyncRead + Send>>>;
-
 /// Represents interface for a Debian Repository
 pub struct DebRepo {
     inner: Arc<dyn DebRepoProvider>,
@@ -70,10 +198,10 @@ pub trait DebRepoBuilder: Send + Sync {
     async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo>;
 }
 
-pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/debian-keys.bin");
+pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
 
-impl DigestUser for DebRepo {
-    type Digester = sha2::Sha256;
+impl HashPolicy for DebRepo {
+    type Algo = sha2::Sha256;
 }
 
 impl DebRepo {
@@ -86,53 +214,19 @@ impl DebRepo {
     ///    let repo: DebRepo = HttpDebRepo::new("https://archive.ubuntu.com/ubuntu/").await?.into();
     ///    let release = repo.fetch_verify_release("bionic", None::<&[u8]>).await?;
     /// ```
-    pub async fn fetch_verify_release(&self, distr: &str) -> io::Result<Release> {
-        let data = self.fetch(&format!("dists/{}/InRelease", distr)).await?;
-        let ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
-        self.verify_release(distr, data, ctx).await
-    }
-    /// Fetches, verifies and parses the InRelease file. Uses the supplied keys to verify.
-    /// Creates and destroys temporary keyring.
-    ///
-    /// Example:
-    /// ```
-    ///    let repo: DebRepo = HttpDebRepo::new("https://ftp.debian.org/debian/").await?.into();
-    ///    let release = repo.fetch_verify_release("bookworm", [DEBIAN_KEYRING]).await?;
-    /// ```
-    pub async fn fetch_verify_release_with_keys<K: IntoIterator<Item = impl AsRef<[u8]>>>(
+    pub async fn fetch_verify_release(
         &self,
         distr: &str,
-        keys: K,
+        keyrings: impl IntoIterator<Item = &Path>,
     ) -> io::Result<Release> {
         let data = self.fetch(&format!("dists/{}/InRelease", distr)).await?;
-        let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
-        let tempdir = tempfile::tempdir()?;
-        ctx.set_engine_home_dir(tempdir.path().as_os_str().as_encoded_bytes())?;
-        ctx.set_flag("auto-key-retrieve", "0")?;
-        for key in keys {
-            ctx.import(key.as_ref())?;
-        }
-        self.verify_release(distr, data, ctx).await
-    }
-    async fn verify_release(
-        &self,
-        distr: &str,
-        release: Vec<u8>,
-        mut ctx: gpgme::Context,
-    ) -> io::Result<Release> {
-        let mut plaintext = Vec::new();
-        let verify_result = ctx.verify_opaque(release, &mut plaintext)?;
-        if let Some(signature) = verify_result.signatures().next() {
-            println!("Signature: {:?}", &signature);
-            if let Err(err) = signature.status() {
-                return Err(err.into());
-            }
-        } else {
-            return Err(io::Error::new(
+        let verifier = ReleaseVerifier::new(keyrings);
+        let plaintext = verifier.verify(&data).map_err(|err| {
+            io::Error::new(
                 io::ErrorKind::InvalidData,
-                "no signature found in InRelease",
-            ));
-        }
+                format!("failed to verify release: {}", err),
+            )
+        })?;
         let file = String::from_utf8(plaintext)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{}", err)))?;
         Release::new(self.clone(), distr, file.into_boxed_str()).map_err(|err| err.into())
@@ -144,7 +238,7 @@ impl DebRepo {
         Release::new(self.clone(), distr, data.into_boxed_str()).map_err(|err| err.into())
     }
     /// Returns a debian package reader.
-    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader<'_, DigesterOf<Self>>> {
+    pub async fn deb_reader(&self, path: &str) -> io::Result<DebReader> {
         DebReader::new(self.inner.reader(path).await?).await
     }
     /// Returns a verifying Debian package reader that generates an error
@@ -153,21 +247,17 @@ impl DebRepo {
         &self,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
-    ) -> io::Result<DebReader<'_, DigesterOf<Self>>> {
-        DebReader::<DigesterOf<Self>>::new_verifying(self.inner.reader(path).await?, size, digest).await
+        digest: HashOf<Self>,
+    ) -> io::Result<DebReader> {
+        DebReader::new(self.inner.verifying_reader(path, size, &digest).await?).await
     }
     pub async fn verifying_reader(
         &self,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
-    ) -> io::Result<VerifyingReader> {
-        Ok(VerifyingReader::new(
-            self.inner.reader(path).await?,
-            size,
-            digest,
-        ))
+        digest: HashOf<Self>,
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        self.inner.verifying_reader(path, size, &digest).await
     }
     pub async fn unpacking_reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(path, self.inner.reader(path).await?))
@@ -176,11 +266,11 @@ impl DebRepo {
         &self,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
+        digest: HashOf<Self>,
     ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(
             path,
-            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
+            self.inner.verifying_reader(path, size, &digest).await?,
         ))
     }
     pub async fn fetch(&self, path: &str) -> io::Result<Vec<u8>> {
@@ -199,12 +289,19 @@ impl DebRepo {
             .await?;
         Ok(buffer)
     }
-    pub async fn fetch_verify(&self, path: &str, size: u64, digest: DigestOf<Self>) -> io::Result<Vec<u8>> {
+    pub async fn fetch_verify(
+        &self,
+        path: &str,
+        size: u64,
+        digest: HashOf<Self>,
+    ) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::<u8>::with_capacity(
             size.try_into()
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
         );
-        VerifyingReader::new(self.inner.reader(path).await?, size, digest)
+        self.inner
+            .verifying_reader(path, size, &digest)
+            .await?
             .read_to_end(&mut buffer)
             .await?;
         Ok(buffer)
@@ -213,7 +310,7 @@ impl DebRepo {
         &self,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
+        digest: HashOf<Self>,
     ) -> io::Result<Vec<u8>> {
         let mut buffer = Vec::<u8>::with_capacity(
             size.try_into()
@@ -221,7 +318,7 @@ impl DebRepo {
         );
         unpacker(
             path,
-            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
+            self.inner.verifying_reader(path, size, &digest).await?,
         )
         .read_to_end(&mut buffer)
         .await?;
@@ -242,9 +339,9 @@ impl DebRepo {
         w: W,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
+        digest: HashOf<Self>,
     ) -> io::Result<u64> {
-        let mut reader = VerifyingReader::new(self.inner.reader(path).await?, size, digest);
+        let mut reader = self.inner.verifying_reader(path, size, &digest).await?;
         copy(&mut reader, &mut pin!(w)).await
     }
     pub async fn copy_verify_unpack<W: AsyncWrite + Send>(
@@ -252,11 +349,11 @@ impl DebRepo {
         w: W,
         path: &str,
         size: u64,
-        digest: DigestOf<Self>,
+        digest: HashOf<Self>,
     ) -> io::Result<u64> {
         let mut reader = unpacker(
             path,
-            VerifyingReader::new(self.inner.reader(path).await?, size, digest),
+            self.inner.verifying_reader(path, size, &digest).await?,
         );
         copy(&mut reader, &mut pin!(w)).await
     }
@@ -270,8 +367,8 @@ impl<P: DebRepoProvider + 'static> From<P> for DebRepo {
     }
 }
 
-impl<T: DebRepoProvider> DigestUser for T {
-    type Digester = DigesterOf<DebRepo>;
+impl<T: DebRepoProvider> HashPolicy for T {
+    type Algo = HashAlgoOf<DebRepo>;
 }
 
 /// Debian repository provider abstraction.

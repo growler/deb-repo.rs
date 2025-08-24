@@ -1,6 +1,6 @@
 //! Digest verification
 
-pub use digest::{FixedOutputReset, Output as DigesterOutput};
+pub use digest::{FixedOutputReset, Output as HashOutput};
 use {
     ::serde::{
         de::{self, Visitor},
@@ -14,37 +14,37 @@ use {
     std::{fmt, pin::Pin},
 };
 
-pub trait Digester: FixedOutputReset + Default + Send {}
-impl<T: FixedOutputReset + Default + Send> Digester for T {}
+pub trait HashAlgo: FixedOutputReset + Default + Send {}
+impl<T: FixedOutputReset + Default + Send> HashAlgo for T {}
 
-pub trait DigestFieldName {
+pub trait HashFieldName {
     const DIGEST_FIELD_NAME: &'static str;
 }
-impl DigestFieldName for sha2::Sha256 {
+impl HashFieldName for sha2::Sha256 {
     const DIGEST_FIELD_NAME: &'static str = "SHA256";
 }
-impl DigestFieldName for md5::Md5 {
+impl HashFieldName for md5::Md5 {
     const DIGEST_FIELD_NAME: &'static str = "MD5sum";
 }
 
 #[derive(Default, Debug)]
-pub struct Digest<D: Digester> {
-    inner: DigesterOutput<D>,
+pub struct Hash<D: HashAlgo> {
+    inner: HashOutput<D>,
 }
 
-pub trait DigestUser {
-    type Digester;
+pub trait HashPolicy {
+    type Algo: HashAlgo;
 }
-pub(crate) type DigestOf<T> = Digest<<T as DigestUser>::Digester>;
-pub(crate) type DigesterOf<T> = <T as DigestUser>::Digester;
-pub(crate) const fn digest_field_name<T: DigestUser>() -> &'static str 
+pub(crate) type HashOf<T> = Hash<<T as HashPolicy>::Algo>;
+pub(crate) type HashAlgoOf<T> = <T as HashPolicy>::Algo;
+pub(crate) const fn digest_field_name<T: HashPolicy>() -> &'static str 
 where 
-    T::Digester: DigestFieldName,
+    T::Algo: HashFieldName,
 {
-    <T::Digester as DigestFieldName>::DIGEST_FIELD_NAME
+    <T::Algo as HashFieldName>::DIGEST_FIELD_NAME
 }
 
-impl<D: Digester> Serialize for Digest<D> {
+impl<D: HashAlgo> Serialize for Hash<D> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
@@ -53,15 +53,15 @@ impl<D: Digester> Serialize for Digest<D> {
     }
 }
 
-impl<'de, D: Digester> Deserialize<'de> for Digest<D> {
+impl<'de, D: HashAlgo> Deserialize<'de> for Hash<D> {
     fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
     where
         DE: Deserializer<'de>,
     {
         struct DigestVisitor<T>(std::marker::PhantomData<T>);
 
-        impl<'de, T: Digester> Visitor<'de> for DigestVisitor<T> {
-            type Value = Digest<T>;
+        impl<'de, T: HashAlgo> Visitor<'de> for DigestVisitor<T> {
+            type Value = Hash<T>;
 
             fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
                 formatter.write_str("a hex encoded string representing the digest")
@@ -71,10 +71,10 @@ impl<'de, D: Digester> Deserialize<'de> for Digest<D> {
             where
                 E: de::Error,
             {
-                let mut inner = DigesterOutput::<T>::default();
+                let mut inner = HashOutput::<T>::default();
                 hex::decode_to_slice(value, inner.as_mut_slice())
                     .map_err(|e| de::Error::custom(format!("error decoding hash: {}", e)))?;
-                Ok(Digest { inner })
+                Ok(Hash { inner })
             }
         }
         deserializer.deserialize_str(DigestVisitor(std::marker::PhantomData))
@@ -84,31 +84,31 @@ impl<'de, D: Digester> Deserialize<'de> for Digest<D> {
 pub mod serde {
     // Hexadecimal encoding (default). Accepts mixed case, outputs only lowercase.
     pub mod hex {
-        use crate::digest::{Digest, Digester, DigesterOutput};
+        use crate::digest::{Hash, HashAlgo, HashOutput};
         use serde::{
             de::{self, Visitor},
             Deserializer, Serializer,
         };
         use std::{fmt, marker::PhantomData};
 
-        pub fn serialize<D, S>(value: &Digest<D>, serializer: S) -> Result<S::Ok, S::Error>
+        pub fn serialize<D, S>(value: &Hash<D>, serializer: S) -> Result<S::Ok, S::Error>
         where
-            D: Digester,
+            D: HashAlgo,
             S: Serializer,
         {
             let s = ::hex::encode(value.inner.as_slice());
             serializer.serialize_str(&s)
         }
 
-        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Digest<D>, DE::Error>
+        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Hash<D>, DE::Error>
         where
-            D: Digester,
+            D: HashAlgo,
             DE: Deserializer<'de>,
         {
             struct HexVisitor<T>(PhantomData<T>);
 
-            impl<'de, T: Digester> Visitor<'de> for HexVisitor<T> {
-                type Value = Digest<T>;
+            impl<'de, T: HashAlgo> Visitor<'de> for HexVisitor<T> {
+                type Value = Hash<T>;
 
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                     write!(
@@ -122,10 +122,10 @@ pub mod serde {
                 where
                     E: de::Error,
                 {
-                    let mut inner = DigesterOutput::<T>::default();
+                    let mut inner = HashOutput::<T>::default();
                     ::hex::decode_to_slice(v, inner.as_mut_slice())
                         .map_err(|e| E::custom(format!("error decoding hex digest: {}", e)))?;
-                    Ok(Digest { inner })
+                    Ok(Hash { inner })
                 }
             }
 
@@ -135,7 +135,7 @@ pub mod serde {
 
     // base64 URL-safe encoding
     pub mod base64 {
-        use crate::digest::{Digest, Digester, DigesterOutput};
+        use crate::digest::{Hash, HashAlgo, HashOutput};
         use ::base64::prelude::*;
         use serde::{
             de::{self, Visitor},
@@ -143,24 +143,24 @@ pub mod serde {
         };
         use std::{fmt, marker::PhantomData};
 
-        pub fn serialize<D, S>(value: &Digest<D>, serializer: S) -> Result<S::Ok, S::Error>
+        pub fn serialize<D, S>(value: &Hash<D>, serializer: S) -> Result<S::Ok, S::Error>
         where
-            D: Digester,
+            D: HashAlgo,
             S: Serializer,
         {
             let s = ::base64::engine::general_purpose::URL_SAFE.encode(value.inner.as_slice());
             serializer.serialize_str(&s)
         }
 
-        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Digest<D>, DE::Error>
+        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Hash<D>, DE::Error>
         where
-            D: Digester,
+            D: HashAlgo,
             DE: Deserializer<'de>,
         {
             struct B64Visitor<T>(PhantomData<T>);
 
-            impl<'de, T: Digester> Visitor<'de> for B64Visitor<T> {
-                type Value = Digest<T>;
+            impl<'de, T: HashAlgo> Visitor<'de> for B64Visitor<T> {
+                type Value = Hash<T>;
 
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
                     write!(f, "a base64url encoded digest")
@@ -184,9 +184,9 @@ pub mod serde {
                         )));
                     }
 
-                    let mut inner = DigesterOutput::<T>::default();
+                    let mut inner = HashOutput::<T>::default();
                     inner.as_mut_slice().copy_from_slice(&bytes);
-                    Ok(Digest { inner })
+                    Ok(Hash { inner })
                 }
             }
 
@@ -195,18 +195,18 @@ pub mod serde {
     }
 }
 
-impl<D: Digester> std::ops::Deref for Digest<D> {
+impl<D: HashAlgo> std::ops::Deref for Hash<D> {
     type Target = [u8];
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
 }
 
-pub(crate) trait GetDigest<D: Digester> {
-    fn get_digest(&mut self) -> Digest<D>;
+pub(crate) trait GetDigest<D: HashAlgo> {
+    fn get_digest(&mut self) -> Hash<D>;
 }
 
-impl<D: Digester> Clone for Digest<D> {
+impl<D: HashAlgo> Clone for Hash<D> {
     fn clone(&self) -> Self {
         Self {
             inner: self.inner.clone(),
@@ -214,16 +214,16 @@ impl<D: Digester> Clone for Digest<D> {
     }
 }
 
-impl<This: Digester, That: Digester> PartialEq<Digest<That>> for Digest<This> {
-    fn eq(&self, other: &Digest<That>) -> bool {
+impl<This: HashAlgo, That: HashAlgo> PartialEq<Hash<That>> for Hash<This> {
+    fn eq(&self, other: &Hash<That>) -> bool {
         This::output_size() == That::output_size()
             && self.inner.as_slice() == other.inner.as_slice()
     }
 }
 
-impl<D: Digester> PartialEq<str> for Digest<D> {
+impl<D: HashAlgo> PartialEq<str> for Hash<D> {
     fn eq(&self, other: &str) -> bool {
-        let mut digest = DigesterOutput::<D>::default();
+        let mut digest = HashOutput::<D>::default();
         match hex::decode_to_slice(other, digest.as_mut_slice()) {
             Ok(_) => self.inner.eq(&digest),
             Err(_) => false,
@@ -231,32 +231,32 @@ impl<D: Digester> PartialEq<str> for Digest<D> {
     }
 }
 
-impl<D: Digester> Digest<D> {
-    pub fn into_inner(self) -> DigesterOutput<D> {
+impl<D: HashAlgo> Hash<D> {
+    pub fn into_inner(self) -> HashOutput<D> {
         self.inner
     }
 }
 
-impl<D: Digester> TryFrom<&str> for Digest<D> {
+impl<D: HashAlgo> TryFrom<&str> for Hash<D> {
     type Error = std::io::Error;
     fn try_from(value: &str) -> std::io::Result<Self> {
-        let mut inner = DigesterOutput::<D>::default();
+        let mut inner = HashOutput::<D>::default();
         hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|e| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("Invalid digest: {}", e),
             )
         })?;
-        Ok(Digest { inner })
+        Ok(Hash { inner })
     }
 }
 
-impl<D: Digester> TryFrom<&[u8]> for Digest<D> {
+impl<D: HashAlgo> TryFrom<&[u8]> for Hash<D> {
     type Error = std::io::Error;
     fn try_from(value: &[u8]) -> std::io::Result<Self> {
         if value.len() == D::output_size() {
-            Ok(Digest {
-                inner: DigesterOutput::<D>::from_slice(value).clone(),
+            Ok(Hash {
+                inner: HashOutput::<D>::from_slice(value).clone(),
             })
         } else {
             Err(std::io::Error::new(
@@ -270,38 +270,78 @@ impl<D: Digester> TryFrom<&[u8]> for Digest<D> {
     }
 }
 
-impl<D: Digester> From<Digest<D>> for String {
-    fn from(value: Digest<D>) -> Self {
+impl<D: HashAlgo> From<&Hash<D>> for async_std::path::PathBuf {
+    fn from(value: &Hash<D>) -> Self {
+        let bytes = &value.inner;
+        if bytes.is_empty() {
+            return async_std::path::PathBuf::new();
+        }
+
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+
+        let needs_sep = bytes.len() > 1;
+        let total_len = 2 * bytes.len() + usize::from(needs_sep);
+        let mut os = std::ffi::OsString::with_capacity(total_len);
+
+        let b0 = bytes[0];
+        let mut pair = [0u8; 2];
+        pair[0] = HEX[(b0 >> 4) as usize];
+        pair[1] = HEX[(b0 & 0x0f) as usize];
+        // Safety: HEX only contains ASCII; pair is always valid UTF-8
+        unsafe {
+            os.push(std::str::from_utf8_unchecked(&pair));
+        }
+
+        if needs_sep {
+            os.push(std::ffi::OsStr::new("/"));
+            for &b in &bytes[1..] {
+                pair[0] = HEX[(b >> 4) as usize];
+                pair[1] = HEX[(b & 0x0f) as usize];
+                // Safety: HEX only contains ASCII; pair is always valid UTF-8
+                unsafe {
+                    os.push(std::str::from_utf8_unchecked(&pair));
+                }
+            }
+        }
+
+        async_std::path::PathBuf::from(os)
+    }
+}
+
+
+
+impl<D: HashAlgo> From<Hash<D>> for String {
+    fn from(value: Hash<D>) -> Self {
         hex::encode(&value.inner)
     }
 }
 
-impl<D: Digester> From<Digest<D>> for DigesterOutput<D> {
-    fn from(value: Digest<D>) -> Self {
+impl<D: HashAlgo> From<Hash<D>> for HashOutput<D> {
+    fn from(value: Hash<D>) -> Self {
         value.inner
     }
 }
 
-impl<D: Digester> From<DigesterOutput<D>> for Digest<D> {
-    fn from(value: DigesterOutput<D>) -> Self {
+impl<D: HashAlgo> From<HashOutput<D>> for Hash<D> {
+    fn from(value: HashOutput<D>) -> Self {
         Self { inner: value }
     }
 }
 
-impl<D: Digester> std::fmt::LowerHex for Digest<D> {
+impl<D: HashAlgo> std::fmt::LowerHex for Hash<D> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(f, "{}", hex::encode(&self.inner))
     }
 }
 
 #[pin_project]
-pub struct DigestingReader<D: Digester, R: Read + Unpin + Send> {
+pub struct HashingReader<D: HashAlgo, R: Read + Unpin + Send> {
     digester: D,
     #[pin]
     inner: R,
 }
 
-impl<D: Digester + Default + Send, R: Read + Unpin + Send> DigestingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
             digester: D::default(),
@@ -310,15 +350,15 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> DigestingReader<D, R>
     }
 }
 
-impl<D: Digester, R: Read + Unpin + Send> GetDigest<D> for DigestingReader<D, R> {
-    fn get_digest(&mut self) -> Digest<D> {
-        Digest {
+impl<D: HashAlgo, R: Read + Unpin + Send> GetDigest<D> for HashingReader<D, R> {
+    fn get_digest(&mut self) -> Hash<D> {
+        Hash {
             inner: self.digester.finalize_fixed_reset(),
         }
     }
 }
 
-impl<D: Digester, R: Read + Unpin + Send> Read for DigestingReader<D, R> {
+impl<D: HashAlgo, R: Read + Unpin + Send> Read for HashingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -337,25 +377,25 @@ impl<D: Digester, R: Read + Unpin + Send> Read for DigestingReader<D, R> {
 }
 
 #[pin_project]
-pub struct VerifyingReader<D: Digester, R: Read + Unpin + Send> {
+pub struct VerifyingReader<D: HashAlgo, R: Read + Unpin + Send> {
     digester: D,
-    digest: DigesterOutput<D>,
+    digest: HashOutput<D>,
     size: u64,
     read: u64,
     #[pin]
     inner: R,
 }
 
-impl<D: Digester + Default + Send, R: Read + Unpin + Send> GetDigest<D> for VerifyingReader<D, R> {
-    fn get_digest(&mut self) -> Digest<D> {
-        Digest {
+impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> GetDigest<D> for VerifyingReader<D, R> {
+    fn get_digest(&mut self) -> Hash<D> {
+        Hash {
             inner: self.digest.clone(),
         }
     }
 }
 
-impl<D: Digester + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {
-    pub fn new(reader: R, size: u64, digest: Digest<D>) -> Self {
+impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {
+    pub fn new(reader: R, size: u64, digest: Hash<D>) -> Self {
         Self {
             digester: D::default(),
             digest: digest.into(),
@@ -366,7 +406,7 @@ impl<D: Digester + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R>
     }
 }
 
-impl<D: Digester + Default + Send, R: Read + Unpin + Send> Read for VerifyingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> Read for VerifyingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,

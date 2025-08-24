@@ -4,6 +4,7 @@ mod control;
 mod deb;
 mod deployfs;
 pub mod digest;
+pub mod exec;
 mod fsrepo;
 mod httprepo;
 mod idmap;
@@ -13,6 +14,7 @@ mod release;
 mod repo;
 mod universe;
 mod version;
+mod builder;
 
 pub use {
     control::{
@@ -22,12 +24,12 @@ pub use {
     deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
     deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSDebRepo,
-    httprepo::{HttpDebRepo, HttpRepoBuilder},
+    httprepo::{HttpDebRepo, HttpRepoBuilder, HttpCachingDebRepo, HttpCachingRepoBuilder},
     manifest::{LockFile, Manifest},
     packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::{
-        null_provider, DebRepo, DebRepoBuilder, DebRepoProvider, DigestingReader, VerifyingReader,
+        null_provider, DebRepo, DebRepoBuilder, DebRepoProvider,
         DEBIAN_KEYRING,
     },
     resolvo::{NameId, StringId},

@@ -5,7 +5,7 @@ use {
             ParseError,
         },
         deb::DebReader,
-        digest::{digest_field_name, DigestOf, DigesterOf},
+        digest::{digest_field_name, HashOf},
         repo::{null_provider, DebRepo},
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
@@ -124,7 +124,7 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    pub fn repo_file(&self) -> io::Result<(&'a str, u64, DigestOf<DebRepo>)> {
+    pub fn repo_file(&self) -> io::Result<(&'a str, u64, HashOf<DebRepo>)> {
         let (path, size, digest) = self
             .fields()
             .find_fields(("Filename", "Size", digest_field_name::<DebRepo>()))
@@ -137,7 +137,7 @@ impl<'a> Package<'a> {
         Ok((
             path,
             crate::parse_size(size.as_bytes())?,
-            DigestOf::<DebRepo>::try_from(digest)?,
+            HashOf::<DebRepo>::try_from(digest)?,
         ))
     }
     pub fn src(&self) -> &'a str {
@@ -337,7 +337,7 @@ impl Packages {
     pub async fn get_deb_reader(
         &self,
         index: usize,
-    ) -> std::io::Result<DebReader<'_, DigesterOf<DebRepo>>> {
+    ) -> std::io::Result<DebReader> {
         let (path, size, hash) = self
             .get(index)
             .ok_or_else(|| {

@@ -1,23 +1,23 @@
 use {
-    crate::{
-        common::*,
-        exec::{unshare_root, unshare_user_ns},
-    },
+    crate::common::*,
     anyhow::{anyhow, Result},
     async_std::{
         fs,
+        io::WriteExt,
         path::{Path, PathBuf},
     },
-    clap::{Parser, Subcommand},
+    clap::{Parser, Subcommand, Args},
     debrepo::{
-        DebRepo, Dependency, DeploymentFileSystem, 
-        HttpDebRepo, HttpRepoBuilder, Manifest, MutableControlStanza,
+        exec::{dpkg, unshare_root, unshare_user_ns},
+        DebRepo, Dependency, DeploymentFileSystem, HttpCachingRepoBuilder, HttpDebRepo, Manifest,
         Universe, Version,
     },
-    std::{process::ExitCode, str::FromStr},
+    futures::stream::{self, StreamExt, TryStreamExt},
+    std::{iter, process::ExitCode, str::FromStr},
+    tracing::level_filters::LevelFilter,
+    tracing_subscriber::{filter::EnvFilter, fmt, prelude::*},
 };
 mod common;
-mod exec;
 
 fn default_arch() -> &'static str {
     match std::env::consts::ARCH {
@@ -45,7 +45,7 @@ struct App {
     #[arg(short, long)]
     quiet: bool,
 
-    /// Turns on debugging output
+    /// Turns on debugging output (repeat -d for more)
     #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
@@ -54,12 +54,43 @@ struct App {
     manifest: PathBuf,
 
     /// Number of concurrent downloads
-    #[arg(short, long, value_name = "NUM", default_value = "20")]
+    #[arg(
+        short = 'n',
+        long = "downloads",
+        value_name = "NUM",
+        default_value = "20"
+    )]
     limit: usize,
 
     /// Target architecture
     #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
     arch: String,
+
+    /// HTTP download cache directory
+    #[arg(
+        long = "cache-dir",
+        value_name = "DIR",
+        // Default to "$XDG_CACHE_HOME/debrepo" or "$HOME/.cache/debrepo" if XDG_CACHE_HOME is not set
+        default_value_os_t = {
+            let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+                PathBuf::from(xdg)
+            } else if let Some(home) = std::env::var_os("HOME") {
+                PathBuf::from(home).join(".cache")
+            } else {
+                PathBuf::from(".cache")
+            };
+            base.join("debrepo")
+        }
+    )]
+    pub cache_dir: PathBuf,
+
+    /// Do not verify Release files (not recommended)
+    #[arg(long = "no-verify")]
+    pub no_verify: bool,
+
+    /// Keyring for verification (use multiple times to add more)
+    #[arg(short = 'k', long = "keyring", value_name = "FILE")]
+    pub keyring: Vec<PathBuf>,
 
     #[command(subcommand)]
     cmd: Commands,
@@ -68,12 +99,18 @@ struct App {
 #[enum_dispatch::enum_dispatch(AsyncCommand)]
 #[derive(Subcommand)]
 enum Commands {
+    /// Initialize a new manifest file
+    #[command(name = "init")]
+    Init,
     /// Fetch artefact
-    #[command(name = "fetch")]
+    #[command(name = "fetch", hide = true)]
     Fetch,
     /// Update lock file
     #[command(name = "update")]
     Update,
+    /// Extract system to a target directory
+    #[command(name = "extract")]
+    Extract,
     /// Add dependency to manifest file
     #[command(name = "add")]
     Add,
@@ -165,6 +202,48 @@ enum Commands {
     // },
 }
 
+#[derive(Args, Default)]
+#[group(required = true, multiple = true)]
+struct Source {
+    /// Repository URL
+    #[arg(value_name = "URL", default_value = "https://ftp.debian.org/debian/")]
+    url: String,
+
+    /// Distribution name (e.g., bookworm, bookworm-security, sid)
+    #[arg(long, default_value = "sid")]
+    pub distr: String,
+
+    /// Components (comma-separated), default: all available
+    #[arg(long = "comp", value_delimiter = ',')]
+    pub comp: Vec<String>,
+
+    /// Only include these architectures (comma-separated)
+    #[arg(long = "arch-only", conflicts_with = "arch_exclude", value_delimiter = ',')]
+    pub arch_only: Vec<String>,
+
+    /// Exclude this architecture
+    #[arg(long = "arch-exclude", conflicts_with = "arch_only")]
+    pub arch_exclude: Option<String>,
+}
+
+#[derive(Parser, Default)]
+pub struct Init {
+    /// Overwrite existing manifest if present
+    #[arg(long)]
+    pub force: bool,
+
+    /// Source definitions (use multiple times to add more)
+    #[command(flatten)]
+    source: Source,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Init {
+    async fn exec(&self, conf: &Config) -> Result<()> {
+        Ok(())
+    }
+}
+
 async fn update_manifest<F>(manifest_path: &Path, modifier: F) -> Result<()>
 where
     F: FnOnce(&mut Manifest) -> Result<()>,
@@ -190,7 +269,7 @@ struct Remove {
     name: Vec<String>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl AsyncCommand for Remove {
     async fn exec(&self, conf: &Config) -> Result<()> {
         update_manifest(&conf.manifest, |manifest| {
@@ -203,13 +282,14 @@ impl AsyncCommand for Remove {
         .await
     }
 }
+
 #[derive(Parser)]
 struct Add {
     #[arg(value_name = "DEPENDENCY")]
     name: Vec<String>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl AsyncCommand for Add {
     async fn exec(&self, conf: &Config) -> Result<()> {
         update_manifest(&conf.manifest, |manifest| {
@@ -226,16 +306,18 @@ impl AsyncCommand for Add {
 #[derive(Parser)]
 struct Update {}
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl AsyncCommand for Update {
     async fn exec(&self, conf: &Config) -> Result<()> {
         let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
-        let repo_builder = HttpRepoBuilder::new();
-        let mut universe = manifest.fetch_universe(&conf.arch, &repo_builder, conf.limit).await?;
+        let repo_builder = HttpCachingRepoBuilder::new(".cache".into()).await?;
+        let mut universe = manifest
+            .fetch_universe(&conf.arch, &repo_builder, conf.limit)
+            .await?;
         let (requirements, constraints) = manifest.into_requirements();
         match universe.solve(requirements, constraints) {
             Ok(mut solution) => {
-                solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name()); 
+                solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
                 let mut out = std::io::stdout().lock();
                 pretty_print_packages(
                     &mut out,
@@ -255,9 +337,107 @@ impl AsyncCommand for Update {
 }
 
 #[derive(Parser)]
+struct Extract {
+    /// Target path
+    #[arg(short, long, value_name = "PATH", default_value = "out")]
+    path: PathBuf,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Extract {
+    async fn exec(&self, conf: &Config) -> Result<()> {
+        let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
+        let repo_builder = HttpCachingRepoBuilder::new(".cache".into()).await?;
+        let mut universe = manifest
+            .fetch_universe(&conf.arch, &repo_builder, conf.limit)
+            .await?;
+        let (requirements, constraints) = manifest.into_requirements();
+        let solution = universe
+            .solve(requirements, constraints)
+            .map_err(|conflict| {
+                anyhow!(
+                    "failed to solve dependencies: {}",
+                    universe.display_conflict(conflict)
+                )
+            })?;
+        let essentials = solution
+            .iter()
+            .filter_map(|id| {
+                universe.package(*id).and_then(|pkg| {
+                    if pkg.essential() {
+                        Some(pkg.name())
+                    } else {
+                        None
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        fs::create_dir_all(&self.path).await?;
+        let fs = debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
+            .await?;
+        let mut control_file = stream::iter(solution.iter().cloned())
+            .map(|id| {
+                let (deb, package) = (
+                    universe.deb_reader(id),
+                    universe.package(id).unwrap().full_name(),
+                );
+                let fs = fs.clone();
+                async move {
+                    match deb.await {
+                        Ok(deb) => {
+                            tracing::info!("unpacking {}...", package);
+                            let mut stanza = async_std::task::block_on(deb.extract_to(&fs))?;
+                            stanza.set("Status", "install ok unpacked");
+                            stanza.sort_fields_deb_order();
+                            Ok::<_, anyhow::Error>(stanza)
+                        }
+                        Err(err) => {
+                            tracing::error!("failed to unpack {}: {}", package, err);
+                            Err(err.into())
+                        }
+                    }
+                }
+            })
+            .buffer_unordered(conf.limit)
+            .try_collect::<Vec<_>>()
+            .await?;
+        control_file.sort_by(|a, b| a.field("Package").unwrap().cmp(b.field("Package").unwrap()));
+        fs.create_dir_all("var/lib/dpkg", 0, 0, 0o755u32).await?;
+        {
+            let size = control_file.iter().map(|i| i.len() + 1).sum();
+            let mut status = Vec::<u8>::with_capacity(size);
+            for i in control_file.into_iter() {
+                status.write_all(format!("{}", &i).as_bytes()).await?;
+                status.write_all(&[b'\n']).await?;
+            }
+            fs.create_file(
+                status.as_slice(),
+                Some("var/lib/dpkg/status"),
+                0,
+                0,
+                0o644,
+                None,
+                Some(size),
+            )
+            .await?;
+        };
+        let env = ["DEBIAN_FRONTEND=noninteractive"];
+        dpkg(
+            &self.path,
+            ["--force-depends", "--configure"]
+                .iter()
+                .chain(essentials.iter()),
+            Some(&env),
+        )?;
+        dpkg(&self.path, ["--configure", "-a"], Some(&env))?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
 struct Validate {}
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl AsyncCommand for Validate {
     async fn exec(&self, conf: &Config) -> Result<()> {
         let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
@@ -283,6 +463,9 @@ struct Fetch {
         default_value = "https://ftp.debian.org/debian/"
     )]
     origin: String,
+    /// Verify
+    #[arg(short = 'v', long = "verify")]
+    verify: bool,
     /// Target file name
     #[arg(short = 'o', long = "output", value_name = "FILE")]
     out: Option<PathBuf>,
@@ -294,12 +477,16 @@ struct Fetch {
     comp: String,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl AsyncCommand for Fetch {
     async fn exec(&self, _conf: &Config) -> Result<()> {
         let start = std::time::Instant::now();
         let repo: DebRepo = HttpDebRepo::new(&self.origin).await?.into();
-        let release = repo.fetch_release(&self.distr).await?;
+        let release = if self.verify {
+            repo.fetch_verify_release(&self.distr, iter::empty()).await
+        } else {
+            repo.fetch_release(&self.distr).await
+        }?;
         let (path, size, hash) = release
             .packages_file(&self.comp, &self.arch)
             .ok_or_else(|| anyhow!("Packages file for {} {} not found", &self.arch, &self.comp))?;
@@ -369,7 +556,11 @@ fn pretty_print_packages<'a, W: std::io::Write>(
         writeln!(
             f,
             "{:>w0$} {:<w1$} {:<w2$} {:>w3$} {:<w4$}",
-            p.arch, p.prio.as_ref(),p.name, p.ver, p.desc
+            p.arch,
+            p.prio.as_ref(),
+            p.name,
+            p.ver,
+            p.desc
         )?;
     }
     Ok(packages.len())
@@ -391,15 +582,13 @@ async fn copy_repo_package<'a>(
     Ok((id, pkg, size))
 }
 
-async fn extract_repo_package<'a, F: DeploymentFileSystem>(
-    universe: &'a Universe,
-    id: debrepo::PackageId,
-    target: F,
-) -> Result<MutableControlStanza> {
-    let reader = universe.deb_reader(id).await?;
-    let desc = reader.extract_to(&target).await?;
-    Ok(desc)
-}
+// async fn extract_repo_package<'a, F: DeploymentFileSystem>(
+//     deb: DebReader<'a>,
+//     target: F,
+// ) -> Result<MutableControlStanza> {
+//     let desc = deb.extract_to(&target).await?;
+//     Ok(desc)
+// }
 
 // async fn cmd(cli: App) -> Result<ExitCode> {
 //     match cli.cmd {
@@ -642,8 +831,40 @@ fn init(_opts: &App) -> Result<()> {
     Ok(())
 }
 
+fn init_logging(quiet: bool, debug: u8) {
+    let default_level = if quiet {
+        LevelFilter::ERROR
+    } else {
+        match debug {
+            0 => LevelFilter::INFO,
+            1 => LevelFilter::DEBUG,
+            _ => LevelFilter::TRACE,
+        }
+    };
+    let trace = debug > 1;
+    let filter = EnvFilter::builder()
+        .with_default_directive(default_level.into())
+        .from_env_lossy()
+        .add_directive("polling=warn".parse().unwrap())
+        .add_directive("isahc::wire=warn".parse().unwrap())
+        .add_directive("async_std=warn".parse().unwrap());
+
+    let base_format = fmt::format()
+        .without_time()
+        .with_level(trace)
+        .with_target(trace);
+
+    fmt()
+        .with_env_filter(filter)
+        .event_format(base_format)
+        .with_file(trace) // include file path only in debug mode
+        .with_line_number(trace) // include line number only in debug mode
+        .init();
+}
+
 fn main() -> ExitCode {
     let app = App::parse();
+    init_logging(app.quiet, app.debug);
     match init(&app) {
         Err(err) => {
             eprintln!("{}", err);
@@ -654,8 +875,6 @@ fn main() -> ExitCode {
     let conf = Config {
         manifest: app.manifest,
         arch: app.arch,
-        quiet: app.quiet,
-        debug: app.debug,
         limit: app.limit,
     };
     match async_std::task::block_on(app.cmd.exec(&conf)) {

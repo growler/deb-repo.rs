@@ -2,13 +2,13 @@ use {
     crate::{
         control::ParseError,
         deb::DebReader,
-        digest::{DigesterOf, DigestOf, digest_field_name},
+        digest::{digest_field_name, HashOf},
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::{DebRepo, VerifyingReader},
+        repo::DebRepo,
         version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
     },
-    futures::io::{copy, AsyncWrite},
+    futures::io::{copy, AsyncRead, AsyncWrite},
     iterator_ext::IteratorExt,
     resolvo::{
         Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
@@ -21,7 +21,7 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         hash::{Hash, Hasher},
         io,
-        pin::pin,
+        pin::{pin, Pin},
     },
 };
 
@@ -485,7 +485,10 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables[solvable.to_index()].pkgs as usize)
     }
-    pub async fn deb_reader(&self, id: PackageId) -> io::Result<DebReader<'_, DigesterOf<DebRepo>>> {
+    pub async fn deb_reader(
+        &self,
+        id: PackageId,
+    ) -> io::Result<DebReader> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -493,7 +496,10 @@ impl Universe {
         })?;
         repo.verifying_deb_reader(path, size, hash).await
     }
-    pub async fn deb_file_reader(&self, id: PackageId) -> io::Result<VerifyingReader> {
+    pub async fn deb_file_reader(
+        &self,
+        id: PackageId,
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         let (repo, path, size, hash) = self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file()?;
@@ -521,7 +527,7 @@ pub struct DebFetcher<'a> {
 }
 
 impl<'a> DebFetcher<'a> {
-    pub fn hash(&self) -> io::Result<DigestOf<DebRepo>> {
+    pub fn hash(&self) -> io::Result<HashOf<DebRepo>> {
         self.u
             .package(self.i)
             .ok_or_else(|| {
@@ -544,7 +550,7 @@ impl<'a> DebFetcher<'a> {
             })
             .and_then(|hash| hash.try_into())
     }
-    pub async fn deb(&self) -> io::Result<DebReader<'a, DigesterOf<DebRepo>>> {
+    pub async fn deb(&self) -> io::Result<DebReader> {
         self.u.deb_reader(self.i).await
     }
 }
@@ -827,11 +833,6 @@ impl InnerUniverse {
         self.debug_node(solution, &g, "usrmerge");
         self.debug_node(solution, &g, "gpgv");
         (order, breaks)
-        //
-        // petgraph::algo::kosaraju_scc(&self.dependency_graph(solution))
-        //     .into_iter()
-        //     .flat_map(|g| g.into_iter())
-        //     .collect()
     }
 }
 

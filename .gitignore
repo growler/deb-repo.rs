@@ -1,8 +1,8 @@
 /target/
 /tmp/
-.direnv/
-.vscode/
-Cargo.lock
+/.direnv/
+/.cache/
+/.vscode/
 **/*.log
 **/*.tmp
 **/Packages

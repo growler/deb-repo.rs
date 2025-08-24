@@ -40,7 +40,6 @@ impl From<ParseError> for std::io::Error {
     }
 }
 
-
 /// Represents an immutable field in the Debian Control File.
 /// Internally, ControlField holds references to a slice of
 /// parsed block.
@@ -197,6 +196,11 @@ impl MutableControlStanza {
             .try_build()?,
         })
     }
+    pub fn len(&self) -> usize {
+        self.fields()
+            .map(|field| field.name.len() + 1 + field.value.len())
+            .sum()
+    }
     /// Returns the value of the `name` field if it is present in the stanza
     pub fn field(&self, name: &str) -> Option<&str> {
         self.inner.with_fields(|fields| {
@@ -266,7 +270,9 @@ impl MutableControlStanza {
         })
     }
     pub fn package_name(&self) -> std::result::Result<String, ParseError> {
-        let (arch, name, ver) = self.fields().find_fields(("Architecture", "Package", "Version"))?;
+        let (arch, name, ver) =
+            self.fields()
+                .find_fields(("Architecture", "Package", "Version"))?;
         Ok(format!("{}_{}_{}", &name, &ver, &arch))
     }
 }
@@ -348,10 +354,7 @@ where
     F: Field<R>,
     I: Iterator<Item = F>,
 {
-    fn find_fields(
-        self,
-        m: (&'m str, &'m str),
-    ) -> std::result::Result<(R, R), &'m str> {
+    fn find_fields(self, m: (&'m str, &'m str)) -> std::result::Result<(R, R), &'m str> {
         let r = self.fold((None, None), |found, field| {
             if field.is_a(m.0) {
                 (Some(field.value()), found.1)
@@ -502,7 +505,7 @@ impl<'a> std::fmt::Display for ControlFile<'a> {
 }
 
 impl<'a> ControlFile<'a> {
-    /// Parses a string into ControlFile 
+    /// Parses a string into ControlFile
     pub fn parse<S: ?Sized + AsRef<str>>(src: &'a S) -> Result<Self, ParseError> {
         let mut parser = ControlParser::new(src.as_ref());
         let mut stanzas: Vec<ControlStanza<'a>> = vec![];
@@ -645,13 +648,18 @@ impl<'a> ControlParser<'a> {
                 break;
             }
             pos += ws;
-            let n = memchr::memchr(b'\n', inp).ok_or_else(|| {
-                ParseError::from(format!("Unterminated field {}", self.quote_err()))
-            })?;
-            pos += n + 1;
-            inp = &inp[n + 1..];
-            if n == 0 {
-                break;
+            match memchr::memchr(b'\n', inp) {
+                None => {
+                    pos += inp.len();
+                    break;
+                }
+                Some(n) => {
+                    pos += n + 1;
+                    inp = &inp[n + 1..];
+                    if n == 0 {
+                        break;
+                    }
+                }
             }
         }
         Ok(self.advance(pos - 1, 1))

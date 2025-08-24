@@ -1,3 +1,4 @@
+# debian
 https://ftp-master.debian.org/keys/release-6.asc
 https://ftp-master.debian.org/keys/release-7.asc
 https://ftp-master.debian.org/keys/release-8.asc
@@ -13,3 +14,10 @@ https://ftp-master.debian.org/keys/release-11.asc
 https://ftp-master.debian.org/keys/archive-key-12.asc
 https://ftp-master.debian.org/keys/archive-key-12-security.asc
 https://ftp-master.debian.org/keys/release-12.asc
+https://ftp-master.debian.org/keys/archive-key-13.asc
+https://ftp-master.debian.org/keys/archive-key-13-security.asc
+https://ftp-master.debian.org/keys/release-13.asc
+# devuan
+https://files.devuan.org/devuan-archive-keyring.gpg
+# ubuntu
+https://archive.ubuntu.com/ubuntu/project/ubuntu-archive-keyring.gpg

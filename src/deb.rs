@@ -4,22 +4,18 @@ pub use async_tar::{
 };
 use {
     crate::{
-        control::MutableControlStanza,
-        deployfs::DeploymentFile,
-        digest::{Digest, DigestFieldName, Digester, DigestingReader, GetDigest, VerifyingReader},
-        parse_size,
+        control::MutableControlStanza, deployfs::DeploymentFile, digest::GetDigest, parse_size,
     },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     core::task::{self, Context, Poll},
     futures::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
-    pin_project::pin_project,
     std::{
         io::{self, Result},
         ops::Range,
         path::PathBuf,
-        pin::{pin, Pin},
+        pin::Pin,
         sync::{Arc, Mutex},
         time::{Duration, UNIX_EPOCH},
     },
@@ -59,12 +55,7 @@ enum EntryKind {
     Data,
 }
 
-trait DebReaderSource<D: Digester>: AsyncRead + Unpin + Send + GetDigest<D> {}
-impl<D: Digester, R: AsyncRead + Unpin + Send> DebReaderSource<D> for VerifyingReader<D, R> {}
-impl<D: Digester, R: AsyncRead + Unpin + Send> DebReaderSource<D> for DigestingReader<D, R> {}
-
-#[pin_project]
-struct DebReaderInner<'a, D: Digester> {
+struct DebReaderInner {
     // Current state
     state: State,
     // Content padding
@@ -78,38 +69,14 @@ struct DebReaderInner<'a, D: Digester> {
     // Deb entry header
     hdr: [u8; AR_HEADER_SIZE as usize],
     // Source of the data
-    #[pin]
-    source: Box<dyn DebReaderSource<D> + 'a>,
+    source: Pin<Box<dyn AsyncRead + Send + 'static>>,
 }
 
-impl<'a, D: Digester + 'static> DebReaderInner<'a, D> {
-    async fn new<R: AsyncRead + Send + Unpin + 'a>(r: R) -> std::io::Result<Self> {
+impl Unpin for DebReaderInner {}
+
+impl DebReaderInner {
+    async fn new(mut r: Pin<Box<dyn AsyncRead + Send + 'static>>) -> std::io::Result<Self> {
         let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
-        let mut r = Box::new(DigestingReader::<D, _>::new(r));
-        r.read_exact(&mut hdr).await?;
-        if &hdr != AR_MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid deb header",
-            ));
-        }
-        Ok(Self {
-            state: State::Header,
-            size: AR_HEADER_SIZE,
-            padding: 0,
-            read: 0,
-            total: AR_MAGIC_SIZE,
-            hdr: [0u8; AR_HEADER_SIZE as usize],
-            source: r,
-        })
-    }
-    async fn new_verifying<R: AsyncRead + Send + Unpin + 'a>(
-        r: R,
-        size: u64,
-        hash: Digest<D>,
-    ) -> std::io::Result<Self> {
-        let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
-        let mut r = Box::new(VerifyingReader::<D, _>::new(r, size, hash));
         r.read_exact(&mut hdr).await?;
         if &hdr != AR_MAGIC {
             return Err(std::io::Error::new(
@@ -137,38 +104,39 @@ impl<'a, D: Digester + 'static> DebReaderInner<'a, D> {
         self.size + (self.padding as u64)
     }
     fn poll_read_header(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<usize>> {
-        let this = self.project();
-        let buf = this.hdr.as_mut();
-        let remain = (*this.size + *this.padding as u64) - *this.read;
+        let this = self.get_mut();
+        let remain = (this.size + this.padding as u64) - this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         }
-        match ready!(this
-            .source
-            .poll_read(ctx, &mut buf[*this.read as usize..*this.size as usize]))
-        {
+        let size = this.size as usize;
+        let read_so_far = this.read as usize;
+        let padding = this.padding;
+        // Borrow disjoint fields to satisfy the borrow checker
+        let (hdr, source) = (&mut this.hdr, &mut this.source);
+        match ready!(source.as_mut().poll_read(ctx, &mut hdr[read_so_far..size])) {
             0 => Poll::Ready(Ok(0)),
             n => {
-                *this.read += n as u64;
-                *this.total += n as u64;
+                this.read += n as u64;
+                this.total += n as u64;
                 Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
-                    n - *this.padding as usize
+                    n - padding as usize
                 }))
             }
         }
     }
 }
 
-impl<'a, D: Digester + 'a> AsyncRead for DebReaderInner<'a, D> {
+impl AsyncRead for DebReaderInner {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut this = self.project();
-        let remain = (*this.size + *this.padding as u64) - *this.read;
+        let this = self.get_mut();
+        let remain = (this.size + this.padding as u64) - this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         };
@@ -183,19 +151,19 @@ impl<'a, D: Digester + 'a> AsyncRead for DebReaderInner<'a, D> {
                 "unexpected EOF while reading package entry",
             ))),
             n => {
-                *this.read += n as u64;
-                *this.total += n as u64;
+                this.read += n as u64;
+                this.total += n as u64;
                 Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
-                    n - *this.padding as usize
+                    n - this.padding as usize
                 }))
             }
         }
     }
 }
 
-impl<'a, D: Digester + 'static> Stream for DebReaderInner<'a, D> {
+impl Stream for DebReaderInner {
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -297,15 +265,15 @@ impl<'a, D: Digester + 'static> Stream for DebReaderInner<'a, D> {
 ///     }
 /// }
 /// ```
-pub struct DebReader<'a, D: Digester> {
-    inner: Arc<Mutex<DebReaderInner<'a, D>>>,
+pub struct DebReader {
+    inner: Arc<Mutex<DebReaderInner>>,
 }
 
-struct DebEntryReaderInner<'a, D: Digester> {
-    inner: Arc<Mutex<DebReaderInner<'a, D>>>,
+struct DebEntryReaderInner {
+    inner: Arc<Mutex<DebReaderInner>>,
 }
 
-impl<'a, D: Digester + 'static> AsyncRead for DebEntryReaderInner<'a, D> {
+impl AsyncRead for DebEntryReaderInner {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -321,7 +289,7 @@ impl<'a, D: Digester + 'static> AsyncRead for DebEntryReaderInner<'a, D> {
     }
 }
 
-impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
+impl DebReader {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -341,31 +309,20 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
     /// use anyhow::Result;
     ///
     /// async fn example() -> Result<()> {
-    ///     let reader = tokio::fs::File::open("path/to/debian/archive.deb").await?;
+    ///     let reader = async_std::fs::File::open("path/to/debian/archive.deb").await?;
     ///     let deb = Deb::new(reader).await?;
     ///     Ok(())
     /// }
     /// ```
-    pub async fn new<R: AsyncRead + Unpin + Send + 'a>(reader: R) -> Result<Self> {
+    pub async fn new(r: Pin<Box<dyn AsyncRead + Send + 'static>>) -> Result<Self> {
         Ok(DebReader {
-            inner: Arc::new(Mutex::new(DebReaderInner::new(reader).await?)),
-        })
-    }
-    pub async fn new_verifying<R: AsyncRead + Unpin + Send + 'a>(
-        reader: R,
-        size: u64,
-        hash: Digest<D>,
-    ) -> Result<Self> {
-        Ok(DebReader {
-            inner: Arc::new(Mutex::new(
-                DebReaderInner::new_verifying(reader, size, hash).await?,
-            )),
+            inner: Arc::new(Mutex::new(DebReaderInner::new(r).await?)),
         })
     }
     fn entry_reader_for_ext(
         &self,
         ext: &str,
-    ) -> Result<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>> {
+    ) -> Result<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>> {
         let r = DebEntryReaderInner {
             inner: Arc::clone(&self.inner),
         };
@@ -377,25 +334,6 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
             ".zstd" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
             _ => Box::pin(r),
         })
-    }
-    pub async fn finalize(self) -> io::Result<String> {
-        let mut reader = Arc::into_inner(self.inner)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    "unexpected references to debian package inned reader",
-                )
-            })?
-            .into_inner()
-            .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("unexpected mutex error {}", err),
-                )
-            })?;
-        let mut buf = vec![0u8; 512];
-        while reader.source.read(&mut buf).await? > 0 {}
-        Ok(reader.source.get_digest().into())
     }
     pub async fn extract_to<FS: crate::DeploymentFileSystem>(
         mut self,
@@ -583,8 +521,8 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
                         let mode = entry.header().mode()?;
                         let size = entry.header().size()? as usize;
                         match conf_files.iter_mut().find(|(name, _)| name == path_str) {
-                            None => {
-                                fs.create_file(
+                            None => fs
+                                .create_file(
                                     entry,
                                     Some(&path),
                                     uid,
@@ -593,14 +531,19 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
                                     Some(mtime),
                                     Some(size),
                                 )
-                                .await?
-                            }
+                                .await
+                                .map_err(|err| {
+                                    io::Error::new(
+                                        io::ErrorKind::Other,
+                                        format!("error creating file {:#?}: {}", &path, err),
+                                    )
+                                })?,
                             Some((_, sum)) => {
-                                let mut digester =
-                                    crate::digest::DigestingReader::<md5::Md5, _>::new(entry);
+                                let mut hasher =
+                                    crate::digest::HashingReader::<md5::Md5, _>::new(entry);
                                 let file = fs
                                     .create_file(
-                                        &mut digester,
+                                        &mut hasher,
                                         Some(&path),
                                         uid,
                                         gid,
@@ -608,8 +551,19 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
                                         Some(mtime),
                                         Some(size),
                                     )
-                                    .await?;
-                                let hash = digester.get_digest();
+                                    .await
+                                    .map_err(|err| {
+                                        io::Error::new(
+                                            io::ErrorKind::Other,
+                                            format!(
+                                                "error creating config file {:#?} {}: {}",
+                                                path.as_os_str(),
+                                                mode,
+                                                err
+                                            ),
+                                        )
+                                    })?;
+                                let hash = hasher.get_digest();
                                 sum.replace(hash.into());
                                 file
                             }
@@ -701,7 +655,7 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
                 ctrl.set("Conffiles", buf);
             }
         }
-        ctrl.set(D::DIGEST_FIELD_NAME, self.finalize().await?);
+        // ctrl.set(D::DIGEST_FIELD_NAME, Into::<String>::into(self.finalize().await?));
         if ctrl_files_list.len() > 0 {
             ctrl.set("Controlfiles", ctrl_files_list);
         }
@@ -709,8 +663,8 @@ impl<'a, D: Digester + DigestFieldName + 'static> DebReader<'a, D> {
     }
 }
 
-impl<'a, D: Digester + DigestFieldName + 'static> Stream for DebReader<'a, D> {
-    type Item = Result<DebEntry<'a>>;
+impl Stream for DebReader {
+    type Item = Result<DebEntry>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {
             io::Error::new(
@@ -751,18 +705,20 @@ impl<'a, D: Digester + DigestFieldName + 'static> Stream for DebReader<'a, D> {
 //     }
 // }
 
-pub enum DebEntry<'a> {
-    Control(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>),
-    Data(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>),
+pub enum DebEntry {
+    Control(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>),
+    Data(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>),
 }
 
-impl<'a> DebEntry<'a> {
-    pub fn into_inner(self) -> Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>> {
+impl DebEntry {
+    pub fn into_inner(self) -> Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
         }
     }
-    pub fn entries(self) -> Result<TarballEntries<Pin<Box<dyn AsyncRead + Unpin + Send + 'a>>>> {
+    pub fn entries(
+        self,
+    ) -> Result<TarballEntries<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar.entries(),
         }

@@ -1,7 +1,6 @@
 use {
     crate::{
-        digest::{self, Digest},
-        httprepo::HttpDebRepo,
+        digest::{self, Hash},
         repo::{DebRepo, DebRepoBuilder},
         universe::Universe,
         version::{Constraint, Dependency, Version},
@@ -185,11 +184,11 @@ impl Manifest {
 pub struct LockedIndex {
     uri: String,
     #[serde(with = "digest::serde::base64")]
-    hash: Digest<sha2::Sha256>,
+    hash: Hash<sha2::Sha256>,
 }
 
 impl LockedIndex {
-    pub fn new(uri: String, hash: Digest<sha2::Sha256>) -> Self {
+    pub fn new(uri: String, hash: Hash<sha2::Sha256>) -> Self {
         LockedIndex { uri, hash }
     }
 }
@@ -199,11 +198,11 @@ pub struct LockedPackage {
     source: u32,
     uri: String,
     #[serde(with = "digest::serde::base64")]
-    hash: Digest<sha2::Sha256>,
+    hash: Hash<sha2::Sha256>,
 }
 
 impl LockedPackage {
-    pub fn new(source: u32, uri: String, hash: Digest<sha2::Sha256>) -> Self {
+    pub fn new(source: u32, uri: String, hash: Hash<sha2::Sha256>) -> Self {
         LockedPackage { source, uri, hash }
     }
 }
@@ -224,7 +223,7 @@ impl LockedSource {
 pub struct LockFile {
     timestamp: DateTime<Utc>,
     #[serde(with = "digest::serde::base64")]
-    hash: Digest<sha2::Sha256>,
+    hash: Hash<sha2::Sha256>,
     sources: Vec<LockedSource>,
     packages: Vec<LockedPackage>,
 }

@@ -14,10 +14,11 @@
         };
         buildInputs = (with pkgs; [
             curl.dev
-            gpgme.dev
             openssl.dev
             bzip2.dev
             xz.dev
+            libunistring.dev
+            clang
         ]);
         nativeBuildInputs = with pkgs; [ 
             cargo-show-asm
@@ -26,8 +27,10 @@
             cargo-fuzz
             cargo-outdated
 
+            sequoia-sq
+            sequoia-sqv
+
             pkg-config 
-            gpgme
             valgrind
             gdb
         ];
@@ -43,6 +46,9 @@
             ]);
             shellHook = ''
             export RUST_BACKTRACE=1
+            export PKG_CONFIG_ALL_STATIC=1
+            export RUSTFLAGS="-C link-args=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2";
+            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
             '';
         } // params;
     in rec {

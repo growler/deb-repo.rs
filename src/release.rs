@@ -15,7 +15,7 @@
 use {
     crate::{
         control::{ControlStanza, ParseError},
-        digest::{digest_field_name, DigestOf},
+        digest::{digest_field_name, HashOf},
         packages::Packages,
         parse_size,
         repo::DebRepo,
@@ -46,7 +46,7 @@ macro_rules! matches {
 #[derive(Clone)]
 pub struct ReleaseFile<'a> {
     pub path: Cow<'a, str>,
-    pub digest: DigestOf<DebRepo>,
+    pub digest: HashOf<DebRepo>,
     pub size: u64,
 }
 
@@ -80,7 +80,11 @@ impl Release {
         self.inner
             .with_files(|files| files.iter().find(|file| file.path == path))
     }
-    pub fn packages_file(&self, component: &str, arch: &str) -> Option<(String, u64, DigestOf<DebRepo>)> {
+    pub fn packages_file(
+        &self,
+        component: &str,
+        arch: &str,
+    ) -> Option<(String, u64, HashOf<DebRepo>)> {
         self.inner
             .with_files(|files| {
                 files
@@ -105,11 +109,7 @@ impl Release {
                 )
             })
     }
-    pub async fn fetch_packages(
-        &self,
-        component: &str,
-        arch: &str,
-    ) -> io::Result<Packages> {
+    pub async fn fetch_packages(&self, component: &str, arch: &str) -> io::Result<Packages> {
         let (path, size, hash) = self.packages_file(component, arch).ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -136,7 +136,8 @@ impl Release {
         )
     }
     fn field(&self, name: &str) -> Option<&str> {
-        self.inner.with_control(|ctrl| ctrl.field(name).map(|s| s.as_ref()))
+        self.inner
+            .with_control(|ctrl| ctrl.field(name).map(|s| s.as_ref()))
     }
     pub fn codename(&self) -> Option<&str> {
         self.field("Codename")
@@ -176,7 +177,11 @@ impl Release {
             name: distr.to_owned().into(),
             inner: ReleaseInnerTryBuilder {
                 data,
-                control_builder: |data: &'_ Box<str>| ControlStanza::parse(data.as_ref()),
+                control_builder: |data: &'_ Box<str>| ControlStanza::parse(data.as_ref()).map_err(
+                    |err| {
+                        ParseError::from(format!("error parsing release file: {}", err))
+                    },
+                ),
                 files_builder: |control: &'_ ControlStanza| {
                     control
                         .field(digest_field_name::<DebRepo>())
@@ -189,7 +194,7 @@ impl Release {
                         .map(|line| {
                             let parts: Vec<&'_ str> = line.split_ascii_whitespace().collect();
                             if let [digest, size, path] = parts[..] {
-                                let digest: DigestOf<DebRepo> = digest.try_into().map_err(|err| {
+                                let digest: HashOf<DebRepo> = digest.try_into().map_err(|err| {
                                     ParseError::from(format!(
                                         "Invalid digest: {:?} {}",
                                         digest, err
@@ -229,9 +234,9 @@ struct ReleaseInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{digest::DigestOf, repo::DebRepo};
+    use crate::{digest::HashOf, repo::DebRepo};
 
-    type Digest = DigestOf<DebRepo>;
+    type Digest = HashOf<DebRepo>;
 
     #[test]
     fn test_find_release_entry() {

@@ -141,13 +141,41 @@ impl DeploymentFile for LocalFile {
             Ok(())
         } else {
             use std::os::unix::fs::MetadataExt;
-            let from_md = fs::metadata(&self.path).await?;
-            let to_md = fs::metadata(&to).await?;
-            if from_md.dev() == to_md.dev() {
-                fs::rename(&self.path, to).await
+            let rename = if let Some(to_dir) = to.parent() {
+                if let Ok(to_md) = fs::metadata(&to_dir).await {
+                    let from_md = fs::metadata(&self.path).await.map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("failed to get metadata for {:#?}: {}", &to_dir, e),
+                        )
+                    })?;
+                    from_md.dev() == to_md.dev()
+                } else {
+                    false
+                }
             } else {
-                fs::copy(&self.path, to).await?;
-                fs::remove_file(&self.path).await
+                false
+            };
+            if rename {
+                fs::rename(&self.path, &to).await.map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to rename {:#?} to {:?}: {}", &self.path, &to, e),
+                    )
+                })
+            } else {
+                fs::copy(&self.path, &to).await.map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to copy {:#?} to {:?}: {}", &self.path, &to, e),
+                    )
+                })?;
+                fs::remove_file(&self.path).await.map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to remove {:#?}: {}", &self.path, e),
+                    )
+                })
             }
         }
     }
@@ -164,33 +192,30 @@ fn mkdir(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Re
 }
 
 fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
-    if path == std::path::Path::new("") {
+    if path.is_dir() {
         return Ok(());
     }
-    match mkdir(path, owner, mode) {
-        Ok(()) => return Ok(()),
-        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {}
-        Err(_) if path.is_dir() => return Ok(()),
-        Err(e) => return Err(e),
-    }
-    match path.parent() {
-        Some(p) => mkdir(p, owner, mode)?,
-        None => {
-            return Err(io::Error::new(
-                io::ErrorKind::Other,
-                "failed to create tree",
-            ))
-        }
-    }
+
     match mkdir(path, owner, mode) {
         Ok(()) => Ok(()),
+        Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
+            let parent = path.parent().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::Other, "failed to create tree: no parent")
+            })?;
+            mkdir_rec(parent, owner, mode)?;
+            match mkdir(path, owner, mode) {
+                Ok(()) => Ok(()),
+                Err(_) if path.is_dir() => Ok(()),
+                Err(e) => Err(e),
+            }
+        }
         Err(_) if path.is_dir() => Ok(()),
         Err(e) => Err(e),
     }
 }
 
 #[async_trait::async_trait]
-impl DeploymentFileSystem for &LocalFileSystem {
+impl DeploymentFileSystem for LocalFileSystem {
     type File = LocalFile;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
@@ -205,7 +230,15 @@ impl DeploymentFileSystem for &LocalFileSystem {
         } else {
             None
         };
-        async_std::task::spawn_blocking(move || mkdir(target.as_ref(), owner, mode)).await
+        async_std::task::spawn_blocking(move || {
+            mkdir(target.as_ref(), owner, mode).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("failed to create directory {:?}: {}", target, e),
+                )
+            })
+        })
+        .await
     }
     async fn create_dir_all<P: AsRef<Path> + Send>(
         &self,
@@ -220,7 +253,18 @@ impl DeploymentFileSystem for &LocalFileSystem {
         } else {
             None
         };
-        async_std::task::spawn_blocking(move || mkdir_rec(target.as_ref(), owner, mode)).await
+        async_std::task::spawn_blocking(move || {
+            mkdir_rec(target.as_ref(), owner, mode).map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to create directory recursively {:#?}: {}",
+                        target, e
+                    ),
+                )
+            })
+        })
+        .await
     }
     async fn symlink<P: AsRef<Path> + Send, Q: AsRef<Path> + Send>(
         &self,
@@ -268,33 +312,49 @@ impl DeploymentFileSystem for &LocalFileSystem {
     ) -> io::Result<Self::File> {
         let (mut file, path) = if let Some(path) = path {
             let target = self.target_path(path.as_ref())?;
-            let mut open = fs::OpenOptions::new();
-            open.write(true).create_new(true);
-            open.mode(mode);
-            let file = open.open(&target).await?;
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(mode)
+                .open(&target)
+                .await
+                .map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to create file {:#?}: {}", &target, e),
+                    )
+                })?;
             (file, target)
         } else {
-            let mut builder = tempfile::Builder::new();
-            builder.permissions(fs::Permissions::from_mode(mode));
-            let file = builder.tempfile_in(self.root.as_ref())?;
-            let path: PathBuf = file.path().to_owned().into();
-            let file = unsafe { fs::File::from_raw_fd(file.persist(&path)?.into_raw_fd()) };
-            (file, path)
+            let (file, path) = tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(mode))
+                .tempfile_in(self.root.as_ref())?
+                .keep()?;
+            let file = unsafe { fs::File::from_raw_fd(file.into_raw_fd()) };
+            (file, path.into())
         };
         use async_std::os::unix::io::AsRawFd;
         let raw_fd = file.as_raw_fd();
         if let Some(size) = size {
-            let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
-            async_std::task::spawn_blocking(move || {
-                nix::fcntl::fallocate(
-                    raw_fd,
-                    nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-                    0,
-                    size as i64,
-                )
-                .map_err(|err| io::Error::from_raw_os_error(err as i32))
-            })
-            .await?;
+            if size > 0 {
+                let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
+                async_std::task::spawn_blocking(move || {
+                    nix::fcntl::fallocate(
+                        raw_fd,
+                        nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+                        0,
+                        size as i64,
+                    )
+                    .map_err(|err| {
+                        let err = io::Error::from_raw_os_error(err as i32);
+                        io::Error::new(
+                            err.kind(),
+                            format!("failed to allocate file space: {}", err),
+                        )
+                    })
+                })
+                .await?;
+            }
         }
         if self.chown_allowed {
             let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };

@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        digest::{DigestOf, DigesterOf, VerifyingReader},
+        digest::{HashOf, HashAlgoOf, VerifyingReader},
         repo::DebRepoProvider,
     },
     async_std::{
@@ -47,10 +47,10 @@ impl DebRepoProvider for FSDebRepo {
         hash: &[u8],
     ) -> io::Result<Pin<Box<dyn Read + Send>>> {
         let path = self.base.join(path);
-        Ok(Box::pin(VerifyingReader::<DigesterOf<Self>, _>::new(
+        Ok(Box::pin(VerifyingReader::<HashAlgoOf<Self>, _>::new(
             async_std::fs::File::open(path).await?,
             size,
-            DigestOf::<Self>::try_from(hash)?,
+            HashOf::<Self>::try_from(hash)?,
         )))
     }
 }
