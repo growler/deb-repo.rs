@@ -490,9 +490,22 @@ impl MutableControlFile {
     }
 }
 
+impl From<MutableControlFile> for Vec<u8> {
+    fn from(cf: MutableControlFile) -> Self {
+        cf.to_string().into_bytes()
+    }
+}
+
 /// Represents an immutable Debian Control File consisting of multiple Stanzas
 pub struct ControlFile<'a> {
     pub stanzas: Vec<ControlStanza<'a>>,
+}
+
+impl std::iter::FromIterator<MutableControlStanza> for MutableControlFile {
+    fn from_iter<T: IntoIterator<Item = MutableControlStanza>>(iter: T) -> Self {
+        let stanzas: Vec<MutableControlStanza> = iter.into_iter().collect();
+        Self { stanzas }
+    }
 }
 
 impl<'a> std::fmt::Display for ControlFile<'a> {

@@ -84,6 +84,7 @@ pub trait DeploymentFileSystem {
     where
         R: io::Read + Unpin + Send,
         P: AsRef<Path> + Send;
+    async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()>;
 }
 
 #[derive(Clone, Debug)]
@@ -373,5 +374,9 @@ impl DeploymentFileSystem for LocalFileSystem {
             base: Arc::clone(&self.root),
             path,
         })
+    }
+    async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()> {
+        let target = self.target_path(path.as_ref())?;
+        fs::remove_file(target).await
     }
 }

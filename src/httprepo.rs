@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        digest::{HashOf, HashAlgoOf, HashingReader, GetDigest, VerifyingReader},
+        hash::{HashAlgoOf, HashOf, HashingReader, VerifyingReader},
         repo::{DebRepo, DebRepoBuilder, DebRepoProvider},
     },
     async_std::{
@@ -20,20 +20,23 @@ use {
 
 #[derive(Clone)]
 pub struct HttpDebRepo {
+    insecure: bool,
     base: url::Url,
 }
 
 #[derive(Clone)]
 pub struct HttpCachingDebRepo {
+    insecure: bool,
     base: url::Url,
     cache: Arc<PathBuf>,
 }
 
 pub struct HttpCachingRepoBuilder {
+    insecure: bool,
     cache: Arc<PathBuf>,
 }
 impl HttpCachingRepoBuilder {
-    pub async fn new(cache: PathBuf) -> Result<Self> {
+    pub async fn new(insecure: bool, cache: PathBuf) -> Result<Self> {
         fs::create_dir_all(cache.join(".temp"))
             .await
             .map_err(|err| {
@@ -43,14 +46,16 @@ impl HttpCachingRepoBuilder {
                 )
             })?;
         Ok(Self {
+            insecure,
             cache: Arc::new(cache),
         })
     }
 }
 #[async_trait]
 impl DebRepoBuilder for HttpCachingRepoBuilder {
-    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo> {
+    async fn build(&self, url: &str) -> io::Result<DebRepo> {
         let repo: DebRepo = HttpCachingDebRepo {
+            insecure: self.insecure,
             base: url::Url::parse(url.as_ref())
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", err)))?,
             cache: self.cache.clone(),
@@ -61,8 +66,9 @@ impl DebRepoBuilder for HttpCachingRepoBuilder {
 }
 
 impl HttpCachingDebRepo {
-    pub fn new(base: url::Url, cache: PathBuf) -> Self {
+    pub fn new(base: url::Url, insecure: bool, cache: PathBuf) -> Self {
         Self {
+            insecure,
             base,
             cache: Arc::new(cache),
         }
@@ -74,14 +80,18 @@ impl HttpCachingDebRepo {
             .join(path)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .to_string();
-        let rsp = client().get_async(&uri).await?;
+        let rsp = client(self.insecure).get_async(&uri).await?;
         match rsp.status() {
             StatusCode::OK => (),
-            StatusCode::NOT_FOUND => return Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
-            code => return Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected HTTP response {}", code),
-            )),
+            StatusCode::NOT_FOUND => {
+                return Err(io::Error::new(io::ErrorKind::NotFound, uri.clone()))
+            }
+            code => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unexpected HTTP response {}", code),
+                ))
+            }
         };
         if let Some(expect) = size {
             if let Some(size) = rsp.body().len() {
@@ -118,7 +128,7 @@ impl HttpCachingDebRepo {
                 format!("Failed to copy response body: {}", err),
             )
         })?;
-        let digest = body.get_digest();
+        let hash = body.into_hash();
         tmp_file.sync_all().await.map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -126,7 +136,7 @@ impl HttpCachingDebRepo {
             )
         })?;
         drop(tmp_file);
-        let cache_path = self.cache.join(PathBuf::from(&digest));
+        let cache_path = self.cache.join(PathBuf::from(&hash));
         if let Some(parent) = cache_path.parent() {
             if !parent.exists().await {
                 fs::create_dir_all(parent).await.map_err(|err| {
@@ -179,22 +189,25 @@ impl DebRepoProvider for HttpCachingDebRepo {
     }
 }
 
-pub struct HttpRepoBuilder;
+pub struct HttpRepoBuilder {
+    insecure: bool,
+}
 impl HttpRepoBuilder {
-    pub fn new() -> Self {
-        Self {}
+    pub fn new(insecure: bool) -> Self {
+        Self { insecure }
     }
 }
 
 #[async_trait]
 impl DebRepoBuilder for HttpRepoBuilder {
-    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo> {
-        let repo: DebRepo = HttpDebRepo::new(url.as_ref()).await?.into();
+    async fn build(&self, url: &str) -> io::Result<DebRepo> {
+        let repo: DebRepo = HttpDebRepo::new(url, self.insecure).await?.into();
         Ok(repo)
     }
 }
 
-fn client() -> &'static HttpClient {
+fn client(insecure: bool) -> &'static HttpClient {
+
     static SHARED: Lazy<HttpClient> = Lazy::new(|| {
         HttpClient::builder()
             .redirect_policy(RedirectPolicy::Limit(10))
@@ -202,12 +215,28 @@ fn client() -> &'static HttpClient {
             .build()
             .expect("Failed to create HTTP client")
     });
-    &SHARED
+    static SHARED_INSECURE: Lazy<HttpClient> = Lazy::new(|| {
+        use isahc::config::SslOption;
+        HttpClient::builder()
+            .redirect_policy(RedirectPolicy::Limit(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .ssl_options(
+                SslOption::DANGER_ACCEPT_INVALID_CERTS | SslOption::DANGER_ACCEPT_REVOKED_CERTS | SslOption::DANGER_ACCEPT_INVALID_HOSTS,
+            )
+            .build()
+            .expect("Failed to create insecure HTTP client")
+    });
+    if insecure {
+        &SHARED_INSECURE
+    } else {
+        &SHARED
+    }
 }
 
 impl HttpDebRepo {
-    pub async fn new(url: &str) -> io::Result<Self> {
+    pub async fn new(url: &str, insecure: bool) -> io::Result<Self> {
         Ok(Self {
+            insecure,
             base: url::Url::parse(url)
                 .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, format!("{}", err)))?,
         })
@@ -222,7 +251,7 @@ impl DebRepoProvider for HttpDebRepo {
             .join(path)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .to_string();
-        let rsp = client().get_async(&uri).await?;
+        let rsp = client(self.insecure).get_async(&uri).await?;
         match rsp.status() {
             StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
@@ -243,7 +272,7 @@ impl DebRepoProvider for HttpDebRepo {
             .join(path)
             .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err))?
             .to_string();
-        let rsp = client().get_async(&uri).await?;
+        let rsp = client(self.insecure).get_async(&uri).await?;
         match rsp.status() {
             StatusCode::OK => Ok(Box::pin(VerifyingReader::<HashAlgoOf<Self>, _>::new(
                 match rsp.body().len() {

@@ -5,7 +5,7 @@ use std::sync::Arc;
 
 async fn fetch_packages() -> Arc<str> {
     let repo: DebRepo =
-        HttpDebRepo::new("https://snapshot.debian.org/archive/debian/20241201T025825Z/")
+        HttpDebRepo::new("https://snapshot.debian.org/archive/debian/20241201T025825Z/", true)
             .await
             .expect("repo")
             .into();
@@ -41,8 +41,10 @@ pub fn parse_benchmark(c: &mut Criterion) {
 
     g.bench_function("solve test", |b| {
         b.iter(|| {
-            let packages = vec![Packages::new(debrepo::null_provider(), data.clone())
-                .expect("failed to parse packages")];
+            let packages = Some(
+                Packages::new(debrepo::null_provider(), data.clone())
+                    .expect("failed to parse packages"),
+            );
             let mut uni = Universe::new("amd64", packages.into_iter()).expect("universe");
             let _ = match uni.solve(
                 vec![Dependency::try_from("task-gnome-desktop | task-kde-desktop").unwrap()],

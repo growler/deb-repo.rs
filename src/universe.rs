@@ -2,7 +2,7 @@ use {
     crate::{
         control::ParseError,
         deb::DebReader,
-        digest::{digest_field_name, HashOf},
+        hash::{hash_field_name, HashOf},
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
         repo::DebRepo,
@@ -537,7 +537,7 @@ impl<'a> DebFetcher<'a> {
                 )
             })
             .and_then(|pkg| {
-                pkg.field(digest_field_name::<DebRepo>()).ok_or_else(|| {
+                pkg.field(hash_field_name::<DebRepo>()).ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(

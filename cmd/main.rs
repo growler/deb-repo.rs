@@ -1,46 +1,31 @@
 use {
-    crate::common::*,
     anyhow::{anyhow, Result},
     async_std::{
         fs,
         io::WriteExt,
         path::{Path, PathBuf},
     },
-    clap::{Parser, Subcommand, Args},
+    clap::{Args, Parser, Subcommand, ValueEnum},
     debrepo::{
         exec::{dpkg, unshare_root, unshare_user_ns},
-        DebRepo, Dependency, DeploymentFileSystem, HttpCachingRepoBuilder, HttpDebRepo, Manifest,
-        Universe, Version,
+        Constraint, DebRepo, DebRepoBuilder, Dependency, DeploymentFileSystem,
+        HttpCachingRepoBuilder, HttpDebRepo, HttpRepoBuilder, Manifest, ManifestFile,
+        MutableControlFile, Universe, Version,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
-    std::{iter, process::ExitCode, str::FromStr},
+    std::{iter, process::ExitCode},
     tracing::level_filters::LevelFilter,
-    tracing_subscriber::{filter::EnvFilter, fmt, prelude::*},
+    tracing_subscriber::{filter::EnvFilter, fmt},
 };
-mod common;
 
-fn default_arch() -> &'static str {
-    match std::env::consts::ARCH {
-        "x86" => "i386",
-        "x86_64" => "amd64",
-        "aarch64" => "arm64",
-        "powerpc64" => "ppc64el",
-        "riscv64" => "riscv64",
-        "mips32" | "mips32r6" => "mipsel",
-        "mips64" | "mips64r6" => "mips64el",
-        "arm" => {
-            if cfg!(target_feature = "vfp2") {
-                "armhf"
-            } else {
-                "armel"
-            }
-        }
-        a => a,
-    }
+#[async_trait::async_trait(?Send)]
+#[enum_dispatch::enum_dispatch]
+pub trait AsyncCommand {
+    async fn exec(&self, conf: &App) -> Result<()>;
 }
 
 #[derive(Parser)]
-struct App {
+pub struct App {
     /// Turns off all output except errors
     #[arg(short, long)]
     quiet: bool,
@@ -50,7 +35,7 @@ struct App {
     debug: u8,
 
     /// Manifest file
-    #[arg(short, long, default_value = "manifest.yaml")]
+    #[arg(short, long, default_value = ManifestFile::DEFAULT_FILE)]
     manifest: PathBuf,
 
     /// Number of concurrent downloads
@@ -63,34 +48,20 @@ struct App {
     limit: usize,
 
     /// Target architecture
-    #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
+    #[arg(short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
     arch: String,
 
     /// HTTP download cache directory
-    #[arg(
-        long = "cache-dir",
-        value_name = "DIR",
-        // Default to "$XDG_CACHE_HOME/debrepo" or "$HOME/.cache/debrepo" if XDG_CACHE_HOME is not set
-        default_value_os_t = {
-            let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-                PathBuf::from(xdg)
-            } else if let Some(home) = std::env::var_os("HOME") {
-                PathBuf::from(home).join(".cache")
-            } else {
-                PathBuf::from(".cache")
-            };
-            base.join("debrepo")
-        }
-    )]
-    pub cache_dir: PathBuf,
+    #[arg(long = "cache-dir", value_name = "DIR")]
+    pub cache_dir: Option<PathBuf>,
 
-    /// Do not verify Release files (not recommended)
-    #[arg(long = "no-verify")]
-    pub no_verify: bool,
+    /// Do not verify Release files by default (not recommended)
+    #[arg(short = 'K', long = "no-verify")]
+    pub insecure_release: bool,
 
-    /// Keyring for verification (use multiple times to add more)
-    #[arg(short = 'k', long = "keyring", value_name = "FILE")]
-    pub keyring: Vec<PathBuf>,
+    /// Skip the connection verification (not recommended)
+    #[arg(short = 'k', long = "insecure", action)]
+    pub insecure: bool,
 
     #[command(subcommand)]
     cmd: Commands,
@@ -111,63 +82,18 @@ enum Commands {
     /// Extract system to a target directory
     #[command(name = "extract")]
     Extract,
-    /// Add dependency to manifest file
-    #[command(name = "add")]
-    Add,
-    /// Remove dependency from manifest file
-    #[command(name = "remove")]
-    Remove,
-    /// Validate manifest file
-    #[command(name = "validate")]
-    Validate,
-    // #[command(name = "solve")]
-    // Solve {
-    //     /// Architecture
-    //     #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
-    //     arch: String,
-    //     /// Origin repository URL
-    //     #[arg(
-    //         short = 'u',
-    //         long = "url",
-    //         value_name = "URL",
-    //         default_value = "https://ftp.debian.org/debian/"
-    //     )]
-    //     origin: String,
-    //     /// Distribution name
-    //     #[arg(
-    //         short = 'd',
-    //         long = "distr",
-    //         value_name = "DISTR",
-    //         default_value = "sid"
-    //     )]
-    //     distr: String,
-    //     /// Component
-    //     #[arg(
-    //         short = 'c',
-    //         long = "component",
-    //         value_name = "COMPONENT",
-    //         default_value = "all"
-    //     )]
-    //     comp: String,
-    //     /// Fetch packages
-    //     #[arg(short = 'g', long = "print-graph", value_name = "dot|text")]
-    //     print_graph: Option<String>,
-    //     /// Number of concurrent downloads
-    //     #[arg(short = 'l', long = "limit", value_name = "NUM", default_value = "5")]
-    //     limit: usize,
-    //     /// Fetch packages
-    //     #[arg(short = 'f', long = "fetch-packages", action)]
-    //     fetch: bool,
-    //     /// Extract packages into target directory
-    //     #[arg(short = 'e', long = "extract-packages", action)]
-    //     extract: bool,
-    //     /// Target directory
-    //     #[arg(short = 't', long = "target", value_name = "DIR", default_value = ".")]
-    //     target: PathBuf,
-    //     /// Requirements
-    //     #[arg(value_name = "REQUIREMENT")]
-    //     reqs: Vec<String>,
-    // },
+    /// Include a package or packages into the recipe  
+    #[command(name = "include")]
+    Include,
+    /// Exlicitly exclude a package or packages from the recipe  
+    #[command(name = "exclude")]
+    Exclude,
+    /// Remove a package or packages from the recipe
+    #[command(name = "drop")]
+    Drop,
+    /// Lists packages
+    #[command(name = "list")]
+    List,
     // #[command(name = "search")]
     // Search {
     //     #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
@@ -202,104 +128,371 @@ enum Commands {
     // },
 }
 
-#[derive(Args, Default)]
+#[derive(Args, Clone, Default)]
 #[group(required = true, multiple = true)]
 struct Source {
-    /// Repository URL
-    #[arg(value_name = "URL", default_value = "https://ftp.debian.org/debian/")]
-    url: String,
+    /// Do not verify release signature (not recommended)
+    #[arg(short = 'K', long = "allow-insecure", action)]
+    pub allow_insecure: Option<bool>,
 
-    /// Distribution name (e.g., bookworm, bookworm-security, sid)
-    #[arg(long, default_value = "sid")]
-    pub distr: String,
-
-    /// Components (comma-separated), default: all available
-    #[arg(long = "comp", value_delimiter = ',')]
-    pub comp: Vec<String>,
+    /// Keyring file to verify release signature
+    #[arg(short = 's', long = "signed-by")]
+    pub signed_by: Option<PathBuf>,
 
     /// Only include these architectures (comma-separated)
-    #[arg(long = "arch-only", conflicts_with = "arch_exclude", value_delimiter = ',')]
-    pub arch_only: Vec<String>,
+    #[arg(long = "arch", value_delimiter = ',')]
+    pub arch: Vec<String>,
 
-    /// Exclude this architecture
-    #[arg(long = "arch-exclude", conflicts_with = "arch_only")]
-    pub arch_exclude: Option<String>,
+    /// Repository URL
+    #[arg(value_name = "URL")]
+    url: String,
+
+    /// Suite name (e.g., bookworm, bookworm-security, sid)
+    #[arg(value_name = "SUITE")]
+    pub suite: String,
+
+    /// Components, default: all available
+    #[arg(value_name = "COMPONENT")]
+    pub comp: Vec<String>,
 }
 
-#[derive(Parser, Default)]
+impl TryFrom<&Source> for debrepo::Source {
+    type Error = anyhow::Error;
+    fn try_from(src: &Source) -> anyhow::Result<Self> {
+        Ok(Self {
+            arch: src.arch.clone(),
+            allow_insecure: src.allow_insecure.map(|v| !v),
+            signed_by: src.signed_by.as_ref().map(|p| p.try_into()).transpose()?,
+            url: src.url.clone(),
+            suite: src.suite.clone(),
+            components: src.comp.clone(),
+        })
+    }
+}
+
+#[derive(Parser)]
 pub struct Init {
     /// Overwrite existing manifest if present
     #[arg(long)]
     pub force: bool,
 
-    /// Source definitions (use multiple times to add more)
-    #[command(flatten)]
-    source: Source,
+    #[command(subcommand)]
+    cmd: InitCommands,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Init {
-    async fn exec(&self, conf: &Config) -> Result<()> {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = ManifestFile::new(
+            &conf.manifest,
+            match &self.cmd {
+                InitCommands::InitFromSource(_) => None,
+                InitCommands::InitFromVendor(cmd) => {
+                    Some(format!("default manifest file for {}", &cmd.vendor))
+                }
+            },
+        );
+        for source in match &self.cmd {
+            InitCommands::InitFromSource(cmd) => {
+                vec![debrepo::Source::try_from(&cmd.source)?]
+            }
+            InitCommands::InitFromVendor(cmd) => cmd.sources(),
+        } {
+            mf.add_source(source, None)?;
+        }
+        for req in match &self.cmd {
+            InitCommands::InitFromSource(cmd) => cmd
+                .requirements
+                .iter()
+                .map(|s| {
+                    s.parse::<Dependency<Option<String>, String, Version<String>>>()
+                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            InitCommands::InitFromVendor(cmd) => cmd
+                .requirements()
+                .iter()
+                .map(|s| {
+                    s.parse::<Dependency<Option<String>, String, Version<String>>>()
+                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        } {
+            mf.add_requirement("", req, None::<String>)
+                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))?;
+        }
+        mf.store().await?;
         Ok(())
     }
 }
 
-async fn update_manifest<F>(manifest_path: &Path, modifier: F) -> Result<()>
-where
-    F: FnOnce(&mut Manifest) -> Result<()>,
-{
-    let mut manifest = Manifest::read(async_std::fs::File::open(manifest_path).await?).await?;
-    modifier(&mut manifest)?;
-
-    let mut temp_path = manifest_path.to_path_buf();
-    temp_path.set_extension("tmp");
-    let mut temp_file = async_std::fs::File::create(&temp_path).await?;
-    manifest
-        .write(&mut temp_file)
-        .await
-        .map_err(|err| anyhow!("failed to write manifest to temporary file: {}", err))?;
-    drop(temp_file);
-    async_std::fs::rename(&temp_path, manifest_path).await?;
-    Ok(())
+#[derive(Subcommand)]
+enum InitCommands {
+    /// Initialize manifest for a source definition
+    #[command(name = "from-source")]
+    InitFromSource(InitFromSource),
+    /// Initialize manifest for a known vendor (Debian, Devuan, Ubuntu)
+    #[command(name = "from-vendor")]
+    InitFromVendor(InitFromVendor),
 }
 
-#[derive(Parser)]
-struct Remove {
-    #[arg(value_name = "DEPENDENCY")]
-    name: Vec<String>,
+#[derive(Parser, Default)]
+pub struct InitFromSource {
+    /// Package to add
+    #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
+    requirements: Vec<String>,
+    /// Source definition
+    #[command(flatten)]
+    source: Source,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Remove {
-    async fn exec(&self, conf: &Config) -> Result<()> {
-        update_manifest(&conf.manifest, |manifest| {
-            for item in self.name.iter() {
-                let dep = Dependency::from_str(item.as_ref())?;
-                manifest.drop_requirement(dep);
-            }
-            Ok(())
+#[derive(Clone, Default)]
+pub enum Vendor {
+    #[default]
+    Debian,
+    Devuan,
+    Ubuntu,
+}
+
+impl std::fmt::Display for Vendor {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Debian => write!(f, "debian"),
+            Self::Devuan => write!(f, "devuan"),
+            Self::Ubuntu => write!(f, "ubuntu"),
+        }
+    }
+}
+
+impl ValueEnum for Vendor {
+    fn value_variants<'a>() -> &'a [Self] {
+        &[Self::Debian, Self::Devuan, Self::Ubuntu]
+    }
+    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
+        Some(match self {
+            Self::Debian => clap::builder::PossibleValue::new("debian")
+                .help("Use Debian as the vendor")
+                .alias("Debian"),
+            Self::Devuan => clap::builder::PossibleValue::new("devuan")
+                .help("Use Devuan as the vendor")
+                .alias("Devuan"),
+            Self::Ubuntu => clap::builder::PossibleValue::new("ubuntu")
+                .help("Use Ubuntu as the vendor")
+                .alias("Ubuntu"),
         })
-        .await
+    }
+}
+
+#[derive(Parser, Default)]
+pub struct InitFromVendor {
+    /// Vendor
+    pub vendor: Vendor,
+
+    /// Suite
+    pub suite: Option<String>,
+}
+
+impl InitFromVendor {
+    fn requirements(&self) -> &[&'static str] {
+        match self.vendor {
+            Vendor::Debian => &["apt", "ca-certificates"],
+            Vendor::Ubuntu => &["apt", "ca-certificates"],
+            Vendor::Devuan => &["apt", "ca-certificates", "devuan-keyring"],
+        }
+    }
+    fn sources(&self) -> Vec<debrepo::Source> {
+        match self.vendor {
+            Vendor::Debian => vec![
+                debrepo::Source {
+                    url: "https://ftp.debian.org/debian/".into(),
+                    suite: self.suite.clone().unwrap_or_else(|| "trixie".into()),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+                debrepo::Source {
+                    url: "https://ftp.debian.org/debian/".into(),
+                    suite: self
+                        .suite
+                        .clone()
+                        .or_else(|| Some("trixie".into()))
+                        .map(|s| s + "-updates")
+                        .unwrap(),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+                debrepo::Source {
+                    url: "https://ftp.debian.org/debian/".into(),
+                    suite: self
+                        .suite
+                        .clone()
+                        .or_else(|| Some("trixie".into()))
+                        .map(|s| s + "-backports")
+                        .unwrap(),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+                debrepo::Source {
+                    url: "https://security.debian.org/debian-security/".into(),
+                    suite: self
+                        .suite
+                        .clone()
+                        .or_else(|| Some("trixie".into()))
+                        .map(|s| s + "-security")
+                        .unwrap(),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+            ],
+            Vendor::Devuan => vec![
+                debrepo::Source {
+                    url: "http://deb.devuan.org/merged/".into(),
+                    suite: self.suite.clone().unwrap_or_else(|| "daedalus".into()),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+                debrepo::Source {
+                    url: "http://deb.devuan.org/merged/".into(),
+                    suite: self
+                        .suite
+                        .clone()
+                        .or_else(|| Some("daedalus".into()))
+                        .map(|s| s + "-updates")
+                        .unwrap(),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+                debrepo::Source {
+                    url: "http://deb.devuan.org/merged/".into(),
+                    suite: self
+                        .suite
+                        .clone()
+                        .or_else(|| Some("daedalus".into()))
+                        .map(|s| s + "-security")
+                        .unwrap(),
+                    components: vec!["main".into()],
+                    ..Default::default()
+                },
+            ],
+            Vendor::Ubuntu => vec![debrepo::Source {
+                url: "https://archive.ubuntu.com/ubuntu/".into(),
+                suite: "noble".into(),
+                components: vec!["main", "universe"]
+                    .into_iter()
+                    .map(String::from)
+                    .collect(),
+                ..Default::default()
+            }],
+        }
     }
 }
 
 #[derive(Parser)]
-struct Add {
-    #[arg(value_name = "DEPENDENCY")]
-    name: Vec<String>,
+struct Drop {
+    /// Specify to drop only requirements
+    #[arg(
+        short = 'R',
+        long = "requirements-only",
+        conflicts_with = "constraints_only"
+    )]
+    requirements_only: Option<bool>,
+    /// Specify to drop only constraints
+    #[arg(
+        short = 'C',
+        long = "constraints-only",
+        conflicts_with = "requirements_only"
+    )]
+    constraints_only: Option<bool>,
+    /// The recipe name to modify (by default drop from all recipes).
+    /// Use "" to specify the primary recipe.
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+    /// Package name or package version set
+    #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
+    name: Vec<Constraint<Option<String>, String, Version<String>>>,
 }
 
 #[async_trait::async_trait(?Send)]
-impl AsyncCommand for Add {
-    async fn exec(&self, conf: &Config) -> Result<()> {
-        update_manifest(&conf.manifest, |manifest| {
-            for item in self.name.iter() {
-                let dep = Dependency::from_str(item.as_ref())?;
-                manifest.add_requirement(dep);
-            }
-            Ok(())
-        })
-        .await
+impl AsyncCommand for Drop {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let recipes = self
+            .recipe
+            .as_ref()
+            .map(|s| vec![s.to_string()])
+            .unwrap_or_else(|| mf.recipes().map(|s| s.into()).collect::<Vec<String>>());
+        for recipe in recipes.into_iter() {
+            self.name.iter().try_for_each(|con| {
+                mf.remove_constraint(&recipe, con)
+                    .map_err(|e| anyhow!("invalid manifest: failed to drop constraint: {e}"))
+                // if self.requirements_only.unwrap_or(false) {
+                //     mf.remove_requirement(&recipe, con)
+                //         .map_err(|e| anyhow!("invalid manifest: failed to drop requirement: {e}"))
+                // } else if self.constraints_only.unwrap_or(false) {
+                //     mf.remove_constraint(&recipe, &con)
+                //         .map_err(|e| anyhow!("invalid manifest: failed to drop constraint: {e}"))
+                // } else {
+                //     mf.remove_requirement(&recipe, con)
+                //         .or_else(|_| mf.remove_constraint(&recipe, con))
+                //         .map_err(|e| {
+                //             anyhow!(
+                //                 "invalid manifest: failed to drop requirement or constraint: {e}"
+                //             )
+                //         })
+                // }
+            })?;
+        }
+        mf.store().await?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct Include {
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+    #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+    comment: Option<String>,
+    #[arg(value_name = "REQUIREMENT", value_parser = debrepo::cli::DependencyParser)]
+    reqs: Vec<Dependency<Option<String>, String, Version<String>>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Include {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let recipe = self.recipe.clone().unwrap_or_default();
+        let mut comment = self.comment.clone();
+        self.reqs.iter().try_for_each(|req| {
+            mf.add_requirement(&recipe, req.clone(), comment.take())
+                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
+        })?;
+        mf.store().await?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct Exclude {
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+    #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+    comment: Option<String>,
+    #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
+    reqs: Vec<Constraint<Option<String>, String, Version<String>>>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Exclude {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let recipe = self.recipe.clone().unwrap_or_default();
+        let mut comment = self.comment.clone();
+        self.reqs.iter().try_for_each(|con| {
+            mf.add_constraint(&recipe, con.clone(), comment.take())
+                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
+        })?;
+        mf.store().await?;
+        Ok(())
     }
 }
 
@@ -308,58 +501,105 @@ struct Update {}
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Update {
-    async fn exec(&self, conf: &Config) -> Result<()> {
-        let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
-        let repo_builder = HttpCachingRepoBuilder::new(".cache".into()).await?;
-        let mut universe = manifest
-            .fetch_universe(&conf.arch, &repo_builder, conf.limit)
-            .await?;
-        let (requirements, constraints) = manifest.into_requirements();
-        match universe.solve(requirements, constraints) {
-            Ok(mut solution) => {
-                solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
-                let mut out = std::io::stdout().lock();
-                pretty_print_packages(
-                    &mut out,
-                    solution
-                        .into_iter()
-                        .map(|s| -> Package { universe.package(s).unwrap().into() }),
-                    false,
-                )?;
-                Ok(())
-            }
-            Err(conflict) => Err(anyhow!(
-                "failed to solve dependencies: {}",
-                universe.display_conflict(conflict)
-            )),
-        }
+    async fn exec(&self, conf: &App) -> Result<()> {
+        Ok(())
+        // let manifest =
+        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
+        // let repo_builder =
+        //     HttpCachingRepoBuilder::new(conf.insecure, conf.cache.clone().into()).await?;
+        // let mut universe = manifest
+        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
+        //     .await?;
+        // match universe.solve(
+        //     manifest.requirements().cloned(),
+        //     manifest.constraints().cloned(),
+        // ) {
+        //     Ok(mut solution) => {
+        //         solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
+        //         let mut out = std::io::stdout().lock();
+        //         pretty_print_packages(
+        //             &mut out,
+        //             solution
+        //                 .into_iter()
+        //                 .map(|s| -> Package { universe.package(s).unwrap().into() }),
+        //             false,
+        //         )?;
+        //         Ok(())
+        //     }
+        //     Err(conflict) => Err(anyhow!(
+        //         "failed to solve dependencies: {}",
+        //         universe.display_conflict(conflict)
+        //     )),
+        // }
+    }
+}
+
+#[derive(Parser)]
+struct List {}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for List {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        // let manifest =
+        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
+        // let repo_builder = debrepo::HttpRepoBuilder::new(conf.insecure);
+        // let mut universe = manifest
+        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
+        //     .await?;
+        // let mut solution = universe
+        //     .solve(
+        //         manifest.requirements().cloned(),
+        //         manifest.constraints().cloned(),
+        //     )
+        //     .map_err(|conflict| {
+        //         anyhow!(
+        //             "failed to solve dependencies: {}",
+        //             universe.display_conflict(conflict)
+        //         )
+        //     })?;
+        // solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
+        // let mut out = std::io::stdout().lock();
+        // pretty_print_packages(
+        //     &mut out,
+        //     solution
+        //         .iter()
+        //         .map(|s| -> Package { universe.package(*s).unwrap().into() }),
+        //     false,
+        // )?;
+        Ok(())
     }
 }
 
 #[derive(Parser)]
 struct Extract {
-    /// Target path
-    #[arg(short, long, value_name = "PATH", default_value = "out")]
+    /// The recipe name to build (default is the primary nameless recipe)
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+    /// The target directory
+    #[arg(short, long, value_name = "PATH")]
     path: PathBuf,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Extract {
-    async fn exec(&self, conf: &Config) -> Result<()> {
-        let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
-        let repo_builder = HttpCachingRepoBuilder::new(".cache".into()).await?;
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let manifest = Manifest::from_file(&conf.manifest).await?;
+        let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
+            Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
+        } else {
+            Box::new(HttpRepoBuilder::new(conf.insecure))
+        };
         let mut universe = manifest
             .fetch_universe(&conf.arch, &repo_builder, conf.limit)
             .await?;
-        let (requirements, constraints) = manifest.into_requirements();
-        let solution = universe
-            .solve(requirements, constraints)
-            .map_err(|conflict| {
-                anyhow!(
-                    "failed to solve dependencies: {}",
-                    universe.display_conflict(conflict)
-                )
-            })?;
+        let (reqs, cons) =
+            manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
+        let solution = universe.solve(reqs, cons).map_err(|conflict| {
+            anyhow!(
+                "failed to solve dependencies: {}",
+                universe.display_conflict(conflict)
+            )
+        })?;
         let essentials = solution
             .iter()
             .filter_map(|id| {
@@ -402,6 +642,24 @@ impl AsyncCommand for Extract {
             .try_collect::<Vec<_>>()
             .await?;
         control_file.sort_by(|a, b| a.field("Package").unwrap().cmp(b.field("Package").unwrap()));
+        fs.create_dir_all("etc/apt", 0, 0, 0o755u32).await?;
+        {
+            let sources: Vec<u8> = manifest
+                .sources()
+                .map(|s| s.into())
+                .collect::<MutableControlFile>()
+                .into();
+            fs.create_file(
+                sources.as_slice(),
+                Some("etc/apt/sources.list"),
+                0,
+                0,
+                0o644,
+                None,
+                Some(sources.len()),
+            )
+            .await?;
+        }
         fs.create_dir_all("var/lib/dpkg", 0, 0, 0o755u32).await?;
         {
             let size = control_file.iter().map(|i| i.len() + 1).sum();
@@ -420,7 +678,18 @@ impl AsyncCommand for Extract {
                 Some(size),
             )
             .await?;
-        };
+        }
+        fs.create_dir_all("usr/sbin", 0, 0, 0o755u32).await?;
+        fs.create_file(
+            b"#!/bin/sh\nexit 101\n".as_slice(),
+            Some("usr/sbin/policy-rc.d"),
+            0,
+            0,
+            0o755,
+            None,
+            None,
+        )
+        .await?;
         let env = ["DEBIAN_FRONTEND=noninteractive"];
         dpkg(
             &self.path,
@@ -430,6 +699,7 @@ impl AsyncCommand for Extract {
             Some(&env),
         )?;
         dpkg(&self.path, ["--configure", "-a"], Some(&env))?;
+        fs.remove_file("usr/sbin/policy-rc.d").await?;
         Ok(())
     }
 }
@@ -439,13 +709,9 @@ struct Validate {}
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Validate {
-    async fn exec(&self, conf: &Config) -> Result<()> {
-        let manifest = Manifest::read(async_std::fs::File::open(&conf.manifest).await?).await?;
-        use async_std::io;
-        manifest
-            .write(&mut io::stdout())
-            .await
-            .map_err(|err| anyhow!("failed to write manifest: {}", err))?;
+    async fn exec(&self, conf: &App) -> Result<()> {
+        // let _manifest =
+        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
         Ok(())
     }
 }
@@ -453,7 +719,7 @@ impl AsyncCommand for Validate {
 #[derive(Parser)]
 struct Fetch {
     /// Architecture
-    #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
+    #[arg(short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
     arch: String,
     /// Origin repository URL
     #[arg(
@@ -479,9 +745,9 @@ struct Fetch {
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Fetch {
-    async fn exec(&self, _conf: &Config) -> Result<()> {
+    async fn exec(&self, conf: &App) -> Result<()> {
         let start = std::time::Instant::now();
-        let repo: DebRepo = HttpDebRepo::new(&self.origin).await?.into();
+        let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
         let release = if self.verify {
             repo.fetch_verify_release(&self.distr, iter::empty()).await
         } else {
@@ -863,7 +1129,7 @@ fn init_logging(quiet: bool, debug: u8) {
 }
 
 fn main() -> ExitCode {
-    let app = App::parse();
+    let mut app = App::parse();
     init_logging(app.quiet, app.debug);
     match init(&app) {
         Err(err) => {
@@ -872,12 +1138,17 @@ fn main() -> ExitCode {
         }
         Ok(_) => {}
     }
-    let conf = Config {
-        manifest: app.manifest,
-        arch: app.arch,
-        limit: app.limit,
-    };
-    match async_std::task::block_on(app.cmd.exec(&conf)) {
+    app.cache_dir = app.cache_dir.clone().or_else(|| {
+        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            Some(PathBuf::from(xdg))
+        } else if let Some(home) = std::env::var_os("HOME") {
+            Some(PathBuf::from(home).join(".cache"))
+        } else {
+            None
+        }
+        .map(|base| base.join("debrepo"))
+    });
+    match async_std::task::block_on(app.cmd.exec(&app)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             println!("{}", err);

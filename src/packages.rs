@@ -5,7 +5,7 @@ use {
             ParseError,
         },
         deb::DebReader,
-        digest::{digest_field_name, HashOf},
+        hash::{hash_field_name, HashOf},
         repo::{null_provider, DebRepo},
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
@@ -127,7 +127,7 @@ impl<'a> Package<'a> {
     pub fn repo_file(&self) -> io::Result<(&'a str, u64, HashOf<DebRepo>)> {
         let (path, size, digest) = self
             .fields()
-            .find_fields(("Filename", "Size", digest_field_name::<DebRepo>()))
+            .find_fields(("Filename", "Size", hash_field_name::<DebRepo>()))
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,

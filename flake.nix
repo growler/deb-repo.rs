@@ -15,6 +15,7 @@
         buildInputs = (with pkgs; [
             curl.dev
             openssl.dev
+            gpgme.dev
             bzip2.dev
             xz.dev
             libunistring.dev
@@ -26,6 +27,12 @@
             cargo-bloat
             cargo-fuzz
             cargo-outdated
+            cargo-machete
+            cargo-sort
+            cargo-cache
+            cargo-bloat
+            cargo-depgraph
+            cargo-benchcmp
 
             sequoia-sq
             sequoia-sqv
@@ -46,9 +53,9 @@
             ]);
             shellHook = ''
             export RUST_BACKTRACE=1
-            export PKG_CONFIG_ALL_STATIC=1
+            # export PKG_CONFIG_ALL_STATIC=1
             export RUSTFLAGS="-C link-args=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2";
-            export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
+            # export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
             '';
         } // params;
     in rec {

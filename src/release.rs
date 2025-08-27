@@ -15,7 +15,7 @@
 use {
     crate::{
         control::{ControlStanza, ParseError},
-        digest::{digest_field_name, HashOf},
+        hash::{hash_field_name, HashOf},
         packages::Packages,
         parse_size,
         repo::DebRepo,
@@ -184,7 +184,7 @@ impl Release {
                 ),
                 files_builder: |control: &'_ ControlStanza| {
                     control
-                        .field(digest_field_name::<DebRepo>())
+                        .field(hash_field_name::<DebRepo>())
                         .ok_or_else(|| {
                             ParseError::from("Field SHA256 not found in the release file")
                         })?
@@ -234,7 +234,7 @@ struct ReleaseInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{digest::HashOf, repo::DebRepo};
+    use crate::{hash::HashOf, repo::DebRepo};
 
     type Digest = HashOf<DebRepo>;
 

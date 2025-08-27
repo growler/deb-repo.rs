@@ -3,6 +3,7 @@
 /.direnv/
 /.cache/
 /.vscode/
+/out/
 **/*.log
 **/*.tmp
 **/Packages

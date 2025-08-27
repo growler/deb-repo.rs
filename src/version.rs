@@ -192,6 +192,18 @@ impl<A: Eq, N: Eq, V: Eq> PartialEq for Constraint<A, N, V> {
     }
 }
 
+impl<A: Eq, N: Eq, V> Satisfies<Constraint<Option<A>, N, Version<V>>> for Constraint<Option<A>, N, Version<V>>
+where
+    Version<V>: Eq + Ord,
+{
+    fn satisfies(&self, other: &Constraint<Option<A>, N, Version<V>>) -> bool {
+        other.arch.as_ref().map(|s| Some(s) == self.arch.as_ref()).unwrap_or(true)
+            && self.name.eq(&other.name)
+            && self.range.satisfies(&other.range)
+    }
+}
+
+
 impl<A: DisplayName, N: Display, V: Display> Display for Constraint<A, N, V> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.range().fmt_name(self.arch.fmt_name(&self.name)).fmt(f)
@@ -420,6 +432,67 @@ impl<V: Eq> PartialEq for VersionSet<V> {
     }
 }
 
+impl<V> Satisfies<VersionSet<V>> for VersionSet<V>
+where
+    V: Eq + Ord,
+{
+    fn satisfies(&self, req: &VersionSet<V>) -> bool {
+        use VersionSet::*;
+
+        // If the required set is empty, only the empty set satisfies it.
+        if let None = req {
+            return matches!(self, None);
+        }
+
+        match (self, req) {
+            // Trivial cases
+            (None, _) => true,          // ∅ ⊆ anything
+            (Any, Any) => true,
+            (Any, _) => false,          // U ⊆ X  => X must be U
+
+            // Single-point set {a} ⊆ req  <=>  a ∈ req
+            (Exactly(a), r) => a.satisfies(r),
+
+            // "All but a" can only be ⊆ Any or exactly the same "Except(a)"
+            (Except(_), Any) => true,
+            (Except(a), Except(b)) => a == b,
+            (Except(_), _) => false,
+
+            // (-∞, a) subsets
+            (StrictlyEarlierThan(_), Any) => true,
+            (StrictlyEarlierThan(a), StrictlyEarlierThan(b)) => a <= b,
+            (StrictlyEarlierThan(a), EarlierOrEqualThan(b)) => a <= b,
+            // S ⊆ (U \ {x}) iff x ∉ S  -> x >= a
+            (StrictlyEarlierThan(a), Except(x)) => x >= a,
+            (StrictlyEarlierThan(_), _) => false,
+
+            // (-∞, a] subsets
+            (EarlierOrEqualThan(_), Any) => true,
+            (EarlierOrEqualThan(a), StrictlyEarlierThan(b)) => a < b,
+            (EarlierOrEqualThan(a), EarlierOrEqualThan(b)) => a <= b,
+            // S ⊆ (U \ {x}) iff x ∉ S  -> x > a
+            (EarlierOrEqualThan(a), Except(x)) => x > a,
+            (EarlierOrEqualThan(_), _) => false,
+
+            // (a, ∞) subsets
+            (StrictlyLaterThan(_), Any) => true,
+            (StrictlyLaterThan(a), StrictlyLaterThan(b)) => a >= b,
+            (StrictlyLaterThan(a), LaterOrEqualThan(b)) => a >= b,
+            // S ⊆ (U \ {x}) iff x ∉ S  -> x <= a
+            (StrictlyLaterThan(a), Except(x)) => x <= a,
+            (StrictlyLaterThan(_), _) => false,
+
+            // [a, ∞) subsets
+            (LaterOrEqualThan(_), Any) => true,
+            (LaterOrEqualThan(a), StrictlyLaterThan(b)) => a > b,
+            (LaterOrEqualThan(a), LaterOrEqualThan(b)) => a >= b,
+            // S ⊆ (U \ {x}) iff x ∉ S  -> x < a
+            (LaterOrEqualThan(a), Except(x)) => x < a,
+            (LaterOrEqualThan(_), _) => false,
+        }
+    }
+}
+
 struct VersionSetDisplay<'a, V: Display, N: Display> {
     name: N,
     range: &'a VersionSet<V>,
@@ -550,11 +623,11 @@ where
     }
 }
 
-impl<V> Satisfies<VersionSet<Version<V>>> for Version<V>
+impl<V> Satisfies<VersionSet<V>> for V
 where
-    Version<V>: Eq + Ord,
+    V: Eq + Ord,
 {
-    fn satisfies(&self, set: &VersionSet<Version<V>>) -> bool {
+    fn satisfies(&self, set: &VersionSet<V>) -> bool {
         match set {
             VersionSet::Any => true,
             VersionSet::StrictlyEarlierThan(set) => self < set,
@@ -864,6 +937,40 @@ impl<'a> Iterator for ParsedConstraintIterator<'a> {
                 }
                 err => Some(err),
             }
+        }
+    }
+}
+
+impl std::str::FromStr for Constraint<Option<String>, String, Version<String>> {
+    type Err = ParseError;
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let dep = Constraint::parse_internal(&mut parser, true)?;
+        if parser.is_empty() {
+            Ok(dep.translate(
+                |a| a.map(|s| s.to_string()),
+                |n| n.to_string(),
+                |v| v.translate(|s| s.to_string()),
+            ))
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
+}
+
+impl<'a> TryFrom<&'a str> for Constraint<Option<&'a str>, &'a str, Version<&'a str>> {
+    type Error = ParseError;
+    fn try_from(src: &'a str) -> Result<Self, Self::Error> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let dep = Constraint::parse_internal(&mut parser, true)?;
+        if parser.is_empty() {
+            Ok(dep)
+        } else {
+            Err("unexpected remaining input".into())
         }
     }
 }

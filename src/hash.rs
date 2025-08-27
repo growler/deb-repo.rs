@@ -1,7 +1,8 @@
 //! Digest verification
 
-pub use digest::{FixedOutputReset, Output as HashOutput};
+pub use digest::{Output as HashOutput};
 use {
+    digest::FixedOutputReset,
     ::serde::{
         de::{self, Visitor},
         Deserialize, Deserializer, Serialize, Serializer,
@@ -37,7 +38,7 @@ pub trait HashPolicy {
 }
 pub(crate) type HashOf<T> = Hash<<T as HashPolicy>::Algo>;
 pub(crate) type HashAlgoOf<T> = <T as HashPolicy>::Algo;
-pub(crate) const fn digest_field_name<T: HashPolicy>() -> &'static str 
+pub(crate) const fn hash_field_name<T: HashPolicy>() -> &'static str 
 where 
     T::Algo: HashFieldName,
 {
@@ -84,7 +85,7 @@ impl<'de, D: HashAlgo> Deserialize<'de> for Hash<D> {
 pub mod serde {
     // Hexadecimal encoding (default). Accepts mixed case, outputs only lowercase.
     pub mod hex {
-        use crate::digest::{Hash, HashAlgo, HashOutput};
+        use crate::hash::{Hash, HashAlgo, HashOutput};
         use serde::{
             de::{self, Visitor},
             Deserializer, Serializer,
@@ -135,7 +136,7 @@ pub mod serde {
 
     // base64 URL-safe encoding
     pub mod base64 {
-        use crate::digest::{Hash, HashAlgo, HashOutput};
+        use crate::hash::{Hash, HashAlgo, HashOutput};
         use ::base64::prelude::*;
         use serde::{
             de::{self, Visitor},
@@ -200,10 +201,6 @@ impl<D: HashAlgo> std::ops::Deref for Hash<D> {
     fn deref(&self) -> &Self::Target {
         &self.inner
     }
-}
-
-pub(crate) trait GetDigest<D: HashAlgo> {
-    fn get_digest(&mut self) -> Hash<D>;
 }
 
 impl<D: HashAlgo> Clone for Hash<D> {
@@ -348,12 +345,9 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
             inner: reader,
         }
     }
-}
-
-impl<D: HashAlgo, R: Read + Unpin + Send> GetDigest<D> for HashingReader<D, R> {
-    fn get_digest(&mut self) -> Hash<D> {
+    pub fn into_hash(self) -> Hash<D> {
         Hash {
-            inner: self.digester.finalize_fixed_reset(),
+            inner: self.digester.finalize_fixed(),
         }
     }
 }
@@ -376,6 +370,90 @@ impl<D: HashAlgo, R: Read + Unpin + Send> Read for HashingReader<D, R> {
     }
 }
 
+pub struct SyncHashingWriter<D: HashAlgo, W: std::io::Write> {
+    digester: D,
+    inner: W,
+}
+
+impl<D: HashAlgo + Default, W: std::io::Write> SyncHashingWriter<D, W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            digester: D::default(),
+            inner: writer,
+        }
+    }
+    pub fn into_hash(self) -> Hash<D> {
+        Hash {
+            inner: self.digester.finalize_fixed(),
+        }
+    }
+}
+
+impl<D: HashAlgo, W: std::io::Write> std::io::Write for SyncHashingWriter<D, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        match self.inner.write(buf) {
+            Ok(0) => Ok(0),
+            Ok(size) => {
+                self.digester.update(&buf[0..size]);
+                Ok(size)
+            }
+            Err(err) => Err(err),
+        }
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+#[pin_project]
+pub struct HashingWriter<D: HashAlgo, W: Write + Unpin + Send> {
+    digester: D,
+    #[pin]
+    inner: W,
+}
+
+impl<D: HashAlgo + Default + Send, W: Write + Unpin + Send> HashingWriter<D, W> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            digester: D::default(),
+            inner: writer,
+        }
+    }
+
+    pub fn into_hash(self) -> Hash<D> {
+        Hash {
+            inner: self.digester.finalize_fixed(),
+        }
+    }
+}
+
+impl<D: HashAlgo, W: Write + Unpin + Send> Write for HashingWriter<D, W> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let mut this = self.project();
+        match this.inner.as_mut().poll_write(cx, buf) {
+            Poll::Ready(Ok(0)) => Poll::Ready(Ok(0)),
+            Poll::Ready(Ok(size)) => {
+                this.digester.update(&buf[..size]);
+                Poll::Ready(Ok(size))
+            }
+            Poll::Ready(Err(e)) => Poll::Ready(Err(e)),
+            Poll::Pending => Poll::Pending,
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().inner.poll_flush(cx)
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.project().inner.poll_close(cx)
+    }
+}
+
 #[pin_project]
 pub struct VerifyingReader<D: HashAlgo, R: Read + Unpin + Send> {
     digester: D,
@@ -384,14 +462,6 @@ pub struct VerifyingReader<D: HashAlgo, R: Read + Unpin + Send> {
     read: u64,
     #[pin]
     inner: R,
-}
-
-impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> GetDigest<D> for VerifyingReader<D, R> {
-    fn get_digest(&mut self) -> Hash<D> {
-        Hash {
-            inner: self.digest.clone(),
-        }
-    }
 }
 
 impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {

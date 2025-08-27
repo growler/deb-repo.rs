@@ -2,7 +2,7 @@
 
 use {
     crate::{
-        digest::{HashOf, HashAlgoOf, VerifyingReader},
+        hash::{HashOf, HashAlgoOf, VerifyingReader},
         repo::DebRepoProvider,
     },
     async_std::{

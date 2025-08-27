@@ -3,8 +3,9 @@
 mod control;
 mod deb;
 mod deployfs;
-pub mod digest;
+pub mod hash;
 pub mod exec;
+pub mod cli;
 mod fsrepo;
 mod httprepo;
 mod idmap;
@@ -15,8 +16,10 @@ mod repo;
 mod universe;
 mod version;
 mod builder;
+mod arch;
 
 pub use {
+    arch::DEFAULT_ARCH,
     control::{
         ControlField, ControlFile, ControlParser, ControlStanza, Field, MutableControlField,
         MutableControlFile, MutableControlStanza, ParseError,
@@ -25,7 +28,7 @@ pub use {
     deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSDebRepo,
     httprepo::{HttpDebRepo, HttpRepoBuilder, HttpCachingDebRepo, HttpCachingRepoBuilder},
-    manifest::{LockFile, Manifest},
+    manifest::{Source, SignedBy, Manifest, LockFile, ManifestFile},
     packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::{

@@ -260,6 +260,7 @@ fn exec_cmd<As: AsRef<CStr>, Es: AsRef<CStr>>(
         Some(""),
     )
     .context("mounting /run")?;
+    mkdir("/run/lock", Mode::from_bits(0o1777u32).unwrap()).context("mkdir /tmp")?;
     if let Some(cwd) = cwd {
         chdir(cwd).context("changing working directory")?;
     }
@@ -404,11 +405,7 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn dpkg<Rp, A, E>(
-    root: Rp,
-    args: A,
-    env: Option<E>,
-) -> Result<ExitCode>
+pub fn dpkg<Rp, A, E>(root: Rp, args: A, env: Option<E>) -> Result<ExitCode>
 where
     Rp: AsRef<Path>,
     A: IntoIterator,

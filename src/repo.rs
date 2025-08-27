@@ -3,7 +3,7 @@
 use {
     crate::{
         deb::DebReader,
-        digest::{HashAlgoOf, HashOf, HashPolicy},
+        hash::{HashAlgoOf, HashOf, HashPolicy},
         release::Release,
     },
     async_compression::futures::bufread::{
@@ -12,137 +12,26 @@ use {
     async_std::{io, path::Path},
     async_trait::async_trait,
     futures::io::{copy, AsyncRead, AsyncReadExt, AsyncWrite, BufReader},
-    sequoia_openpgp::{
-        self as openpgp,
-        cert::prelude::*,
-        parse::{
-            stream::{
-                GoodChecksum, MessageLayer, MessageStructure, VerificationHelper, VerifierBuilder,
-            },
-            Parse,
-        },
-        Cert, KeyHandle,
-    },
     std::{
-        ffi::OsStr,
-        io::Read,
         pin::{pin, Pin},
         sync::Arc,
     },
     tracing::{info, trace, warn},
 };
 
-struct ReleaseVerifier {
-    keyrings: Vec<async_std::path::PathBuf>,
+pub enum KeyMaterial<'a> {
+    Key(&'a [u8]),
+    KeyFile(&'a Path),
 }
 
-impl ReleaseVerifier {
-    fn new<P>(keyrings: P) -> Self
-    where
-        P: IntoIterator,
-        P::Item: AsRef<Path>,
-    {
-        Self { keyrings: keyrings.into_iter().map(|p| p.as_ref().to_path_buf()).collect() }
-    }
-    fn verify(self, release: &[u8]) -> anyhow::Result<Vec<u8>> {
-        let policy = openpgp::policy::StandardPolicy::new();
-        let mut verifier =
-            VerifierBuilder::from_bytes(release)?.with_policy(&policy, None, self)?;
-        let mut sink = Vec::<u8>::with_capacity(release.len());
-        verifier.read_to_end(&mut sink)?;
-        Ok(sink)
-    }
-}
-
-impl VerificationHelper for ReleaseVerifier {
-    fn get_certs(&mut self, ids: &[KeyHandle]) -> anyhow::Result<Vec<Cert>> {
-        let mut certs = std::iter::once((
-            OsStr::new("<builtin>"),
-            CertParser::from_bytes(DEBIAN_KEYRING),
-        ))
-        .chain(
-            self.keyrings
-                .iter()
-                .map(|filename| (filename.as_os_str(), CertParser::from_file(filename))),
-        )
-        .filter_map(|(name, parser)| match parser {
-            Ok(p) => Some((name, p)),
-            Err(err) => {
-                warn!("Failed to read keyring {:#?}: {}", name, err);
-                None
+impl KeyMaterial<'_> {
+    fn import_into(&self, ctx: &mut gpgme::Context) -> io::Result<()> {
+        match self {
+            KeyMaterial::Key(data) => {
+                ctx.import(*data)?;
             }
-        })
-        .flat_map(|(name, parser)| {
-            parser
-                .unvalidated_cert_filter(|cert, _| {
-                    cert.keys().key_handles(ids.iter()).next().is_some()
-                })
-                .filter_map(move |cert| match cert {
-                    Ok(c) => Some(c),
-                    Err(err) => {
-                        warn!("Malformed certificate in keyring {:#?}: {}", name, err);
-                        None
-                    }
-                })
-        })
-        .collect::<Vec<_>>();
-        certs.sort_by(|a, b| a.fingerprint().cmp(&b.fingerprint()));
-        let count = certs.len();
-        let (certs, errs) = certs.into_iter().fold(
-            (Vec::with_capacity(count), Vec::new()),
-            |(mut certs, mut errs), a| {
-                if certs.is_empty() {
-                    certs.push(a);
-                } else if certs[certs.len() - 1].fingerprint() == a.fingerprint() {
-                    match certs
-                        .pop()
-                        .expect("non-empty signatures vec")
-                        .merge_public(a)
-                    {
-                        Ok(cert) => certs.push(cert),
-                        Err(err) => errs.push(err),
-                    }
-                } else {
-                    certs.push(a);
-                }
-                (certs, errs)
-            },
-        );
-        if !errs.is_empty() {
-            warn!("Error merging duplicate keys:");
-            for err in errs.iter() {
-                warn!("  {}", err);
-            }
-        }
-        trace!("Using {} keys for verification", certs.len());
-        Ok(certs)
-    }
-
-    fn check(&mut self, structure: MessageStructure) -> anyhow::Result<()> {
-        for (i, layer) in structure.into_iter().enumerate() {
-            match layer {
-                MessageLayer::Encryption { .. } if i == 0 => (),
-                MessageLayer::Compression { .. } if i == 1 => (),
-                MessageLayer::SignatureGroup { ref results } => {
-                    if results
-                        .iter()
-                        .filter_map(|res| match res {
-                            Ok(GoodChecksum { sig, ka, .. }) => {
-                                info!("Verified signature by key {:X}", ka.cert().fingerprint());
-                                Some(sig)
-                            }
-                            Err(err) => {
-                                warn!("Signature verification error: {}", err);
-                                None
-                            }
-                        })
-                        .count()
-                        == 0
-                    {
-                        return Err(anyhow::anyhow!("No valid signature"));
-                    }
-                }
-                _ => return Err(anyhow::anyhow!("Unexpected message structure")),
+            KeyMaterial::KeyFile(path) => {
+                ctx.import(std::fs::File::open(path)?)?;
             }
         }
         Ok(())
@@ -195,7 +84,14 @@ impl Clone for DebRepo {
 
 #[async_trait]
 pub trait DebRepoBuilder: Send + Sync {
-    async fn build<U: AsRef<str> + Send>(&self, url: U) -> io::Result<DebRepo>;
+    async fn build(&self, url: &str) -> io::Result<DebRepo>;
+}
+
+#[async_trait]
+impl<T: DebRepoBuilder + ?Sized> DebRepoBuilder for Box<T> {
+    async fn build(&self, url: &str) -> io::Result<DebRepo> {
+        (**self).build(url).await
+    }
 }
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
@@ -217,18 +113,36 @@ impl DebRepo {
     pub async fn fetch_verify_release(
         &self,
         distr: &str,
-        keyrings: impl IntoIterator<Item = &Path>,
+        keys: impl IntoIterator<Item = KeyMaterial<'_>>,
     ) -> io::Result<Release> {
         let data = self.fetch(&format!("dists/{}/InRelease", distr)).await?;
-        let verifier = ReleaseVerifier::new(keyrings);
-        let plaintext = verifier.verify(&data).map_err(|err| {
-            io::Error::new(
+
+        let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
+        let tempdir = tempfile::tempdir()?;
+        ctx.set_engine_home_dir(tempdir.path().as_os_str().as_encoded_bytes())?;
+        ctx.set_flag("auto-key-retrieve", "0")?;
+
+        ctx.import(DEBIAN_KEYRING)?;
+
+        for key in keys {
+            key.import_into(&mut ctx)?
+        }
+
+        let mut plaintext = Vec::new();
+        let verify_result = ctx.verify_opaque(data, &mut plaintext)?;
+        if let Some(signature) = verify_result.signatures().next() {
+            if let Err(err) = signature.status() {
+                return Err(err.into());
+            }
+        } else {
+            return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("failed to verify release: {}", err),
-            )
-        })?;
+                "no signature found in InRelease",
+            ));
+        }
         let file = String::from_utf8(plaintext)
-            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, format!("{}", err)))?;
+            .map_err(|err| io::Error::new(io::ErrorKind::InvalidData, err.to_string()))?;
+
         Release::new(self.clone(), distr, file.into_boxed_str()).map_err(|err| err.into())
     }
     /// Fetch the Release file, skip verification.
@@ -425,7 +339,7 @@ fn unpacker<'a, R: AsyncRead + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn AsyncRea
         ".gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
         ".bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
         ".lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
-        ".zstd" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+        ".zstd" | ".zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
         _ => Box::pin(r),
     }
 }

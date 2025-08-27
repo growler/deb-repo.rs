@@ -3,9 +3,7 @@ pub use async_tar::{
     EntryType as TarballEntryType,
 };
 use {
-    crate::{
-        control::MutableControlStanza, deployfs::DeploymentFile, digest::GetDigest, parse_size,
-    },
+    crate::{control::MutableControlStanza, deployfs::DeploymentFile, parse_size, hash::HashingReader},
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
@@ -331,7 +329,7 @@ impl DebReader {
             ".gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
             ".bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
             ".lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
-            ".zstd" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+            ".zstd" | ".zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
             _ => Box::pin(r),
         })
     }
@@ -502,7 +500,16 @@ impl DebReader {
                             format!("package file name {:?} is not a valid UTF-8", path),
                         )
                     })
-                    .map(|p| if p.starts_with('.') { &p[1..] } else { p })?;
+                    .map(|p| if p.starts_with('.') { &p[1..] } else { p })
+                    .map(|p| {
+                        if p == "/" {
+                            "/."
+                        } else if p.ends_with('/') {
+                            &p[..p.len() - 1]
+                        } else {
+                            p
+                        }
+                    })?;
                 installed_files.push(path_str.to_owned());
                 match entry.header().entry_type() {
                     TarballEntryType::Directory => {
@@ -540,7 +547,7 @@ impl DebReader {
                                 })?,
                             Some((_, sum)) => {
                                 let mut hasher =
-                                    crate::digest::HashingReader::<md5::Md5, _>::new(entry);
+                                    HashingReader::<md5::Md5, _>::new(entry);
                                 let file = fs
                                     .create_file(
                                         &mut hasher,
@@ -563,7 +570,7 @@ impl DebReader {
                                             ),
                                         )
                                     })?;
-                                let hash = hasher.get_digest();
+                                let hash = hasher.into_hash();
                                 sum.replace(hash.into());
                                 file
                             }
