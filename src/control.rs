@@ -1,8 +1,12 @@
-/// Provides an interface to work with Debian Control files.
-/// See <https://www.debian.org/doc/debian-policy/ch-controlfields.html>.
+/// Utilities for parsing Debian control files (control fields).
+/// See <https://www.debian.org/doc/debian-policy/ch-controlfields.html> for the
+/// official specification.
 ///
-/// The parser does not process comments and is only suitable
-/// for parsing binary package descriptions.
+/// This parser focuses on machine-readable package metadata (for example,
+/// binary package descriptions and Packages index files). It does not
+/// interpret Debian-style comments and is not a full implementation of the
+/// Debian policy — it is intended for parsing and extracting fields rather
+/// than preserving formatting or comments when serializing.
 use {
     crate::idmap::IntoBoxed,
     std::{borrow::Cow, usize},

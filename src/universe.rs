@@ -2,11 +2,10 @@ use {
     crate::{
         control::ParseError,
         deb::DebReader,
-        hash::{hash_field_name, HashOf},
+        hash::{hash_field_name, HashAlgo},
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
-        repo::DebRepo,
-        version::{self, Constraint, Dependency, ProvidedName, Satisfies, Version},
+        version::{self, Constraint, Dependency, Satisfies, Version},
     },
     futures::io::{copy, AsyncRead, AsyncWrite},
     iterator_ext::IteratorExt,
@@ -102,6 +101,7 @@ struct Solvable<'a> {
     arch: ArchId,
     name: NameId,
     pkgs: u32,
+    version: Version<&'a str>,
     package: &'a Package<'a>,
 }
 
@@ -113,14 +113,8 @@ impl<'a> std::fmt::Debug for Solvable<'a> {
             self.name.to_index(),
             self.package.name(),
             self.package.architecture(),
-            self.package.version()
+            self.version,
         )
-    }
-}
-
-impl<'a> Solvable<'a> {
-    fn full_name(&self) -> ProvidedName<NameId, Version<&'a str>> {
-        ProvidedName::Exact(self.name, self.package.version())
     }
 }
 
@@ -145,12 +139,14 @@ struct InnerUniverse {
 }
 
 impl<'a> UniverseIndex<'a> {
-    fn get_arch_id(&self, arch: &'a str) -> ArchId {
-        if arch.eq_ignore_ascii_case("all") {
-            ArchId::Any
-        } else {
-            self.archlist.get_or_insert(arch).into()
-        }
+    fn get_arch_id(&self, arch: &Option<&'a str>) -> ArchId {
+        arch.map_or(ArchId::Any, |arch| {
+            if arch.eq_ignore_ascii_case("all") {
+                ArchId::Any
+            } else {
+                self.archlist.get_or_insert(arch).into()
+            }
+        })
     }
     fn insert_or_update_name(
         &self,
@@ -185,39 +181,28 @@ impl<'a> UniverseIndex<'a> {
             k
         }
     }
-    fn intern_version_set<A, N, V>(
+    fn intern_version_set<R: AsRef<str>>(
         &self,
-        dep: Constraint<Option<A>, N, Version<V>>,
+        dep: Constraint<R>,
         strings: &'a IdMap<StringId, Box<str>>,
-    ) -> VersionSetId
-    where
-        A: AsRef<str>,
-        N: AsRef<str>,
-        V: AsRef<str>,
-    {
+    ) -> VersionSetId {
         self.get_single_dependency_id(dep.translate(
-            |a| {
-                a.as_ref()
-                    .map_or(self.arch, |a| self.get_arch_id(strings.intern(a).as_ref()))
-            },
+            |a| strings.intern(a.as_ref()).as_ref(),
             |n| strings.intern(n).as_ref(),
             |v| v.translate(|v| strings.intern(v).as_ref()),
         ))
     }
-    fn get_single_dependency_id(
-        &self,
-        dep: Constraint<ArchId, &'a str, Version<&'a str>>,
-    ) -> VersionSetId {
+    fn get_single_dependency_id(&self, dep: Constraint<&'a str>) -> VersionSetId {
         self.version_sets.get_or_insert(VersionSet {
             name: self.insert_or_update_name(dep.name(), None).into(),
-            arch: *dep.arch(),
+            arch: self.get_arch_id(dep.arch()),
             selfref: None,
             range: dep.into_range(),
         })
     }
     fn get_union_dependency_id(
         &self,
-        deps: impl Iterator<Item = Constraint<ArchId, &'a str, Version<&'a str>>>,
+        deps: impl Iterator<Item = Constraint<&'a str>>,
     ) -> VersionSetUnionId {
         self.version_set_unions
             .get_or_insert(deps.map(|dep| self.get_single_dependency_id(dep)).collect())
@@ -231,7 +216,7 @@ impl<'a> UniverseIndex<'a> {
     ) -> Result<(), ParseError> {
         let solvable_id: SolvableId = self.solvables.len().into_id();
         let is_required = package.essential() || package.required();
-        let arch = self.get_arch_id(package.architecture());
+        let arch = self.get_arch_id(&Some(package.architecture()));
         let name =
             match self.insert_or_update_name(package.name(), Some((solvable_id, is_required))) {
                 UpdateResult::Updated(id) => id,
@@ -242,11 +227,13 @@ impl<'a> UniverseIndex<'a> {
                     id
                 }
             };
+        let version = package.version()?;
         self.solvables.push(Solvable {
             pkgs,
             arch,
             name,
             package,
+            version,
         });
         for pv in package.provides() {
             self.insert_or_update_name(pv?.name(), Some((solvable_id, false)));
@@ -256,7 +243,7 @@ impl<'a> UniverseIndex<'a> {
     fn add_single_package_dependency(
         &self,
         id: SolvableId,
-        dep: Constraint<Option<&'a str>, &'a str, Version<&'a str>>,
+        dep: Constraint<&'a str>,
     ) -> VersionSetId {
         let pkg = &self.solvables[id.to_index()];
         let self_ref = pkg.package.provides_name(dep.name());
@@ -311,7 +298,7 @@ impl<'a> UniverseIndex<'a> {
                     strings
                         .intern(format!(
                             "error parsing dependencies for {}: {}",
-                            pkg.package.full_name(),
+                            pkg.package.raw_full_name(),
                             err
                         ))
                         .as_id(),
@@ -331,7 +318,7 @@ impl<'a> UniverseIndex<'a> {
                     strings
                         .intern(format!(
                             "error parsing constrains for {}: {}",
-                            pkg.package.full_name(),
+                            pkg.package.raw_full_name(),
                             err
                         ))
                         .as_id(),
@@ -377,17 +364,17 @@ impl Universe {
                                 .iter()
                                 .map(|sid| {
                                     let solvable = &index.solvables[sid.to_index()];
-                                    index.version_sets.get_or_insert(VersionSet {
+                                    Ok(index.version_sets.get_or_insert(VersionSet {
                                         name,
                                         arch: solvable.arch,
                                         selfref: None,
                                         range: index.solvables[sid.to_index()]
-                                            .full_name()
-                                            .version()
+                                            .version
+                                            .clone()
                                             .into(),
-                                    })
+                                    }))
                                 })
-                                .collect();
+                                .collect::<std::result::Result<_, ParseError>>()?;
                             index.required.push(match pkgs.len() {
                                 1 => Requirement::Single(pkgs[0]),
                                 _ => {
@@ -402,17 +389,15 @@ impl Universe {
             ),
         })
     }
-    pub fn solve<A, N, V, Id, Ic>(
+    pub fn solve<R, Id, Ic>(
         &mut self,
         requirements: Id,
         constraints: Ic,
     ) -> std::result::Result<Vec<PackageId>, resolvo::conflict::Conflict>
     where
-        A: AsRef<str>,
-        N: AsRef<str>,
-        V: AsRef<str>,
-        Id: IntoIterator<Item = Dependency<Option<A>, N, Version<V>>>,
-        Ic: IntoIterator<Item = Constraint<Option<A>, N, Version<V>>>,
+        R: AsRef<str>,
+        Id: IntoIterator<Item = Dependency<R>>,
+        Ic: IntoIterator<Item = Constraint<R>>,
     {
         let problem = resolvo::Problem::new()
             .requirements(
@@ -485,99 +470,95 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables[solvable.to_index()].pkgs as usize)
     }
-    pub async fn deb_reader(
-        &self,
-        id: PackageId,
-    ) -> io::Result<DebReader> {
-        let (repo, path, size, hash) = self.inner.provider().with(|u| {
+    pub async fn package_file(&self, id: PackageId, hash_field_name: &'static str) -> io::Result<(&'_ str, u64, Box<[u8]>)> {
+        self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
-            let (path, size, hash) = s.package.repo_file()?;
-            Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
-        })?;
-        repo.verifying_deb_reader(path, size, hash).await
+            let (path, size, hash) = s.package.repo_file(hash_field_name)?;
+            Ok::<_, io::Error>((path, size, hash))
+        })
     }
-    pub async fn deb_file_reader(
-        &self,
-        id: PackageId,
-    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-        let (repo, path, size, hash) = self.inner.provider().with(|u| {
-            let s = &u.index.solvables[id.to_index()];
-            let (path, size, hash) = s.package.repo_file()?;
-            Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
-        })?;
-        repo.verifying_reader(path, size, hash).await
-    }
-    pub async fn copy_deb_file<W: AsyncWrite + Send>(
-        &self,
-        w: W,
-        id: PackageId,
-    ) -> io::Result<u64> {
-        let (repo, path, size, hash) = self.inner.provider().with(|u| {
-            let s = &u.index.solvables[id.to_index()];
-            let (path, size, hash) = s.package.repo_file()?;
-            Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
-        })?;
-        copy(repo.verifying_reader(path, size, hash).await?, &mut pin!(w)).await
-    }
+    // pub async fn deb_file_reader(
+    //     &self,
+    //     id: PackageId,
+    // ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+    //     let (repo, path, size, hash) = self.inner.provider().with(|u| {
+    //         let s = &u.index.solvables[id.to_index()];
+    //         let (path, size, hash) = s.package.repo_file()?;
+    //         Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
+    //     })?;
+    //     repo.verifying_reader(path, size, hash).await
+    // }
+    // pub async fn copy_deb_file<W: AsyncWrite + Send>(
+    //     &self,
+    //     w: W,
+    //     id: PackageId,
+    // ) -> io::Result<u64> {
+    //     let (repo, path, size, hash) = self.inner.provider().with(|u| {
+    //         let s = &u.index.solvables[id.to_index()];
+    //         let (path, size, hash) = s.package.repo_file()?;
+    //         Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
+    //     })?;
+    //     copy(repo.verifying_reader(path, size, hash).await?, &mut pin!(w)).await
+    // }
 }
 
-pub struct DebFetcher<'a> {
-    u: &'a Universe,
-    i: PackageId,
-}
+// pub struct DebFetcher<'a> {
+//     u: &'a Universe,
+//     i: PackageId,
+// }
+//
+// impl<'a> DebFetcher<'a> {
+//     pub fn hash(&self) -> io::Result<HashOf<DebRepo>> {
+//         self.u
+//             .package(self.i)
+//             .ok_or_else(|| {
+//                 io::Error::new(
+//                     io::ErrorKind::NotFound,
+//                     format!("package id {} not found", self.i.to_index()),
+//                 )
+//             })
+//             .and_then(|pkg| {
+//                 pkg.field(hash_field_name::<DebRepo>()).ok_or_else(|| {
+//                     io::Error::new(
+//                         io::ErrorKind::InvalidData,
+//                         format!(
+//                             "package id {} has no SHA256 field\n{}",
+//                             self.i.to_index(),
+//                             &pkg
+//                         ),
+//                     )
+//                 })
+//             })
+//             .and_then(|hash| hash.try_into())
+//     }
+//     pub async fn deb(&self) -> io::Result<DebReader> {
+//         self.u.deb_reader(self.i).await
+//     }
+// }
+//
+// pub struct FetcherIterator<'a, I: Iterator<Item = PackageId>> {
+//     u: &'a Universe,
+//     i: I,
+// }
+//
+// impl<'a, I: Iterator<Item = PackageId>> Iterator for FetcherIterator<'a, I> {
+//     type Item = DebFetcher<'a>;
+//     fn next(&mut self) -> Option<DebFetcher<'a>> {
+//         self.i.next().map(|id| DebFetcher { u: self.u, i: id })
+//     }
+// }
 
-impl<'a> DebFetcher<'a> {
-    pub fn hash(&self) -> io::Result<HashOf<DebRepo>> {
-        self.u
-            .package(self.i)
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("package id {} not found", self.i.to_index()),
-                )
-            })
-            .and_then(|pkg| {
-                pkg.field(hash_field_name::<DebRepo>()).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "package id {} has no SHA256 field\n{}",
-                            self.i.to_index(),
-                            &pkg
-                        ),
-                    )
-                })
-            })
-            .and_then(|hash| hash.try_into())
-    }
-    pub async fn deb(&self) -> io::Result<DebReader> {
-        self.u.deb_reader(self.i).await
-    }
-}
-
-pub struct FetcherIterator<'a, I: Iterator<Item = PackageId>> {
-    u: &'a Universe,
-    i: I,
-}
-
-impl<'a, I: Iterator<Item = PackageId>> Iterator for FetcherIterator<'a, I> {
-    type Item = DebFetcher<'a>;
-    fn next(&mut self) -> Option<DebFetcher<'a>> {
-        self.i.next().map(|id| DebFetcher { u: self.u, i: id })
-    }
-}
-
-impl Universe {
-    pub fn fetch<I: IntoIterator<Item = PackageId>>(
-        &self,
-        it: I,
-    ) -> FetcherIterator<'_, <I as IntoIterator>::IntoIter> {
-        FetcherIterator {
-            u: self,
-            i: it.into_iter(),
-        }
-    }
-}
+// impl Universe {
+//     pub fn fetch<I: IntoIterator<Item = PackageId>>(
+//         &self,
+//         it: I,
+//     ) -> FetcherIterator<'_, <I as IntoIterator>::IntoIter> {
+//         FetcherIterator {
+//             u: self,
+//             i: it.into_iter(),
+//         }
+//     }
+// }
 
 impl std::fmt::Debug for Universe {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -586,32 +567,21 @@ impl std::fmt::Debug for Universe {
 }
 
 impl InnerUniverse {
-    fn intern_single_dependency<A, N, V>(
-        &self,
-        dep: Constraint<Option<A>, N, Version<V>>,
-    ) -> VersionSetId
+    fn intern_single_dependency<R>(&self, dep: Constraint<R>) -> VersionSetId
     where
-        A: AsRef<str>,
-        N: AsRef<str>,
-        V: AsRef<str>,
+        R: AsRef<str>,
     {
         self.with(|u| u.index.intern_version_set(dep, &u.interned))
     }
-    fn intern_union_dependency<A, N, V, U>(&self, vsu: U) -> VersionSetUnionId
+    fn intern_union_dependency<R, U>(&self, vsu: U) -> VersionSetUnionId
     where
-        A: AsRef<str>,
-        N: AsRef<str>,
-        V: AsRef<str>,
-        U: IntoIterator<Item = Constraint<Option<A>, N, Version<V>>>,
+        R: AsRef<str>,
+        U: IntoIterator<Item = Constraint<R>>,
     {
         self.with(|u| {
             u.index.get_union_dependency_id(vsu.into_iter().map(|dep| {
                 dep.translate(
-                    |a| {
-                        a.as_ref().map_or(u.index.arch, |a| {
-                            u.index.get_arch_id(u.interned.intern(a).as_ref())
-                        })
-                    },
+                    |a| u.interned.intern(a).as_ref(),
                     |n| u.interned.intern(n).as_ref().as_ref(),
                     |v| v.translate(|v| u.interned.intern(v).as_ref()),
                 )
@@ -637,6 +607,7 @@ impl InnerUniverse {
     fn package(&self, id: SolvableId) -> &'_ Package<'_> {
         self.with_index(|i| i.solvables[id.to_index()].package)
     }
+    #[allow(dead_code)]
     fn lookup_by_name(&self, s: &[SolvableId], name: &str) -> Option<SolvableId> {
         self.with_index(|i| {
             i.names.get(name).and_then(|n| {
@@ -649,6 +620,7 @@ impl InnerUniverse {
             })
         })
     }
+    #[allow(dead_code)]
     fn debug_node(
         &self,
         s: &[SolvableId],
@@ -829,9 +801,6 @@ impl InnerUniverse {
                 pos[&v]
             );
         }
-        self.debug_node(solution, &g, "init-system-helpers");
-        self.debug_node(solution, &g, "usrmerge");
-        self.debug_node(solution, &g, "gpgv");
         (order, breaks)
     }
 }
@@ -894,8 +863,8 @@ impl Interner for InnerUniverse {
         self.with_index(|i| {
             let vs = &i.version_sets[version_set];
             Constraint::new(
-                Some(&i.archlist[vs.arch]),
-                &i.names[vs.name].name,
+                Some(i.archlist[vs.arch]),
+                i.names[vs.name].name,
                 vs.range.clone(),
             )
         })
@@ -917,13 +886,13 @@ impl Interner for InnerUniverse {
         self.with_index(|i| {
             let mut buf = String::new();
             let mut first = true;
-            for pv in solvables.iter().map(|&s| i.solvables[s.to_index()].package) {
+            for pv in solvables.iter().map(|&s| &i.solvables[s.to_index()]) {
                 if first {
                     first = false
                 } else {
                     let _ = buf.write_str(", ");
                 }
-                let _ = write!(&mut buf, "{}={}", pv.name(), pv.version());
+                let _ = write!(&mut buf, "{}={}", pv.package.name(), pv.version);
             }
             buf
         })
@@ -945,19 +914,19 @@ impl DependencyProvider for InnerUniverse {
                     .iter()
                     .map(|c| {
                         let c = &u.index.solvables[c.to_index()];
-                        format!("{}", c.package.full_name())
+                        format!("{}", c.package.raw_full_name())
                     })
                     .collect::<Vec<_>>(),
                 u.index.version_sets[version_set].selfref.map_or_else(
                     || "".to_string(),
                     |c| {
                         let c = &u.index.solvables[c.to_index()];
-                        format!("({}={}) ", c.package.name(), c.package.version())
+                        format!("({}={}) ", c.package.name(), c.package.raw_version())
                     }
                 ),
                 Constraint::new(
-                    Some(&u.index.archlist[vs.arch]),
-                    &u.index.names[vs.name].name,
+                    Some(u.index.archlist[vs.arch]),
+                    u.index.names[vs.name].name,
                     vs.range.clone(),
                 ),
                 if inverse { " inverse" } else { "" },
@@ -966,15 +935,14 @@ impl DependencyProvider for InnerUniverse {
                 .iter()
                 .filter(|&&sid| {
                     let solvable = &u.index.solvables[sid.to_index()];
-                    tracing::trace!("  validating {}", solvable.package.full_name(),);
+                    tracing::trace!("  validating {}", solvable.package.raw_full_name(),);
                     if Some(sid) == vs.selfref {
                         false // always exclude self-referencing dependencies
                     } else if !solvable.arch.satisfies(&vs.arch) {
                         false // always exclude dependencies with not suitable arch
                     } else {
                         let sname = u.index.names[vs.name].name;
-                        ((solvable.name == vs.name
-                            && (solvable.package.version().satisfies(&vs.range)))
+                        ((solvable.name == vs.name && (solvable.version.satisfies(&vs.range)))
                             || solvable
                                 .package
                                 .provides()
@@ -1042,9 +1010,7 @@ impl DependencyProvider for InnerUniverse {
                     (false, true) => std::cmp::Ordering::Less,
                     (true, false) => std::cmp::Ordering::Greater,
                     _ => match this.package.name().cmp(that.package.name()) {
-                        std::cmp::Ordering::Equal => {
-                            this.package.version().cmp(&that.package.version())
-                        }
+                        std::cmp::Ordering::Equal => this.version.cmp(&that.version),
                         cmp => cmp,
                     },
                 }
@@ -1079,7 +1045,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new(crate::repo::null_provider(), $src)
+                    vec![Packages::new($src)
                         .expect("failed to parse test source")]
                     .into_iter(),
                 )
@@ -1307,8 +1273,8 @@ Priority: optional
     // 8) Union with duplicate version-sets for the same package -- must dedup candidates
     // Expect simple foo -> x order.
     test_solution!(union_duplicate_vs_dedup
-    [ "x" ] => [ "foo:amd64=1.0", "x:amd64=1.0" ],
-"Package: x
+    [ "xz" ] => [ "foo:amd64=1.0", "xz:amd64=1.0" ],
+"Package: xz
 Architecture: amd64
 Version: 1.0
 Depends: foo (= 1.0) | foo (>= 1.0)

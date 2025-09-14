@@ -1,8 +1,7 @@
 //! Digest verification
 
-pub use digest::{Output as HashOutput};
+pub use digest::Output as HashOutput;
 use {
-    digest::FixedOutputReset,
     ::serde::{
         de::{self, Visitor},
         Deserialize, Deserializer, Serialize, Serializer,
@@ -11,21 +10,23 @@ use {
         io::prelude::*,
         task::{ready, Context, Poll},
     },
+    digest::FixedOutputReset,
     pin_project::pin_project,
     std::{fmt, pin::Pin},
 };
 
-pub trait HashAlgo: FixedOutputReset + Default + Send {}
-impl<T: FixedOutputReset + Default + Send> HashAlgo for T {}
+pub trait HashAlgo: FixedOutputReset + Default + Send {
+    const HASH_FIELD_NAME: &'static str;
+}
 
-pub trait HashFieldName {
-    const DIGEST_FIELD_NAME: &'static str;
+impl HashAlgo for sha2::Sha256 {
+    const HASH_FIELD_NAME: &'static str = "SHA256";
 }
-impl HashFieldName for sha2::Sha256 {
-    const DIGEST_FIELD_NAME: &'static str = "SHA256";
+impl HashAlgo for sha2::Sha512 {
+    const HASH_FIELD_NAME: &'static str = "SHA512";
 }
-impl HashFieldName for md5::Md5 {
-    const DIGEST_FIELD_NAME: &'static str = "MD5sum";
+impl HashAlgo for md5::Md5 {
+    const HASH_FIELD_NAME: &'static str = "MD5sum";
 }
 
 #[derive(Default, Debug)]
@@ -33,16 +34,15 @@ pub struct Hash<D: HashAlgo> {
     inner: HashOutput<D>,
 }
 
-pub trait HashPolicy {
-    type Algo: HashAlgo;
-}
-pub(crate) type HashOf<T> = Hash<<T as HashPolicy>::Algo>;
-pub(crate) type HashAlgoOf<T> = <T as HashPolicy>::Algo;
-pub(crate) const fn hash_field_name<T: HashPolicy>() -> &'static str 
-where 
-    T::Algo: HashFieldName,
+// pub trait HashPolicy {
+//     type Algo: HashAlgo;
+// }
+// pub(crate) type HashOf<T> = Hash<<T as HashPolicy>::Algo>;
+// pub(crate) type HashAlgoOf<T> = <T as HashPolicy>::Algo;
+pub(crate) const fn hash_field_name<T: HashAlgo>() -> &'static str
+where
 {
-    <T::Algo as HashFieldName>::DIGEST_FIELD_NAME
+    <T as HashAlgo>::HASH_FIELD_NAME
 }
 
 impl<D: HashAlgo> Serialize for Hash<D> {
@@ -305,7 +305,11 @@ impl<D: HashAlgo> From<&Hash<D>> for async_std::path::PathBuf {
     }
 }
 
-
+impl<D: HashAlgo> From<Hash<D>> for Box<[u8]> {
+    fn from(value: Hash<D>) -> Self {
+        Vec::from(value.inner.as_slice()).into_boxed_slice()
+    }
+}
 
 impl<D: HashAlgo> From<Hash<D>> for String {
     fn from(value: Hash<D>) -> Self {
@@ -334,13 +338,19 @@ impl<D: HashAlgo> std::fmt::LowerHex for Hash<D> {
 #[pin_project]
 pub struct HashingReader<D: HashAlgo, R: Read + Unpin + Send> {
     digester: D,
+    counter: u64,
     #[pin]
     inner: R,
+}
+
+pub trait HashingRead: Read + Unpin {
+    fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64);
 }
 
 impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
+            counter: 0,
             digester: D::default(),
             inner: reader,
         }
@@ -349,6 +359,14 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
         Hash {
             inner: self.digester.finalize_fixed(),
         }
+    }
+}
+impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingRead for HashingReader<D, R> {
+    fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64) {
+        (
+            self.digester.finalize_fixed_reset().to_vec().into_boxed_slice(),
+            self.counter,
+        )
     }
 }
 
@@ -363,6 +381,7 @@ impl<D: HashAlgo, R: Read + Unpin + Send> Read for HashingReader<D, R> {
             Ok(0) => Ok(0),
             Ok(size) => {
                 this.digester.update(&buf[0..size]);
+                *this.counter += size as u64;
                 Ok(size)
             }
             Err(err) => Err(err),

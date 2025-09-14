@@ -4,9 +4,7 @@ use {
             ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
             ParseError,
         },
-        deb::DebReader,
-        hash::{hash_field_name, HashOf},
-        repo::{null_provider, DebRepo},
+        hash::{hash_field_name, Hash, HashAlgo},
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
@@ -124,10 +122,10 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    pub fn repo_file(&self) -> io::Result<(&'a str, u64, HashOf<DebRepo>)> {
+    pub fn repo_file(&self, hash_field_name: &'static str) -> io::Result<(&'a str, u64, Box<[u8]>)> {
         let (path, size, digest) = self
             .fields()
-            .find_fields(("Filename", "Size", hash_field_name::<DebRepo>()))
+            .find_fields(("Filename", "Size", hash_field_name))
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
@@ -137,7 +135,15 @@ impl<'a> Package<'a> {
         Ok((
             path,
             crate::parse_size(size.as_bytes())?,
-            HashOf::<DebRepo>::try_from(digest)?,
+            hex::decode(digest).map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "package {} field {} is not valid hex: {}",
+                        self, hash_field_name, err
+                    ),
+                )
+            })?.into_boxed_slice(),
         ))
     }
     pub fn src(&self) -> &'a str {
@@ -149,12 +155,25 @@ impl<'a> Package<'a> {
     pub fn arch(&self) -> &'a str {
         self.arch
     }
-    pub fn full_name(&self) -> ProvidedName<&'a str, Version<&'a str>> {
-        ProvidedName::Exact(self.name, Version::from(self.version))
+    pub fn raw_full_name(
+        &self,
+    ) -> ProvidedName<&'a str> {
+        ProvidedName::Exact(
+            self.name,
+            Version::new(self.version),
+        )
+    }
+    pub fn full_name(
+        &self,
+    ) -> std::result::Result<ProvidedName<&'a str>, ParseError> {
+        Ok(ProvidedName::Exact(
+            self.name,
+            Version::try_from(self.version)?,
+        ))
     }
     pub fn provides(
         &self,
-    ) -> impl Iterator<Item = std::result::Result<ProvidedName<&'a str, Version<&'a str>>, ParseError>>
+    ) -> impl Iterator<Item = std::result::Result<ProvidedName<&'a str>, ParseError>>
     {
         ParsedProvidedNameIterator::new(self.provides.unwrap_or(""))
     }
@@ -191,14 +210,17 @@ impl<'a> Package<'a> {
     pub fn architecture(&self) -> &'a str {
         self.arch
     }
-    pub fn version(&self) -> Version<&'a str> {
-        Version::from(self.version)
+    pub fn raw_version(&self) -> Version<&'a str> {
+        Version::new(self.version)
+    }
+    pub fn version(&self) -> std::result::Result<Version<&'a str>, ParseError> {
+        Version::try_from(self.version)
     }
     pub fn depends(
         &self,
     ) -> impl Iterator<
         Item = std::result::Result<
-            Dependency<Option<&'a str>, &'a str, Version<&'a str>>,
+            Dependency<&'a str>,
             ParseError,
         >,
     > {
@@ -208,7 +230,7 @@ impl<'a> Package<'a> {
         &self,
     ) -> impl Iterator<
         Item = std::result::Result<
-            Dependency<Option<&'a str>, &'a str, Version<&'a str>>,
+            Dependency<&'a str>,
             ParseError,
         >,
     > {
@@ -218,7 +240,7 @@ impl<'a> Package<'a> {
         &self,
     ) -> impl Iterator<
         Item = std::result::Result<
-            Constraint<Option<&'a str>, &'a str, Version<&'a str>>,
+            Constraint<&'a str>,
             ParseError,
         >,
     > {
@@ -228,7 +250,7 @@ impl<'a> Package<'a> {
         &self,
     ) -> impl Iterator<
         Item = std::result::Result<
-            Constraint<Option<&'a str>, &'a str, Version<&'a str>>,
+            Constraint<&'a str>,
             ParseError,
         >,
     > {
@@ -326,7 +348,6 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 }
 
 pub struct Packages {
-    pub(crate) repo: DebRepo,
     inner: PackagesInner,
 }
 
@@ -334,20 +355,15 @@ impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
     }
-    pub async fn get_deb_reader(
-        &self,
-        index: usize,
-    ) -> std::io::Result<DebReader> {
-        let (path, size, hash) = self
-            .get(index)
+    pub fn repo_file(&self, index: usize, hash_field_name: &'static str) -> io::Result<(&str, u64, Box<[u8]>)> {
+        self.get(index)
             .ok_or_else(|| {
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     format!("package index {} is out of range", index),
                 )
             })
-            .and_then(|p| p.repo_file())?;
-        self.repo.verifying_deb_reader(path, size, hash).await
+            .and_then(|p| p.repo_file(hash_field_name))
     }
     pub fn package_by_name(&self, name: &str) -> Option<&Package<'_>> {
         self.inner
@@ -356,12 +372,11 @@ impl Packages {
     pub fn packages(&self) -> impl Iterator<Item = &Package<'_>> {
         self.inner.with_packages(|packages| packages.iter())
     }
-    pub fn new<S>(repo: DebRepo, data: S) -> Result<Self, ParseError>
+    pub fn new<S>(data: S) -> Result<Self, ParseError>
     where
         Arc<str>: From<S>,
     {
         Ok(Packages {
-            repo,
             inner: PackagesInnerTryBuilder {
                 data: Arc::<str>::from(data),
                 packages_builder: |data: &'_ Arc<str>| -> Result<Vec<Package<'_>>, ParseError> {
@@ -392,14 +407,14 @@ impl Packages {
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(null_provider(), inp.to_owned().into_boxed_str())
+        Self::new(inp.to_owned().into_boxed_str())
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(null_provider(), inp.into_boxed_str())
+        Self::new(inp.into_boxed_str())
     }
 }
 
@@ -407,7 +422,6 @@ impl TryFrom<Vec<u8>> for Packages {
     type Error = ParseError;
     fn try_from(inp: Vec<u8>) -> Result<Self, Self::Error> {
         Self::new(
-            null_provider(),
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into_boxed_str(),

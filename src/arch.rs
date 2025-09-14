@@ -1,5 +1,4 @@
 // explicit compile-time mapping to a distro-style arch name
-// (resolved entirely with #[cfg] so it's a true compile-time constant)
 
 #[cfg(target_arch = "x86")]
 pub const DEFAULT_ARCH: &str = "i386";
@@ -21,7 +20,6 @@ pub const DEFAULT_ARCH: &str = "riscv64";
 pub const DEFAULT_ARCH: &str = "mipsel";
 
 // mips 64-bit -> mips64el
-// cover both target_arch = "mips64" and the case target_arch = "mips" + 64-bit pointer width
 #[cfg(any(target_arch = "mips64", all(target_arch = "mips", target_pointer_width = "64")))]
 pub const DEFAULT_ARCH: &str = "mips64el";
 

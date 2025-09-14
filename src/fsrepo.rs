@@ -2,11 +2,11 @@
 
 use {
     crate::{
-        hash::{HashOf, HashAlgoOf, VerifyingReader},
-        repo::DebRepoProvider,
+        hash::{Hash, HashAlgo, HashingRead, HashingReader, VerifyingReader},
+        repo::TransportProvider,
     },
     async_std::{
-        io::{self, Read},
+        io::{self, Read, ReadExt},
         path::{Path, PathBuf},
     },
     async_trait::async_trait,
@@ -14,16 +14,18 @@ use {
 };
 
 #[derive(Clone)]
-pub struct FSDebRepo {
+pub struct FSTransportProvider<H: HashAlgo> {
     base: PathBuf,
+    _marker: std::marker::PhantomData<Hash<H>>,
 }
 
-impl FSDebRepo {
+impl<H: HashAlgo> FSTransportProvider<H> {
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let base = path.as_ref().to_path_buf();
         if base.is_dir().await {
-            Ok(FSDebRepo {
+            Ok(FSTransportProvider {
                 base: base,
+                _marker: std::marker::PhantomData,
             })
         } else {
             Err(io::Error::new(
@@ -35,7 +37,10 @@ impl FSDebRepo {
 }
 
 #[async_trait]
-impl DebRepoProvider for FSDebRepo {
+impl<H: HashAlgo + 'static> TransportProvider for FSTransportProvider<H> {
+    fn hash_field_name(&self) -> &'static str {
+        H::HASH_FIELD_NAME
+    }
     async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
         let path = self.base.join(path);
         Ok(Box::pin(async_std::fs::File::open(path).await?) as Pin<Box<dyn Read + Send>>)
@@ -47,10 +52,20 @@ impl DebRepoProvider for FSDebRepo {
         hash: &[u8],
     ) -> io::Result<Pin<Box<dyn Read + Send>>> {
         let path = self.base.join(path);
-        Ok(Box::pin(VerifyingReader::<HashAlgoOf<Self>, _>::new(
+        Ok(Box::pin(VerifyingReader::<H, _>::new(
             async_std::fs::File::open(path).await?,
             size,
-            HashOf::<Self>::try_from(hash)?,
+            Hash::<H>::try_from(hash)?,
         )))
+    }
+    async fn hashing_reader(
+        &self,
+        path: &str,
+        limit: u64,
+    ) -> io::Result<Pin<Box<dyn HashingRead + Send>>> {
+        let path = self.base.join(path);
+        let file = async_std::fs::File::open(path).await?;
+        let reader = HashingReader::<H, _>::new(file.take(limit));
+        Ok(Box::pin(reader) as Pin<Box<dyn HashingRead + Send + Unpin>>)
     }
 }

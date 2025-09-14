@@ -5,12 +5,12 @@ use {
         io::WriteExt,
         path::{Path, PathBuf},
     },
-    clap::{Args, Parser, Subcommand, ValueEnum},
+    clap::{Parser, Subcommand},
     debrepo::{
+        cli::{Source, Vendor},
         exec::{dpkg, unshare_root, unshare_user_ns},
-        Constraint, DebRepo, DebRepoBuilder, Dependency, DeploymentFileSystem,
-        HttpCachingRepoBuilder, HttpDebRepo, HttpRepoBuilder, Manifest, ManifestFile,
-        MutableControlFile, Universe, Version,
+        Constraint, Dependency, DeploymentFileSystem, HttpCachingTransportProvider,
+        HttpTransportProvider, Manifest, MutableControlFile, TransportProvider, Universe, Version,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     std::{iter, process::ExitCode},
@@ -21,8 +21,13 @@ use {
 #[async_trait::async_trait(?Send)]
 #[enum_dispatch::enum_dispatch]
 pub trait AsyncCommand {
+    fn init(&self, _conf: &App) -> Result<()> {
+        Ok(())
+    }
     async fn exec(&self, conf: &App) -> Result<()>;
 }
+
+
 
 #[derive(Parser)]
 pub struct App {
@@ -35,7 +40,7 @@ pub struct App {
     debug: u8,
 
     /// Manifest file
-    #[arg(short, long, default_value = ManifestFile::DEFAULT_FILE)]
+    #[arg(short, long, default_value = Manifest::DEFAULT_FILE)]
     manifest: PathBuf,
 
     /// Number of concurrent downloads
@@ -52,8 +57,11 @@ pub struct App {
     arch: String,
 
     /// HTTP download cache directory
-    #[arg(long = "cache-dir", value_name = "DIR")]
+    #[arg(long = "cache-dir", value_name = "DIR", conflicts_with = "no_cache")]
     pub cache_dir: Option<PathBuf>,
+
+    #[arg(long = "no-cache", conflicts_with = "cache_dir")]
+    pub no_cache: bool,
 
     /// Do not verify Release files by default (not recommended)
     #[arg(short = 'K', long = "no-verify")]
@@ -128,48 +136,6 @@ enum Commands {
     // },
 }
 
-#[derive(Args, Clone, Default)]
-#[group(required = true, multiple = true)]
-struct Source {
-    /// Do not verify release signature (not recommended)
-    #[arg(short = 'K', long = "allow-insecure", action)]
-    pub allow_insecure: Option<bool>,
-
-    /// Keyring file to verify release signature
-    #[arg(short = 's', long = "signed-by")]
-    pub signed_by: Option<PathBuf>,
-
-    /// Only include these architectures (comma-separated)
-    #[arg(long = "arch", value_delimiter = ',')]
-    pub arch: Vec<String>,
-
-    /// Repository URL
-    #[arg(value_name = "URL")]
-    url: String,
-
-    /// Suite name (e.g., bookworm, bookworm-security, sid)
-    #[arg(value_name = "SUITE")]
-    pub suite: String,
-
-    /// Components, default: all available
-    #[arg(value_name = "COMPONENT")]
-    pub comp: Vec<String>,
-}
-
-impl TryFrom<&Source> for debrepo::Source {
-    type Error = anyhow::Error;
-    fn try_from(src: &Source) -> anyhow::Result<Self> {
-        Ok(Self {
-            arch: src.arch.clone(),
-            allow_insecure: src.allow_insecure.map(|v| !v),
-            signed_by: src.signed_by.as_ref().map(|p| p.try_into()).transpose()?,
-            url: src.url.clone(),
-            suite: src.suite.clone(),
-            components: src.comp.clone(),
-        })
-    }
-}
-
 #[derive(Parser)]
 pub struct Init {
     /// Overwrite existing manifest if present
@@ -178,52 +144,6 @@ pub struct Init {
 
     #[command(subcommand)]
     cmd: InitCommands,
-}
-
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Init {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = ManifestFile::new(
-            &conf.manifest,
-            match &self.cmd {
-                InitCommands::InitFromSource(_) => None,
-                InitCommands::InitFromVendor(cmd) => {
-                    Some(format!("default manifest file for {}", &cmd.vendor))
-                }
-            },
-        );
-        for source in match &self.cmd {
-            InitCommands::InitFromSource(cmd) => {
-                vec![debrepo::Source::try_from(&cmd.source)?]
-            }
-            InitCommands::InitFromVendor(cmd) => cmd.sources(),
-        } {
-            mf.add_source(source, None)?;
-        }
-        for req in match &self.cmd {
-            InitCommands::InitFromSource(cmd) => cmd
-                .requirements
-                .iter()
-                .map(|s| {
-                    s.parse::<Dependency<Option<String>, String, Version<String>>>()
-                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            InitCommands::InitFromVendor(cmd) => cmd
-                .requirements()
-                .iter()
-                .map(|s| {
-                    s.parse::<Dependency<Option<String>, String, Version<String>>>()
-                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        } {
-            mf.add_requirement("", req, None::<String>)
-                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))?;
-        }
-        mf.store().await?;
-        Ok(())
-    }
 }
 
 #[derive(Subcommand)]
@@ -246,43 +166,6 @@ pub struct InitFromSource {
     source: Source,
 }
 
-#[derive(Clone, Default)]
-pub enum Vendor {
-    #[default]
-    Debian,
-    Devuan,
-    Ubuntu,
-}
-
-impl std::fmt::Display for Vendor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Debian => write!(f, "debian"),
-            Self::Devuan => write!(f, "devuan"),
-            Self::Ubuntu => write!(f, "ubuntu"),
-        }
-    }
-}
-
-impl ValueEnum for Vendor {
-    fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Debian, Self::Devuan, Self::Ubuntu]
-    }
-    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        Some(match self {
-            Self::Debian => clap::builder::PossibleValue::new("debian")
-                .help("Use Debian as the vendor")
-                .alias("Debian"),
-            Self::Devuan => clap::builder::PossibleValue::new("devuan")
-                .help("Use Devuan as the vendor")
-                .alias("Devuan"),
-            Self::Ubuntu => clap::builder::PossibleValue::new("ubuntu")
-                .help("Use Ubuntu as the vendor")
-                .alias("Ubuntu"),
-        })
-    }
-}
-
 #[derive(Parser, Default)]
 pub struct InitFromVendor {
     /// Vendor
@@ -292,97 +175,65 @@ pub struct InitFromVendor {
     pub suite: Option<String>,
 }
 
-impl InitFromVendor {
-    fn requirements(&self) -> &[&'static str] {
-        match self.vendor {
-            Vendor::Debian => &["apt", "ca-certificates"],
-            Vendor::Ubuntu => &["apt", "ca-certificates"],
-            Vendor::Devuan => &["apt", "ca-certificates", "devuan-keyring"],
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Init {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let comment = match &self.cmd {
+            InitCommands::InitFromSource(_) => None,
+            InitCommands::InitFromVendor(cmd) => {
+                Some(format!("default manifest file for {}", &cmd.vendor))
+            }
+        };
+        let transport = conf.transport().await?;
+        let mut mf = match &self.cmd {
+            InitCommands::InitFromSource(cmd) => Manifest::from_sources(
+                &conf.arch,
+                iter::once(&cmd.source),
+                comment,
+                conf.limit,
+                transport.as_ref(),
+            )
+            .await
+            .map_err(|e| anyhow!("failed to add source: {e}"))?,
+            InitCommands::InitFromVendor(cmd) => {
+                let sources = cmd
+                    .vendor
+                    .sources_for(
+                        cmd.suite
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .unwrap_or_else(|| cmd.vendor.defailt_suite()),
+                    );
+                Manifest::from_sources(&conf.arch, sources.iter(), comment, conf.limit, transport.as_ref())
+                    .await
+                    .map_err(|e| anyhow!("failed to add sources: {e}"))?
+            }
+        };
+        for req in match &self.cmd {
+            InitCommands::InitFromSource(cmd) => cmd
+                .requirements
+                .iter()
+                .map(|s| {
+                    s.parse::<Dependency<String>>()
+                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+            InitCommands::InitFromVendor(cmd) => cmd
+                .vendor
+                .default_requirements()
+                .iter()
+                .map(|s| {
+                    s.parse::<Dependency<String>>()
+                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
+                })
+                .collect::<Result<Vec<_>>>()?,
+        } {
+            mf.add_requirement("", &req, None::<String>)
+                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))?;
         }
-    }
-    fn sources(&self) -> Vec<debrepo::Source> {
-        match self.vendor {
-            Vendor::Debian => vec![
-                debrepo::Source {
-                    url: "https://ftp.debian.org/debian/".into(),
-                    suite: self.suite.clone().unwrap_or_else(|| "trixie".into()),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-                debrepo::Source {
-                    url: "https://ftp.debian.org/debian/".into(),
-                    suite: self
-                        .suite
-                        .clone()
-                        .or_else(|| Some("trixie".into()))
-                        .map(|s| s + "-updates")
-                        .unwrap(),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-                debrepo::Source {
-                    url: "https://ftp.debian.org/debian/".into(),
-                    suite: self
-                        .suite
-                        .clone()
-                        .or_else(|| Some("trixie".into()))
-                        .map(|s| s + "-backports")
-                        .unwrap(),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-                debrepo::Source {
-                    url: "https://security.debian.org/debian-security/".into(),
-                    suite: self
-                        .suite
-                        .clone()
-                        .or_else(|| Some("trixie".into()))
-                        .map(|s| s + "-security")
-                        .unwrap(),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-            ],
-            Vendor::Devuan => vec![
-                debrepo::Source {
-                    url: "http://deb.devuan.org/merged/".into(),
-                    suite: self.suite.clone().unwrap_or_else(|| "daedalus".into()),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-                debrepo::Source {
-                    url: "http://deb.devuan.org/merged/".into(),
-                    suite: self
-                        .suite
-                        .clone()
-                        .or_else(|| Some("daedalus".into()))
-                        .map(|s| s + "-updates")
-                        .unwrap(),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-                debrepo::Source {
-                    url: "http://deb.devuan.org/merged/".into(),
-                    suite: self
-                        .suite
-                        .clone()
-                        .or_else(|| Some("daedalus".into()))
-                        .map(|s| s + "-security")
-                        .unwrap(),
-                    components: vec!["main".into()],
-                    ..Default::default()
-                },
-            ],
-            Vendor::Ubuntu => vec![debrepo::Source {
-                url: "https://archive.ubuntu.com/ubuntu/".into(),
-                suite: "noble".into(),
-                components: vec!["main", "universe"]
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
-                ..Default::default()
-            }],
-        }
+        mf.update_recipes(conf.limit, transport.as_ref()).await?;
+        mf.store(&conf.manifest).await?;
+        Ok(())
     }
 }
 
@@ -408,13 +259,13 @@ struct Drop {
     recipe: Option<String>,
     /// Package name or package version set
     #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
-    name: Vec<Constraint<Option<String>, String, Version<String>>>,
+    name: Vec<Constraint<String>>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Drop {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
         let recipes = self
             .recipe
             .as_ref()
@@ -422,7 +273,7 @@ impl AsyncCommand for Drop {
             .unwrap_or_else(|| mf.recipes().map(|s| s.into()).collect::<Vec<String>>());
         for recipe in recipes.into_iter() {
             self.name.iter().try_for_each(|con| {
-                mf.remove_constraint(&recipe, con)
+                mf.drop_constraint(&recipe, con)
                     .map_err(|e| anyhow!("invalid manifest: failed to drop constraint: {e}"))
                 // if self.requirements_only.unwrap_or(false) {
                 //     mf.remove_requirement(&recipe, con)
@@ -441,7 +292,7 @@ impl AsyncCommand for Drop {
                 // }
             })?;
         }
-        mf.store().await?;
+        mf.store(&conf.manifest).await?;
         Ok(())
     }
 }
@@ -453,20 +304,23 @@ struct Include {
     #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
     comment: Option<String>,
     #[arg(value_name = "REQUIREMENT", value_parser = debrepo::cli::DependencyParser)]
-    reqs: Vec<Dependency<Option<String>, String, Version<String>>>,
+    reqs: Vec<Dependency<String>>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Include {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
         let recipe = self.recipe.clone().unwrap_or_default();
         let mut comment = self.comment.clone();
         self.reqs.iter().try_for_each(|req| {
-            mf.add_requirement(&recipe, req.clone(), comment.take())
+            mf.add_requirement(&recipe, &req, comment.take())
                 .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
         })?;
-        mf.store().await?;
+        mf.update_recipes(conf.limit, conf.transport().await?.as_ref())
+            .await
+            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
+        mf.store(&conf.manifest).await?;
         Ok(())
     }
 }
@@ -478,20 +332,20 @@ struct Exclude {
     #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
     comment: Option<String>,
     #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
-    reqs: Vec<Constraint<Option<String>, String, Version<String>>>,
+    reqs: Vec<Constraint<String>>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Exclude {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = ManifestFile::from_file(&conf.manifest).await?;
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
         let recipe = self.recipe.clone().unwrap_or_default();
         let mut comment = self.comment.clone();
         self.reqs.iter().try_for_each(|con| {
-            mf.add_constraint(&recipe, con.clone(), comment.take())
+            mf.add_constraint(&recipe, &con, comment.take())
                 .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
         })?;
-        mf.store().await?;
+        mf.store(&conf.manifest).await?;
         Ok(())
     }
 }
@@ -510,7 +364,7 @@ impl AsyncCommand for Update {
         // let mut universe = manifest
         //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
         //     .await?;
-        // match universe.solve(
+        // match universe.Solve(
         //     manifest.requirements().cloned(),
         //     manifest.constraints().cloned(),
         // ) {
@@ -535,35 +389,37 @@ impl AsyncCommand for Update {
 }
 
 #[derive(Parser)]
-struct List {}
+struct List {
+    /// The recipe name to build (default is the primary nameless recipe)
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+}
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for List {
     async fn exec(&self, conf: &App) -> Result<()> {
-        // let manifest =
-        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
-        // let repo_builder = debrepo::HttpRepoBuilder::new(conf.insecure);
+        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        // let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
+        //     Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
+        // } else {
+        //     Box::new(HttpRepoBuilder::new(conf.insecure))
+        // };
         // let mut universe = manifest
         //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
         //     .await?;
-        // let mut solution = universe
-        //     .solve(
-        //         manifest.requirements().cloned(),
-        //         manifest.constraints().cloned(),
+        // let (reqs, cons) =
+        //     manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
+        // let mut solution = universe.solve(reqs, cons).map_err(|conflict| {
+        //     anyhow!(
+        //         "failed to solve dependencies: {}",
+        //         universe.display_conflict(conflict)
         //     )
-        //     .map_err(|conflict| {
-        //         anyhow!(
-        //             "failed to solve dependencies: {}",
-        //             universe.display_conflict(conflict)
-        //         )
-        //     })?;
+        // })?;
         // solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
         // let mut out = std::io::stdout().lock();
         // pretty_print_packages(
         //     &mut out,
-        //     solution
-        //         .iter()
-        //         .map(|s| -> Package { universe.package(*s).unwrap().into() }),
+        //     solution.iter().map(|s| universe.package(*s).unwrap()),
         //     false,
         // )?;
         Ok(())
@@ -582,136 +438,131 @@ struct Extract {
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Extract {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let manifest = Manifest::from_file(&conf.manifest).await?;
-        let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
-            Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
-        } else {
-            Box::new(HttpRepoBuilder::new(conf.insecure))
-        };
-        let mut universe = manifest
-            .fetch_universe(&conf.arch, &repo_builder, conf.limit)
-            .await?;
-        let (reqs, cons) =
-            manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
-        let solution = universe.solve(reqs, cons).map_err(|conflict| {
-            anyhow!(
-                "failed to solve dependencies: {}",
-                universe.display_conflict(conflict)
-            )
-        })?;
-        let essentials = solution
-            .iter()
-            .filter_map(|id| {
-                universe.package(*id).and_then(|pkg| {
-                    if pkg.essential() {
-                        Some(pkg.name())
-                    } else {
-                        None
-                    }
-                })
-            })
-            .collect::<Vec<_>>();
-        fs::create_dir_all(&self.path).await?;
-        let fs = debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
-            .await?;
-        let mut control_file = stream::iter(solution.iter().cloned())
-            .map(|id| {
-                let (deb, package) = (
-                    universe.deb_reader(id),
-                    universe.package(id).unwrap().full_name(),
-                );
-                let fs = fs.clone();
-                async move {
-                    match deb.await {
-                        Ok(deb) => {
-                            tracing::info!("unpacking {}...", package);
-                            let mut stanza = async_std::task::block_on(deb.extract_to(&fs))?;
-                            stanza.set("Status", "install ok unpacked");
-                            stanza.sort_fields_deb_order();
-                            Ok::<_, anyhow::Error>(stanza)
-                        }
-                        Err(err) => {
-                            tracing::error!("failed to unpack {}: {}", package, err);
-                            Err(err.into())
-                        }
-                    }
-                }
-            })
-            .buffer_unordered(conf.limit)
-            .try_collect::<Vec<_>>()
-            .await?;
-        control_file.sort_by(|a, b| a.field("Package").unwrap().cmp(b.field("Package").unwrap()));
-        fs.create_dir_all("etc/apt", 0, 0, 0o755u32).await?;
-        {
-            let sources: Vec<u8> = manifest
-                .sources()
-                .map(|s| s.into())
-                .collect::<MutableControlFile>()
-                .into();
-            fs.create_file(
-                sources.as_slice(),
-                Some("etc/apt/sources.list"),
-                0,
-                0,
-                0o644,
-                None,
-                Some(sources.len()),
-            )
-            .await?;
+    fn init(&self, _opts: &App) -> Result<()> {
+        if !nix::unistd::Uid::effective().is_root() {
+            unshare_user_ns()?;
         }
-        fs.create_dir_all("var/lib/dpkg", 0, 0, 0o755u32).await?;
-        {
-            let size = control_file.iter().map(|i| i.len() + 1).sum();
-            let mut status = Vec::<u8>::with_capacity(size);
-            for i in control_file.into_iter() {
-                status.write_all(format!("{}", &i).as_bytes()).await?;
-                status.write_all(&[b'\n']).await?;
-            }
-            fs.create_file(
-                status.as_slice(),
-                Some("var/lib/dpkg/status"),
-                0,
-                0,
-                0o644,
-                None,
-                Some(size),
-            )
-            .await?;
-        }
-        fs.create_dir_all("usr/sbin", 0, 0, 0o755u32).await?;
-        fs.create_file(
-            b"#!/bin/sh\nexit 101\n".as_slice(),
-            Some("usr/sbin/policy-rc.d"),
-            0,
-            0,
-            0o755,
-            None,
-            None,
-        )
-        .await?;
-        let env = ["DEBIAN_FRONTEND=noninteractive"];
-        dpkg(
-            &self.path,
-            ["--force-depends", "--configure"]
-                .iter()
-                .chain(essentials.iter()),
-            Some(&env),
-        )?;
-        dpkg(&self.path, ["--configure", "-a"], Some(&env))?;
-        fs.remove_file("usr/sbin/policy-rc.d").await?;
+        unshare_root()?;
         Ok(())
     }
-}
-
-#[derive(Parser)]
-struct Validate {}
-
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Validate {
     async fn exec(&self, conf: &App) -> Result<()> {
-        // let _manifest =
-        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
+        // let manifest = Manifest::from_file(&conf.manifest).await?;
+        // let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
+        //     Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
+        // } else {
+        //     Box::new(HttpRepoBuilder::new(conf.insecure))
+        // };
+        // let mut universe = manifest
+        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
+        //     .await?;
+        // let (reqs, cons) =
+        //     manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
+        // let solution = universe.solve(reqs, cons).map_err(|conflict| {
+        //     anyhow!(
+        //         "failed to solve dependencies: {}",
+        //         universe.display_conflict(conflict)
+        //     )
+        // })?;
+        // let essentials = solution
+        //     .iter()
+        //     .filter_map(|id| {
+        //         universe.package(*id).and_then(|pkg| {
+        //             if pkg.essential() {
+        //                 Some(pkg.name())
+        //             } else {
+        //                 None
+        //             }
+        //         })
+        //     })
+        //     .collect::<Vec<_>>();
+        // fs::create_dir_all(&self.path).await?;
+        // let fs = debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
+        //     .await?;
+        // let mut control_file = stream::iter(solution.iter().cloned())
+        //     .map(|id| {
+        //         let (deb, package) = (
+        //             universe.deb_reader(id),
+        //             universe.package(id).unwrap().raw_full_name(),
+        //         );
+        //         let fs = fs.clone();
+        //         async move {
+        //             match deb.await {
+        //                 Ok(deb) => {
+        //                     tracing::info!("unpacking {}...", package);
+        //                     let mut stanza = async_std::task::block_on(deb.extract_to(&fs))?;
+        //                     stanza.set("Status", "install ok unpacked");
+        //                     stanza.sort_fields_deb_order();
+        //                     Ok::<_, anyhow::Error>(stanza)
+        //                 }
+        //                 Err(err) => {
+        //                     tracing::error!("failed to unpack {}: {}", package, err);
+        //                     Err(err.into())
+        //                 }
+        //             }
+        //         }
+        //     })
+        //     .buffer_unordered(conf.limit)
+        //     .try_collect::<Vec<_>>()
+        //     .await?;
+        // control_file.sort_by(|a, b| a.field("Package").unwrap().cmp(b.field("Package").unwrap()));
+        // fs.create_dir_all("etc/apt", 0, 0, 0o755u32).await?;
+        // {
+        //     let sources: Vec<u8> = manifest
+        //         .sources()
+        //         .map(|s| s.into())
+        //         .collect::<MutableControlFile>()
+        //         .into();
+        //     fs.create_file(
+        //         sources.as_slice(),
+        //         Some("etc/apt/sources.list"),
+        //         0,
+        //         0,
+        //         0o644,
+        //         None,
+        //         Some(sources.len()),
+        //     )
+        //     .await?;
+        // }
+        // fs.create_dir_all("var/lib/dpkg", 0, 0, 0o755u32).await?;
+        // {
+        //     let size = control_file.iter().map(|i| i.len() + 1).sum();
+        //     let mut status = Vec::<u8>::with_capacity(size);
+        //     for i in control_file.into_iter() {
+        //         status.write_all(format!("{}", &i).as_bytes()).await?;
+        //         status.write_all(&[b'\n']).await?;
+        //     }
+        //     fs.create_file(
+        //         status.as_slice(),
+        //         Some("var/lib/dpkg/status"),
+        //         0,
+        //         0,
+        //         0o644,
+        //         None,
+        //         Some(size),
+        //     )
+        //     .await?;
+        // }
+        // fs.create_dir_all("usr/sbin", 0, 0, 0o755u32).await?;
+        // fs.create_file(
+        //     b"#!/bin/sh\nexit 101\n".as_slice(),
+        //     Some("usr/sbin/policy-rc.d"),
+        //     0,
+        //     0,
+        //     0o755,
+        //     None,
+        //     None,
+        // )
+        // .await?;
+        // let env = ["DEBIAN_FRONTEND=noninteractive"];
+        // dpkg(
+        //     &self.path,
+        //     ["--force-depends", "--configure"]
+        //         .iter()
+        //         .chain(essentials.iter()),
+        //     Some(&env),
+        // )?;
+        // dpkg(&self.path, ["--configure", "-a"], Some(&env))?;
+        // fs.remove_file("usr/sbin/policy-rc.d").await?;
         Ok(())
     }
 }
@@ -746,27 +597,27 @@ struct Fetch {
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Fetch {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let start = std::time::Instant::now();
-        let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
-        let release = if self.verify {
-            repo.fetch_verify_release(&self.distr, iter::empty()).await
-        } else {
-            repo.fetch_release(&self.distr).await
-        }?;
-        let (path, size, hash) = release
-            .packages_file(&self.comp, &self.arch)
-            .ok_or_else(|| anyhow!("Packages file for {} {} not found", &self.arch, &self.comp))?;
-        match self.out {
-            None => {
-                repo.copy_verify_unpack(async_std::io::stdout(), &path, size, hash)
-                    .await
-            }
-            Some(ref out) => {
-                let out = async_std::fs::File::create(out).await?;
-                repo.copy_verify_unpack(out, &path, size, hash).await
-            }
-        }?;
-        println!("fetched in {:?}", start.elapsed());
+        // let start = std::time::Instant::now();
+        // let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
+        // let release = if self.verify {
+        //     repo.fetch_verify_release(&self.distr, iter::empty()).await
+        // } else {
+        //     repo.fetch_release(&self.distr).await
+        // }?;
+        // let (path, size, hash) = release
+        //     .packages_file(&self.comp, &self.arch)
+        //     .ok_or_else(|| anyhow!("Packages file for {} {} not found", &self.arch, &self.comp))?;
+        // match self.out {
+        //     None => {
+        //         repo.copy_verify_unpack(async_std::io::stdout(), &path, size, hash)
+        //             .await
+        //     }
+        //     Some(ref out) => {
+        //         let out = async_std::fs::File::create(out).await?;
+        //         repo.copy_verify_unpack(out, &path, size, hash).await
+        //     }
+        // }?;
+        // println!("fetched in {:?}", start.elapsed());
         Ok(())
     }
 }
@@ -784,7 +635,7 @@ impl<'a> From<&'a debrepo::Package<'a>> for Package<'a> {
         Self {
             name: pkg.name(),
             arch: pkg.arch(),
-            ver: pkg.version(),
+            ver: pkg.raw_version(),
             desc: pkg.field("Description").unwrap_or(""),
             prio: pkg.install_priority(),
         }
@@ -793,9 +644,9 @@ impl<'a> From<&'a debrepo::Package<'a>> for Package<'a> {
 
 fn pretty_print_packages<'a, W: std::io::Write>(
     f: &mut W,
-    iter: impl IntoIterator<Item = Package<'a>>,
+    iter: impl IntoIterator<Item = &'a debrepo::Package<'a>>,
     sort: bool,
-) -> std::result::Result<usize, std::io::Error> {
+) -> Result<usize> {
     let mut w0 = 0usize;
     let mut w1 = 0usize;
     let mut w2 = 0usize;
@@ -803,15 +654,17 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     let mut w4 = 0usize;
     let mut packages = iter
         .into_iter()
+        .map(|pkg| Package::try_from(pkg))
         .map(|pkg| {
+            let pkg = pkg?;
             w0 = std::cmp::max(w0, pkg.arch.len());
             w1 = std::cmp::max(w1, pkg.prio.as_ref().len());
             w2 = std::cmp::max(w2, pkg.name.len());
             w3 = std::cmp::max(w3, pkg.ver.as_ref().len());
             w4 = std::cmp::max(w4, pkg.desc.len());
-            pkg
+            Ok(pkg)
         })
-        .collect::<Vec<_>>();
+        .collect::<Result<Vec<_>>>()?;
     if sort {
         packages.sort_by(|this, that| match this.name.cmp(that.name) {
             std::cmp::Ordering::Equal => this.ver.cmp(&that.ver),
@@ -821,32 +674,28 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     for p in packages.iter() {
         writeln!(
             f,
-            "{:>w0$} {:<w1$} {:<w2$} {:>w3$} {:<w4$}",
-            p.arch,
-            p.prio.as_ref(),
-            p.name,
-            p.ver,
-            p.desc
+            "{:>w0$} {:<w2$} {:>w3$} {:<w4$}",
+            p.arch, p.name, p.ver, p.desc
         )?;
     }
     Ok(packages.len())
 }
 
-async fn copy_repo_package<'a>(
-    universe: &'a Universe,
-    id: debrepo::PackageId,
-    target: &Path,
-) -> Result<(debrepo::PackageId, impl std::fmt::Display + 'a, u64)> {
-    let pkg = universe
-        .package(id)
-        .ok_or_else(|| anyhow!("package id {:?} not found", id))?;
-    let path: PathBuf = pkg.ensure_field("Filename")?.into();
-    let mut out = PathBuf::from(target);
-    out.push(path.file_name().unwrap());
-    let out = fs::File::create(out).await?;
-    let size = universe.copy_deb_file(out, id).await?;
-    Ok((id, pkg, size))
-}
+// async fn copy_repo_package<'a>(
+//     universe: &'a Universe,
+//     id: debrepo::PackageId,
+//     target: &Path,
+// ) -> Result<(debrepo::PackageId, impl std::fmt::Display + 'a, u64)> {
+//     let pkg = universe
+//         .package(id)
+//         .ok_or_else(|| anyhow!("package id {:?} not found", id))?;
+//     let path: PathBuf = pkg.ensure_field("Filename")?.into();
+//     let mut out = PathBuf::from(target);
+//     out.push(path.file_name().unwrap());
+//     let out = fs::File::create(out).await?;
+//     let size = universe.copy_deb_file(out, id).await?;
+//     Ok((id, pkg, size))
+// }
 
 // async fn extract_repo_package<'a, F: DeploymentFileSystem>(
 //     deb: DebReader<'a>,
@@ -1088,13 +937,22 @@ async fn copy_repo_package<'a>(
 //         }
 //     }
 // }
+//
 
-fn init(_opts: &App) -> Result<()> {
-    if !nix::unistd::Uid::effective().is_root() {
-        unshare_user_ns()?;
+impl App {
+    async fn transport(&self) -> Result<Box<dyn TransportProvider>> {
+        if let Some(cache) = &self.cache_dir {
+            Ok(Box::new(
+                HttpCachingTransportProvider::<sha2::Sha256>::new(self.insecure, cache.clone())
+                    .await
+                    .map_err(|e| anyhow!("failed to create transport provider: {e}"))?,
+            ))
+        } else {
+            Ok(Box::new(
+                HttpTransportProvider::<sha2::Sha256>::new(self.insecure).await,
+            ))
+        }
     }
-    unshare_root()?;
-    Ok(())
 }
 
 fn init_logging(quiet: bool, debug: u8) {
@@ -1131,23 +989,27 @@ fn init_logging(quiet: bool, debug: u8) {
 fn main() -> ExitCode {
     let mut app = App::parse();
     init_logging(app.quiet, app.debug);
-    match init(&app) {
+    if !app.no_cache {
+        app.cache_dir = app.cache_dir.clone().or_else(|| {
+            if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+                Some(PathBuf::from(xdg))
+            } else if let Some(home) = std::env::var_os("HOME") {
+                Some(PathBuf::from(home).join(".cache"))
+            } else {
+                None
+            }
+            .map(|base| base.join("debrepo"))
+        });
+    } else {
+        app.cache_dir = None;
+    }
+    match app.cmd.init(&app) {
         Err(err) => {
             eprintln!("{}", err);
             return ExitCode::FAILURE;
         }
         Ok(_) => {}
     }
-    app.cache_dir = app.cache_dir.clone().or_else(|| {
-        if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-            Some(PathBuf::from(xdg))
-        } else if let Some(home) = std::env::var_os("HOME") {
-            Some(PathBuf::from(home).join(".cache"))
-        } else {
-            None
-        }
-        .map(|base| base.join("debrepo"))
-    });
     match async_std::task::block_on(app.cmd.exec(&app)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {

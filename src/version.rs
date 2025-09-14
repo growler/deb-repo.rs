@@ -56,16 +56,16 @@ impl<A: Display> DisplayName for Option<A> {
 }
 
 #[derive(Clone)]
-pub enum ProvidedName<N, V> {
-    Any(N),
-    Exact(N, V),
+pub enum ProvidedName<R> {
+    Any(R),
+    Exact(R, Version<R>),
 }
 
-impl<N, V> ProvidedName<N, V> {
-    pub fn translate<OtherN, OtherV, FN, FV>(&self, tn: FN, tv: FV) -> ProvidedName<OtherN, OtherV>
+impl<R1> ProvidedName<R1> {
+    pub fn translate<R2, FN, FV>(&self, tn: FN, tv: FV) -> ProvidedName<R2>
     where
-        FN: FnMut(&N) -> OtherN,
-        FV: FnMut(&V) -> OtherV,
+        FN: FnMut(&R1) -> R2,
+        FV: FnMut(&Version<R1>) -> Version<R2>,
     {
         let mut tn = tn;
         let mut tv = tv;
@@ -76,7 +76,7 @@ impl<N, V> ProvidedName<N, V> {
     }
 }
 
-impl<N: Display, V: Display> Display for ProvidedName<N, V> {
+impl<R: Display> Display for ProvidedName<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Any(n) => n.fmt(f),
@@ -89,7 +89,7 @@ impl<N: Display, V: Display> Display for ProvidedName<N, V> {
     }
 }
 
-impl<N: Debug, V: Debug> Debug for ProvidedName<N, V> {
+impl<R: Debug> Debug for ProvidedName<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         f.write_str("ProvidedName::")?;
         match self {
@@ -109,14 +109,14 @@ impl<N: Debug, V: Debug> Debug for ProvidedName<N, V> {
     }
 }
 
-impl<N, V> ProvidedName<N, V> {
-    pub fn name(&self) -> &N {
+impl<R> ProvidedName<R> {
+    pub fn name(&self) -> &R {
         match self {
             Self::Any(n) => n,
             Self::Exact(n, _) => n,
         }
     }
-    pub fn version(&self) -> Option<&V> {
+    pub fn version(&self) -> Option<&Version<R>> {
         match self {
             Self::Exact(_, v) => Some(v),
             _ => None,
@@ -134,14 +134,13 @@ impl<V: Clone> From<Option<&Version<V>>> for VersionSet<Version<V>> {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Constraint<A, N, V> {
-    name: N,
-    arch: A,
-    range: VersionSet<V>,
+pub struct Constraint<R> {
+    name: R,
+    arch: Option<R>,
+    range: VersionSet<Version<R>>,
 }
 
-
-impl<A, N, V> std::ops::Not for Constraint<A, N, Version<V>> {
+impl<R> std::ops::Not for Constraint<R> {
     type Output = Self;
     fn not(self) -> Self::Output {
         Constraint {
@@ -152,32 +151,32 @@ impl<A, N, V> std::ops::Not for Constraint<A, N, Version<V>> {
     }
 }
 
-impl<A, N, V> Constraint<A, N, V> {
-    pub fn new(arch: A, name: N, version_set: VersionSet<V>) -> Self {
+impl<R> Constraint<R> {
+    pub fn new(arch: Option<R>, name: R, version_set: VersionSet<Version<R>>) -> Self {
         Self {
             arch,
             name,
             range: version_set,
         }
     }
-    pub fn arch(&self) -> &A {
+    pub fn arch(&self) -> &Option<R> {
         &self.arch
     }
-    pub fn name(&self) -> &N {
+    pub fn name(&self) -> &R {
         &self.name
     }
-    pub fn version(&self) -> Option<&V> {
+    pub fn version(&self) -> Option<&Version<R>> {
         self.range.version()
     }
-    pub fn range(&self) -> &VersionSet<V> {
+    pub fn range(&self) -> &VersionSet<Version<R>> {
         &self.range
     }
-    pub fn into_range(self) -> VersionSet<V> {
+    pub fn into_range(self) -> VersionSet<Version<R>> {
         self.range
     }
 }
 
-impl<A: Hash + Eq, N: Hash + Eq, V: Hash + Eq> Hash for Constraint<A, N, V> {
+impl<R: Hash + Eq> Hash for Constraint<R> {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.name.hash(state);
         self.range.hash(state);
@@ -185,32 +184,44 @@ impl<A: Hash + Eq, N: Hash + Eq, V: Hash + Eq> Hash for Constraint<A, N, V> {
     }
 }
 
-impl<A: Eq, N: Eq, V: Eq> Eq for Constraint<A, N, V> {}
-impl<A: Eq, N: Eq, V: Eq> PartialEq for Constraint<A, N, V> {
+impl<R: Eq> Eq for Constraint<R> {}
+impl<R: Eq> PartialEq for Constraint<R> {
     fn eq(&self, other: &Self) -> bool {
         self.arch.eq(&other.arch) && self.name.eq(&other.name) && self.range.eq(&other.range)
     }
 }
 
-impl<A: Eq, N: Eq, V> Satisfies<Constraint<Option<A>, N, Version<V>>> for Constraint<Option<A>, N, Version<V>>
+impl<R> Satisfies<Constraint<R>> for Constraint<R>
 where
-    Version<V>: Eq + Ord,
+    R: Eq,
+    Version<R>: Eq + Ord,
 {
-    fn satisfies(&self, other: &Constraint<Option<A>, N, Version<V>>) -> bool {
-        other.arch.as_ref().map(|s| Some(s) == self.arch.as_ref()).unwrap_or(true)
+    fn satisfies(&self, other: &Constraint<R>) -> bool {
+        other
+            .arch
+            .as_ref()
+            .map(|s| Some(s) == self.arch.as_ref())
+            .unwrap_or(true)
             && self.name.eq(&other.name)
             && self.range.satisfies(&other.range)
     }
 }
 
-
-impl<A: DisplayName, N: Display, V: Display> Display for Constraint<A, N, V> {
+impl<R: Display> Display for Constraint<R>
+where
+    VersionSet<Version<R>>: DisplayName,
+    Option<R>: DisplayName,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         self.range().fmt_name(self.arch.fmt_name(&self.name)).fmt(f)
     }
 }
 
-impl<A: DisplayName, N: Display, V: Display> Debug for Constraint<A, N, V> {
+impl<R: Display> Debug for Constraint<R>
+where
+    VersionSet<Version<R>>: DisplayName,
+    Option<R>: DisplayName,
+{
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("Constraint(")?;
         self.range()
@@ -221,12 +232,12 @@ impl<A: DisplayName, N: Display, V: Display> Debug for Constraint<A, N, V> {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub enum Dependency<A, N, V> {
-    Single(Constraint<A, N, V>),
-    Union(SmallVec<[Constraint<A, N, V>; 2]>),
+pub enum Dependency<R> {
+    Single(Constraint<R>),
+    Union(SmallVec<[Constraint<R>; 2]>),
 }
-impl<A: Eq, N: Eq, V: Eq> Eq for Dependency<A, N, V> {}
-impl<A: Eq, N: Eq, V: Eq> PartialEq for Dependency<A, N, V> {
+impl<R: Eq> Eq for Dependency<R> {}
+impl<R: Eq> PartialEq for Dependency<R> {
     fn eq(&self, other: &Self) -> bool {
         match self {
             Self::Single(a) => match other {
@@ -241,7 +252,11 @@ impl<A: Eq, N: Eq, V: Eq> PartialEq for Dependency<A, N, V> {
     }
 }
 
-impl<A: DisplayName, N: Display, V: Display> fmt::Debug for Dependency<A, N, V> {
+impl<R: Display> fmt::Debug for Dependency<R>
+where
+    VersionSet<Version<R>>: DisplayName,
+    Option<R>: DisplayName,
+{
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Single(dep) => {
@@ -263,7 +278,7 @@ impl<A: DisplayName, N: Display, V: Display> fmt::Debug for Dependency<A, N, V> 
     }
 }
 
-impl<A: DisplayName, N: Display, V: Display> fmt::Display for Dependency<A, N, V> {
+impl<R: Display> fmt::Display for Dependency<R> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
             Self::Single(dep) => fmt::Display::fmt(&dep, f),
@@ -280,40 +295,141 @@ impl<A: DisplayName, N: Display, V: Display> fmt::Display for Dependency<A, N, V
     }
 }
 
-impl<A, N, V> Constraint<A, N, V> {
-    pub fn translate<OtherA, OtherN, OtherV, FA, FN, FV>(
-        &self,
-        ta: FA,
-        tn: FN,
-        tv: FV,
-    ) -> Constraint<OtherA, OtherN, OtherV>
+impl<R1> Constraint<R1> {
+    pub fn translate<R2, FA, FN, FV>(&self, ta: FA, tn: FN, tv: FV) -> Constraint<R2>
     where
-        FA: FnMut(&A) -> OtherA,
-        FN: FnMut(&N) -> OtherN,
-        FV: FnMut(&V) -> OtherV,
+        FA: FnMut(&R1) -> R2,
+        FN: FnMut(&R1) -> R2,
+        FV: FnMut(&Version<R1>) -> Version<R2>,
     {
         let mut ta = ta;
         let mut tn = tn;
         let mut tv = tv;
         Constraint {
-            arch: ta(&self.arch),
+            arch: self.arch.as_ref().map(|a| ta(&a)),
             name: tn(&self.name),
             range: self.range.translate_internal(&mut tv),
         }
     }
 }
 
-impl<A, N, V> Dependency<A, N, V> {
-    pub fn translate<OtherA, OtherN, OtherV, FA, FN, FV>(
-        &self,
-        ta: FA,
-        tn: FN,
-        tv: FV,
-    ) -> Dependency<OtherA, OtherN, OtherV>
+pub(crate) trait DropConstraint<C> {
+    fn drop_constraint(&self, con: &C) -> Option<Option<Self>>
     where
-        FA: FnMut(&A) -> OtherA,
-        FN: FnMut(&N) -> OtherN,
-        FV: FnMut(&V) -> OtherV,
+        Self: Sized;
+}
+impl<R> DropConstraint<Constraint<R>> for Vec<Constraint<R>>
+where
+    R: Eq,
+    Version<R>: Ord + Eq,
+    Constraint<R>: Clone,
+{
+    fn drop_constraint(&self, con: &Constraint<R>) -> Option<Option<Self>> {
+        for (i, c) in self.iter().enumerate() {
+            if c.satisfies(con) {
+                let result = self
+                    .iter()
+                    .take(i)
+                    .cloned()
+                    .chain(
+                        self.iter()
+                            .skip(i + 1)
+                            .cloned()
+                            .filter(|dep| !dep.satisfies(con)),
+                    )
+                    .collect::<Vec<_>>();
+                return match result.len() {
+                    0 => Some(None),
+                    _ => Some(Some(result)),
+                };
+            }
+        }
+        None
+    }
+}
+
+impl<R> DropConstraint<Constraint<R>> for Vec<Dependency<R>>
+where
+    R: Eq,
+    Version<R>: Ord + Eq,
+    Constraint<R>: Clone,
+    Dependency<R>: Clone,
+{
+    fn drop_constraint(&self, con: &Constraint<R>) -> Option<Option<Self>> {
+        for (i, d) in self.iter().enumerate() {
+            if let Some(d) = d.drop_constraint(con) {
+                let result = self
+                    .iter()
+                    .take(i)
+                    .cloned()
+                    .chain(
+                        std::iter::once(d)
+                            .chain(
+                                self.iter()
+                                    .skip(i + 1)
+                                    .filter_map(|d| d.drop_constraint(con)),
+                            )
+                            .filter(|d| d.is_some())
+                            .map(|d| d.unwrap()),
+                    )
+                    .collect::<Vec<_>>();
+                return match result.len() {
+                    0 => Some(None),
+                    _ => Some(Some(result)),
+                };
+            }
+        }
+        None
+    }
+}
+
+impl<R> DropConstraint<Constraint<R>> for Dependency<R>
+where
+    R: Eq,
+    Version<R>: Ord + Eq,
+    Constraint<R>: Clone,
+{
+    fn drop_constraint(&self, con: &Constraint<R>) -> Option<Option<Self>> {
+        match self {
+            Self::Single(dep) => {
+                if dep.satisfies(con) {
+                    Some(None)
+                } else {
+                    None
+                }
+            }
+            Self::Union(deps) => {
+                for (i, dep) in deps.iter().enumerate() {
+                    if dep.satisfies(con) {
+                        let result = deps
+                            .iter()
+                            .take(i)
+                            .cloned()
+                            .chain(
+                                deps.iter()
+                                    .skip(i + 1)
+                                    .cloned()
+                                    .filter(|dep| !dep.satisfies(con)),
+                            )
+                            .collect::<SmallVec<[_; 2]>>();
+                        return match result.len() {
+                            0 => Some(None),
+                            _ => Some(Some(Self::Union(result))),
+                        };
+                    }
+                }
+                None
+            }
+        }
+    }
+}
+
+impl<R1> Dependency<R1> {
+    pub fn translate<R2, FA, FN, FV>(&self, ta: FA, tn: FN, tv: FV) -> Dependency<R2>
+    where
+        FA: FnMut(&R1) -> R2,
+        FN: FnMut(&R1) -> R2,
+        FV: FnMut(&Version<R1>) -> Version<R2>,
     {
         let mut tn = tn;
         let mut tv = tv;
@@ -327,13 +443,13 @@ impl<A, N, V> Dependency<A, N, V> {
             ),
         }
     }
-    pub fn iter(&self) -> DependencyRefIterator<'_, A, N, V> {
+    pub fn iter(&self) -> DependencyRefIterator<'_, R1> {
         DependencyRefIterator { dep: self, item: 0 }
     }
-    pub fn into_iter(self) -> impl Iterator<Item = Constraint<A, N, V>> {
+    pub fn into_iter(self) -> impl Iterator<Item = Constraint<R1>> {
         match self {
             Self::Single(dep) => {
-                let single: SmallVec<[Constraint<A, N, V>; 2]> = smallvec![dep];
+                let single: SmallVec<[Constraint<R1>; 2]> = smallvec![dep];
                 single.into_iter()
             }
             Self::Union(deps) => deps.into_iter(),
@@ -341,14 +457,14 @@ impl<A, N, V> Dependency<A, N, V> {
     }
 }
 
-pub struct DependencyRefIterator<'a, A, N, V> {
-    dep: &'a Dependency<A, N, V>,
+pub struct DependencyRefIterator<'a, R> {
+    dep: &'a Dependency<R>,
     item: usize,
 }
 
-impl<'a, A, N, V> Iterator for DependencyRefIterator<'a, A, N, V> {
-    type Item = &'a Constraint<A, N, V>;
-    fn next(&mut self) -> Option<&'a Constraint<A, N, V>> {
+impl<'a, R> Iterator for DependencyRefIterator<'a, R> {
+    type Item = &'a Constraint<R>;
+    fn next(&mut self) -> Option<&'a Constraint<R>> {
         match self.dep {
             Dependency::Single(dep) => {
                 if self.item == 0 {
@@ -446,9 +562,9 @@ where
 
         match (self, req) {
             // Trivial cases
-            (None, _) => true,          // ∅ ⊆ anything
+            (None, _) => true, // ∅ ⊆ anything
             (Any, Any) => true,
-            (Any, _) => false,          // U ⊆ X  => X must be U
+            (Any, _) => false, // U ⊆ X  => X must be U
 
             // Single-point set {a} ⊆ req  <=>  a ∈ req
             (Exactly(a), r) => a.satisfies(r),
@@ -541,6 +657,12 @@ impl<V: Display> Debug for VersionSet<V> {
     }
 }
 
+impl<V> Into<VersionSet<Version<V>>> for Version<V> {
+    fn into(self) -> VersionSet<Version<V>> {
+        VersionSet::Exactly(self)
+    }
+}
+
 impl<V> VersionSet<V> {
     pub fn is_any(&self) -> bool {
         matches!(self, Self::Any)
@@ -589,6 +711,12 @@ pub struct Version<V> {
     inner: V,
 }
 
+impl<'a> Version<&'a str> {
+    pub(crate) fn new(v: &'a str) -> Self {
+        Version { inner: v }
+    }
+}
+
 impl<V> Version<V> {
     pub(crate) fn translate<OtherV, TV>(&self, tv: TV) -> Version<OtherV>
     where
@@ -602,20 +730,20 @@ impl<V> Version<V> {
 }
 
 impl<V> std::ops::Not for Version<V>
-where V: std::ops::Not<Output = V> {
+where
+    V: std::ops::Not<Output = V>,
+{
     type Output = Self;
     fn not(self) -> Self::Output {
-        Version {
-            inner: !self.inner,
-        }
+        Version { inner: !self.inner }
     }
 }
 
-impl<N, V> Satisfies<VersionSet<Version<V>>> for ProvidedName<N, Version<V>>
+impl<R> Satisfies<VersionSet<Version<R>>> for ProvidedName<R>
 where
-    Version<V>: Eq + Ord,
+    Version<R>: Eq + Ord,
 {
-    fn satisfies(&self, set: &VersionSet<Version<V>>) -> bool {
+    fn satisfies(&self, set: &VersionSet<Version<R>>) -> bool {
         match self {
             Self::Any(_) => true,
             Self::Exact(_, v) => v.satisfies(set),
@@ -709,9 +837,34 @@ impl<V: AsRef<str>> From<&Version<V>> for String {
     }
 }
 
-impl<'a> From<&'a str> for Version<&'a str> {
-    fn from(value: &'a str) -> Self {
-        Version { inner: value }
+impl<'a> TryFrom<&'a str> for Version<&'a str> {
+    type Error = ParseError;
+    fn try_from(src: &'a str) -> std::result::Result<Self, Self::Error> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let v = Version {
+            inner: parser.parse_string_of(1, version_char, "version number")?,
+        };
+        if parser.is_empty() {
+            Ok(v)
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
+}
+
+impl std::str::FromStr for Version<String> {
+    type Err = ParseError;
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        Self::try_from(src)
+    }
+}
+
+impl TryFrom<&str> for Version<String> {
+    type Error = ParseError;
+    fn try_from(value: &str) -> std::result::Result<Self, Self::Error> {
+        Version::<&'_ str>::try_from(value).map(|s| s.translate(|v| v.to_string()))
     }
 }
 
@@ -925,7 +1078,7 @@ impl<'a> ParsedConstraintIterator<'a> {
 }
 
 impl<'a> Iterator for ParsedConstraintIterator<'a> {
-    type Item = Result<Constraint<Option<&'a str>, &'a str, Version<&'a str>>, ParseError>;
+    type Item = Result<Constraint<&'a str>, ParseError>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.parser.is_empty() {
             None
@@ -941,7 +1094,7 @@ impl<'a> Iterator for ParsedConstraintIterator<'a> {
     }
 }
 
-impl std::str::FromStr for Constraint<Option<String>, String, Version<String>> {
+impl std::str::FromStr for Constraint<String> {
     type Err = ParseError;
     fn from_str(src: &str) -> Result<Self, Self::Err> {
         let mut parser = Parser {
@@ -950,7 +1103,7 @@ impl std::str::FromStr for Constraint<Option<String>, String, Version<String>> {
         let dep = Constraint::parse_internal(&mut parser, true)?;
         if parser.is_empty() {
             Ok(dep.translate(
-                |a| a.map(|s| s.to_string()),
+                |a| a.to_string(),
                 |n| n.to_string(),
                 |v| v.translate(|s| s.to_string()),
             ))
@@ -960,7 +1113,7 @@ impl std::str::FromStr for Constraint<Option<String>, String, Version<String>> {
     }
 }
 
-impl<'a> TryFrom<&'a str> for Constraint<Option<&'a str>, &'a str, Version<&'a str>> {
+impl<'a> TryFrom<&'a str> for Constraint<&'a str> {
     type Error = ParseError;
     fn try_from(src: &'a str) -> Result<Self, Self::Error> {
         let mut parser = Parser {
@@ -990,7 +1143,7 @@ impl<'a> ParsedDependencyIterator<'a> {
 }
 
 impl<'a> Iterator for ParsedDependencyIterator<'a> {
-    type Item = Result<Dependency<Option<&'a str>, &'a str, Version<&'a str>>, ParseError>;
+    type Item = Result<Dependency<&'a str>, ParseError>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.parser.is_empty() {
             None
@@ -1006,7 +1159,7 @@ impl<'a> Iterator for ParsedDependencyIterator<'a> {
     }
 }
 
-impl std::str::FromStr for Dependency<Option<String>, String, Version<String>> {
+impl std::str::FromStr for Dependency<String> {
     type Err = ParseError;
     fn from_str(src: &str) -> Result<Self, Self::Err> {
         let mut parser = Parser {
@@ -1015,7 +1168,7 @@ impl std::str::FromStr for Dependency<Option<String>, String, Version<String>> {
         let dep = Dependency::parse(&mut parser)?;
         if parser.is_empty() {
             Ok(dep.translate(
-                |a| a.map(|s| s.to_string()),
+                |a| a.to_string(),
                 |n| n.to_string(),
                 |v| v.translate(|s| s.to_string()),
             ))
@@ -1025,7 +1178,7 @@ impl std::str::FromStr for Dependency<Option<String>, String, Version<String>> {
     }
 }
 
-impl<'a> TryFrom<&'a str> for Dependency<Option<&'a str>, &'a str, Version<&'a str>> {
+impl<'a> TryFrom<&'a str> for Dependency<&'a str> {
     type Error = ParseError;
     fn try_from(src: &'a str) -> Result<Self, Self::Error> {
         let mut parser = Parser {
@@ -1055,7 +1208,7 @@ impl<'a> ParsedProvidedNameIterator<'a> {
 }
 
 impl<'a> Iterator for ParsedProvidedNameIterator<'a> {
-    type Item = Result<ProvidedName<&'a str, Version<&'a str>>, ParseError>;
+    type Item = Result<ProvidedName<&'a str>, ParseError>;
     fn next(&mut self) -> Option<Self::Item> {
         if self.parser.is_empty() {
             None
@@ -1071,8 +1224,8 @@ impl<'a> Iterator for ParsedProvidedNameIterator<'a> {
     }
 }
 
-impl<'a> ProvidedName<&'a str, Version<&'a str>> {
-    fn parse(inp: &mut Parser<'a>) -> Result<ProvidedName<&'a str, Version<&'a str>>, ParseError> {
+impl<'a> ProvidedName<&'a str> {
+    fn parse(inp: &mut Parser<'a>) -> Result<ProvidedName<&'a str>, ParseError> {
         if inp.is_empty() {
             return Err("provided version".into());
         }
@@ -1083,11 +1236,14 @@ impl<'a> ProvidedName<&'a str, Version<&'a str>> {
         inp.parse(b'=', "'=' in provided version")?;
         let version = inp.parse_string_of(1, version_char, "version number")?;
         inp.parse(b')', "closing ')'")?;
-        Ok(ProvidedName::Exact(package_name, Version::from(version)))
+        Ok(ProvidedName::Exact(
+            package_name,
+            Version { inner: version },
+        ))
     }
 }
 
-impl<'a> Constraint<Option<&'a str>, &'a str, Version<&'a str>> {
+impl<'a> Constraint<&'a str> {
     pub fn parse_inverse(src: &'a str) -> Result<Self, ParseError> {
         let mut parser = Parser {
             inp: src.as_bytes(),
@@ -1126,6 +1282,36 @@ impl<'a> Constraint<Option<&'a str>, &'a str, Version<&'a str>> {
         };
         let range = VersionSet::<Version<&'a str>>::parse(inp, straight)?;
         Ok(Constraint { arch, name, range })
+    }
+}
+
+impl<'a> TryFrom<&'a str> for VersionSet<Version<&'a str>> {
+    type Error = ParseError;
+    fn try_from(src: &'a str) -> Result<Self, Self::Error> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let vs = VersionSet::parse(&mut parser, true)?;
+        if parser.is_empty() {
+            Ok(vs)
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
+}
+
+impl std::str::FromStr for VersionSet<Version<String>> {
+    type Err = ParseError;
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        Self::try_from(src)
+    }
+}
+
+impl TryFrom<&str> for VersionSet<Version<String>> {
+    type Error = ParseError;
+    fn try_from(src: &str) -> Result<Self, Self::Error> {
+        VersionSet::<Version<&'_ str>>::try_from(src)
+            .map(|vs| vs.translate(|v| v.translate(|s| s.to_string())))
     }
 }
 
@@ -1186,10 +1372,9 @@ impl<'a> VersionSet<Version<&'a str>> {
     }
 }
 
-impl<'a> Dependency<Option<&'a str>, &'a str, Version<&'a str>> {
+impl<'a> Dependency<&'a str> {
     fn parse(inp: &mut Parser<'a>) -> Result<Self, ParseError> {
-        let mut union: SmallVec<[Constraint<Option<&'a str>, &'a str, Version<&'a str>>; 2]> =
-            smallvec![];
+        let mut union: SmallVec<[Constraint<&'a str>; 2]> = smallvec![];
         loop {
             let dep = Constraint::parse_internal(inp, true)?;
             match inp.matches(b'|') {
@@ -1435,25 +1620,114 @@ mod comparator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::str::FromStr;
 
     macro_rules! assert {
         ($left:tt $op:tt $right:tt) => {
-            std::assert!( Version::from($left) $op Version::from($right) )
+            std::assert!( Version::from_str($left).unwrap() $op Version::from_str($right).unwrap() )
         }
     }
 
     macro_rules! satisfies {
-        ($left:tt $right:tt) => {
-            std::assert!(Version::from($left).satisfies(
-                &VersionSet::parse(
-                    &mut Parser {
-                        inp: $right.as_bytes()
-                    },
-                    true
-                )
+        ($ltype:tt($left:tt) $rtype:tt($right:tt)) => {
+            std::assert!($ltype::from_str($left)
                 .unwrap()
-            ))
+                .satisfies(&$rtype::from_str($right).unwrap()))
         };
+    }
+
+    fn v(s: &str) -> Version<String> {
+        Version::from_str(s).unwrap()
+    }
+
+    #[test]
+    fn versionset_subset_relations() {
+        type VS = VersionSet<Version<String>>;
+
+        // None ⊆ anything
+        std::assert!(VS::None.satisfies(&VS::Any));
+        std::assert!(VS::None.satisfies(&VS::StrictlyLaterThan(v("0"))));
+
+        // Only None satisfies required None
+        std::assert!(VS::None.satisfies(&VS::None));
+        std::assert!(!VS::Any.satisfies(&VS::None));
+        std::assert!(!VS::Exactly(v("1")).satisfies(&VS::None));
+        std::assert!(!VS::Except(v("1")).satisfies(&VS::None));
+
+        // U ⊆ U, U ⊄ X (X != U)
+        std::assert!(VS::Any.satisfies(&VS::Any));
+        std::assert!(!VS::Any.satisfies(&VS::StrictlyEarlierThan(v("100"))));
+
+        // {a} ⊆ R iff a ∈ R
+        std::assert!(VS::Exactly(v("1")).satisfies(&VS::LaterOrEqualThan(v("1"))));
+        std::assert!(!VS::Exactly(v("1")).satisfies(&VS::StrictlyLaterThan(v("1"))));
+
+        // Except
+        std::assert!(VS::Except(v("2")).satisfies(&VS::Any));
+        std::assert!(VS::Except(v("2")).satisfies(&VS::Except(v("2"))));
+        std::assert!(!VS::Except(v("2")).satisfies(&VS::Except(v("3"))));
+
+        // (-∞, a)
+        std::assert!(VS::StrictlyEarlierThan(v("3")).satisfies(&VS::Any));
+        std::assert!(VS::StrictlyEarlierThan(v("3")).satisfies(&VS::StrictlyEarlierThan(v("3"))));
+        std::assert!(VS::StrictlyEarlierThan(v("3")).satisfies(&VS::EarlierOrEqualThan(v("3"))));
+        std::assert!(VS::StrictlyEarlierThan(v("3")).satisfies(&VS::Except(v("4")))); // 4 >= 3
+        std::assert!(!VS::StrictlyEarlierThan(v("3")).satisfies(&VS::LaterOrEqualThan(v("0"))));
+
+        // (-∞, a]
+        std::assert!(VS::EarlierOrEqualThan(v("3")).satisfies(&VS::Any));
+        std::assert!(VS::EarlierOrEqualThan(v("3")).satisfies(&VS::StrictlyEarlierThan(v("4"))));
+        std::assert!(VS::EarlierOrEqualThan(v("3")).satisfies(&VS::EarlierOrEqualThan(v("3"))));
+        std::assert!(VS::EarlierOrEqualThan(v("3")).satisfies(&VS::Except(v("4")))); // 4 > 3
+        std::assert!(!VS::EarlierOrEqualThan(v("3")).satisfies(&VS::Except(v("3"))));
+
+        // (a, ∞)
+        std::assert!(VS::StrictlyLaterThan(v("2")).satisfies(&VS::Any));
+        std::assert!(VS::StrictlyLaterThan(v("2")).satisfies(&VS::StrictlyLaterThan(v("2"))));
+        std::assert!(VS::StrictlyLaterThan(v("2")).satisfies(&VS::LaterOrEqualThan(v("2"))));
+        std::assert!(VS::StrictlyLaterThan(v("2")).satisfies(&VS::Except(v("2")))); // 2 <= 2
+        std::assert!(!VS::StrictlyLaterThan(v("2")).satisfies(&VS::EarlierOrEqualThan(v("9"))));
+
+        // [a, ∞)
+        std::assert!(VS::LaterOrEqualThan(v("3")).satisfies(&VS::Any));
+        std::assert!(VS::LaterOrEqualThan(v("3")).satisfies(&VS::StrictlyLaterThan(v("2"))));
+        std::assert!(VS::LaterOrEqualThan(v("3")).satisfies(&VS::LaterOrEqualThan(v("3"))));
+        std::assert!(VS::LaterOrEqualThan(v("3")).satisfies(&VS::Except(v("2")))); // 2 < 3
+        std::assert!(!VS::LaterOrEqualThan(v("3")).satisfies(&VS::Except(v("3"))));
+    }
+
+    #[test]
+    fn constraint_satisfies_with_arch() {
+        let cand_arm: Constraint<String> = "pkg:arm64 (>= 1)".parse().unwrap();
+        let cand_none: Constraint<String> = "pkg (>= 1)".parse().unwrap();
+        let req_arm: Constraint<String> = "pkg:arm64 (>= 1)".parse().unwrap();
+        let req_noarch: Constraint<String> = "pkg (>= 1)".parse().unwrap();
+
+        // Requirement has arch -> candidate must match arch
+        std::assert!(cand_arm.satisfies(&req_arm));
+        std::assert!(!cand_none.satisfies(&req_arm));
+
+        // Requirement has no arch -> candidate arch ignored
+        std::assert!(cand_arm.satisfies(&req_noarch));
+        std::assert!(cand_none.satisfies(&req_noarch));
+    }
+
+    #[test]
+    fn satisfied_by_adapter_works() {
+        // ProvidedName vs VersionSet
+        let req = VersionSet::LaterOrEqualThan(v("1.0"));
+        let prov_ok = ProvidedName::Exact("pkg".to_string(), v("1.2"));
+        let prov_bad = ProvidedName::Exact("pkg".to_string(), v("0.9"));
+        std::assert!(req.is_satisfied_by(&prov_ok));
+        std::assert!(!req.is_satisfied_by(&prov_bad));
+
+        // Constraint vs Constraint
+        let req_c: Constraint<String> =
+            "pkg (>= 1)".parse().unwrap();
+        let cand_c: Constraint<String> =
+            "pkg (>= 2)".parse().unwrap();
+        std::assert!(req_c.is_satisfied_by(&cand_c));
+        std::assert!(!cand_c.is_satisfied_by(&req_c));
     }
 
     #[test]
@@ -1467,9 +1741,10 @@ mod tests {
 
     #[test]
     fn test_requirements() {
-        satisfies!("1.0.1" "(>= 1.0.0)");
-        satisfies!("1:1.0" "(= 1:1.0)");
-        satisfies!("2.0.0~rc1" "(<< 2.0.0)");
+        satisfies!(Version("1.0.1") VersionSet("(>= 1.0.0)"));
+        satisfies!(Version("1:1.0") VersionSet("(= 1:1.0)"));
+        satisfies!(Version("2.0.0~rc1") VersionSet("(<< 2.0.0)"));
+        satisfies!(VersionSet("(= 2.0.0~rc1)") VersionSet("(<= 2.0.0)"));
     }
 
     #[test]
@@ -1478,10 +1753,6 @@ mod tests {
         assert!("~~a" > "~~");
         assert!("~~a" < "~");
         assert!("~" > "~~a");
-        assert!("~" < "");
-        assert!("" > "~");
-        assert!("" < "a");
-        assert!("a" > "");
         assert!("a" < "b");
         assert!("b" > "a");
         assert!("c" < "db");

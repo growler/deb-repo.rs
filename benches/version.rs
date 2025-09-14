@@ -3,8 +3,9 @@ use debrepo::Version;
 
 macro_rules! bench {
     ($c:expr, $left:tt $op:tt $right:tt) => {{
-        let this = Version::from($left);
-        let that = Version::from($right);
+        use std::str::FromStr;
+        let this = Version::from_str($left).unwrap();
+        let that = Version::from_str($right).unwrap();
         $c.bench_function(&format!("benchmark {}", stringify!($left $op $right)), |b| b.iter(|| {
             black_box({
                 &this $op &that
