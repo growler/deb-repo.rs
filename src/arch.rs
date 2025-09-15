@@ -31,7 +31,6 @@ pub const DEFAULT_ARCH: &str = "armhf";
 pub const DEFAULT_ARCH: &str = "armel";
 
 // Fallback: if none of the above matched, use the literal from std::env::consts::ARCH
-// This is still a const (std::env::consts::ARCH is a compile-time constant).
 #[cfg(not(any(
     target_arch = "x86",
     target_arch = "x86_64",

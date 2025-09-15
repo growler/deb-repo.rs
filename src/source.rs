@@ -1,5 +1,5 @@
 use {
-    crate::{control::MutableControlStanza, Packages, Release, TransportProvider},
+    crate::{control::MutableControlStanza, hash::FileHash, Packages, Release, TransportProvider},
     async_std::{
         io,
         path::{Path, PathBuf},
@@ -434,6 +434,88 @@ impl clap::builder::TypedValueParser for ClapSnapshotParser {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SourceHashKind {
+    #[default]
+    SHA256,
+    SHA512,
+    MD5sum,
+}
+
+impl SourceHashKind {
+    pub fn is_sha256(&self) -> bool {
+        *self == SourceHashKind::SHA256
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            SourceHashKind::MD5sum => "MD5",
+            SourceHashKind::SHA256 => "SHA256",
+            SourceHashKind::SHA512 => "SHA512",
+        }
+    }
+}
+
+impl std::str::FromStr for SourceHashKind {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_ascii_lowercase().as_str() {
+            "md5" | "md5sum" => Ok(SourceHashKind::MD5sum),
+            "sha256" => Ok(SourceHashKind::SHA256),
+            "sha512" => Ok(SourceHashKind::SHA512),
+            other => Err(format!("unsupported hash: {other}")),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct SourceHashKindValueParser;
+
+impl clap::builder::TypedValueParser for SourceHashKindValueParser {
+    type Value = SourceHashKind;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let val: SourceHashKind = value
+            .to_str()
+            .ok_or_else(|| {
+                let mut err = clap::Error::new(clap::error::ErrorKind::InvalidUtf8).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                err
+            })?
+            .parse()
+            .map_err(|e: String| {
+                let mut err =
+                    clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                err.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(value.to_string_lossy().into()),
+                );
+                err.insert(
+                    clap::error::ContextKind::Custom,
+                    clap::error::ContextValue::String(e),
+                );
+                err
+            })?;
+
+        Ok(val)
+    }
+}
+
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 #[group(required = true, multiple = true)]
@@ -473,6 +555,21 @@ pub struct Source {
     #[arg(value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
+
+    /// Hash type for veryfing repository files
+    #[arg(
+        long = "hash",
+        value_parser = SourceHashKindValueParser,
+        value_name = "md5|sha256|sha512",
+        default_value = "sha256"
+    )]
+    #[serde(default, skip_serializing_if = "SourceHashKind::is_sha256")]
+    pub hash: SourceHashKind,
+
+    /// Source priority (higher number means higher priority)
+    #[arg(long = "priority", value_name = "N")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub priority: Option<u16>,
 }
 
 impl Source {
@@ -493,7 +590,7 @@ impl Source {
         transport: &T,
         path: &str,
         size: u64,
-        hash: &[u8],
+        hash: &FileHash,
     ) -> async_std::io::Result<Release> {
         transport
             .fetch_verify(
@@ -511,11 +608,12 @@ impl Source {
     pub async fn fetch_unsigned_release<T: TransportProvider + ?Sized>(
         &self,
         transport: &T,
-    ) -> async_std::io::Result<(Release, String, u64, Box<[u8]>)> {
+    ) -> async_std::io::Result<(Release, String, u64, FileHash)> {
         let path = format!("dists/{}/Release", self.suite);
         transport
             .fetch_hash(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
+                self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
             )
             .await
@@ -560,11 +658,12 @@ impl Source {
     pub async fn fetch_signed_release<T: TransportProvider>(
         &self,
         transport: &T,
-    ) -> async_std::io::Result<(Release, String, u64, Box<[u8]>)> {
+    ) -> async_std::io::Result<(Release, String, u64, FileHash)> {
         let path = format!("dists/{}/InRelease", self.suite);
         let (data, size, hash) = transport
             .fetch_hash(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
+                self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
             )
             .await?;
@@ -575,7 +674,7 @@ impl Source {
         transport: &T,
         path: &str,
         size: u64,
-        hash: &[u8],
+        hash: &FileHash,
     ) -> io::Result<Release> {
         let data = transport
             .fetch_verify(
@@ -590,7 +689,7 @@ impl Source {
         &self,
         path: &str,
         size: u64,
-        hash: &[u8],
+        hash: &FileHash,
         transport: &T,
     ) -> io::Result<Packages> {
         transport
@@ -602,12 +701,12 @@ impl Source {
                     path
                 ),
                 size,
-                &hash,
+                hash,
                 Self::MAX_PACKAGE_SIZE,
             )
             .await
             .and_then(|buf| {
-                Packages::try_from(buf).map_err(|e| {
+                Packages::new_from_bytes(buf, self.priority).map_err(|e| {
                     async_std::io::Error::new(async_std::io::ErrorKind::InvalidData, e)
                 })
             })

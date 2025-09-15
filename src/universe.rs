@@ -1,13 +1,11 @@
 use {
     crate::{
         control::ParseError,
-        deb::DebReader,
-        hash::{hash_field_name, HashAlgo},
+        hash::FileHash,
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
         version::{self, Constraint, Dependency, Satisfies, Version},
     },
-    futures::io::{copy, AsyncRead, AsyncWrite},
     iterator_ext::IteratorExt,
     resolvo::{
         Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
@@ -20,7 +18,6 @@ use {
         collections::{BinaryHeap, HashMap, HashSet},
         hash::{Hash, Hasher},
         io,
-        pin::{pin, Pin},
     },
 };
 
@@ -101,6 +98,7 @@ struct Solvable<'a> {
     arch: ArchId,
     name: NameId,
     pkgs: u32,
+    prio: u16,
     version: Version<&'a str>,
     package: &'a Package<'a>,
 }
@@ -211,6 +209,7 @@ impl<'a> UniverseIndex<'a> {
     fn add_package(
         &mut self,
         pkgs: u32,
+        prio: u16,
         required: &mut Vec<NameId>,
         package: &'a Package<'a>,
     ) -> Result<(), ParseError> {
@@ -230,6 +229,7 @@ impl<'a> UniverseIndex<'a> {
         let version = package.version()?;
         self.solvables.push(Solvable {
             pkgs,
+            prio,
             arch,
             name,
             package,
@@ -355,7 +355,12 @@ impl Universe {
                         let mut required = Vec::<NameId>::new();
                         for (num, pkgs) in list.iter().enumerate() {
                             for package in pkgs.packages() {
-                                index.add_package(num as u32, &mut required, package)?;
+                                index.add_package(
+                                    num as u32,
+                                    pkgs.prio(),
+                                    &mut required,
+                                    package,
+                                )?;
                             }
                         }
                         for name in required {
@@ -465,12 +470,17 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables.iter().map(|s| s.package))
     }
-    pub fn package_source(&self, solvable: PackageId) -> usize {
+    pub fn package_source(&self, solvable: PackageId) -> Option<usize> {
         self.inner
             .provider()
-            .with_index(|i| i.solvables[solvable.to_index()].pkgs as usize)
+            .with_index(|i| i.solvables.get(solvable.to_index()))
+            .map(|p| p.pkgs as usize)
     }
-    pub async fn package_file(&self, id: PackageId, hash_field_name: &'static str) -> io::Result<(&'_ str, u64, Box<[u8]>)> {
+    pub async fn package_file(
+        &self,
+        id: PackageId,
+        hash_field_name: &'static str,
+    ) -> io::Result<(&'_ str, u64, FileHash)> {
         self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file(hash_field_name)?;
@@ -1007,10 +1017,13 @@ impl DependencyProvider for InnerUniverse {
                 let this = &i.solvables[this.to_index()];
                 let that = &i.solvables[that.to_index()];
                 match (this.arch.satisfies(&i.arch), that.arch.satisfies(&i.arch)) {
-                    (false, true) => std::cmp::Ordering::Less,
-                    (true, false) => std::cmp::Ordering::Greater,
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
                     _ => match this.package.name().cmp(that.package.name()) {
-                        std::cmp::Ordering::Equal => this.version.cmp(&that.version),
+                        std::cmp::Ordering::Equal => match that.prio.cmp(&this.prio) { // higher prio first
+                            std::cmp::Ordering::Equal => that.version.cmp(&this.version), // newer versions first
+                            cmp => cmp,
+                        },
                         cmp => cmp,
                     },
                 }
@@ -1045,9 +1058,8 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src)
-                        .expect("failed to parse test source")]
-                    .into_iter(),
+                    vec![Packages::new($src, None).expect("failed to parse test source")]
+                        .into_iter(),
                 )
                 .unwrap();
                 let solution = match uni.solve(

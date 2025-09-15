@@ -4,7 +4,7 @@ use {
             ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
             ParseError,
         },
-        hash::{hash_field_name, Hash, HashAlgo},
+        hash::FileHash,
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
@@ -105,7 +105,6 @@ pub struct Package<'a> {
     version: &'a str,
     arch: &'a str,
     provides: Option<&'a str>,
-    path: Option<&'a str>,
     depends: Option<&'a str>,
     pre_depends: Option<&'a str>,
     conflicts: Option<&'a str>,
@@ -122,7 +121,7 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    pub fn repo_file(&self, hash_field_name: &'static str) -> io::Result<(&'a str, u64, Box<[u8]>)> {
+    pub fn repo_file(&self, hash_field_name: &'static str) -> io::Result<(&'a str, u64, FileHash)> {
         let (path, size, digest) = self
             .fields()
             .find_fields(("Filename", "Size", hash_field_name))
@@ -135,15 +134,7 @@ impl<'a> Package<'a> {
         Ok((
             path,
             crate::parse_size(size.as_bytes())?,
-            hex::decode(digest).map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "package {} field {} is not valid hex: {}",
-                        self, hash_field_name, err
-                    ),
-                )
-            })?.into_boxed_slice(),
+            digest.try_into()?,
         ))
     }
     pub fn src(&self) -> &'a str {
@@ -155,17 +146,10 @@ impl<'a> Package<'a> {
     pub fn arch(&self) -> &'a str {
         self.arch
     }
-    pub fn raw_full_name(
-        &self,
-    ) -> ProvidedName<&'a str> {
-        ProvidedName::Exact(
-            self.name,
-            Version::new(self.version),
-        )
+    pub fn raw_full_name(&self) -> ProvidedName<&'a str> {
+        ProvidedName::Exact(self.name, Version::new(self.version))
     }
-    pub fn full_name(
-        &self,
-    ) -> std::result::Result<ProvidedName<&'a str>, ParseError> {
+    pub fn full_name(&self) -> std::result::Result<ProvidedName<&'a str>, ParseError> {
         Ok(ProvidedName::Exact(
             self.name,
             Version::try_from(self.version)?,
@@ -173,8 +157,7 @@ impl<'a> Package<'a> {
     }
     pub fn provides(
         &self,
-    ) -> impl Iterator<Item = std::result::Result<ProvidedName<&'a str>, ParseError>>
-    {
+    ) -> impl Iterator<Item = std::result::Result<ProvidedName<&'a str>, ParseError>> {
         ParsedProvidedNameIterator::new(self.provides.unwrap_or(""))
     }
     pub fn provides_name(&self, name: &str) -> bool {
@@ -218,42 +201,22 @@ impl<'a> Package<'a> {
     }
     pub fn depends(
         &self,
-    ) -> impl Iterator<
-        Item = std::result::Result<
-            Dependency<&'a str>,
-            ParseError,
-        >,
-    > {
+    ) -> impl Iterator<Item = std::result::Result<Dependency<&'a str>, ParseError>> {
         ParsedDependencyIterator::new(self.depends.unwrap_or(""))
     }
     pub fn pre_depends(
         &self,
-    ) -> impl Iterator<
-        Item = std::result::Result<
-            Dependency<&'a str>,
-            ParseError,
-        >,
-    > {
+    ) -> impl Iterator<Item = std::result::Result<Dependency<&'a str>, ParseError>> {
         ParsedDependencyIterator::new(self.pre_depends.unwrap_or(""))
     }
     pub fn breaks(
         &self,
-    ) -> impl Iterator<
-        Item = std::result::Result<
-            Constraint<&'a str>,
-            ParseError,
-        >,
-    > {
+    ) -> impl Iterator<Item = std::result::Result<Constraint<&'a str>, ParseError>> {
         ParsedConstraintIterator::new(self.breaks.unwrap_or(""), false)
     }
     pub fn conflicts(
         &self,
-    ) -> impl Iterator<
-        Item = std::result::Result<
-            Constraint<&'a str>,
-            ParseError,
-        >,
-    > {
+    ) -> impl Iterator<Item = std::result::Result<Constraint<&'a str>, ParseError>> {
         ParsedConstraintIterator::new(self.conflicts.unwrap_or(""), false)
     }
     pub fn control(&self) -> Result<ControlStanza<'a>, ParseError> {
@@ -302,8 +265,6 @@ impl<'a> Package<'a> {
                     pkg.version = field.value().trim();
                 } else if field.is_a("Provides") {
                     pkg.provides.replace(field.value());
-                } else if field.is_a("Filename") {
-                    pkg.path.replace(field.value());
                 } else if field.is_a("Depends") {
                     pkg.depends.replace(field.value());
                 } else if field.is_a("Pre-Depends") {
@@ -349,13 +310,18 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 
 pub struct Packages {
     inner: PackagesInner,
+    prio: u16,
 }
 
 impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
     }
-    pub fn repo_file(&self, index: usize, hash_field_name: &'static str) -> io::Result<(&str, u64, Box<[u8]>)> {
+    pub fn repo_file(
+        &self,
+        index: usize,
+        hash_field_name: &'static str,
+    ) -> io::Result<(&str, u64, FileHash)> {
         self.get(index)
             .ok_or_else(|| {
                 std::io::Error::new(
@@ -372,11 +338,24 @@ impl Packages {
     pub fn packages(&self) -> impl Iterator<Item = &Package<'_>> {
         self.inner.with_packages(|packages| packages.iter())
     }
-    pub fn new<S>(data: S) -> Result<Self, ParseError>
+    pub fn prio(&self) -> u16 {
+        self.prio
+    }
+    pub fn new_from_bytes<S>(data: S, prio: Option<u16>) -> Result<Self, ParseError>
+    where
+        Arc<str>: From<String>,
+        S: AsRef<[u8]>,
+    {
+        let s = String::from_utf8(data.as_ref().to_vec())
+            .map_err(|err| ParseError::from(format!("Invalid UTF-8: {}", err)))?;
+        Self::new(s.into_boxed_str(), prio)
+    }
+    pub fn new<S>(data: S, prio: Option<u16>) -> Result<Self, ParseError>
     where
         Arc<str>: From<S>,
     {
         Ok(Packages {
+            prio: prio.unwrap_or(500),
             inner: PackagesInnerTryBuilder {
                 data: Arc::<str>::from(data),
                 packages_builder: |data: &'_ Arc<str>| -> Result<Vec<Package<'_>>, ParseError> {
@@ -407,14 +386,14 @@ impl Packages {
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(inp.to_owned().into_boxed_str())
+        Self::new(inp.to_owned().into_boxed_str(), None)
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(inp.into_boxed_str())
+        Self::new(inp.into_boxed_str(), None)
     }
 }
 
@@ -425,6 +404,7 @@ impl TryFrom<Vec<u8>> for Packages {
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into_boxed_str(),
+            None,
         )
     }
 }

@@ -15,34 +15,251 @@ use {
     std::{fmt, pin::Pin},
 };
 
-pub trait HashAlgo: FixedOutputReset + Default + Send {
-    const HASH_FIELD_NAME: &'static str;
+// pub enum HashRef<'a, H: HashAlgo> {
+//     Borrowed(&'a Hash<H>),
+//     Boxed(Box<Hash<H>>),
+// }
+//
+// impl<'a, H: HashAlgo> std::fmt::Debug for HashRef<'a, H> {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         write!(f, "\"{}\"", hex::encode(self.as_ref()))
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> AsRef<Hash<H>> for HashRef<'a, H> {
+//     fn as_ref(&self) -> &Hash<H> {
+//         match self {
+//             HashRef::Borrowed(b) => b,
+//             HashRef::Boxed(b) => b.as_ref(),
+//         }
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> std::ops::Deref for HashRef<'a, H> {
+//     type Target = Hash<H>;
+//     fn deref(&self) -> &Self::Target {
+//         match self {
+//             HashRef::Borrowed(b) => b,
+//             HashRef::Boxed(b) => b.as_ref(),
+//         }
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> From<&'a Hash<H>> for HashRef<'a, H> {
+//     fn from(value: &'a Hash<H>) -> Self {
+//         HashRef::Borrowed(value)
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> From<Box<Hash<H>>> for HashRef<'a, H> {
+//     fn from(value: Box<Hash<H>>) -> Self {
+//         HashRef::Boxed(value)
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> From<Hash<H>> for HashRef<'a, H> {
+//     fn from(value: Hash<H>) -> Self {
+//         HashRef::Boxed(Box::new(value))
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> Clone for HashRef<'a, H> {
+//     fn clone(&self) -> Self {
+//         match self {
+//             HashRef::Borrowed(b) => HashRef::Borrowed(b),
+//             HashRef::Boxed(b) => HashRef::Boxed(b.clone()),
+//         }
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> From<&HashRef<'a, H>> for Hash<H> {
+//     fn from(hashref: &HashRef<'a, H>) -> Self {
+//         Hash {
+//             inner: match hashref {
+//                 HashRef::Borrowed(b) => b.inner.clone(),
+//                 HashRef::Boxed(b) => b.inner.clone(),
+//             },
+//         }
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> Eq for HashRef<'a, H> {}
+// impl<'a, H: HashAlgo> PartialEq for HashRef<'a, H> {
+//     fn eq(&self, other: &Self) -> bool {
+//         use std::ops::Deref;
+//         self.deref().eq(other.deref())
+//     }
+// }
+//
+// impl<'a, H: HashAlgo> HashRef<'a, H> {
+//     pub fn verifying_reader<R: Read + Unpin + Send>(
+//         &self,
+//         size: u64,
+//         reader: R,
+//     ) -> VerifyingReader<H, R> {
+//         VerifyingReader::new(reader, size, self.into())
+//     }
+//     pub fn hash(data: &[u8]) -> Self {
+//         let mut hasher = H::default();
+//         hasher.update(data);
+//         HashRef::Boxed(Box::new(Hash {
+//             inner: hasher.finalize_fixed(),
+//         }))
+//     }
+// }
+
+#[derive(Debug, Clone)]
+pub enum FileHash {
+    MD5sum(Hash<md5::Md5>),
+    SHA256(Hash<sha2::Sha256>),
+    SHA512(Hash<sha2::Sha512>),
+}
+impl AsRef<[u8]> for FileHash {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            FileHash::MD5sum(h) => h.as_ref(),
+            FileHash::SHA256(h) => h.as_ref(),
+            FileHash::SHA512(h) => h.as_ref(),
+        }
+    }
+}
+impl From<Hash<sha2::Sha512>> for FileHash {
+    fn from(value: Hash<sha2::Sha512>) -> Self {
+        FileHash::SHA512(value)
+    }
+}
+impl From<Hash<sha2::Sha256>> for FileHash {
+    fn from(value: Hash<sha2::Sha256>) -> Self {
+        FileHash::SHA256(value)
+    }
+}
+impl From<Hash<md5::Md5>> for FileHash {
+    fn from(value: Hash<md5::Md5>) -> Self {
+        FileHash::MD5sum(value)
+    }
+}
+impl std::ops::Deref for FileHash {
+    type Target = [u8];
+    fn deref(&self) -> &Self::Target {
+        match self {
+            FileHash::MD5sum(h) => h.as_ref(),
+            FileHash::SHA256(h) => h.as_ref(),
+            FileHash::SHA512(h) => h.as_ref(),
+        }
+    }
+}
+impl FileHash {
+    pub fn verifying_reader<'b, R: Read + Unpin + Send + 'b>(
+        &self,
+        size: u64,
+        reader: R,
+    ) -> Pin<Box<dyn Read + Send + 'b>> {
+        match self {
+            FileHash::MD5sum(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
+            FileHash::SHA256(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
+            FileHash::SHA512(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
+        }
+    }
+    pub fn name(&self) -> &'static str {
+        match self {
+            FileHash::MD5sum(_) => "MD5sum",
+            FileHash::SHA256(_) => "SHA256",
+            FileHash::SHA512(_) => "SHA512",
+        }
+    }
+    pub fn hash(kind: &str, data: &[u8]) -> Option<Self> {
+        match kind {
+            "MD5sum" => Some(Hash::<md5::Md5>::hash(data).into()),
+            "SHA256" => Some(Hash::<sha2::Sha256>::hash(data).into()),
+            "SHA512" => Some(Hash::<sha2::Sha512>::hash(data).into()),
+            _ => None,
+        }
+    }
 }
 
-impl HashAlgo for sha2::Sha256 {
-    const HASH_FIELD_NAME: &'static str = "SHA256";
+impl TryFrom<&str> for FileHash {
+    type Error = std::io::Error;
+    fn try_from(value: &str) -> std::io::Result<Self> {
+        use digest::OutputSizeUser;
+        match value.len() {
+            c if c == md5::Md5::output_size() * 2 => {
+                Ok(FileHash::from(Hash::<md5::Md5>::try_from(value)?))
+            }
+            c if c == sha2::Sha256::output_size() * 2 => {
+                Ok(FileHash::from(Hash::<sha2::Sha256>::try_from(value)?))
+            }
+            c if c == sha2::Sha512::output_size() * 2 => {
+                Ok(FileHash::from(Hash::<sha2::Sha512>::try_from(value)?))
+            }
+            _ => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid digest length {}", value.len()),
+            )),
+        }
+    }
 }
-impl HashAlgo for sha2::Sha512 {
-    const HASH_FIELD_NAME: &'static str = "SHA512";
+
+impl Serialize for FileHash {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        let s = ::hex::encode(self.as_ref());
+        serializer.serialize_str(&s)
+    }
 }
-impl HashAlgo for md5::Md5 {
-    const HASH_FIELD_NAME: &'static str = "MD5sum";
+
+impl<'de> Deserialize<'de> for FileHash {
+    fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
+    where
+        DE: Deserializer<'de>,
+    {
+        struct DigestVisitor;
+
+        impl<'de> Visitor<'de> for DigestVisitor {
+            type Value = FileHash;
+
+            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+                formatter.write_str("a hex encoded string representing the digest")
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                TryFrom::<&str>::try_from(value)
+                    .map_err(|e| de::Error::custom(format!("error decoding hash: {}", e)))
+            }
+        }
+        deserializer.deserialize_str(DigestVisitor)
+    }
 }
+
+pub trait HashAlgo: FixedOutputReset + Default + Send {}
+
+impl HashAlgo for sha2::Sha256 {}
+impl HashAlgo for sha2::Sha512 {}
+impl HashAlgo for md5::Md5 {}
 
 #[derive(Default, Debug)]
 pub struct Hash<D: HashAlgo> {
     inner: HashOutput<D>,
 }
 
-// pub trait HashPolicy {
-//     type Algo: HashAlgo;
-// }
-// pub(crate) type HashOf<T> = Hash<<T as HashPolicy>::Algo>;
-// pub(crate) type HashAlgoOf<T> = <T as HashPolicy>::Algo;
-pub(crate) const fn hash_field_name<T: HashAlgo>() -> &'static str
-where
-{
-    <T as HashAlgo>::HASH_FIELD_NAME
+impl<D: HashAlgo> Hash<D> {
+    pub fn hash(data: &[u8]) -> Self {
+        let mut hasher = D::default();
+        hasher.update(data);
+        Hash {
+            inner: hasher.finalize_fixed(),
+        }
+    }
+}
+
+impl<H: HashAlgo> AsRef<[u8]> for Hash<H> {
+    fn as_ref(&self) -> &[u8] {
+        &self.inner
+    }
 }
 
 impl<D: HashAlgo> Serialize for Hash<D> {
@@ -267,41 +484,46 @@ impl<D: HashAlgo> TryFrom<&[u8]> for Hash<D> {
     }
 }
 
-impl<D: HashAlgo> From<&Hash<D>> for async_std::path::PathBuf {
-    fn from(value: &Hash<D>) -> Self {
-        let bytes = &value.inner;
-        if bytes.is_empty() {
-            return async_std::path::PathBuf::new();
-        }
+fn path_for_hash(bytes: &[u8]) -> async_std::path::PathBuf {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
 
-        const HEX: &[u8; 16] = b"0123456789abcdef";
+    let needs_sep = bytes.len() > 1;
+    let total_len = 2 * bytes.len() + usize::from(needs_sep);
+    let mut os = std::ffi::OsString::with_capacity(total_len);
 
-        let needs_sep = bytes.len() > 1;
-        let total_len = 2 * bytes.len() + usize::from(needs_sep);
-        let mut os = std::ffi::OsString::with_capacity(total_len);
+    let b0 = bytes[0];
+    let mut pair = [0u8; 2];
+    pair[0] = HEX[(b0 >> 4) as usize];
+    pair[1] = HEX[(b0 & 0x0f) as usize];
+    // Safety: HEX only contains ASCII; pair is always valid UTF-8
+    unsafe {
+        os.push(std::str::from_utf8_unchecked(&pair));
+    }
 
-        let b0 = bytes[0];
-        let mut pair = [0u8; 2];
-        pair[0] = HEX[(b0 >> 4) as usize];
-        pair[1] = HEX[(b0 & 0x0f) as usize];
-        // Safety: HEX only contains ASCII; pair is always valid UTF-8
-        unsafe {
-            os.push(std::str::from_utf8_unchecked(&pair));
-        }
-
-        if needs_sep {
-            os.push(std::ffi::OsStr::new("/"));
-            for &b in &bytes[1..] {
-                pair[0] = HEX[(b >> 4) as usize];
-                pair[1] = HEX[(b & 0x0f) as usize];
-                // Safety: HEX only contains ASCII; pair is always valid UTF-8
-                unsafe {
-                    os.push(std::str::from_utf8_unchecked(&pair));
-                }
+    if needs_sep {
+        os.push(std::ffi::OsStr::new("/"));
+        for &b in &bytes[1..] {
+            pair[0] = HEX[(b >> 4) as usize];
+            pair[1] = HEX[(b & 0x0f) as usize];
+            // Safety: HEX only contains ASCII; pair is always valid UTF-8
+            unsafe {
+                os.push(std::str::from_utf8_unchecked(&pair));
             }
         }
+    }
 
-        async_std::path::PathBuf::from(os)
+    async_std::path::PathBuf::from(os)
+}
+
+impl From<&FileHash> for async_std::path::PathBuf {
+    fn from(value: &FileHash) -> Self {
+        path_for_hash(value.as_ref())
+    }
+}
+
+impl<D: HashAlgo> From<&Hash<D>> for async_std::path::PathBuf {
+    fn from(value: &Hash<D>) -> Self {
+        path_for_hash(&value.inner)
     }
 }
 
@@ -364,7 +586,10 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
 impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingRead for HashingReader<D, R> {
     fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64) {
         (
-            self.digester.finalize_fixed_reset().to_vec().into_boxed_slice(),
+            self.digester
+                .finalize_fixed_reset()
+                .to_vec()
+                .into_boxed_slice(),
             self.counter,
         )
     }

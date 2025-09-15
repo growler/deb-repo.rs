@@ -1,5 +1,5 @@
 use {
-    crate::version::{Constraint, Dependency, Version},
+    crate::version::{Constraint, Dependency},
     std::str::FromStr,
 };
 pub use {

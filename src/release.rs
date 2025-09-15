@@ -31,7 +31,7 @@ pub struct Release {
 #[derive(Clone)]
 pub(crate) struct ReleaseFile<'a> {
     pub path: Cow<'a, str>,
-    pub hash: Box<[u8]>,
+    pub hash: Cow<'a, str>,
     pub size: u64,
 }
 
@@ -72,17 +72,12 @@ impl Release {
             })
             .try_filter_map(move |(digest, size, path)| {
                 if filter(path) {
-                    let digest: Box<[u8]> = hex::decode(digest)
-                        .map_err(|err| {
-                            ParseError::from(format!("Invalid digest: {:?} {}", digest, err))
-                        })?
-                        .into_boxed_slice();
                     let size = parse_size(size.as_bytes()).map_err(|err| {
                         ParseError::from(format!("Invalid size: {:?} {}", size, err))
                     })?;
                     Ok(Some(ReleaseFile {
                         path: path.into(),
-                        hash: digest,
+                        hash: digest.into(),
                         size: size,
                     }))
                 } else {

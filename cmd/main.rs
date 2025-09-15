@@ -1,16 +1,14 @@
 use {
     anyhow::{anyhow, Result},
     async_std::{
-        fs,
-        io::WriteExt,
-        path::{Path, PathBuf},
+        path::{PathBuf},
     },
     clap::{Parser, Subcommand},
     debrepo::{
         cli::{Source, Vendor},
         exec::{dpkg, unshare_root, unshare_user_ns},
         Constraint, Dependency, DeploymentFileSystem, HttpCachingTransportProvider,
-        HttpTransportProvider, Manifest, MutableControlFile, TransportProvider, Universe, Version,
+        HttpTransportProvider, Manifest,  TransportProvider, Version,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     std::{iter, process::ExitCode},
@@ -32,19 +30,20 @@ pub trait AsyncCommand {
 #[derive(Parser)]
 pub struct App {
     /// Turns off all output except errors
-    #[arg(short, long)]
+    #[arg(global = true, short, long)]
     quiet: bool,
 
     /// Turns on debugging output (repeat -d for more)
-    #[arg(short, long, action = clap::ArgAction::Count)]
+    #[arg(global = true, short, long, action = clap::ArgAction::Count)]
     debug: u8,
 
     /// Manifest file
-    #[arg(short, long, default_value = Manifest::DEFAULT_FILE)]
+    #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE)]
     manifest: PathBuf,
 
     /// Number of concurrent downloads
     #[arg(
+        global = true,
         short = 'n',
         long = "downloads",
         value_name = "NUM",
@@ -53,7 +52,7 @@ pub struct App {
     limit: usize,
 
     /// Target architecture
-    #[arg(short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
+    #[arg(global = true, short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
     arch: String,
 
     /// HTTP download cache directory
@@ -943,13 +942,13 @@ impl App {
     async fn transport(&self) -> Result<Box<dyn TransportProvider>> {
         if let Some(cache) = &self.cache_dir {
             Ok(Box::new(
-                HttpCachingTransportProvider::<sha2::Sha256>::new(self.insecure, cache.clone())
+                HttpCachingTransportProvider::new(self.insecure, cache.clone())
                     .await
                     .map_err(|e| anyhow!("failed to create transport provider: {e}"))?,
             ))
         } else {
             Ok(Box::new(
-                HttpTransportProvider::<sha2::Sha256>::new(self.insecure).await,
+                HttpTransportProvider::new(self.insecure).await,
             ))
         }
     }

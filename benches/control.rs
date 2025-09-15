@@ -1,5 +1,5 @@
 use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use debrepo::ControlFile;
+use debrepo::control::ControlFile;
 
 const TEXT : &str = "\
 Package: coreutils

@@ -1,6 +1,6 @@
 use {
     crate::{
-        hash::{self, Hash},
+        hash::{self, FileHash, Hash},
         matches_path,
         repo::TransportProvider,
         source::{SignedBy, Source},
@@ -236,7 +236,7 @@ impl Manifest {
             hash,
             file: &self.lock,
         };
-        let out = Vec::from(toml_edit::ser::to_vec(&lock).map_err(|err| {
+        let out = Vec::from(toml_edit::ser::to_string_pretty(&lock).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("Failed to serialize lock file: {}", err),
@@ -609,7 +609,7 @@ impl Manifest {
         limit: usize,
         transport: &T,
     ) -> io::Result<(Vec<usize>, Universe)> {
-        let packages = stream::iter(
+        let mut packages = stream::iter(
             self.lock
                 .sources
                 .iter()
@@ -647,6 +647,7 @@ impl Manifest {
         .try_buffer_unordered(limit)
         .try_collect::<Vec<_>>()
         .await?;
+        packages.sort_by_key(|(i, _)| *i);
         let pkg_src = packages.iter().map(|(i, _)| *i).collect();
         let universe = Universe::new(&self.arch, packages.into_iter().map(|(_, p)| p))?;
         Ok((pkg_src, universe))
@@ -671,7 +672,7 @@ impl Manifest {
             .try_collect::<Vec<_>>()
             .await
     }
-    async fn update_locked_sources<T: TransportProvider>(
+    async fn update_locked_sources<T: TransportProvider + ?Sized>(
         &mut self,
         limit: usize,
         transport: &T,
@@ -685,14 +686,16 @@ impl Manifest {
         limit: usize,
         transport: &T,
     ) -> io::Result<()> {
+        if self.lock.sources.iter().any(|s| s.is_none()) {
+            self.update_locked_sources(limit, transport).await?;
+        }
         let (pkg_src, mut universe) = self.universe(limit, transport).await?;
         self.lock.recipes = self
             .file
             .recipes
             .iter()
             .zip(self.lock.recipes.iter())
-            .enumerate()
-            .map(|(i, (r, l))| {
+            .map(|(r, l)| {
                 if l.is_none() {
                     let (reqs, cons) = self.requirements_for(r)?;
                     universe
@@ -708,33 +711,41 @@ impl Manifest {
                             )
                         })
                         .and_then(|mut solvables| {
+                            use digest::{FixedOutput, Update};
                             solvables.sort();
-                            Ok(Some(LockedRecipe {
-                                installables: solvables
-                                    .into_iter()
-                                    .map(|solvable| {
-                                        let pkg = universe.package(solvable).unwrap();
-                                        let (path, size, hash) = pkg
-                                            .repo_file(transport.hash_field_name())
-                                            .map_err(|err| {
-                                                io::Error::new(
-                                                    io::ErrorKind::InvalidData,
-                                                    format!(
-                                                        "failed to parse package {}: {}",
-                                                        pkg.name(),
-                                                        err
-                                                    ),
-                                                )
-                                            })?;
-                                        let src = pkg_src.get(i).unwrap();
-                                        Ok(LockedPackage {
-                                            path: path.to_string(),
-                                            src: *src as u32,
-                                            size: size,
-                                            hash: hash.into(),
-                                        })
+                            let mut hasher = sha2::Sha256::default();
+                            let installables = solvables
+                                .into_iter()
+                                .map(|solvable| {
+                                    let pkg = universe.package(solvable).unwrap();
+                                    let src = pkg_src
+                                        .get(universe.package_source(solvable).unwrap())
+                                        .unwrap();
+                                    let hash_kind =
+                                        self.file.sources.get(*src).unwrap().hash.name();
+                                    let (path, size, hash) =
+                                        pkg.repo_file(hash_kind).map_err(|err| {
+                                            io::Error::new(
+                                                io::ErrorKind::InvalidData,
+                                                format!(
+                                                    "failed to parse package {}: {}",
+                                                    pkg.name(),
+                                                    err
+                                                ),
+                                            )
+                                        })?;
+                                    hasher.update(hash.as_ref());
+                                    Ok(LockedPackage {
+                                        path: path.to_string(),
+                                        src: *src as u32,
+                                        size: size,
+                                        hash: hash,
                                     })
-                                    .collect::<io::Result<Vec<_>>>()?,
+                                })
+                                .collect::<io::Result<Vec<_>>>()?;
+                            Ok(Some(LockedRecipe {
+                                hash: hasher.finalize_fixed().into(),
+                                installables,
                             }))
                         })
                 } else {
@@ -828,8 +839,7 @@ impl ManifestFile {
 struct LockedIndex {
     path: String,
     size: u64,
-    #[serde(with = "hex_hash")]
-    hash: Box<[u8]>,
+    hash: FileHash,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -850,7 +860,7 @@ impl LockedSource {
         let ext = ".xz";
         let mut components = source.components.iter().map(|_| false).collect::<Vec<_>>();
         let packages = release
-            .files(transport.hash_field_name(), |f| {
+            .files(source.hash.name(), |f| {
                 for (i, s) in source.components.iter().enumerate() {
                     if matches_path!(f, [ s "/binary-" arch "/Packages" ext ]) {
                         components[i] = true;
@@ -863,20 +873,20 @@ impl LockedSource {
                 }
                 return false;
             })?
-            .and_then(|f| {
-                Ok(LockedIndex {
-                    path: f.path.to_string(),
-                    size: f.size,
-                    hash: f.hash.into(),
-                })
-            })
-            .collect::<Result<Vec<_>, _>>()
             .map_err(|e| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("failed to read release file: {}", e),
                 )
-            })?;
+            })
+            .and_then(|f| {
+                Ok(LockedIndex {
+                    path: f.path.to_string(),
+                    size: f.size,
+                    hash: f.hash.as_ref().try_into()?,
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
         if components.iter().any(|c| !*c) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -909,13 +919,15 @@ struct LockedPackage {
     src: u32,
     path: String,
     size: u64,
-    #[serde(with = "hex_hash")]
-    hash: Box<[u8]>,
+    hash: FileHash,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 struct LockedRecipe {
+    #[serde(with = "crate::hash::serde::base64")]
+    hash: Hash<sha2::Sha256>,
+
     installables: Vec<LockedPackage>,
 }
 

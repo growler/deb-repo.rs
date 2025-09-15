@@ -3,8 +3,8 @@
 mod arch;
 mod builder;
 pub mod cli;
-mod control;
-mod deb;
+pub mod control;
+pub mod deb;
 mod deployfs;
 pub mod exec;
 mod fsrepo;
@@ -16,26 +16,20 @@ mod packages;
 mod release;
 mod repo;
 mod source;
-mod universe;
+pub mod universe;
 mod version;
+// mod caching;
 
 pub use {
     arch::DEFAULT_ARCH,
-    control::{
-        ControlField, ControlFile, ControlParser, ControlStanza, Field, MutableControlField,
-        MutableControlFile, MutableControlStanza, ParseError,
-    },
-    deb::{DebEntry, DebReader, Tarball, TarballEntry, TarballEntryType},
     deployfs::{DeploymentFile, DeploymentFileSystem, LocalFileSystem},
     fsrepo::FSTransportProvider,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
-    manifest::{Manifest},
+    manifest::Manifest,
     packages::{InstallPriority, Package, Packages},
     release::Release,
-    repo::{TransportProvider},
-    resolvo::{NameId, StringId},
+    repo::TransportProvider,
     source::{SignedBy, Snapshot, Source},
-    universe::{PackageId, Universe},
     version::{Constraint, Dependency, Version},
 };
 
@@ -71,7 +65,8 @@ pub(crate) async fn safe_store<P: AsRef<async_std::path::Path>, D: AsRef<[u8]>>(
         .as_ref()
         .parent()
         .ok_or_else(|| io::Error::new(async_std::io::ErrorKind::Other, "file has no parent"))?;
-    let file_name = path.as_ref()
+    let file_name = path
+        .as_ref()
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| io::Error::new(async_std::io::ErrorKind::Other, "invalid file name"))?;
@@ -121,5 +116,3 @@ macro_rules! matches_path {
     };
 }
 pub(crate) use matches_path;
-
-

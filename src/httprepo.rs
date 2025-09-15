@@ -1,30 +1,25 @@
 //! Debian repository client
 
 use {
-    crate::{
-        hash::{Hash, HashAlgo, HashingRead, HashingReader, VerifyingReader},
-        repo::TransportProvider,
-    },
+    crate::{hash::FileHash, repo::TransportProvider},
     async_std::{
         fs,
-        io::{self, Read, ReadExt, Result},
+        io::{self, Read, Result, WriteExt},
         path::PathBuf,
     },
     async_trait::async_trait,
     isahc::{config::RedirectPolicy, http::StatusCode, prelude::*, HttpClient},
     once_cell::sync::Lazy,
-    std::pin::Pin,
-    std::sync::Arc,
+    std::{pin::Pin, sync::Arc},
 };
 
 #[derive(Clone)]
-pub struct HttpCachingTransportProvider<H: HashAlgo> {
+pub struct HttpCachingTransportProvider {
     insecure: bool,
     cache: Arc<PathBuf>,
-    _marker: std::marker::PhantomData<Hash<H>>,
 }
 
-impl<H: HashAlgo> HttpCachingTransportProvider<H> {
+impl HttpCachingTransportProvider {
     pub async fn new(insecure: bool, cache: PathBuf) -> Result<Self> {
         fs::create_dir_all(cache.join(".temp"))
             .await
@@ -37,34 +32,9 @@ impl<H: HashAlgo> HttpCachingTransportProvider<H> {
         Ok(Self {
             insecure,
             cache: Arc::new(cache),
-            _marker: std::marker::PhantomData,
         })
     }
-    async fn fetch_and_cache(&self, uri: &str, size: Option<u64>) -> io::Result<fs::File> {
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => (),
-            StatusCode::NOT_FOUND => {
-                return Err(io::Error::new(io::ErrorKind::NotFound, uri.clone()))
-            }
-            code => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("unexpected HTTP response {}", code),
-                ))
-            }
-        };
-        if let Some(expect) = size {
-            if let Some(size) = rsp.body().len() {
-                if size != expect {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("size mismatch: expected {}, got {}", expect, size),
-                    ));
-                }
-            }
-        }
-        let mut body = HashingReader::<H, _>::new(rsp.into_body());
+    async fn tmp_file(&self) -> Result<(tempfile::TempPath, fs::File)> {
         let tmp = tempfile::NamedTempFile::new_in(self.cache.join(".temp")).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -83,13 +53,9 @@ impl<H: HashAlgo> HttpCachingTransportProvider<H> {
                     format!("Failed to open temporary file: {}", err),
                 )
             })?;
-        io::copy(&mut body, &tmp_file).await.map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
-                format!("Failed to copy response body: {}", err),
-            )
-        })?;
-        let hash = body.into_hash();
+        Ok((tmp_path, tmp_file))
+    }
+    async fn persist_tmp_file(&self, tmp_path: tempfile::TempPath, tmp_file: fs::File, cache_path: &PathBuf) -> io::Result<()> {
         tmp_file.sync_all().await.map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -97,7 +63,6 @@ impl<H: HashAlgo> HttpCachingTransportProvider<H> {
             )
         })?;
         drop(tmp_file);
-        let cache_path = self.cache.join(PathBuf::from(&hash));
         if let Some(parent) = cache_path.parent() {
             if !parent.exists().await {
                 fs::create_dir_all(parent).await.map_err(|err| {
@@ -108,57 +73,123 @@ impl<H: HashAlgo> HttpCachingTransportProvider<H> {
                 })?;
             }
         }
-        tmp_path.persist(&cache_path).map_err(|err| {
+        tmp_path.persist(cache_path).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
                 format!("Failed to persist temporary file: {}", err),
             )
         })?;
-        fs::OpenOptions::new()
-            .read(true)
-            .open(cache_path)
+        Ok(())
+    }
+    async fn caching_reader(
+        &self,
+        uri: &str,
+        cache_path: PathBuf,
+        size: u64,
+        hash: &FileHash,
+    ) -> io::Result<Pin<Box<dyn Read + Send + Unpin>>> {
+        tracing::debug!("HTTP Caching Transport Fetching (cache miss) {}", uri);
+        let rsp = client(self.insecure).get_async(uri).await?;
+        match rsp.status() {
+            StatusCode::OK => (),
+            StatusCode::NOT_FOUND => return Err(io::Error::new(io::ErrorKind::NotFound, uri)),
+            code => {
+                return Err(io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("unexpected HTTP response {}", code),
+                ))
+            }
+        };
+        if let Some(s) = rsp.body().len() {
+            if s != size {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("size mismatch: expected {}, got {}", size, s),
+                ));
+            }
+        }
+        let (tmp_path, tmp_file) = self.tmp_file().await?;
+        io::copy(hash.verifying_reader(size, rsp.into_body()), &tmp_file)
             .await
             .map_err(|err| {
                 io::Error::new(
                     io::ErrorKind::Other,
-                    format!("Failed to open cached file: {}", err),
+                    format!("Failed to copy response body: {}", err),
                 )
-            })
+            })?;
+        self.persist_tmp_file(tmp_path, tmp_file, &cache_path).await?;
+        Ok(Box::pin(
+            fs::OpenOptions::new()
+                .read(true)
+                .open(cache_path)
+                .await
+                .map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("Failed to open cached file: {}", err),
+                    )
+                })?,
+        ) as Pin<Box<dyn Read + Send + Unpin>>)
     }
 }
 
 #[async_trait]
-impl<H: HashAlgo + 'static> TransportProvider for HttpCachingTransportProvider<H> {
-    fn hash_field_name(&self) -> &'static str {
-        H::HASH_FIELD_NAME
-    }
-    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
-        let file = self.fetch_and_cache(path, None).await?;
-        Ok(Box::pin(file) as Pin<Box<dyn Read + Send + Unpin>>)
+impl TransportProvider for HttpCachingTransportProvider {
+    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+        tracing::debug!("HTTP Caching Transport Fetching {}", uri);
+        let rsp = client(self.insecure).get_async(uri).await?;
+        match rsp.status() {
+            StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
+            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
+            code => Err(io::Error::new(
+                io::ErrorKind::Other,
+                format!("unexpected HTTP response {}", code),
+            )),
+        }
     }
     async fn verifying_reader(
         &self,
         path: &str,
         size: u64,
-        hash: &[u8],
+        hash: &FileHash,
     ) -> io::Result<Pin<Box<dyn Read + Send>>> {
-        let digest = Hash::<H>::try_from(hash)?;
-        let cache_path = self.cache.join(PathBuf::from(&digest));
-        let file = match fs::File::open(cache_path).await {
-            Ok(file) => Ok(file),
-            Err(_) => self.fetch_and_cache(path, Some(size)).await,
-        }?;
-        let reader = VerifyingReader::<H, _>::new(file, size, digest);
-        Ok(Box::pin(reader) as Pin<Box<dyn Read + Send + Unpin>>)
+        let cache_path = self.cache.join(PathBuf::from(hash));
+        match fs::File::open(&cache_path).await {
+            Ok(file) => {
+                Ok(Box::pin(hash.verifying_reader(size, file))
+                    as Pin<Box<dyn Read + Send + Unpin>>)
+            }
+            Err(_) => Ok(self.caching_reader(path, cache_path, size, hash).await?),
+        }
     }
-    async fn hashing_reader(
+    async fn fetch_hash(
         &self,
         path: &str,
+        hash_type: &str,
         limit: u64,
-    ) -> io::Result<Pin<Box<dyn HashingRead + Send>>> {
-        let file = self.fetch_and_cache(path, None).await?;
-        let reader = HashingReader::<H, _>::new(file.take(limit));
-        Ok(Box::pin(reader) as Pin<Box<dyn HashingRead + Send + Unpin>>)
+    ) -> io::Result<(Vec<u8>, u64, FileHash)> {
+        use async_std::io::ReadExt;
+        let mut buffer = vec![0u8; 0];
+        let mut r = self.reader(path).await?.take(limit);
+        r.read_to_end(&mut buffer).await?;
+        let hash = FileHash::hash(hash_type, &buffer).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("unexpected hash type {}", hash_type),
+            )
+        })?;
+        let (tmp_path, mut tmp_file) = self.tmp_file().await?;
+        tmp_file.write_all(&buffer).await
+            .map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::Other,
+                    format!("Failed to copy response body: {}", err),
+                )
+            })?;
+        let cache_path = self.cache.join(PathBuf::from(&hash));
+        self.persist_tmp_file(tmp_path, tmp_file, &cache_path).await?;
+        let l = buffer.len() as u64;
+        Ok((buffer, l, hash))
     }
 }
 
@@ -191,70 +222,23 @@ fn client(insecure: bool) -> &'static HttpClient {
 }
 
 #[derive(Clone)]
-pub struct HttpTransportProvider<H: HashAlgo> {
+pub struct HttpTransportProvider {
     insecure: bool,
-    _marker: std::marker::PhantomData<Hash<H>>,
 }
 
-impl<H: HashAlgo> HttpTransportProvider<H> {
+impl HttpTransportProvider {
     pub async fn new(insecure: bool) -> Self {
-        Self { insecure, _marker: std::marker::PhantomData }
+        Self { insecure }
     }
 }
 
 #[async_trait]
-impl<H: HashAlgo + 'static> TransportProvider for HttpTransportProvider<H> {
-    fn hash_field_name(&self) -> &'static str {
-        H::HASH_FIELD_NAME
-    }
+impl TransportProvider for HttpTransportProvider {
     async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
         let rsp = client(self.insecure).get_async(uri).await?;
         match rsp.status() {
             StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
-            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
-            code => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected HTTP response {}", code),
-            )),
-        }
-    }
-    async fn verifying_reader(
-        &self,
-        uri: &str,
-        size: u64,
-        hash: &[u8],
-    ) -> io::Result<Pin<Box<dyn Read + Send>>> {
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => Ok(Box::pin(VerifyingReader::<H, _>::new(
-                match rsp.body().len() {
-                    Some(l) if l != size => Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("size mismatch: expected {}, got {}", size, l),
-                    )),
-                    _ => Ok(rsp.into_body()),
-                }?,
-                size,
-                Hash::<H>::try_from(hash)?,
-            ))),
-            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
-            code => Err(io::Error::new(
-                io::ErrorKind::Other,
-                format!("unexpected HTTP response {}", code),
-            )),
-        }
-    }
-    async fn hashing_reader(
-        &self,
-        uri: &str,
-        limit: u64,
-    ) -> io::Result<Pin<Box<dyn HashingRead + Send>>> {
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => Ok(Box::pin(HashingReader::<H, _>::new(
-                rsp.into_body().take(limit),
-            ))),
-            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri.clone())),
+            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
             code => Err(io::Error::new(
                 io::ErrorKind::Other,
                 format!("unexpected HTTP response {}", code),
