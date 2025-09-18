@@ -49,14 +49,14 @@ impl<T> UpdateResult<T> {
         }
     }
 }
-impl Into<u32> for UpdateResult<u32> {
-    fn into(self) -> u32 {
-        self.unwrap()
+impl From<UpdateResult<u32>> for u32 {
+    fn from(val: UpdateResult<u32>) -> Self {
+        val.unwrap()
     }
 }
-impl<T: ToIndex> Into<usize> for UpdateResult<T> {
-    fn into(self) -> usize {
-        self.unwrap().to_index()
+impl<T: ToIndex> From<UpdateResult<T>> for usize {
+    fn from(val: UpdateResult<T>) -> Self {
+        val.unwrap().to_index()
     }
 }
 
@@ -72,9 +72,9 @@ macro_rules! id_type {
                 self.0 as usize
             }
         }
-        impl Into<$name> for UpdateResult<$name> {
-            fn into(self: UpdateResult<$name>) -> $name {
-                self.unwrap()
+        impl From<UpdateResult<$name>> for $name {
+            fn from(r: UpdateResult<$name>) -> Self {
+                r.unwrap()
             }
         }
     };
@@ -125,7 +125,7 @@ impl<T: Hash + Eq + ?Sized> From<&T> for HashRef<T> {
 }
 
 pub(crate) struct IdMap<IdMap, Value: Hash + Eq> {
-    arena: UnsafeCell<Vec<Box<Vec<Value>>>>,
+    arena: UnsafeCell<Vec<Vec<Value>>>,
     index: UnsafeCell<HashMap<HashRef<Value>, IdMap>>,
 }
 
@@ -133,7 +133,7 @@ impl<IdType, Value: std::fmt::Debug + Hash + Eq> std::fmt::Debug for IdMap<IdTyp
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         unsafe {
             let arena = &mut *self.arena.get();
-            let size = if arena.len() == 0 {
+            let size = if arena.is_empty() {
                 return Ok(());
             } else {
                 let al = arena.len() - 1;
@@ -180,13 +180,13 @@ where
     where
         HashRef<Value>: Borrow<K>,
     {
-        unsafe { (&*self.index.get()).get(item).map(|id| *id) }
+        unsafe { (&*self.index.get()).get(item).copied() }
     }
     fn insert(&self, item: Value) -> IdType {
         unsafe {
             let map = &mut *self.index.get();
             let arena = &mut *self.arena.get();
-            let size = if arena.len() == 0 {
+            let size = if arena.is_empty() {
                 0
             } else {
                 let al = arena.len() - 1;
@@ -195,7 +195,7 @@ where
             let bi = size / BLOCK_SIZE;
             let ii = size % BLOCK_SIZE;
             if ii == 0 {
-                arena.push(Box::new(Vec::with_capacity(BLOCK_SIZE)))
+                arena.push(Vec::with_capacity(BLOCK_SIZE))
             }
             arena[bi].push(item);
             let item_ref = &arena[bi][ii];
@@ -218,7 +218,7 @@ where
         K: Hash + Eq + ?Sized,
         HashRef<Value>: Borrow<K>,
         Fi: FnOnce() -> Value,
-        Fu: FnOnce(&mut Value) -> (),
+        Fu: FnOnce(&mut Value),
     {
         match self.get(key) {
             None => UpdateResult::Inserted(self.insert(insert())),
@@ -277,7 +277,7 @@ pub(crate) struct InternResult<IdType, Value> {
     val: Value,
 }
 impl<IdType, Value> InternResult<IdType, Value> {
-    pub(crate) fn as_ref(self) -> Value {
+    pub(crate) fn into_ref(self) -> Value {
         self.val
     }
     pub(crate) fn as_id(self) -> IdType {

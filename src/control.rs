@@ -7,10 +7,7 @@
 /// interpret Debian-style comments and is not a full implementation of the
 /// Debian policy — it is intended for parsing and extracting fields rather
 /// than preserving formatting or comments when serializing.
-use {
-    crate::idmap::IntoBoxed,
-    std::{borrow::Cow, usize},
-};
+use {crate::idmap::IntoBoxed, std::borrow::Cow};
 
 /// Represents parsing error
 #[derive(Debug, Clone)]
@@ -137,7 +134,7 @@ impl<'a> ControlStanza<'a> {
         self.fields
             .iter()
             .find(|f| f.name.eq_ignore_ascii_case(name))
-            .map(|f| f.value.as_ref())
+            .map(|f| f.value)
     }
     /// Provides an iterator over the fields of a ControlStanza.
     pub fn fields(&self) -> impl Iterator<Item = &'_ ControlField<'a>> {
@@ -167,6 +164,12 @@ impl std::fmt::Display for MutableControlStanza {
     }
 }
 
+impl Default for MutableControlStanza {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl MutableControlStanza {
     /// Creates new empty Stanza
     pub fn new() -> Self {
@@ -183,6 +186,7 @@ impl MutableControlStanza {
         Ok(MutableControlStanza {
             inner: MutableControlStanzaInnerTryBuilder {
                 src: src.into_boxed(),
+                #[allow(clippy::borrowed_box)]
                 fields_builder: |src: &'_ Box<str>| {
                     let fields = ControlParser::new(src)
                         .map(|f| match f {
@@ -409,12 +413,10 @@ fn cmp_ascii_ignore_case(left: &str, right: &str) -> std::cmp::Ordering {
             } else {
                 break std::cmp::Ordering::Greater;
             }
+        } else if right.next().is_some() {
+            break std::cmp::Ordering::Less;
         } else {
-            if right.next().is_some() {
-                break std::cmp::Ordering::Less;
-            } else {
-                break std::cmp::Ordering::Equal;
-            }
+            break std::cmp::Ordering::Equal;
         }
     }
 }
@@ -469,7 +471,13 @@ impl std::fmt::Display for MutableControlFile {
         for stanza in &self.stanzas {
             write!(f, "{}", stanza)?;
         }
-        write!(f, "\n")
+        writeln!(f)
+    }
+}
+
+impl Default for MutableControlFile {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -517,7 +525,7 @@ impl<'a> std::fmt::Display for ControlFile<'a> {
         for stanza in &self.stanzas {
             write!(f, "{}", stanza)?;
         }
-        write!(f, "\n")
+        writeln!(f)
     }
 }
 
@@ -530,7 +538,7 @@ impl<'a> ControlFile<'a> {
             let snap = unsafe { parser.snap() };
             let mut fields: Vec<ControlField<'a>> = vec![];
             while let Some(field) = parser.field()? {
-                fields.push(field.into())
+                fields.push(field)
             }
             if fields.is_empty() {
                 break;
@@ -572,12 +580,12 @@ impl<'a> ControlParserSnapshot<'a> {
 
 #[inline]
 fn valid_field_name_char(c: u8) -> bool {
-    (c >= b';' && c <= b'~') || (c >= b'!' && c <= b'9')
+    (b';'..=b'~').contains(&c) || (b'!'..=b'9').contains(&c)
 }
 
 #[inline]
 fn valid_field_name_first_char(c: u8) -> bool {
-    (c >= b';' && c <= b'~') || (c >= b'!' && c <= b'9' && c != b'-' && c != b'#')
+    (b';'..=b'~').contains(&c) || ((b'!'..=b'9').contains(&c) && c != b'-' && c != b'#')
 }
 
 #[inline]
@@ -685,7 +693,7 @@ impl<'a> ControlParser<'a> {
     /// The next call either returns None at the end of the file or the first field of the next stanza.
     pub fn field(&mut self) -> Result<Option<ControlField<'a>>, ParseError> {
         match self.field_name()? {
-            None => return Ok(None),
+            None => Ok(None),
             Some(name) => Ok(Some(ControlField {
                 name,
                 value: self.field_value()?,

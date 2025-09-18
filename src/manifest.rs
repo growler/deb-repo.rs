@@ -3,9 +3,9 @@ use {
         hash::{self, FileHash, Hash},
         matches_path,
         repo::TransportProvider,
-        source::{SignedBy, Source},
+        source::Source,
         universe::Universe,
-        version::{Constraint, Dependency, Satisfies, Version},
+        version::{Constraint, Dependency},
     },
     chrono::{DateTime, Utc},
     futures::stream::{self, StreamExt, TryStreamExt},
@@ -98,7 +98,7 @@ impl Manifest {
             arch: arch.to_string(),
             doc,
             file: ManifestFile {
-                sources: sources.iter().cloned().collect(),
+                sources: sources.to_vec(),
                 recipes: Vec::new(),
             },
             lock: LockFile {
@@ -174,11 +174,11 @@ impl Manifest {
                             format!("failed to parse locked recipe: {}", err),
                         )
                     })
-                    .and_then(|lock| {
-                        if &lock.hash == &hash && lock.arch == arch {
-                            Ok(Some(lock))
+                    .map(|lock| {
+                        if lock.hash == hash && lock.arch == arch {
+                            Some(lock)
                         } else {
-                            Ok(None)
+                            None
                         }
                     })?
             }
@@ -217,8 +217,7 @@ impl Manifest {
         let out = self.doc.to_string();
         let mut r = crate::hash::HashingReader::<sha2::Sha256, _>::new(out.as_bytes());
         io::copy(&mut r, &mut io::sink()).await.map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to hash manifest: {}", err),
             )
         })?;
@@ -242,8 +241,7 @@ impl Manifest {
             file: &self.lock,
         };
         let out = Vec::from(toml_edit::ser::to_string_pretty(&lock).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to serialize lock file: {}", err),
             )
         })?);
@@ -684,7 +682,6 @@ impl Manifest {
                 .try_flatten(),
         )
         .map_ok(|(source_id, source, locked)| {
-            let transport = transport;
             async move {
                 let packages = source
                     .fetch_packages_index(&locked.path, locked.size, &locked.hash, transport)
@@ -786,8 +783,8 @@ impl Manifest {
                                     Ok(LockedPackage {
                                         path: path.to_string(),
                                         src: *src as u32,
-                                        size: size,
-                                        hash: hash,
+                                        size,
+                                        hash,
                                     })
                                 })
                                 .collect::<io::Result<Vec<_>>>()?;
@@ -915,7 +912,7 @@ impl LockedSource {
                         return true;
                     }
                 }
-                return false;
+                false
             })?
             .map_err(|e| {
                 io::Error::new(
@@ -950,7 +947,7 @@ impl LockedSource {
             release: LockedIndex {
                 path,
                 size,
-                hash: hash.into(),
+                hash,
             },
             packages,
         })
@@ -1034,7 +1031,7 @@ mod requirements_list {
             .collect()
     }
 
-    pub fn serialize<S>(value: &Vec<Dependency<String>>, ser: S) -> Result<S::Ok, S::Error>
+    pub fn serialize<S>(value: &[Dependency<String>], ser: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {

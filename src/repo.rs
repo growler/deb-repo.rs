@@ -1,14 +1,14 @@
 //! Debian repository client
 
 use {
-    crate::{deb::DebReader, hash::FileHash, DeploymentFileSystem},
+    crate::{deb::DebReader, hash::FileHash},
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     async_trait::async_trait,
     futures_lite::io::{AsyncRead, AsyncReadExt, BufReader},
     smol::io,
-    std::{path::Path, pin::Pin, sync::Arc},
+    std::{path::Path, pin::Pin},
 };
 
 pub enum KeyMaterial<'a> {
@@ -168,7 +168,7 @@ pub trait TransportProvider: Sync + Send {
 fn unpacker<'a, R: AsyncRead + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
     let ext = match u.rfind('.') {
         Some(n) => &u[n..],
-        None => &"",
+        None => "",
     };
     match ext {
         ".xz" => Box::pin(XzDecoder::new(BufReader::new(r))),

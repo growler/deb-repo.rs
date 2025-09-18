@@ -3,11 +3,11 @@ use {
     clap::{Parser, Subcommand},
     debrepo::{
         cli::{Source, Vendor},
-        exec::{dpkg, unshare_root, unshare_user_ns},
-        Constraint, Dependency, DeploymentFileSystem, HttpCachingTransportProvider,
+        exec::{unshare_root, unshare_user_ns},
+        Constraint, Dependency, HttpCachingTransportProvider,
         HttpTransportProvider, Manifest, TransportProvider, Version,
     },
-    futures::stream::{self, StreamExt, TryStreamExt},
+    futures::stream::{StreamExt, TryStreamExt},
     smol::fs,
     std::path::PathBuf,
     std::{iter, process::ExitCode},
@@ -193,9 +193,7 @@ impl AsyncCommand for Init {
             .map_err(|e| anyhow!("failed to add source: {e}"))?,
             InitCommands::InitFromVendor(cmd) => {
                 let sources = cmd.vendor.sources_for(
-                    cmd.suite
-                        .as_ref()
-                        .map(|s| s.as_str())
+                    cmd.suite.as_deref()
                         .unwrap_or_else(|| cmd.vendor.defailt_suite()),
                 );
                 Manifest::from_sources(
@@ -314,7 +312,7 @@ impl AsyncCommand for Include {
         let recipe = self.recipe.clone().unwrap_or_default();
         let mut comment = self.comment.clone();
         self.reqs.iter().try_for_each(|req| {
-            mf.add_requirement(&recipe, &req, comment.take())
+            mf.add_requirement(&recipe, req, comment.take())
                 .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
         })?;
         mf.update_recipes(conf.limit, conf.transport().await?.as_ref())
@@ -342,7 +340,7 @@ impl AsyncCommand for Exclude {
         let recipe = self.recipe.clone().unwrap_or_default();
         let mut comment = self.comment.clone();
         self.reqs.iter().try_for_each(|con| {
-            mf.add_constraint(&recipe, &con, comment.take())
+            mf.add_constraint(&recipe, con, comment.take())
                 .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
         })?;
         mf.store(&conf.manifest).await?;
@@ -676,7 +674,7 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     let mut w4 = 0usize;
     let mut packages = iter
         .into_iter()
-        .map(|pkg| Package::try_from(pkg))
+        .map(Package::try_from)
         .map(|pkg| {
             let pkg = pkg?;
             w0 = std::cmp::max(w0, pkg.arch.len());
@@ -1015,22 +1013,15 @@ fn main() -> ExitCode {
         app.cache_dir = app.cache_dir.clone().or_else(|| {
             if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
                 Some(PathBuf::from(xdg))
-            } else if let Some(home) = std::env::var_os("HOME") {
-                Some(PathBuf::from(home).join(".cache"))
-            } else {
-                None
-            }
+            } else { std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")) }
             .map(|base| base.join("debrepo"))
         });
     } else {
         app.cache_dir = None;
     }
-    match app.cmd.init(&app) {
-        Err(err) => {
-            eprintln!("{}", err);
-            return ExitCode::FAILURE;
-        }
-        Ok(_) => {}
+    if let Err(err) = app.cmd.init(&app) {
+        eprintln!("{}", err);
+        return ExitCode::FAILURE;
     }
     match smol::block_on(app.cmd.exec(&app)) {
         Ok(()) => ExitCode::SUCCESS,

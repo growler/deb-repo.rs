@@ -74,7 +74,7 @@ impl<'a> Hash for Name<'a> {
 }
 impl<'a> Borrow<str> for HashRef<Name<'a>> {
     fn borrow(&self) -> &str {
-        &self.name
+        self.name
     }
 }
 impl<'a> Eq for Name<'a> {}
@@ -142,7 +142,7 @@ impl<'a> UniverseIndex<'a> {
             if arch.eq_ignore_ascii_case("all") {
                 ArchId::Any
             } else {
-                self.archlist.get_or_insert(arch).into()
+                self.archlist.get_or_insert(arch)
             }
         })
     }
@@ -152,7 +152,7 @@ impl<'a> UniverseIndex<'a> {
         solvable: Option<(SolvableId, bool)>,
     ) -> UpdateResult<NameId> {
         unsafe {
-            let k = self.names.insert_or_update(
+            self.names.insert_or_update(
                 name,
                 || match solvable {
                     Some((id, required)) => Name {
@@ -166,17 +166,15 @@ impl<'a> UniverseIndex<'a> {
                         required: vec![],
                     },
                 },
-                |name| match solvable {
-                    Some((id, required)) => {
+                |name| {
+                    if let Some((id, required)) = solvable {
                         name.packages.push(id);
                         if required {
                             name.required.push(id);
                         }
                     }
-                    None => {}
                 },
-            );
-            k
+            )
         }
     }
     fn intern_version_set<R: AsRef<str>>(
@@ -185,9 +183,9 @@ impl<'a> UniverseIndex<'a> {
         strings: &'a IdMap<StringId, Box<str>>,
     ) -> VersionSetId {
         self.get_single_dependency_id(dep.translate(
-            |a| strings.intern(a.as_ref()).as_ref(),
-            |n| strings.intern(n).as_ref(),
-            |v| v.translate(|v| strings.intern(v).as_ref()),
+            |a| strings.intern(a.as_ref()).into_ref(),
+            |n| strings.intern(n).into_ref(),
+            |v| v.translate(|v| strings.intern(v).into_ref()),
         ))
     }
     fn get_single_dependency_id(&self, dep: Constraint<&'a str>) -> VersionSetId {
@@ -204,7 +202,6 @@ impl<'a> UniverseIndex<'a> {
     ) -> VersionSetUnionId {
         self.version_set_unions
             .get_or_insert(deps.map(|dep| self.get_single_dependency_id(dep)).collect())
-            .into()
     }
     fn add_package(
         &mut self,
@@ -420,7 +417,7 @@ impl Universe {
                         self.inner
                             .provider()
                             .with_index(|i| i.required.iter())
-                            .map(|v: &Requirement| v.clone()),
+                            .copied(),
                     )
                     // the new resolvo 0.10 API added conditions. until
                     // I figure out where and if it might be useful, I just
@@ -581,7 +578,7 @@ impl InnerUniverse {
     where
         R: AsRef<str>,
     {
-        self.with(|u| u.index.intern_version_set(dep, &u.interned))
+        self.with(|u| u.index.intern_version_set(dep, u.interned))
     }
     fn intern_union_dependency<R, U>(&self, vsu: U) -> VersionSetUnionId
     where
@@ -591,9 +588,9 @@ impl InnerUniverse {
         self.with(|u| {
             u.index.get_union_dependency_id(vsu.into_iter().map(|dep| {
                 dep.translate(
-                    |a| u.interned.intern(a).as_ref(),
-                    |n| u.interned.intern(n).as_ref().as_ref(),
-                    |v| v.translate(|v| u.interned.intern(v).as_ref()),
+                    |a| u.interned.intern(a).into_ref(),
+                    |n| u.interned.intern(n).into_ref(),
+                    |v| v.translate(|v| u.interned.intern(v).into_ref()),
                 )
             }))
         })
@@ -612,7 +609,7 @@ impl InnerUniverse {
         })
     }
     fn get_dependencies(&self, solvable: SolvableId) -> Dependencies {
-        self.with(|u| u.index.add_package_dependencies(solvable, &u.interned))
+        self.with(|u| u.index.add_package_dependencies(solvable, u.interned))
     }
     fn package(&self, id: SolvableId) -> &'_ Package<'_> {
         self.with_index(|i| i.solvables[id.to_index()].package)
@@ -684,7 +681,7 @@ impl InnerUniverse {
                             .flat_map(|c| c.candidates.into_iter()),
                     ),
                 }
-                .filter(|dep| *dep != pkg && solution.contains(&dep))
+                .filter(|dep| *dep != pkg && solution.contains(dep))
                 .collect::<Vec<_>>();
                 candidates.sort_by_key(|&p| {
                     (
@@ -719,7 +716,7 @@ impl InnerUniverse {
             );
         }
 
-        let mut by_name: Vec<SolvableId> = solution.iter().copied().collect();
+        let mut by_name: Vec<SolvableId> = solution.to_vec();
         by_name.sort_by_key(|&s| self.package(s).name().to_string());
         let name_ord: HashMap<SolvableId, usize> = by_name
             .into_iter()
@@ -889,7 +886,7 @@ impl Interner for InnerUniverse {
         &self,
         version_set_union: VersionSetUnionId,
     ) -> impl Iterator<Item = VersionSetId> {
-        self.with_index(|i| i.version_set_unions[version_set_union].iter().map(|v| *v))
+        self.with_index(|i| i.version_set_unions[version_set_union].iter().copied())
     }
     fn display_merged_solvables(&self, solvables: &[SolvableId]) -> impl std::fmt::Display + '_ {
         use std::fmt::Write;
@@ -946,10 +943,10 @@ impl DependencyProvider for InnerUniverse {
                 .filter(|&&sid| {
                     let solvable = &u.index.solvables[sid.to_index()];
                     tracing::trace!("  validating {}", solvable.package.raw_full_name(),);
-                    if Some(sid) == vs.selfref {
-                        false // always exclude self-referencing dependencies
-                    } else if !solvable.arch.satisfies(&vs.arch) {
-                        false // always exclude dependencies with not suitable arch
+                    if Some(sid) == vs.selfref || !solvable.arch.satisfies(&vs.arch) {
+                        // always exclude self-referencing dependencies
+                        // and always exclude dependencies with not suitable arch
+                        false 
                     } else {
                         let sname = u.index.names[vs.name].name;
                         ((solvable.name == vs.name && (solvable.version.satisfies(&vs.range)))
@@ -957,12 +954,11 @@ impl DependencyProvider for InnerUniverse {
                                 .package
                                 .provides()
                                 .filter_map(|pv| pv.ok()) // TODO:: report parsing error
-                                .find(|pv| *pv.name() == sname && (pv.satisfies(&vs.range)))
-                                .is_some())
+                                .any(|pv| *pv.name() == sname && (pv.satisfies(&vs.range))))
                             ^ inverse
                     }
                 })
-                .map(|s| *s)
+                .copied()
                 .collect()
         });
         tracing::trace!("result is {:?}", &c);
@@ -987,9 +983,9 @@ impl DependencyProvider for InnerUniverse {
                             .iter()
                             .map(|r| match r.requirement {
                                 Requirement::Single(c) =>
-                                    format!("{}", self.display_version_set(c.clone())),
+                                    format!("{}", self.display_version_set(c)),
                                 Requirement::Union(u) => self
-                                    .version_sets_in_union(u.clone())
+                                    .version_sets_in_union(u)
                                     .map(|v| format!("{}", self.display_version_set(v)))
                                     .collect::<Vec<_>>()
                                     .join(" | "),

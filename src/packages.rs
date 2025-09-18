@@ -162,11 +162,10 @@ impl<'a> Package<'a> {
     }
     pub fn provides_name(&self, name: &str) -> bool {
         self.name == name
-            || self.provides.map_or(false, |provides| {
+            || self.provides.is_some_and(|provides| {
                 ParsedProvidedNameIterator::new(provides)
                     .filter_map(|n| n.ok())
-                    .find(|pv| *pv.name() == name)
-                    .is_some()
+                    .any(|pv| *pv.name() == name)
             })
     }
     pub fn essential(&self) -> bool {
@@ -287,17 +286,15 @@ impl<'a> Package<'a> {
         )?;
         if !parsed {
             Ok(None)
+        } else if package.name.is_empty() {
+            Err(ParseError::from("Field Package not found"))
+        } else if package.arch.is_empty() {
+            Err(ParseError::from("Field Architecture not found"))
+        } else if package.version.is_empty() {
+            Err(ParseError::from("Field Version not found"))
         } else {
-            if package.name.is_empty() {
-                Err(ParseError::from("Field Package not found"))
-            } else if package.arch.is_empty() {
-                Err(ParseError::from("Field Architecture not found"))
-            } else if package.version.is_empty() {
-                Err(ParseError::from("Field Version not found"))
-            } else {
-                package.src = unsafe { snap.into_slice(parser) };
-                Ok(Some(package))
-            }
+            package.src = unsafe { snap.into_slice(parser) };
+            Ok(Some(package))
         }
     }
 }

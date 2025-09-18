@@ -42,9 +42,9 @@ fn main() {
         .map(|uri| {
             client
                 .get(&uri)
-                .expect(&format!("Failed to fetch URI: {}", uri))
+                .unwrap_or_else(|_| panic!("Failed to fetch URI: {}", uri))
                 .bytes()
-                .expect(&format!("Failed to read response body: {}", uri))
+                .unwrap_or_else(|_| panic!("Failed to read response body: {}", uri))
         })
         .for_each(|data| {
             ctx.import(&data).expect("Failed to import key");

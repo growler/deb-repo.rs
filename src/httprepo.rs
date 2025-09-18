@@ -22,8 +22,7 @@ impl HttpCachingTransportProvider {
         fs::create_dir_all(cache.join(".temp"))
             .await
             .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     format!("Failed to create cache directory: {}", err),
                 )
             })?;
@@ -34,8 +33,7 @@ impl HttpCachingTransportProvider {
     }
     async fn tmp_file(&self) -> io::Result<(tempfile::TempPath, fs::File)> {
         let tmp = tempfile::NamedTempFile::new_in(self.cache.join(".temp")).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to create temporary file: {}", err),
             )
         })?;
@@ -46,8 +44,7 @@ impl HttpCachingTransportProvider {
             .open(tmp_path.to_path_buf())
             .await
             .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     format!("Failed to open temporary file: {}", err),
                 )
             })?;
@@ -60,8 +57,7 @@ impl HttpCachingTransportProvider {
         cache_path: &PathBuf,
     ) -> io::Result<()> {
         tmp_file.sync_all().await.map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to close temporary file: {}", err),
             )
         })?;
@@ -69,19 +65,17 @@ impl HttpCachingTransportProvider {
         if let Some(parent) = cache_path.parent() {
             if fs::metadata(&parent)
                 .await
-                .map_or(false, |meta| meta.is_dir())
+                .is_ok_and(|meta| meta.is_dir())
             {
                 fs::create_dir_all(parent).await.map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to create cache directory: {}", err),
                     )
                 })?;
             }
         }
         tmp_path.persist(cache_path).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to persist temporary file: {}", err),
             )
         })?;
@@ -100,8 +94,7 @@ impl HttpCachingTransportProvider {
             StatusCode::OK => (),
             StatusCode::NOT_FOUND => return Err(io::Error::new(io::ErrorKind::NotFound, uri)),
             code => {
-                return Err(io::Error::new(
-                    io::ErrorKind::Other,
+                return Err(io::Error::other(
                     format!("unexpected HTTP response {}", code),
                 ))
             }
@@ -118,8 +111,7 @@ impl HttpCachingTransportProvider {
         copy(hash.verifying_reader(size, rsp.into_body()), &mut tmp_file)
             .await
             .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
+                io::Error::other(
                     format!("Failed to copy response body: {}", err),
                 )
             })?;
@@ -131,8 +123,7 @@ impl HttpCachingTransportProvider {
                 .open(cache_path)
                 .await
                 .map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::Other,
+                    io::Error::other(
                         format!("Failed to open cached file: {}", err),
                     )
                 })?,
@@ -150,8 +141,7 @@ impl TransportProvider for HttpCachingTransportProvider {
                 Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
             }
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
-            code => Err(io::Error::new(
-                io::ErrorKind::Other,
+            code => Err(io::Error::other(
                 format!("unexpected HTTP response {}", code),
             )),
         }
@@ -186,8 +176,7 @@ impl TransportProvider for HttpCachingTransportProvider {
         })?;
         let (tmp_path, mut tmp_file) = self.tmp_file().await?;
         tmp_file.write_all(&buffer).await.map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to copy response body: {}", err),
             )
         })?;
@@ -247,8 +236,7 @@ impl TransportProvider for HttpTransportProvider {
                 Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
             }
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
-            code => Err(io::Error::new(
-                io::ErrorKind::Other,
+            code => Err(io::Error::other(
                 format!("unexpected HTTP response {}", code),
             )),
         }

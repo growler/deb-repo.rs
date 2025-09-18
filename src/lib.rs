@@ -40,7 +40,7 @@ pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
         if byte == b' ' {
             break;
         }
-        if byte < b'0' || byte > b'9' {
+        if !byte.is_ascii_digit() {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 "not a digit",
@@ -65,16 +65,15 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
     let dir = path
         .as_ref()
         .parent()
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "file has no parent"))?;
+        .ok_or_else(|| io::Error::other("file has no parent"))?;
     let file_name = path
         .as_ref()
         .file_name()
         .and_then(|s| s.to_str())
-        .ok_or_else(|| io::Error::new(io::ErrorKind::Other, "invalid file name"))?;
+        .ok_or_else(|| io::Error::other("invalid file name"))?;
     let tmp = tempfile::NamedTempFile::with_prefix_in(file_name, dir)
         .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to create temporary file: {}", err),
             )
         })?
@@ -85,22 +84,19 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
         .open(tmp.to_path_buf())
         .await
         .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to open temporary file: {}", err),
             )
         })?;
     futures_lite::io::copy(data.as_ref(), &mut tmp_file)
         .await
         .map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("Failed to copy to temporary file: {}", err),
             )
         })?;
     fs::rename(tmp.to_path_buf(), &path).await.map_err(|err| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("Failed to rename temporary file: {}", err),
         )
     })?;

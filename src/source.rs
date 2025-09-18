@@ -277,7 +277,7 @@ impl From<&Snapshot> for String {
 
 impl From<&DateTime<Utc>> for Snapshot {
     fn from(dt: &DateTime<Utc>) -> Self {
-        Snapshot::Use(dt.clone())
+        Snapshot::Use(*dt)
     }
 }
 
@@ -291,15 +291,15 @@ impl SnapshotFormatSpec {
         const fn contains_tz(fmt: &str) -> bool {
             let mut b = fmt.as_bytes();
             loop {
-                b = match &b {
-                    &[] => return false,
-                    &[b'%', b'Z', ..] => return true,
-                    &[b'%', b'z', ..] => return true,
-                    &[b'%', b':', b'z', ..] => return true,
-                    &[b'%', b':', b':', b'z', ..] => return true,
-                    &[b'%', b':', b':', b':', b'z', ..] => return true,
-                    &[b'%', b'#', b'z', ..] => return true,
-                    &[_, rest @ ..] => rest,
+                b = match b {
+                    [] => return false,
+                    [b'%', b'Z', ..] => return true,
+                    [b'%', b'z', ..] => return true,
+                    [b'%', b':', b'z', ..] => return true,
+                    [b'%', b':', b':', b'z', ..] => return true,
+                    [b'%', b':', b':', b':', b'z', ..] => return true,
+                    [b'%', b'#', b'z', ..] => return true,
+                    [_, rest @ ..] => rest,
                 }
             }
         }
@@ -348,7 +348,7 @@ impl TryFrom<&str> for Snapshot {
             ]
             .iter()
             .filter_map(|f| f.parse(s))
-            .map(|dt| Snapshot::Use(dt))
+            .map(Snapshot::Use)
             .next()
             .ok_or_else(|| format!("invalid snapshot ID '{}' - expected a timestamp", s))
         }

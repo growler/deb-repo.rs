@@ -33,7 +33,7 @@ impl fmt::Debug for ExecError {
 impl fmt::Display for ExecError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str("error")?;
-        if self.context.len() > 0 {
+        if !self.context.is_empty() {
             f.write_str(" ")?;
             f.write_str(self.context)?;
         }
@@ -122,8 +122,7 @@ pub fn unshare_user_ns() -> io::Result<()> {
     let uid = Uid::effective();
     let gid = Gid::effective();
     let user = nix::unistd::User::from_uid(uid)?.ok_or_else(|| {
-        io::Error::new(
-            io::ErrorKind::Other,
+        io::Error::other(
             format!("user record not found for uid {}", uid),
         )
     })?;
@@ -133,8 +132,7 @@ pub fn unshare_user_ns() -> io::Result<()> {
             _ => true,
         })
         .unwrap_or_else(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 format!("/etc/subuid entry not found for user {}", &user.name),
             ))
         })?;
@@ -144,8 +142,7 @@ pub fn unshare_user_ns() -> io::Result<()> {
             _ => true,
         })
         .unwrap_or_else(|| {
-            Err(io::Error::new(
-                io::ErrorKind::Other,
+            Err(io::Error::other(
                 format!("/etc/subgid entry not found for user {}", &user.name),
             ))
         })?;
@@ -179,20 +176,18 @@ pub fn unshare_user_ns() -> io::Result<()> {
                 _ => std::process::exit(1),
             };
             _ = newgid.exec();
-            _ = std::process::exit(1); // unreachable
+            std::process::exit(1); // unreachable
         }
         ForkResult::Parent { child } => {
             drop(read_fd);
             unshare(CloneFlags::CLONE_NEWUSER)?;
             drop(write_fd);
             match waitpid(child, None)? {
-                WaitStatus::Exited(_, code) if code == 0 => Ok(()),
-                WaitStatus::Exited(_, code) => Err(io::Error::new(
-                    io::ErrorKind::Other,
+                WaitStatus::Exited(_, 0) => Ok(()),
+                WaitStatus::Exited(_, code) => Err(io::Error::other(
                     format!("failed to set uid/gid map (code {})", code),
                 )),
-                status => Err(io::Error::new(
-                    io::ErrorKind::Other,
+                status => Err(io::Error::other(
                     format!("failed to set uid/gid map ({:?})", status),
                 )),
             }
@@ -368,7 +363,7 @@ where
                 match exec_cmd(
                     &root,
                     &proc,
-                    dir.as_ref().map(|d| d.as_c_str()),
+                    dir.as_deref(),
                     &cmd,
                     &args,
                     &env,
@@ -391,15 +386,12 @@ where
         )
     }?;
     loop {
-        match waitpid(pid, None)? {
-            WaitStatus::Exited(_, code) => {
-                if code == 0 {
-                    break;
-                } else {
-                    return Err(nix::errno::Errno::from_raw(code).into());
-                }
+        if let WaitStatus::Exited(_, code) = waitpid(pid, None)? {
+            if code == 0 {
+                break;
+            } else {
+                return Err(nix::errno::Errno::from_raw(code).into());
             }
-            _ => {}
         }
     }
     Ok(ExitCode::SUCCESS)

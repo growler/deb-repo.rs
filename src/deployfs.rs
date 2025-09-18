@@ -1,13 +1,11 @@
 use smol::{fs::{self, unix::OpenOptionsExt}, io, prelude::*};
 use std::{
-    ffi::OsStr,
-    fmt::Write,
-    os::unix::{fs::PermissionsExt, io::IntoRawFd},
+    os::unix::fs::PermissionsExt,
     sync::Arc,
     time::SystemTime,
 };
 use std::{
-    os::unix::{self, fs::DirBuilderExt, io::FromRawFd},
+    os::unix::{self, fs::DirBuilderExt},
     path::{Path, PathBuf},
 };
 
@@ -193,7 +191,7 @@ impl DeploymentFile for LocalFile {
 fn mkdir(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(mode);
-    builder.create(&path)?;
+    builder.create(path)?;
     if let Some((uid, gid)) = owner {
         std::os::unix::fs::chown(path, Some(uid), Some(gid))?
     }
@@ -209,7 +207,7 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
         Ok(()) => Ok(()),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
             let parent = path.parent().ok_or_else(|| {
-                io::Error::new(io::ErrorKind::Other, "failed to create tree: no parent")
+                io::Error::other("failed to create tree: no parent")
             })?;
             mkdir_rec(parent, owner, mode)?;
             match mkdir(path, owner, mode) {
@@ -408,6 +406,12 @@ impl DeploymentFileSystem for LocalFileSystem {
 #[derive(Clone, Debug)]
 pub struct FileList {
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
+}
+
+impl Default for FileList {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl FileList {

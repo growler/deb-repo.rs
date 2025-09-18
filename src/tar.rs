@@ -71,11 +71,11 @@ impl Header {
     fn kind(&self) -> HeaderKind<'_> {
         let gnu = unsafe { self.cast::<GnuHeader>() };
         if gnu.magic == *b"ustar " && gnu.version == *b" \0" {
-            return HeaderKind::Gnu(gnu);
+            HeaderKind::Gnu(gnu)
         } else if gnu.magic == *b"ustar\0" && gnu.version == *b"00" {
-            return HeaderKind::Ustar(unsafe { self.cast::<UstarHeader>() });
+            HeaderKind::Ustar(unsafe { self.cast::<UstarHeader>() })
         } else {
-            return HeaderKind::Old(unsafe { self.cast::<OldHeader>() });
+            HeaderKind::Old(unsafe { self.cast::<OldHeader>() })
         }
     }
     fn entry_type(&self) -> std::result::Result<Kind, u8> {
@@ -85,6 +85,7 @@ impl Header {
         let gnu = unsafe { self.cast::<GnuHeader>() };
         gnu.magic == *b"ustar " && gnu.version == *b" \0"
     }
+    #[allow(dead_code)]
     fn is_ustar(&self) -> bool {
         let ustar = unsafe { self.cast::<UstarHeader>() };
         ustar.magic == *b"ustar\0" && ustar.version == *b"00"
@@ -144,26 +145,6 @@ impl Header {
                     ErrorKind::InvalidData,
                     format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
                 )
-            })
-    }
-    fn ensure_zero_size(&self, kind: Kind) -> Result<()> {
-        let gnu = unsafe { self.cast::<GnuHeader>() };
-        parse_octal(&gnu.mode)
-            .map_err(|err| {
-                Error::new(
-                    ErrorKind::InvalidData,
-                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
-                )
-            })
-            .and_then(|s| {
-                if s != 0 {
-                    Err(Error::new(
-                        ErrorKind::InvalidData,
-                        format!("unexpected non-zero lenght for {}", kind),
-                    ))
-                } else {
-                    Ok(())
-                }
             })
     }
     fn is_zero(&self) -> bool {
@@ -342,27 +323,23 @@ enum ExtensionHeader {
 
 struct ExtensionBuffer {
     buf: Vec<u8>,
-    pos: usize,
 }
 
 impl ExtensionBuffer {
     fn new(size: usize) -> Self {
-        let mut buf = Vec::<u8>::with_capacity(size);
-        unsafe { buf.set_len(size) };
-        ExtensionBuffer { buf, pos: 0 }
+        ExtensionBuffer {
+            buf: Vec::<u8>::with_capacity(size),
+        }
     }
-    fn upto(&mut self, n: usize) -> &mut [u8] {
-        &mut self.buf[..n]
+    unsafe fn upto(&mut self, n: usize) -> &mut [u8] {
+        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut u8, n)
     }
-    fn remaining_buf(&mut self) -> &mut [u8] {
-        &mut self.buf[self.pos..]
+    unsafe fn remaining_buf(&mut self) -> &mut [u8] {
+        let remaining = self.buf.spare_capacity_mut();
+        std::slice::from_raw_parts_mut(remaining.as_mut_ptr() as *mut u8, remaining.len())
     }
-    fn advance(&mut self, n: usize) {
-        self.pos += n
-    }
-    fn finalize(mut self, l: usize) -> Vec<u8> {
-        unsafe { self.buf.set_len(l) };
-        self.buf
+    unsafe fn advance(&mut self, n: usize) {
+        self.buf.set_len(self.buf.len() + n)
     }
 }
 
@@ -483,8 +460,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     let n = {
                         let filled = BLOCK_SIZE - remaining as usize;
                         let (hdr, reader) = (&mut this.header, &mut this.reader);
-                        let n =
-                            ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled as usize..)));
+                        let n = ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled..)));
                         if n == 0 {
                             Err(Error::new(
                                 ErrorKind::UnexpectedEof,
@@ -499,7 +475,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         continue;
                     }
                     if this.header.is_zero() {
-                        *this.nxt = *this.nxt + BLOCK_SIZE as u64;
+                        *this.nxt += BLOCK_SIZE as u64;
                         *this.state = EOF;
                         continue;
                     }
@@ -512,12 +488,12 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     return Poll::Ready(Some(match kind {
                         Kind::File | Kind::File0 => {
                             let size = this.header.size()?;
-                            let path_name = entry_name(&this.header, &mut this.exts)?;
+                            let path_name = entry_name(this.header, this.exts)?;
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
                                 *this.nxt += BLOCK_SIZE as u64;
                                 *this.state = HEADER;
                                 Entry::Directory(TarDirectory {
-                                    size: size,
+                                    size,
                                     mode: this.header.mode()?,
                                     mtime: this.header.mtime()?,
                                     uid: this.header.uid()?,
@@ -528,7 +504,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                                 *this.nxt += size;
                                 *this.state = ENTRY;
                                 Entry::File {
-                                    size: size,
+                                    size,
                                     mode: this.header.mode()?,
                                     mtime: this.header.mtime()?,
                                     uid: this.header.uid()?,
@@ -542,9 +518,9 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             let size = this.header.size()?;
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = HEADER;
-                            let path_name = entry_name(&this.header, &mut this.exts)?;
+                            let path_name = entry_name(this.header, this.exts)?;
                             Ok(Entry::Directory(TarDirectory {
-                                size: size,
+                                size,
                                 mode: this.header.mode()?,
                                 mtime: this.header.mtime()?,
                                 uid: this.header.uid()?,
@@ -555,8 +531,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         Kind::Link => {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = HEADER;
-                            let (path_name, link_name) =
-                                entry_name_link(&this.header, &mut this.exts)?;
+                            let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
                             Ok(Entry::Link(TarLink {
                                 path_name,
                                 link_name,
@@ -565,8 +540,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         Kind::Symlink if !this.header.is_old() => {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = HEADER;
-                            let (path_name, link_name) =
-                                entry_name_link(&this.header, &mut this.exts)?;
+                            let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
                             Ok(Entry::Symlink(TarSymlink {
                                 mode: this.header.mode()?,
                                 mtime: this.header.mtime()?,
@@ -590,7 +564,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             *this.state = EXTENSION((size as u32, kind));
                             let padded = padded_size(size as u64);
                             *this.nxt += padded;
-                            if size as usize > BLOCK_SIZE {
+                            if size > BLOCK_SIZE {
                                 this.ext.replace(ExtensionBuffer::new(padded as usize));
                             }
                             continue;
@@ -607,13 +581,13 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         let remaining = *this.nxt - *this.pos;
                         let filled = BLOCK_SIZE - remaining as usize;
                         let (hdr, reader) = (&mut this.header, &mut this.reader);
-                        let n =
-                            ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled as usize..)));
+                        let n = ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled..)));
                         n
                     } else {
                         let buf = ext.as_mut().unwrap();
-                        let n = ready_opt!(pin!(reader).poll_read(ctx, buf.remaining_buf()));
-                        buf.advance(n);
+                        let n =
+                            ready_opt!(pin!(reader).poll_read(ctx, unsafe { buf.remaining_buf() }));
+                        unsafe { buf.advance(n) };
                         n
                     };
                     *this.pos += if n == 0 {
@@ -674,7 +648,8 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             this.ext.as_mut().unwrap()
                         };
                         let reader = &mut this.reader;
-                        match ready_opt!(pin!(reader).poll_read(ctx, buf.upto(remaining))) {
+                        match ready_opt!(pin!(reader).poll_read(ctx, unsafe { buf.upto(remaining) }))
+                        {
                             0 => Err(Error::new(
                                 ErrorKind::UnexpectedEof,
                                 "unexpected end of tar file",
@@ -697,9 +672,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     let remaining = *this.nxt - *this.pos;
                     let filled = BLOCK_SIZE - remaining as usize;
                     let (hdr, reader) = (&mut this.header, &mut this.reader);
-                    let n = match ready_opt!(
-                        pin!(reader).poll_read(ctx, hdr.buf_mut(filled as usize..))
-                    ) {
+                    let n = match ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled..))) {
                         0 => Err(Error::new(
                             ErrorKind::UnexpectedEof,
                             "unexpected end of tar file",
@@ -707,7 +680,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         n => Ok(n as u64),
                     }?;
                     *this.pos += n;
-                    if remaining > n as u64 {
+                    if remaining > n {
                         continue;
                     }
                     return Poll::Ready(if hdr.is_zero() {
@@ -886,7 +859,7 @@ impl<R: AsyncRead + Send> AsyncRead for TarRegularFile<R> {
             0
         };
         *inner.pos += n as u64;
-        return Poll::Ready(Ok(if (n as u64) < remain {
+        Poll::Ready(Ok(if (n as u64) < remain {
             n
         } else {
             let nxt = padded_size(*inner.nxt);
@@ -898,7 +871,7 @@ impl<R: AsyncRead + Send> AsyncRead for TarRegularFile<R> {
                 *inner.state = PADDING;
             }
             n
-        }));
+        }))
     }
 }
 
@@ -906,7 +879,7 @@ fn null_terminated(bytes: &[u8]) -> &[u8] {
     &bytes[..bytes
         .iter()
         .position(|b| *b == b'\0')
-        .unwrap_or_else(|| bytes.len())]
+        .unwrap_or(bytes.len())]
 }
 
 fn ustar_path_name(name: &[u8; 100], prefix: &[u8; 155]) -> Result<Box<str>> {
@@ -938,7 +911,7 @@ fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {
         if d == &0 || d == &b' ' {
             break;
         }
-        if d < &b'0' || d > &b'7' {
+        if !(&b'0'..=&b'7').contains(&d) {
             return Err(field);
         }
         rest = r;
@@ -947,7 +920,7 @@ fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {
         }
         n = (n << 3) | (u64::from(*d) - u64::from(b'0'));
     }
-    return Ok(n);
+    Ok(n)
 }
 
 const fn padded_size(n: u64) -> u64 {

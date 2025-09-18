@@ -302,11 +302,11 @@ impl<R1> Constraint<R1> {
         FN: FnMut(&R1) -> R2,
         FV: FnMut(&Version<R1>) -> Version<R2>,
     {
-        let mut ta = ta;
+        let ta = ta;
         let mut tn = tn;
         let mut tv = tv;
         Constraint {
-            arch: self.arch.as_ref().map(|a| ta(&a)),
+            arch: self.arch.as_ref().map(ta),
             name: tn(&self.name),
             range: self.range.translate_internal(&mut tv),
         }
@@ -333,9 +333,7 @@ where
                     .cloned()
                     .chain(
                         self.iter()
-                            .skip(i + 1)
-                            .cloned()
-                            .filter(|dep| !dep.satisfies(con)),
+                            .skip(i + 1).filter(|&dep| !dep.satisfies(con)).cloned(),
                     )
                     .collect::<Vec<_>>();
                 return match result.len() {
@@ -369,8 +367,7 @@ where
                                     .skip(i + 1)
                                     .filter_map(|d| d.drop_constraint(con)),
                             )
-                            .filter(|d| d.is_some())
-                            .map(|d| d.unwrap()),
+                            .flatten(),
                     )
                     .collect::<Vec<_>>();
                 return match result.len() {
@@ -407,9 +404,7 @@ where
                             .cloned()
                             .chain(
                                 deps.iter()
-                                    .skip(i + 1)
-                                    .cloned()
-                                    .filter(|dep| !dep.satisfies(con)),
+                                    .skip(i + 1).filter(|&dep| !dep.satisfies(con)).cloned(),
                             )
                             .collect::<SmallVec<[_; 2]>>();
                         return match result.len() {
@@ -446,14 +441,13 @@ impl<R1> Dependency<R1> {
     pub fn iter(&self) -> DependencyRefIterator<'_, R1> {
         DependencyRefIterator { dep: self, item: 0 }
     }
-    pub fn into_iter(self) -> impl Iterator<Item = Constraint<R1>> {
-        match self {
-            Self::Single(dep) => {
-                let single: SmallVec<[Constraint<R1>; 2]> = smallvec![dep];
-                single.into_iter()
-            }
-            Self::Union(deps) => deps.into_iter(),
-        }
+}
+
+impl<'a, R> IntoIterator for &'a Dependency<R> {
+    type Item = &'a Constraint<R>;
+    type IntoIter = DependencyRefIterator<'a, R>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -657,9 +651,9 @@ impl<V: Display> Debug for VersionSet<V> {
     }
 }
 
-impl<V> Into<VersionSet<Version<V>>> for Version<V> {
-    fn into(self) -> VersionSet<Version<V>> {
-        VersionSet::Exactly(self)
+impl<V> From<Version<V>> for VersionSet<Version<V>> {
+    fn from(val: Version<V>) -> Self {
+        VersionSet::Exactly(val)
     }
 }
 
@@ -887,7 +881,7 @@ enum Predicate {
     LaterOrEqual,
     StrictlyLater,
 }
-impl<'a> std::fmt::Display for Predicate {
+impl std::fmt::Display for Predicate {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::StrictlyEarlier => f.write_str("<<"),
@@ -937,7 +931,7 @@ impl ByteMatcher for [u8] {
                 return true;
             }
         }
-        return false;
+        false
     }
 }
 impl<F: Fn(&u8) -> bool> ByteMatcher for F {
@@ -1274,7 +1268,7 @@ impl<'a> Constraint<&'a str> {
         let arch = if inp.next_matches(b':').is_some() {
             Some(inp.parse_string_of(
                 2,
-                |&b: &u8| (b >= b'a' && b <= b'z') || (b >= b'0' && b <= b'9') || b == b'-',
+                |&b: &u8| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-',
                 "invalid arch qualifier",
             )?)
         } else {
@@ -1446,18 +1440,16 @@ mod comparator {
             Err(Ordering::Less)
         } else if that == b'-' {
             Err(Ordering::Greater)
-        } else if (this >= b'a' && this <= b'z') || (this >= b'A' && this <= b'Z') {
-            if (that >= b'a' && that <= b'z') || (that >= b'A' && that <= b'Z') {
+        } else if this.is_ascii_lowercase() || this.is_ascii_uppercase() {
+            if that.is_ascii_lowercase() || that.is_ascii_uppercase() {
                 cmp(&this, &that)
             } else {
                 Err(Ordering::Less)
             }
+        } else if that.is_ascii_lowercase() || that.is_ascii_uppercase() {
+            Err(Ordering::Greater)
         } else {
-            if (that >= b'a' && that <= b'z') || (that >= b'A' && that <= b'Z') {
-                Err(Ordering::Greater)
-            } else {
-                cmp(&this, &that)
-            }
+            cmp(&this, &that)
         }
     }
 
@@ -1480,7 +1472,7 @@ mod comparator {
         }
         #[inline]
         fn peek(&self) -> Option<u8> {
-            if self.data.len() == 0 {
+            if self.data.is_empty() {
                 None
             } else {
                 Some(self.data[0])
@@ -1498,8 +1490,8 @@ mod comparator {
         fn peek_char(&self) -> Option<u8> {
             match self.peek() {
                 Some(c)
-                    if (c >= b'a' && c <= b'z')
-                        || (c >= b'A' && c <= b'Z')
+                    if c.is_ascii_lowercase()
+                        || c.is_ascii_uppercase()
                         || c == b'.'
                         || c == b'-'
                         || c == b'+'
@@ -1594,7 +1586,7 @@ mod comparator {
         }
         fn compare(&mut self, other: &mut Self) -> Result<()> {
             self.compare_initial(other)?;
-            while self.data.len() > 0 || other.data.len() > 0 {
+            while !self.data.is_empty() || !other.data.is_empty() {
                 self.compare_alpha(other)?;
                 self.compare_num(other)?;
             }

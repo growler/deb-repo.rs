@@ -149,15 +149,12 @@ async fn run(cmd: Cli) -> Result<ExitCode> {
         )
     }?;
     loop {
-        match waitpid(pid, None)? {
-            WaitStatus::Exited(_, code) => {
-                if code == 0 {
-                    break;
-                } else {
-                    return Err(nix::errno::Errno::from_raw(code).into());
-                }
+        if let WaitStatus::Exited(_, code) = waitpid(pid, None)? {
+            if code == 0 {
+                break;
+            } else {
+                return Err(nix::errno::Errno::from_raw(code).into());
             }
-            _ => {}
         }
     }
     Ok(ExitCode::SUCCESS)

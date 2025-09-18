@@ -565,7 +565,7 @@ pub struct HashingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
 }
 
 pub trait HashingRead: AsyncRead + Unpin {
-    fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64);
+    fn hash_and_size(&mut self) -> (Box<[u8]>, u64);
 }
 
 impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
@@ -585,7 +585,7 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingReader<D,
 impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingRead
     for HashingReader<D, R>
 {
-    fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64) {
+    fn hash_and_size(&mut self) -> (Box<[u8]>, u64) {
         (
             self.digester
                 .finalize_fixed_reset()
@@ -735,8 +735,7 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                 this.digester.update(&buf[0..size]);
                 *this.read += size as u64;
                 if this.read > this.size {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(std::io::Error::other(
                         format!(
                             "unexpected stream size {} (expected {})",
                             this.read, this.size
@@ -747,8 +746,7 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                 }
             } else if this.read < this.size {
                 // size == 0, EOF
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
+                Err(std::io::Error::other(
                     format!(
                         "unexpected stream size {} (expected {})",
                         this.read, this.size
@@ -761,8 +759,7 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                 if this.digest == &digest {
                     Ok(0)
                 } else {
-                    Err(std::io::Error::new(
-                        std::io::ErrorKind::Other,
+                    Err(std::io::Error::other(
                         format!(
                             "unexpected stream digest `{}` (expected `{}`)",
                             hex::encode(&digest),

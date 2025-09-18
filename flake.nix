@@ -105,6 +105,6 @@
         inherit self pkgs;
         devShells.stable = pkgs.mkShell (shell rust-stable { name = "deb-repo-stable"; });
         devShells.nightly = pkgs.mkShell (shell rust-nightly { name = "deb-repo-nightly"; });
-        devShell = devShells.nightly;
+        devShell = devShells.stable;
     });
 }

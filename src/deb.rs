@@ -280,8 +280,7 @@ impl AsyncRead for DebEntryReaderInner {
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let mut reader = self.inner.lock().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("unexpected mutex error {}", err),
             )
         })?;
@@ -400,7 +399,7 @@ impl DebReader {
                                     Some(size as usize),
                                 )
                                 .await?;
-                            ctrl_files.push((filename.into(), file));
+                            ctrl_files.push((filename, file));
                         } else {
                             let file = fs
                                 .create_file(
@@ -500,8 +499,7 @@ impl DebReader {
                                 )
                                 .await
                                 .map_err(|err| {
-                                    io::Error::new(
-                                        io::ErrorKind::Other,
+                                    io::Error::other(
                                         format!("error creating file {}: {}", path.display(), err),
                                     )
                                 })?,
@@ -519,8 +517,7 @@ impl DebReader {
                                     )
                                     .await
                                     .map_err(|err| {
-                                        io::Error::new(
-                                            io::ErrorKind::Other,
+                                        io::Error::other(
                                             format!(
                                                 "error creating config file {} {}: {}",
                                                 path.display(),
@@ -580,7 +577,7 @@ impl DebReader {
             .persist(target_name)
             .await?;
         }
-        if conf_files.len() > 0 {
+        if !conf_files.is_empty() {
             let mut buf = String::new();
             for (name, hash) in conf_files.into_iter() {
                 if let Some(hash) = hash {
@@ -590,11 +587,11 @@ impl DebReader {
                     buf.push_str(&hash);
                 }
             }
-            if buf.len() > 0 {
+            if !buf.is_empty() {
                 ctrl.set("Conffiles", buf);
             }
         }
-        if ctrl_files_list.len() > 0 {
+        if !ctrl_files_list.is_empty() {
             ctrl.set("Controlfiles", ctrl_files_list);
         }
         Ok(ctrl)
@@ -605,8 +602,7 @@ impl Stream for DebReader {
     type Item = Result<DebEntry>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let mut reader = self.inner.lock().map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::Other,
+            io::Error::other(
                 format!("unexpected mutex error {}", err),
             )
         })?;

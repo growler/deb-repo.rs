@@ -24,7 +24,7 @@ impl<FS: DeploymentFileSystem + Send + Sync + 'static> Builder<FS> {
     ) -> io::Result<Vec<String>> {
         let mut installed = stream::iter(manifest.installables(recipe.unwrap_or(""))?)
             .map_ok(|(source, path, size, hash)| async move {
-                let deb = source.deb_reader(&path, size, &hash, transport).await?;
+                let deb = source.deb_reader(path, size, hash, transport).await?;
                 tracing::trace!("Extracting package {}", path);
                 let fs = Arc::clone(&self.fs);
                 let mut ctrl = blocking::unblock(move || {
@@ -83,7 +83,7 @@ impl<FS: DeploymentFileSystem + Send + Sync + 'static> Builder<FS> {
             let mut status = Vec::<u8>::with_capacity(size);
             for i in installed.into_iter() {
                 status.write_all(format!("{}", &i).as_bytes()).await?;
-                status.write_all(&[b'\n']).await?;
+                status.write_all(b"\n").await?;
             }
             self.fs
                 .create_file(

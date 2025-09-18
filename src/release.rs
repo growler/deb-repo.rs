@@ -42,6 +42,9 @@ impl Release {
     pub fn len(&self) -> usize {
         self.inner.with_data(|d| d.len())
     }
+    pub fn is_empty(&self) -> bool {
+        self.inner.with_data(|d| d.is_empty())
+    }
     pub(crate) fn files<F>(
         &self,
         hash_field_name: &'static str,
@@ -78,7 +81,7 @@ impl Release {
                     Ok(Some(ReleaseFile {
                         path: path.into(),
                         hash: digest.into(),
-                        size: size,
+                        size,
                     }))
                 } else {
                     Ok(None)
@@ -111,7 +114,7 @@ impl Release {
     // }
     fn field(&self, name: &str) -> Option<&str> {
         self.inner
-            .with_control(|ctrl| ctrl.field(name).map(|s| s.as_ref()))
+            .with_control(|ctrl| ctrl.field(name).map(|s| s))
     }
     pub fn codename(&self) -> Option<&str> {
         self.field("Codename")

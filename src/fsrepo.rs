@@ -16,11 +16,11 @@ pub struct FSTransportProvider {
 impl FSTransportProvider {
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let base = path.as_ref().to_path_buf();
-        if {
+        let res = {
             let meta = fs::metadata(&base).await?;
             meta.is_dir()
-        } {
-            Ok(FSTransportProvider { base: base })
+        }; if res {
+            Ok(FSTransportProvider { base })
         } else {
             Err(io::Error::new(
                 io::ErrorKind::NotADirectory,
