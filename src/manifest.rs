@@ -7,13 +7,14 @@ use {
         universe::Universe,
         version::{Constraint, Dependency, Satisfies, Version},
     },
-    async_std::{io, path::Path},
     chrono::{DateTime, Utc},
     futures::stream::{self, StreamExt, TryStreamExt},
+    futures_lite::io::AsyncReadExt,
     iterator_ext::IteratorExt,
     itertools::Itertools,
     serde::{Deserialize, Serialize},
-    std::{borrow::Cow, pin::pin},
+    smol::{fs::File, io},
+    std::{borrow::Cow, path::Path, pin::pin},
     toml_edit::{self, DocumentMut},
 };
 
@@ -108,10 +109,7 @@ impl Manifest {
         })
     }
     pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<Self> {
-        use io::ReadExt;
-        let r = pin!(async_std::fs::File::open(path.as_ref())
-            .await?
-            .take(Self::MAX_FILE_SIZE));
+        let r = pin!(File::open(path.as_ref()).await?.take(Self::MAX_FILE_SIZE));
         let mut r = crate::hash::HashingReader::<sha2::Sha256, _>::new(r);
         let mut buf = Vec::<u8>::new();
         r.read_to_end(&mut buf).await?;
@@ -139,13 +137,20 @@ impl Manifest {
             .or_insert(toml_edit::ArrayOfTables::new().into());
         let hash = r.into_hash();
         let arch = arch.to_string();
-        let lock_file = match pin!(async_std::fs::File::open(
-            path.as_ref().with_extension(format!("{}.lock", &arch))
-        ))
-        .await
-        {
-            Err(e) if e.kind() == io::ErrorKind::NotFound => None,
-            Err(e) => return Err(e),
+        let lock_file_path = path.as_ref().with_extension(format!("{}.lock", &arch));
+        let lock_file = match pin!(File::open(&lock_file_path)).await {
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                tracing::debug!("lock file {:?} not found", lock_file_path.as_os_str());
+                None
+            }
+            Err(e) => {
+                tracing::error!(
+                    "failed to open lock file {:?}: {}",
+                    lock_file_path.as_os_str(),
+                    e
+                );
+                return Err(e);
+            }
             Ok(r) => {
                 let mut buf = Vec::<u8>::new();
                 #[derive(Deserialize)]
@@ -296,6 +301,53 @@ impl Manifest {
                 format!("source {} {} not found", source.url, source.suite),
             )),
         }
+    }
+    pub fn installables<'a>(
+        &'a self,
+        recipe: &'a str,
+    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, &'a str, u64, &'a FileHash)>> + 'a>
+    {
+        let (i, _) = self
+            .file
+            .recipes
+            .iter()
+            .enumerate()
+            .find(|(_, r)| r.name == recipe)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!("recipe {} not found", recipe),
+                )
+            })?;
+        let locked = self
+            .lock
+            .recipes
+            .get(i)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "inconsistent internal manifest state",
+                )
+            })?
+            .as_ref()
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "no solution for recipe \"{}\", update manifest lock",
+                        recipe
+                    ),
+                )
+            })?;
+        Ok(locked.installables.iter().map(move |p| {
+            let src = self.file.sources.get(p.src as usize).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid source index {} in recipe {}", p.src, recipe),
+                )
+            })?;
+            Ok::<_, io::Error>((src, p.path.as_str(), p.size, &p.hash))
+        }))
     }
     fn requirements_for(
         &self,
@@ -614,34 +666,30 @@ impl Manifest {
                 .sources
                 .iter()
                 .zip(self.file.sources.iter())
-                .enumerate(),
-        )
-        .map(|(i, (locked, source))| match locked {
-            Some(locked) => {
-                let inner = stream::iter(
+                .enumerate()
+                .map(|(i, (locked, source))| {
                     locked
-                        .packages
-                        .iter()
-                        .map(move |p| Ok::<_, io::Error>((i, source, p))),
-                );
-                Ok::<_, io::Error>(inner)
-            }
-            None => Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!(
-                    "inconsistent internal manifest state (no locked source for {}:{})",
-                    &source.url, &source.suite
-                ),
-            )),
-        })
-        .try_flatten()
+                        .as_ref()
+                        .map(|l| l.packages.iter().map(move |p| (i, source, p)))
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "inconsistent internal manifest state (no locked source for {}:{})",
+                                    &source.url, &source.suite
+                                ),
+                            )
+                        })
+                })
+                .try_flatten(),
+        )
         .map_ok(|(source_id, source, locked)| {
             let transport = transport;
             async move {
                 let packages = source
                     .fetch_packages_index(&locked.path, locked.size, &locked.hash, transport)
                     .await?;
-                Ok((source_id, packages))
+                Ok::<_, io::Error>((source_id, packages))
             }
         })
         .try_buffer_unordered(limit)
@@ -866,10 +914,6 @@ impl LockedSource {
                         components[i] = true;
                         return true;
                     }
-                    if matches_path!(f, [ s "/binary-all/Packages" ext ]) {
-                        components[i] = true;
-                        return true;
-                    }
                 }
                 return false;
             })?
@@ -1031,48 +1075,5 @@ mod constraints_list {
     {
         let as_strings: Vec<String> = value.iter().cloned().map(|c| (!c).to_string()).collect();
         as_strings.serialize(ser)
-    }
-}
-
-// Hexadecimal encoding (default). Accepts mixed case, outputs only lowercase.
-pub mod hex_hash {
-    use serde::{
-        de::{self, Visitor},
-        Deserializer, Serializer,
-    };
-    use std::fmt;
-
-    pub fn serialize<S>(value: &Box<[u8]>, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        let s = ::hex::encode(value.as_ref());
-        serializer.serialize_str(&s)
-    }
-
-    pub fn deserialize<'de, DE>(deserializer: DE) -> Result<Box<[u8]>, DE::Error>
-    where
-        DE: Deserializer<'de>,
-    {
-        struct HexVisitor;
-
-        impl<'de> Visitor<'de> for HexVisitor {
-            type Value = Box<[u8]>;
-
-            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                write!(f, "a string with hex-encoded digest",)
-            }
-
-            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                ::hex::decode(v)
-                    .map_err(|e| E::custom(format!("error decoding hex digest: {}", e)))
-                    .map(|v| v.into_boxed_slice())
-            }
-        }
-
-        deserializer.deserialize_str(HexVisitor)
     }
 }

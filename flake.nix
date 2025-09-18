@@ -8,9 +8,50 @@
         };
     };
     outputs = {self, nixpkgs, rust-overlay, flake-utils}: flake-utils.lib.eachDefaultSystem (system: let
+        cargo-afl-source = {
+          lib,
+          fetchFromGitHub,
+          aflplusplus,
+          rustPlatform,
+        }:
+        rustPlatform.buildRustPackage {
+          pname = "cargo-afl";
+          version = "0.16.0-rc.0";
+
+          src = fetchFromGitHub {
+            owner = "rust-fuzz";
+            repo = "afl.rs";
+            rev = "ea1ca87123a42538db5550adc402c3a84536fb47";
+            fetchSubmodules = false;
+            hash = "sha256-AHzAvjA63nRuZ2vd3fRmwhrzCZlky5bWMgVImsw/DUw=";
+          };
+
+          buildInputs = [
+            aflplusplus
+          ];
+
+          cargoHash = "sha256-W+Y/KZjuQZfXTbCx1mSJ0hZXoJYzDxAbyH1GwsdaDMA=";
+
+          doCheck = false;
+
+          meta = with lib; {
+            description = "Command line helpers for fuzzing with AFL++";
+            mainProgram = "cargo-afl";
+            homepage = "https://github.com/rust-fuzz/cargo-afl";
+            license = with licenses; [
+              mit
+              asl20
+            ];
+          };
+        };
         pkgs = import nixpkgs {
             inherit system;
-            overlays = [ (import rust-overlay) ];
+            overlays = [ 
+                (import rust-overlay) 
+                (final: prev: {
+                    cargo-afl = final.callPackage cargo-afl-source {};
+                })
+            ];
         };
         buildInputs = (with pkgs; [
             curl.dev
@@ -22,6 +63,8 @@
             clang
         ]);
         nativeBuildInputs = with pkgs; [ 
+            # aflplusplus
+            # cargo-afl
             cargo-show-asm
             cargo-expand
             cargo-bloat
@@ -62,6 +105,6 @@
         inherit self pkgs;
         devShells.stable = pkgs.mkShell (shell rust-stable { name = "deb-repo-stable"; });
         devShells.nightly = pkgs.mkShell (shell rust-nightly { name = "deb-repo-nightly"; });
-        devShell = devShells.stable;
+        devShell = devShells.nightly;
     });
 }

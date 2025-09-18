@@ -6,12 +6,11 @@ use {
         de::{self, Visitor},
         Deserialize, Deserializer, Serialize, Serializer,
     },
-    async_std::{
-        io::prelude::*,
-        task::{ready, Context, Poll},
-    },
     digest::FixedOutputReset,
+    futures_lite::ready,
     pin_project::pin_project,
+    smol::io::{AsyncRead, AsyncWrite},
+    std::task::{Context, Poll},
     std::{fmt, pin::Pin},
 };
 
@@ -149,11 +148,11 @@ impl std::ops::Deref for FileHash {
     }
 }
 impl FileHash {
-    pub fn verifying_reader<'b, R: Read + Unpin + Send + 'b>(
+    pub fn verifying_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
         &self,
         size: u64,
         reader: R,
-    ) -> Pin<Box<dyn Read + Send + 'b>> {
+    ) -> Pin<Box<dyn AsyncRead + Send + 'b>> {
         match self {
             FileHash::MD5sum(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
             FileHash::SHA256(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
@@ -484,7 +483,7 @@ impl<D: HashAlgo> TryFrom<&[u8]> for Hash<D> {
     }
 }
 
-fn path_for_hash(bytes: &[u8]) -> async_std::path::PathBuf {
+fn path_for_hash(bytes: &[u8]) -> std::path::PathBuf {
     const HEX: &[u8; 16] = b"0123456789abcdef";
 
     let needs_sep = bytes.len() > 1;
@@ -512,16 +511,16 @@ fn path_for_hash(bytes: &[u8]) -> async_std::path::PathBuf {
         }
     }
 
-    async_std::path::PathBuf::from(os)
+    std::path::PathBuf::from(os)
 }
 
-impl From<&FileHash> for async_std::path::PathBuf {
+impl From<&FileHash> for std::path::PathBuf {
     fn from(value: &FileHash) -> Self {
         path_for_hash(value.as_ref())
     }
 }
 
-impl<D: HashAlgo> From<&Hash<D>> for async_std::path::PathBuf {
+impl<D: HashAlgo> From<&Hash<D>> for std::path::PathBuf {
     fn from(value: &Hash<D>) -> Self {
         path_for_hash(&value.inner)
     }
@@ -558,18 +557,18 @@ impl<D: HashAlgo> std::fmt::LowerHex for Hash<D> {
 }
 
 #[pin_project]
-pub struct HashingReader<D: HashAlgo, R: Read + Unpin + Send> {
+pub struct HashingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
     digester: D,
     counter: u64,
     #[pin]
     inner: R,
 }
 
-pub trait HashingRead: Read + Unpin {
+pub trait HashingRead: AsyncRead + Unpin {
     fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64);
 }
 
-impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
             counter: 0,
@@ -583,7 +582,9 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingReader<D, R> {
         }
     }
 }
-impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingRead for HashingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingRead
+    for HashingReader<D, R>
+{
     fn into_hash_and_size(&mut self) -> (Box<[u8]>, u64) {
         (
             self.digester
@@ -595,7 +596,7 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> HashingRead for Hashi
     }
 }
 
-impl<D: HashAlgo, R: Read + Unpin + Send> Read for HashingReader<D, R> {
+impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncRead for HashingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -650,13 +651,13 @@ impl<D: HashAlgo, W: std::io::Write> std::io::Write for SyncHashingWriter<D, W> 
 }
 
 #[pin_project]
-pub struct HashingWriter<D: HashAlgo, W: Write + Unpin + Send> {
+pub struct HashingWriter<D: HashAlgo, W: AsyncWrite + Unpin + Send> {
     digester: D,
     #[pin]
     inner: W,
 }
 
-impl<D: HashAlgo + Default + Send, W: Write + Unpin + Send> HashingWriter<D, W> {
+impl<D: HashAlgo + Default + Send, W: AsyncWrite + Unpin + Send> HashingWriter<D, W> {
     pub fn new(writer: W) -> Self {
         Self {
             digester: D::default(),
@@ -671,7 +672,7 @@ impl<D: HashAlgo + Default + Send, W: Write + Unpin + Send> HashingWriter<D, W> 
     }
 }
 
-impl<D: HashAlgo, W: Write + Unpin + Send> Write for HashingWriter<D, W> {
+impl<D: HashAlgo, W: AsyncWrite + Unpin + Send> AsyncWrite for HashingWriter<D, W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -699,7 +700,7 @@ impl<D: HashAlgo, W: Write + Unpin + Send> Write for HashingWriter<D, W> {
 }
 
 #[pin_project]
-pub struct VerifyingReader<D: HashAlgo, R: Read + Unpin + Send> {
+pub struct VerifyingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
     digester: D,
     digest: HashOutput<D>,
     size: u64,
@@ -708,7 +709,7 @@ pub struct VerifyingReader<D: HashAlgo, R: Read + Unpin + Send> {
     inner: R,
 }
 
-impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> VerifyingReader<D, R> {
     pub fn new(reader: R, size: u64, digest: Hash<D>) -> Self {
         Self {
             digester: D::default(),
@@ -720,7 +721,9 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> VerifyingReader<D, R>
     }
 }
 
-impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> Read for VerifyingReader<D, R> {
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
+    for VerifyingReader<D, R>
+{
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -779,10 +782,12 @@ impl<D: HashAlgo + Default + Send, R: Read + Unpin + Send> Read for VerifyingRea
 #[cfg(test)]
 mod tests {
     use super::*;
-    use async_std::io::{Cursor, ReadExt};
+    use macro_rules_attribute::apply;
     use sha2::{Digest, Sha256};
+    use smol::io::{AsyncReadExt, Cursor};
+    use smol_macros::test;
 
-    #[async_std::test]
+    #[apply(test!)]
     async fn test_verifying_reader() {
         let data = b"hello world";
         let size = data.len() as u64;
@@ -817,7 +822,7 @@ mod tests {
         assert_eq!(n, 0);
     }
 
-    #[async_std::test]
+    #[apply(test!)]
     async fn test_verifying_reader_incorrect_digest() {
         let data = b"hello world";
         let size = data.len() as u64;
@@ -838,7 +843,7 @@ mod tests {
         assert!(err.to_string().contains("unexpected stream digest"));
     }
 
-    #[async_std::test]
+    #[apply(test!)]
     async fn test_verifying_reader_incorrect_size() {
         let data = b"hello world";
         let size = data.len() as u64 + 1; // incorrect size

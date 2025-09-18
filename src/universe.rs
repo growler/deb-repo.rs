@@ -1020,7 +1020,8 @@ impl DependencyProvider for InnerUniverse {
                     (true, false) => std::cmp::Ordering::Less,
                     (false, true) => std::cmp::Ordering::Greater,
                     _ => match this.package.name().cmp(that.package.name()) {
-                        std::cmp::Ordering::Equal => match that.prio.cmp(&this.prio) { // higher prio first
+                        std::cmp::Ordering::Equal => match that.prio.cmp(&this.prio) {
+                            // higher prio first
                             std::cmp::Ordering::Equal => that.version.cmp(&this.version), // newer versions first
                             cmp => cmp,
                         },

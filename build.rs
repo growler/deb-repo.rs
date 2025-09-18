@@ -1,5 +1,5 @@
-use isahc::prelude::*;
 use gpgme::{Context, Protocol};
+use isahc::prelude::*;
 use std::fs::{self, File};
 use std::io::{BufRead, BufReader};
 use std::path::Path;
@@ -26,7 +26,8 @@ fn main() {
     fs::create_dir_all(&gpg_home).expect("create gpg home");
 
     let mut ctx = Context::from_protocol(Protocol::OpenPgp).expect("gpgme context");
-    ctx.set_engine_home_dir(gpg_home.as_os_str().as_encoded_bytes()).expect("set engine home");
+    ctx.set_engine_home_dir(gpg_home.as_os_str().as_encoded_bytes())
+        .expect("set engine home");
 
     let client = isahc::HttpClient::builder()
         .redirect_policy(isahc::config::RedirectPolicy::Limit(10))

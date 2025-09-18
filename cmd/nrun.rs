@@ -1,6 +1,6 @@
 use {
     anyhow::{anyhow, Result},
-    async_std::path::PathBuf,
+    std::path::PathBuf,
     clap::Parser,
     nix::{
         mount::{mount, umount2, MntFlags, MsFlags},
@@ -248,7 +248,7 @@ fn main() -> ExitCode {
         }
     }
 
-    match async_std::task::block_on(run(cli)) {
+    match smol::block_on(run(cli)) {
         Ok(code) => code,
         Err(_) => ExitCode::FAILURE,
     }

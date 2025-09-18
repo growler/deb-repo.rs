@@ -1,14 +1,16 @@
-pub use async_tar::{
-    Archive as Tarball, Entries as TarballEntries, Entry as TarballEntry,
-    EntryType as TarballEntryType,
-};
 use {
-    crate::{control::MutableControlStanza, deployfs::DeploymentFile, parse_size, hash::HashingReader},
+    crate::{
+        control::MutableControlStanza,
+        deployfs::DeploymentFile,
+        hash::HashingReader,
+        parse_size,
+        tar::{TarEntry, TarLink, TarReader},
+    },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     core::task::{self, Context, Poll},
-    futures::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
+    futures_lite::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
     std::{
         io::{self, Result},
         ops::Range,
@@ -233,7 +235,7 @@ impl Stream for DebReaderInner {
                     } else {
                         return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("unexpecteddebian package entry {:?}", &name),
+                            format!("unexpected debian package entry {}", name),
                         ))));
                     }
                 }
@@ -317,21 +319,18 @@ impl DebReader {
             inner: Arc::new(Mutex::new(DebReaderInner::new(r).await?)),
         })
     }
-    fn entry_reader_for_ext(
-        &self,
-        ext: &str,
-    ) -> Result<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>> {
+    fn entry_reader_for_ext(&self, ext: &str) -> TarReader<Pin<Box<dyn AsyncRead + Send>>> {
         let r = DebEntryReaderInner {
             inner: Arc::clone(&self.inner),
         };
-        Ok(match ext {
-            ".xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
-            ".gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
-            ".bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
-            ".lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
-            ".zstd" | ".zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
-            _ => Box::pin(r),
-        })
+        match ext {
+            ".xz" => TarReader::new(Box::pin(XzDecoder::new(BufReader::new(r)))),
+            ".gz" => TarReader::new(Box::pin(GzipDecoder::new(BufReader::new(r)))),
+            ".bz2" => TarReader::new(Box::pin(BzDecoder::new(BufReader::new(r)))),
+            ".lzma" => TarReader::new(Box::pin(LzmaDecoder::new(BufReader::new(r)))),
+            ".zstd" | ".zst" => TarReader::new(Box::pin(ZstdDecoder::new(BufReader::new(r)))),
+            _ => TarReader::new(Box::pin(r)),
+        }
     }
     pub async fn extract_to<FS: crate::DeploymentFileSystem>(
         mut self,
@@ -344,10 +343,10 @@ impl DebReader {
         let mut conf_files: Vec<(String, Option<String>)> = vec![];
         let multiarch: Option<&str>;
         let pkg: &str;
-        let ctrl_base = PathBuf::from("var/lib/dpkg/info");
+        let ctrl_base = PathBuf::from("./var/lib/dpkg/info");
         fs.create_dir_all(&ctrl_base, 0, 0, 0o755).await?;
         {
-            let mut control_entries = self
+            let mut control_tarball = self
                 .next()
                 .await
                 .ok_or_else(|| {
@@ -362,40 +361,21 @@ impl DebReader {
                         io::ErrorKind::InvalidData,
                         "unexpected entry",
                     )),
-                })?
-                .entries()?;
+                })?;
             let mut maybe_ctrl: Option<MutableControlStanza> = None;
-            while let Some(entry) = control_entries.next().await {
-                let mut entry = entry?;
-                match entry.header().entry_type() {
-                    TarballEntryType::Regular => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
-                        let uid = entry.header().uid()? as u32;
-                        let gid = entry.header().gid()? as u32;
-                        let mode = entry.header().mode()?;
-                        let size = entry.header().size()? as usize;
-                        let filename = entry
-                            .header()
-                            .path()?
-                            .file_name()
-                            .ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid entry in control.tar: {:?}", &entry),
-                                )
-                            })
-                            .and_then(|name| {
-                                name.to_str().ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!("path is not a valid UTF-8 string: {:?}", name),
-                                    )
-                                })
-                            })?
-                            .to_owned();
-                        if filename.eq("control") {
+            while let Some(entry) = control_tarball.next().await {
+                let entry = entry?;
+                match entry {
+                    TarEntry::File(mut file) => {
+                        let mtime = UNIX_EPOCH + Duration::from_secs(file.mtime().into());
+                        let uid = file.uid();
+                        let gid = file.gid();
+                        let mode = file.mode();
+                        let size = file.size();
+                        let filename = file.path().to_string();
+                        if filename.eq("./control") {
                             let mut buf = String::new();
-                            entry.read_to_string(&mut buf).await?;
+                            file.read_to_string(&mut buf).await?;
                             maybe_ctrl.replace(MutableControlStanza::parse(buf).map_err(
                                 |err| {
                                     io::Error::new(
@@ -405,9 +385,9 @@ impl DebReader {
                                 },
                             )?);
                             continue;
-                        } else if filename.eq("conffiles") {
-                            let mut buf = String::with_capacity(entry.header().size()? as usize);
-                            entry.read_to_string(&mut buf).await?;
+                        } else if filename.eq("./conffiles") {
+                            let mut buf = String::with_capacity(file.size() as usize);
+                            file.read_to_string(&mut buf).await?;
                             conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
                             let file = fs
                                 .create_file(
@@ -417,31 +397,30 @@ impl DebReader {
                                     gid,
                                     mode,
                                     Some(mtime),
-                                    Some(size),
+                                    Some(size as usize),
                                 )
                                 .await?;
                             ctrl_files.push((filename.into(), file));
                         } else {
                             let file = fs
                                 .create_file(
-                                    entry,
+                                    file,
                                     None::<PathBuf>,
                                     uid,
                                     gid,
                                     mode,
                                     Some(mtime),
-                                    Some(size),
+                                    Some(size as usize),
                                 )
                                 .await?;
-                            ctrl_files.push((filename.into(), file));
+                            ctrl_files.push((filename, file));
                         }
                     }
-                    TarballEntryType::Directory
-                        if entry.header().path()?.as_ref().to_str() == Some("./") => {}
+                    TarEntry::Directory(dir) if dir.path() == "./" => {}
                     _ => {
                         return Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid entry in control.tar: {:?}", &entry),
+                            "invalid entry in control.tar",
                         ));
                     }
                 }
@@ -470,12 +449,12 @@ impl DebReader {
                     target_name.push(arch);
                 }
                 target_name.push(".");
-                target_name.push(name);
+                target_name.push(name.strip_prefix("./").unwrap_or(&name));
                 file.persist(ctrl_base.join(target_name)).await?;
             }
         }
         {
-            let mut data_entries = self
+            let mut data_tarball = self
                 .next()
                 .await
                 .ok_or_else(|| {
@@ -487,50 +466,31 @@ impl DebReader {
                         io::ErrorKind::InvalidData,
                         "unexpected entry",
                     )),
-                })?
-                .entries()?;
-            while let Some(entry) = data_entries.next().await {
+                })?;
+            while let Some(entry) = data_tarball.next().await {
                 let entry = entry?;
-                let path = entry.header().path()?.to_path_buf();
-                let path_str = path
-                    .to_str()
-                    .ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("package file name {:?} is not a valid UTF-8", path),
-                        )
-                    })
-                    .map(|p| if p.starts_with('.') { &p[1..] } else { p })
-                    .map(|p| {
-                        if p == "/" {
-                            "/."
-                        } else if p.ends_with('/') {
-                            &p[..p.len() - 1]
-                        } else {
-                            p
-                        }
-                    })?;
-                installed_files.push(path_str.to_owned());
-                match entry.header().entry_type() {
-                    TarballEntryType::Directory => {
-                        fs.create_dir_all(
-                            &path,
-                            entry.header().uid()? as u32,
-                            entry.header().gid()? as u32,
-                            entry.header().mode()?,
-                        )
-                        .await?;
+                tracing::debug!("{} {}", pkg, entry.path());
+                // tracing::debug!("{} {:?} {:#?}", pkg, path.as_os_str(), entry.header());
+                installed_files.push(entry.path().to_owned());
+                let mut links: Vec<TarLink> = Vec::new();
+                match entry {
+                    TarEntry::Directory(dir) => {
+                        tracing::debug!("creating directory {}", dir.path());
+                        fs.create_dir_all(dir.path(), dir.uid(), dir.gid(), dir.mode())
+                            .await?;
                     }
-                    TarballEntryType::Regular => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
-                        let uid = entry.header().uid()? as u32;
-                        let gid = entry.header().gid()? as u32;
-                        let mode = entry.header().mode()?;
-                        let size = entry.header().size()? as usize;
-                        match conf_files.iter_mut().find(|(name, _)| name == path_str) {
+                    TarEntry::File(mut file) => {
+                        let mtime = UNIX_EPOCH + Duration::from_secs(file.mtime() as u64);
+                        let size = file.size() as usize;
+                        let path = PathBuf::from(file.path());
+                        let uid = file.uid();
+                        let gid = file.gid();
+                        let mode = file.mode();
+                        tracing::debug!("extracting {}", file.path());
+                        match conf_files.iter_mut().find(|(name, _)| name == file.path()) {
                             None => fs
                                 .create_file(
-                                    entry,
+                                    &mut file,
                                     Some(&path),
                                     uid,
                                     gid,
@@ -542,12 +502,11 @@ impl DebReader {
                                 .map_err(|err| {
                                     io::Error::new(
                                         io::ErrorKind::Other,
-                                        format!("error creating file {:#?}: {}", &path, err),
+                                        format!("error creating file {}: {}", path.display(), err),
                                     )
                                 })?,
                             Some((_, sum)) => {
-                                let mut hasher =
-                                    HashingReader::<md5::Md5, _>::new(entry);
+                                let mut hasher = HashingReader::<md5::Md5, _>::new(file);
                                 let file = fs
                                     .create_file(
                                         &mut hasher,
@@ -563,8 +522,8 @@ impl DebReader {
                                         io::Error::new(
                                             io::ErrorKind::Other,
                                             format!(
-                                                "error creating config file {:#?} {}: {}",
-                                                path.as_os_str(),
+                                                "error creating config file {} {}: {}",
+                                                path.display(),
                                                 mode,
                                                 err
                                             ),
@@ -575,49 +534,22 @@ impl DebReader {
                                 file
                             }
                         }
-                        .persist(&path)
+                        .persist(path)
                         .await?;
                     }
-                    TarballEntryType::Link => {
-                        fs.hardlink(
-                            entry.header().link_name()?.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid link entry in data.tar: {:?}", &entry),
-                                )
-                            })?,
-                            &path,
-                        )
-                        .await?;
+                    TarEntry::Symlink(link) => {
+                        let mtime = UNIX_EPOCH + Duration::from_secs(link.mtime() as u64);
+                        let uid = link.uid();
+                        let gid = link.gid();
+                        fs.symlink(link.link(), link.path(), uid, gid, Some(mtime))
+                            .await?;
                     }
-                    TarballEntryType::Symlink => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(entry.header().mtime()?);
-                        let uid = entry.header().uid()? as u32;
-                        let gid = entry.header().gid()? as u32;
-                        fs.symlink(
-                            entry.header().link_name()?.ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!("invalid symlink entry in data.tar: {:?}", &entry),
-                                )
-                            })?,
-                            &path,
-                            uid,
-                            gid,
-                            Some(mtime),
-                        )
-                        .await?;
+                    TarEntry::Link(link) => {
+                        links.push(link);
                     }
-                    _ => {
-                        return Err(io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!(
-                                "invalid entry in data.tar: kind {:?} {:?}",
-                                entry.header().entry_type().as_byte(),
-                                &entry
-                            ),
-                        ))
-                    }
+                }
+                for link in links.drain(..) {
+                    fs.hardlink(link.link(), link.path()).await?;
                 }
             }
         }
@@ -662,7 +594,6 @@ impl DebReader {
                 ctrl.set("Conffiles", buf);
             }
         }
-        // ctrl.set(D::DIGEST_FIELD_NAME, Into::<String>::into(self.finalize().await?));
         if ctrl_files_list.len() > 0 {
             ctrl.set("Controlfiles", ctrl_files_list);
         }
@@ -683,51 +614,31 @@ impl Stream for DebReader {
             None => Poll::Ready(None),
             Some(Err(err)) => Poll::Ready(Some(Err(err))),
             Some(Ok((entry_kind, ext_range))) => Poll::Ready(Some(match entry_kind {
-                EntryKind::Control => {
-                    Ok(DebEntry::Control(Tarball::new(self.entry_reader_for_ext(
-                        unsafe { std::str::from_utf8_unchecked(&reader.hdr[ext_range]) },
-                    )?)))
-                }
-                EntryKind::Data => Ok(DebEntry::Data(Tarball::new(self.entry_reader_for_ext(
-                    unsafe { std::str::from_utf8_unchecked(&reader.hdr[ext_range]) },
-                )?))),
+                EntryKind::Control => Ok(DebEntry::Control(self.entry_reader_for_ext(unsafe {
+                    std::str::from_utf8_unchecked(&reader.hdr[ext_range])
+                }))),
+                EntryKind::Data => Ok(DebEntry::Data(self.entry_reader_for_ext(unsafe {
+                    std::str::from_utf8_unchecked(&reader.hdr[ext_range])
+                }))),
             })),
         }
     }
 }
 
-// TODO: remove
-// pub struct DebEntryReader<'a> {
-//     inner: Pin<Box<dyn AsyncRead + Unpin + Send>>,
-//     _marker: std::marker::PhantomData<&'a ()>,
-// }
-//
-// impl<'a> AsyncRead for DebEntryReader<'a> {
-//     fn poll_read(
-//         mut self: Pin<&mut Self>,
-//         ctx: &mut Context<'_>,
-//         buf: &mut [u8],
-//     ) -> Poll<std::io::Result<usize>> {
-//         self.inner.as_mut().poll_read(ctx, buf)
-//     }
-// }
-
 pub enum DebEntry {
-    Control(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>),
-    Data(Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>),
+    Control(TarReader<Pin<Box<dyn AsyncRead + Send>>>),
+    Data(TarReader<Pin<Box<dyn AsyncRead + Send>>>),
 }
 
 impl DebEntry {
-    pub fn into_inner(self) -> Tarball<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>> {
+    pub fn into_inner(self) -> TarReader<Pin<Box<dyn AsyncRead + Send>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
         }
     }
-    pub fn entries(
-        self,
-    ) -> Result<TarballEntries<Pin<Box<dyn AsyncRead + Unpin + Send + 'static>>>> {
+    pub async fn next(&mut self) -> Option<Result<TarEntry<Pin<Box<dyn AsyncRead + Send>>>>> {
         match self {
-            DebEntry::Control(tar) | DebEntry::Data(tar) => tar.entries(),
+            DebEntry::Control(tar) | DebEntry::Data(tar) => tar.next().await,
         }
     }
 }

@@ -2,14 +2,12 @@
 
 use {
     crate::{hash::FileHash, repo::TransportProvider},
-    async_std::{
-        fs,
-        io::{self, Read, Result, WriteExt},
-        path::PathBuf,
-    },
     async_trait::async_trait,
+    futures_lite::io::{copy, AsyncWriteExt},
     isahc::{config::RedirectPolicy, http::StatusCode, prelude::*, HttpClient},
     once_cell::sync::Lazy,
+    smol::{fs, io, prelude::*},
+    std::path::PathBuf,
     std::{pin::Pin, sync::Arc},
 };
 
@@ -20,7 +18,7 @@ pub struct HttpCachingTransportProvider {
 }
 
 impl HttpCachingTransportProvider {
-    pub async fn new(insecure: bool, cache: PathBuf) -> Result<Self> {
+    pub async fn new(insecure: bool, cache: PathBuf) -> io::Result<Self> {
         fs::create_dir_all(cache.join(".temp"))
             .await
             .map_err(|err| {
@@ -34,7 +32,7 @@ impl HttpCachingTransportProvider {
             cache: Arc::new(cache),
         })
     }
-    async fn tmp_file(&self) -> Result<(tempfile::TempPath, fs::File)> {
+    async fn tmp_file(&self) -> io::Result<(tempfile::TempPath, fs::File)> {
         let tmp = tempfile::NamedTempFile::new_in(self.cache.join(".temp")).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -55,7 +53,12 @@ impl HttpCachingTransportProvider {
             })?;
         Ok((tmp_path, tmp_file))
     }
-    async fn persist_tmp_file(&self, tmp_path: tempfile::TempPath, tmp_file: fs::File, cache_path: &PathBuf) -> io::Result<()> {
+    async fn persist_tmp_file(
+        &self,
+        tmp_path: tempfile::TempPath,
+        tmp_file: fs::File,
+        cache_path: &PathBuf,
+    ) -> io::Result<()> {
         tmp_file.sync_all().await.map_err(|err| {
             io::Error::new(
                 io::ErrorKind::Other,
@@ -64,7 +67,10 @@ impl HttpCachingTransportProvider {
         })?;
         drop(tmp_file);
         if let Some(parent) = cache_path.parent() {
-            if !parent.exists().await {
+            if fs::metadata(&parent)
+                .await
+                .map_or(false, |meta| meta.is_dir())
+            {
                 fs::create_dir_all(parent).await.map_err(|err| {
                     io::Error::new(
                         io::ErrorKind::Other,
@@ -87,7 +93,7 @@ impl HttpCachingTransportProvider {
         cache_path: PathBuf,
         size: u64,
         hash: &FileHash,
-    ) -> io::Result<Pin<Box<dyn Read + Send + Unpin>>> {
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send + Unpin>>> {
         tracing::debug!("HTTP Caching Transport Fetching (cache miss) {}", uri);
         let rsp = client(self.insecure).get_async(uri).await?;
         match rsp.status() {
@@ -108,8 +114,8 @@ impl HttpCachingTransportProvider {
                 ));
             }
         }
-        let (tmp_path, tmp_file) = self.tmp_file().await?;
-        io::copy(hash.verifying_reader(size, rsp.into_body()), &tmp_file)
+        let (tmp_path, mut tmp_file) = self.tmp_file().await?;
+        copy(hash.verifying_reader(size, rsp.into_body()), &mut tmp_file)
             .await
             .map_err(|err| {
                 io::Error::new(
@@ -117,7 +123,8 @@ impl HttpCachingTransportProvider {
                     format!("Failed to copy response body: {}", err),
                 )
             })?;
-        self.persist_tmp_file(tmp_path, tmp_file, &cache_path).await?;
+        self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
+            .await?;
         Ok(Box::pin(
             fs::OpenOptions::new()
                 .read(true)
@@ -129,17 +136,19 @@ impl HttpCachingTransportProvider {
                         format!("Failed to open cached file: {}", err),
                     )
                 })?,
-        ) as Pin<Box<dyn Read + Send + Unpin>>)
+        ) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
     }
 }
 
 #[async_trait]
 impl TransportProvider for HttpCachingTransportProvider {
-    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         tracing::debug!("HTTP Caching Transport Fetching {}", uri);
         let rsp = client(self.insecure).get_async(uri).await?;
         match rsp.status() {
-            StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
+            StatusCode::OK => {
+                Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+            }
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
             code => Err(io::Error::new(
                 io::ErrorKind::Other,
@@ -152,13 +161,11 @@ impl TransportProvider for HttpCachingTransportProvider {
         path: &str,
         size: u64,
         hash: &FileHash,
-    ) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         let cache_path = self.cache.join(PathBuf::from(hash));
         match fs::File::open(&cache_path).await {
-            Ok(file) => {
-                Ok(Box::pin(hash.verifying_reader(size, file))
-                    as Pin<Box<dyn Read + Send + Unpin>>)
-            }
+            Ok(file) => Ok(Box::pin(hash.verifying_reader(size, file))
+                as Pin<Box<dyn AsyncRead + Send + Unpin>>),
             Err(_) => Ok(self.caching_reader(path, cache_path, size, hash).await?),
         }
     }
@@ -168,7 +175,6 @@ impl TransportProvider for HttpCachingTransportProvider {
         hash_type: &str,
         limit: u64,
     ) -> io::Result<(Vec<u8>, u64, FileHash)> {
-        use async_std::io::ReadExt;
         let mut buffer = vec![0u8; 0];
         let mut r = self.reader(path).await?.take(limit);
         r.read_to_end(&mut buffer).await?;
@@ -179,15 +185,15 @@ impl TransportProvider for HttpCachingTransportProvider {
             )
         })?;
         let (tmp_path, mut tmp_file) = self.tmp_file().await?;
-        tmp_file.write_all(&buffer).await
-            .map_err(|err| {
-                io::Error::new(
-                    io::ErrorKind::Other,
-                    format!("Failed to copy response body: {}", err),
-                )
-            })?;
+        tmp_file.write_all(&buffer).await.map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::Other,
+                format!("Failed to copy response body: {}", err),
+            )
+        })?;
         let cache_path = self.cache.join(PathBuf::from(&hash));
-        self.persist_tmp_file(tmp_path, tmp_file, &cache_path).await?;
+        self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
+            .await?;
         let l = buffer.len() as u64;
         Ok((buffer, l, hash))
     }
@@ -234,10 +240,12 @@ impl HttpTransportProvider {
 
 #[async_trait]
 impl TransportProvider for HttpTransportProvider {
-    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         let rsp = client(self.insecure).get_async(uri).await?;
         match rsp.status() {
-            StatusCode::OK => Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn Read + Send + Unpin>>),
+            StatusCode::OK => {
+                Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+            }
             StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
             code => Err(io::Error::new(
                 io::ErrorKind::Other,

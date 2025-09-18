@@ -10,7 +10,7 @@ use {
             ParsedProvidedNameIterator, ProvidedName, Version,
         },
     },
-    futures::io::AsyncRead,
+    futures_lite::io::{AsyncRead, AsyncReadExt},
     ouroboros::self_referencing,
     std::{io, sync::Arc},
 };
@@ -371,7 +371,6 @@ impl Packages {
         })
     }
     pub async fn read<R: AsyncRead + Unpin + Send>(r: &mut R) -> io::Result<Self> {
-        use async_std::io::ReadExt;
         let mut buf = String::new();
         r.read_to_string(&mut buf).await?;
         buf.try_into().map_err(|err| {

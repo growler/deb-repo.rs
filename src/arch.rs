@@ -20,7 +20,10 @@ pub const DEFAULT_ARCH: &str = "riscv64";
 pub const DEFAULT_ARCH: &str = "mipsel";
 
 // mips 64-bit -> mips64el
-#[cfg(any(target_arch = "mips64", all(target_arch = "mips", target_pointer_width = "64")))]
+#[cfg(any(
+    target_arch = "mips64",
+    all(target_arch = "mips", target_pointer_width = "64")
+))]
 pub const DEFAULT_ARCH: &str = "mips64el";
 
 // arm: choose hard-float vs soft-float variant at compile time via target_feature
@@ -44,4 +47,3 @@ pub const DEFAULT_ARCH: &str = "armel";
     all(target_arch = "arm", not(target_feature = "vfp2"))
 )))]
 pub const DEFAULT_ARCH: &str = std::env::consts::ARCH;
-

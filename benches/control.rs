@@ -1,4 +1,4 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
+use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::control::ControlFile;
 
 const TEXT : &str = "\
@@ -29,9 +29,11 @@ Description: GNU core utilities
 ";
 
 pub fn parse_benchmark(c: &mut Criterion) {
-    c.bench_function("parse test", |b| b.iter(||{
-        ControlFile::parse(black_box(TEXT)).unwrap();
-    }));
+    c.bench_function("parse test", |b| {
+        b.iter(|| {
+            std::hint::black_box(ControlFile::parse(TEXT)).unwrap();
+        })
+    });
 }
 
 criterion_group!(benches, parse_benchmark);

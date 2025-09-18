@@ -1,5 +1,4 @@
 use {
-    async_std::path::Path,
     nix::{
         mount::{mount, umount2, MntFlags, MsFlags},
         sched::{clone, unshare, CloneFlags},
@@ -9,6 +8,7 @@ use {
         },
         unistd::{chdir, execve, fork, mkdir, pipe, pivot_root, read, ForkResult, Gid, Pid, Uid},
     },
+    std::path::Path,
     std::{
         convert::Infallible,
         ffi::{CStr, CString, NulError},

@@ -1,16 +1,15 @@
 use {
     anyhow::{anyhow, Result},
-    async_std::{
-        path::{PathBuf},
-    },
     clap::{Parser, Subcommand},
     debrepo::{
         cli::{Source, Vendor},
         exec::{dpkg, unshare_root, unshare_user_ns},
         Constraint, Dependency, DeploymentFileSystem, HttpCachingTransportProvider,
-        HttpTransportProvider, Manifest,  TransportProvider, Version,
+        HttpTransportProvider, Manifest, TransportProvider, Version,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
+    smol::fs,
+    std::path::PathBuf,
     std::{iter, process::ExitCode},
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{filter::EnvFilter, fmt},
@@ -24,8 +23,6 @@ pub trait AsyncCommand {
     }
     async fn exec(&self, conf: &App) -> Result<()>;
 }
-
-
 
 #[derive(Parser)]
 pub struct App {
@@ -195,17 +192,21 @@ impl AsyncCommand for Init {
             .await
             .map_err(|e| anyhow!("failed to add source: {e}"))?,
             InitCommands::InitFromVendor(cmd) => {
-                let sources = cmd
-                    .vendor
-                    .sources_for(
-                        cmd.suite
-                            .as_ref()
-                            .map(|s| s.as_str())
-                            .unwrap_or_else(|| cmd.vendor.defailt_suite()),
-                    );
-                Manifest::from_sources(&conf.arch, sources.iter(), comment, conf.limit, transport.as_ref())
-                    .await
-                    .map_err(|e| anyhow!("failed to add sources: {e}"))?
+                let sources = cmd.vendor.sources_for(
+                    cmd.suite
+                        .as_ref()
+                        .map(|s| s.as_str())
+                        .unwrap_or_else(|| cmd.vendor.defailt_suite()),
+                );
+                Manifest::from_sources(
+                    &conf.arch,
+                    sources.iter(),
+                    comment,
+                    conf.limit,
+                    transport.as_ref(),
+                )
+                .await
+                .map_err(|e| anyhow!("failed to add sources: {e}"))?
             }
         };
         for req in match &self.cmd {
@@ -445,6 +446,28 @@ impl AsyncCommand for Extract {
         Ok(())
     }
     async fn exec(&self, conf: &App) -> Result<()> {
+        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        fs::create_dir_all(&self.path).await?;
+        let fs = std::sync::Arc::new(
+            debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
+                .await?,
+        );
+        // let fs = std::sync::Arc::new(debrepo::FileList::new());
+        {
+            let builder = debrepo::builder::Builder::new(&fs);
+            builder
+                .extract_recipe(
+                    &manifest,
+                    self.recipe.as_deref(),
+                    conf.limit,
+                    conf.transport().await?.as_ref(),
+                )
+                .await?;
+        }
+        // std::sync::Arc::into_inner(fs)
+        //     .unwrap()
+        //     .keep(&self.path)
+        //     .await?;
         // let manifest = Manifest::from_file(&conf.manifest).await?;
         // let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
         //     Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
@@ -947,9 +970,7 @@ impl App {
                     .map_err(|e| anyhow!("failed to create transport provider: {e}"))?,
             ))
         } else {
-            Ok(Box::new(
-                HttpTransportProvider::new(self.insecure).await,
-            ))
+            Ok(Box::new(HttpTransportProvider::new(self.insecure).await))
         }
     }
 }
@@ -980,6 +1001,8 @@ fn init_logging(quiet: bool, debug: u8) {
     fmt()
         .with_env_filter(filter)
         .event_format(base_format)
+        .with_thread_ids(trace) // include thread IDs only in debug mode
+        .with_thread_names(trace) // include thread names only in debug mode
         .with_file(trace) // include file path only in debug mode
         .with_line_number(trace) // include line number only in debug mode
         .init();
@@ -1009,7 +1032,7 @@ fn main() -> ExitCode {
         }
         Ok(_) => {}
     }
-    match async_std::task::block_on(app.cmd.exec(&app)) {
+    match smol::block_on(app.cmd.exec(&app)) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             println!("{}", err);

@@ -20,24 +20,29 @@ path = "cmd/main.rs"
 name = "nrun"
 path = "cmd/nrun.rs"
 
+[[bin]]
+name = "tar-test"
+path = "cmd/tar.rs"
+
 [dependencies]
 anyhow = "1"
-async-std = { version = "1", features = [ "attributes" ] }
-async-tar = "0.5"
 async-trait = "0.1"
-base64 = "0.22.1"
+base64 = "0.22"
+blocking = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
 criterion = "0.7"
 digest = "0.10"
-enum_dispatch = "0.3.13"
-filetime = "0.2.25"
-futures = "0.3"
-gpgme = "0.11.0"
+enum_dispatch = "0.3"
+filetime = "0.2"
+futures = { version = "0.3", default-features = false, features = ["std"] }
+futures-lite = "2"
+gpgme = "0.11"
 hex = "0.4"
 isahc = { version = "1", default-features = false, features = [ "http2" ] }
-iterator-ext = "0.2.1"
-itertools = "0.14.0"
+iterator-ext = "0.2"
+itertools = "0.14"
+macro_rules_attribute = "0.2"
 md-5 = "0.10"
 memchr = "2"
 nix = { version = "0.30.1", features = [ "sched", "mount", "process", "fs", "signal", "user" ] }
@@ -48,16 +53,16 @@ pin-project = "1"
 regex = "1.11"
 resolvo = "0.10.0"
 serde = { version = "1.0.219", features = ["derive"] }
-serde_json = "1.0.140"
-serde_yaml_ng = "0.10.0"
 sha2 = "0.10"
 smallvec = { version = "1.13", features = ["serde", "union"] }
-smol = "2.0.2"
+smol = "2"
+smol-macros = "0.1"
+static_assertions = "1"
 tempfile = "3.15.0"
 toml_edit = { version = "0.23.4", features = ["serde"] }
 tracing = "0.1"
+tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "std"] }
-url = "2"
 
 [dependencies.async-compression]
 version = "0.4"
@@ -70,6 +75,7 @@ isahc = { version = "1", default-features = false, features = [ "http2" ] }
 xtask = "0.1.0"
 
 [dev-dependencies]
+afl = "0"
 criterion = "0.7"
 
 [[bench]]

@@ -1,17 +1,16 @@
-use async_std::task;
 use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::{
-    hash::FileHash,
-    control::ControlParser, Dependency, HttpTransportProvider, Package, Packages, TransportProvider,
-    universe::Universe,
+    control::ControlParser, hash::FileHash, universe::Universe, Dependency, HttpTransportProvider,
+    Package, Packages, TransportProvider,
 };
 use std::sync::Arc;
 
 async fn fetch_packages() -> Arc<str> {
     let transport = HttpTransportProvider::new(false).await;
     let uri = "https://snapshot.debian.org/archive/debian/20241201T025825Z/dists/bookworm/main/binary-amd64/Packages.xz";
-    let size = 6096614;
-    let hash: FileHash = "2f674d057c5f274c5a863664a586ef62a0deb571993914ccfe4e2cd784a4840d".try_into()
+    let size = 8788624;
+    let hash: FileHash = "2f674d057c5f274c5a863664a586ef62a0deb571993914ccfe4e2cd784a4840d"
+        .try_into()
         .unwrap();
     let data = transport
         .fetch_verify_unpack(uri, size, &hash, 100_000_000)
@@ -21,15 +20,16 @@ async fn fetch_packages() -> Arc<str> {
 }
 
 pub fn parse_benchmark(c: &mut Criterion) {
-    let data = task::block_on(fetch_packages());
+    let data = smol::block_on(fetch_packages());
 
     c.bench_function("parse test", |b| {
         b.iter(|| {
             let mut parser = ControlParser::new(&data);
             let mut count = 0;
-            while let Some(_) =
+            while let Some(pkg) =
                 Package::try_parse_from(&mut parser).expect("failed to parse package")
             {
+                std::hint::black_box(&pkg);
                 count += 1;
             }
             std::hint::black_box(count);
@@ -41,7 +41,8 @@ pub fn parse_benchmark(c: &mut Criterion) {
 
     g.bench_function("solve test", |b| {
         b.iter(|| {
-            let packages = Some(Packages::new(data.clone(), None).expect("failed to parse packages"));
+            let packages =
+                Some(Packages::new(data.clone(), None).expect("failed to parse packages"));
             let mut uni = Universe::new("amd64", packages.into_iter()).expect("universe");
             let _ = match uni.solve(
                 vec![Dependency::try_from("task-gnome-desktop | task-kde-desktop").unwrap()],

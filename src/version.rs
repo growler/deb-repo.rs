@@ -1722,10 +1722,8 @@ mod tests {
         std::assert!(!req.is_satisfied_by(&prov_bad));
 
         // Constraint vs Constraint
-        let req_c: Constraint<String> =
-            "pkg (>= 1)".parse().unwrap();
-        let cand_c: Constraint<String> =
-            "pkg (>= 2)".parse().unwrap();
+        let req_c: Constraint<String> = "pkg (>= 1)".parse().unwrap();
+        let cand_c: Constraint<String> = "pkg (>= 2)".parse().unwrap();
         std::assert!(req_c.is_satisfied_by(&cand_c));
         std::assert!(!cand_c.is_satisfied_by(&req_c));
     }

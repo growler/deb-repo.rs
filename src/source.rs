@@ -1,12 +1,13 @@
 use {
-    crate::{control::MutableControlStanza, hash::FileHash, Packages, Release, TransportProvider},
-    async_std::{
-        io,
-        path::{Path, PathBuf},
+    crate::{
+        control::MutableControlStanza, deb::DebReader, hash::FileHash, Packages, Release,
+        TransportProvider,
     },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::{Args, ValueEnum},
     serde::{Deserialize, Serialize},
+    smol::io,
+    std::path::{Path, PathBuf},
 };
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
@@ -591,7 +592,7 @@ impl Source {
         path: &str,
         size: u64,
         hash: &FileHash,
-    ) -> async_std::io::Result<Release> {
+    ) -> std::io::Result<Release> {
         transport
             .fetch_verify(
                 &format!("{}/{}", self.url.trim_end_matches('/'), path,),
@@ -600,15 +601,14 @@ impl Source {
             )
             .await
             .and_then(|buf| {
-                Release::try_from(buf).map_err(|e| {
-                    async_std::io::Error::new(async_std::io::ErrorKind::InvalidData, e)
-                })
+                Release::try_from(buf)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })
     }
     pub async fn fetch_unsigned_release<T: TransportProvider + ?Sized>(
         &self,
         transport: &T,
-    ) -> async_std::io::Result<(Release, String, u64, FileHash)> {
+    ) -> std::io::Result<(Release, String, u64, FileHash)> {
         let path = format!("dists/{}/Release", self.suite);
         transport
             .fetch_hash(
@@ -619,9 +619,8 @@ impl Source {
             .await
             .and_then(|(buf, size, hash)| {
                 Ok((
-                    Release::try_from(buf).map_err(|e| {
-                        async_std::io::Error::new(async_std::io::ErrorKind::InvalidData, e)
-                    })?,
+                    Release::try_from(buf)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
                     path,
                     size,
                     hash,
@@ -653,12 +652,12 @@ impl Source {
             ));
         }
         Release::try_from(plaintext)
-            .map_err(|e| async_std::io::Error::new(async_std::io::ErrorKind::InvalidData, e))
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
     pub async fn fetch_signed_release<T: TransportProvider>(
         &self,
         transport: &T,
-    ) -> async_std::io::Result<(Release, String, u64, FileHash)> {
+    ) -> std::io::Result<(Release, String, u64, FileHash)> {
         let path = format!("dists/{}/InRelease", self.suite);
         let (data, size, hash) = transport
             .fetch_hash(
@@ -706,10 +705,24 @@ impl Source {
             )
             .await
             .and_then(|buf| {
-                Packages::new_from_bytes(buf, self.priority).map_err(|e| {
-                    async_std::io::Error::new(async_std::io::ErrorKind::InvalidData, e)
-                })
+                Packages::new_from_bytes(buf, self.priority)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })
+    }
+    pub async fn deb_reader<T: TransportProvider + ?Sized>(
+        &self,
+        path: &str,
+        size: u64,
+        hash: &FileHash,
+        transport: &T,
+    ) -> io::Result<DebReader> {
+        transport
+            .verifying_deb_reader(
+                &format!("{}/{}", self.url.trim_end_matches('/'), path),
+                size,
+                hash,
+            )
+            .await
     }
 }
 

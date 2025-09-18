@@ -1,9 +1,7 @@
+pub use crate::source::{Source, Vendor};
 use {
     crate::version::{Constraint, Dependency},
     std::str::FromStr,
-};
-pub use {
-    crate::source::{Source, Vendor},
 };
 
 /// A parser type for converting command-line argument strings into a `Dependency`.
@@ -111,4 +109,3 @@ impl clap::builder::TypedValueParser for ConstraintParser {
         })
     }
 }
-

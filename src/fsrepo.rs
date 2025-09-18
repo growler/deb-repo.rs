@@ -2,11 +2,9 @@
 
 use {
     crate::repo::TransportProvider,
-    async_std::{
-        io::{self, Read},
-        path::{Path, PathBuf},
-    },
     async_trait::async_trait,
+    smol::{fs, io, prelude::*},
+    std::path::{Path, PathBuf},
     std::pin::Pin,
 };
 
@@ -18,7 +16,10 @@ pub struct FSTransportProvider {
 impl FSTransportProvider {
     pub async fn new(path: impl AsRef<Path>) -> io::Result<Self> {
         let base = path.as_ref().to_path_buf();
-        if base.is_dir().await {
+        if {
+            let meta = fs::metadata(&base).await?;
+            meta.is_dir()
+        } {
             Ok(FSTransportProvider { base: base })
         } else {
             Err(io::Error::new(
@@ -31,8 +32,8 @@ impl FSTransportProvider {
 
 #[async_trait]
 impl TransportProvider for FSTransportProvider {
-    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn Read + Send>>> {
+    async fn reader(&self, path: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         let path = self.base.join(path);
-        Ok(Box::pin(async_std::fs::File::open(path).await?) as Pin<Box<dyn Read + Send>>)
+        Ok(Box::pin(fs::File::open(path).await?) as Pin<Box<dyn AsyncRead + Send>>)
     }
 }

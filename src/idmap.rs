@@ -248,7 +248,10 @@ where
         let id = self
             .get(value.as_ref())
             .unwrap_or_else(|| self.insert(value.into_boxed()));
-        InternResult { id, val: self[id].as_ref() }
+        InternResult {
+            id,
+            val: self[id].as_ref(),
+        }
     }
 }
 
@@ -282,7 +285,7 @@ impl<IdType, Value> InternResult<IdType, Value> {
     }
 }
 
-pub trait IntoBoxed<Value> 
+pub trait IntoBoxed<Value>
 where
     Value: Hash + Eq + ?Sized,
 {
