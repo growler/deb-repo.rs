@@ -570,7 +570,7 @@ pub struct Source {
     /// Source priority (higher number means higher priority)
     #[arg(long = "priority", value_name = "N")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub priority: Option<u16>,
+    pub priority: Option<u32>,
 }
 
 impl Source {
@@ -686,6 +686,7 @@ impl Source {
     }
     pub(crate) async fn fetch_packages_index<T: TransportProvider + ?Sized>(
         &self,
+        source: u32,
         path: &str,
         size: u64,
         hash: &FileHash,
@@ -705,7 +706,7 @@ impl Source {
             )
             .await
             .and_then(|buf| {
-                Packages::new_from_bytes(buf, self.priority)
+                Packages::new_from_bytes(buf, source, self.priority)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
             })
     }

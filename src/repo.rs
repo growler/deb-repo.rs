@@ -61,7 +61,7 @@ pub trait TransportProvider: Sync + Send {
     ///         be used for namespacing, auditing, or metadata.
     /// - hash: Raw bytes of the content hash.
     ///
-    /// Returns: A pinned, boxed [`AsyncRead`] implementor for the validated content.
+    /// Returns: A pinned, boxed [`AssyncRead`] implementor for the validated content.
     ///
     /// Errors: If the object cannot be found, storage access fails, or the
     /// content does not match `hash` (implementations should return an

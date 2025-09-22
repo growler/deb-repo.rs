@@ -1,9 +1,9 @@
-use smol::{fs::{self, unix::OpenOptionsExt}, io, prelude::*};
-use std::{
-    os::unix::fs::PermissionsExt,
-    sync::Arc,
-    time::SystemTime,
+use smol::{
+    fs::{self, unix::OpenOptionsExt},
+    io,
+    prelude::*,
 };
+use std::{os::unix::fs::PermissionsExt, sync::Arc, time::SystemTime};
 use std::{
     os::unix::{self, fs::DirBuilderExt},
     path::{Path, PathBuf},
@@ -206,9 +206,9 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
     match mkdir(path, owner, mode) {
         Ok(()) => Ok(()),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
-            let parent = path.parent().ok_or_else(|| {
-                io::Error::other("failed to create tree: no parent")
-            })?;
+            let parent = path
+                .parent()
+                .ok_or_else(|| io::Error::other("failed to create tree: no parent"))?;
             mkdir_rec(parent, owner, mode)?;
             match mkdir(path, owner, mode) {
                 Ok(()) => Ok(()),
@@ -363,7 +363,8 @@ impl DeploymentFileSystem for LocalFileSystem {
         let raw_fd = file.as_raw_fd();
         if let Some(size) = size {
             if size > 0 {
-                let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
+                let raw_fd =
+                    unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd).as_raw_fd() };
                 blocking::unblock(move || {
                     nix::fcntl::fallocate(
                         raw_fd,

@@ -113,8 +113,7 @@ impl Release {
     //     })?)
     // }
     fn field(&self, name: &str) -> Option<&str> {
-        self.inner
-            .with_control(|ctrl| ctrl.field(name).map(|s| s))
+        self.inner.with_control(|ctrl| ctrl.field(name).map(|s| s))
     }
     pub fn codename(&self) -> Option<&str> {
         self.field("Codename")

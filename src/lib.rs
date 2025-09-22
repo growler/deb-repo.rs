@@ -18,7 +18,7 @@ mod repo;
 mod source;
 pub mod tar;
 pub mod universe;
-mod version;
+pub mod version;
 // mod caching;
 
 pub use {
@@ -31,7 +31,6 @@ pub use {
     release::Release,
     repo::TransportProvider,
     source::{SignedBy, Snapshot, Source},
-    version::{Constraint, Dependency, Version},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
@@ -72,34 +71,20 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
         .and_then(|s| s.to_str())
         .ok_or_else(|| io::Error::other("invalid file name"))?;
     let tmp = tempfile::NamedTempFile::with_prefix_in(file_name, dir)
-        .map_err(|err| {
-            io::Error::other(
-                format!("Failed to create temporary file: {}", err),
-            )
-        })?
+        .map_err(|err| io::Error::other(format!("Failed to create temporary file: {}", err)))?
         .into_temp_path();
     let mut tmp_file = fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(tmp.to_path_buf())
         .await
-        .map_err(|err| {
-            io::Error::other(
-                format!("Failed to open temporary file: {}", err),
-            )
-        })?;
+        .map_err(|err| io::Error::other(format!("Failed to open temporary file: {}", err)))?;
     futures_lite::io::copy(data.as_ref(), &mut tmp_file)
         .await
-        .map_err(|err| {
-            io::Error::other(
-                format!("Failed to copy to temporary file: {}", err),
-            )
-        })?;
-    fs::rename(tmp.to_path_buf(), &path).await.map_err(|err| {
-        io::Error::other(
-            format!("Failed to rename temporary file: {}", err),
-        )
-    })?;
+        .map_err(|err| io::Error::other(format!("Failed to copy to temporary file: {}", err)))?;
+    fs::rename(tmp.to_path_buf(), &path)
+        .await
+        .map_err(|err| io::Error::other(format!("Failed to rename temporary file: {}", err)))?;
     Ok(())
 }
 

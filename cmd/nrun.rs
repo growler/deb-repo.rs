@@ -1,6 +1,5 @@
 use {
     anyhow::{anyhow, Result},
-    std::path::PathBuf,
     clap::Parser,
     nix::{
         mount::{mount, umount2, MntFlags, MsFlags},
@@ -11,7 +10,13 @@ use {
         },
         unistd::{chdir, execve, fork, mkdir, pipe, pivot_root, read, ForkResult, Pid},
     },
-    std::{convert::Infallible, ffi::CString, os::fd::AsFd, process::ExitCode},
+    std::{
+        convert::Infallible,
+        ffi::CString,
+        os::fd::{AsFd, AsRawFd},
+        path::PathBuf,
+        process::ExitCode,
+    },
 };
 
 #[derive(Parser, Debug)]
@@ -216,7 +221,7 @@ fn set_user_ns() -> Result<bool> {
         ForkResult::Child => {
             drop(write_fd);
             let mut buf = [0u8; 1];
-            _ = read(read_fd.as_fd(), &mut buf);
+            _ = read(read_fd.as_fd().as_raw_fd(), &mut buf);
             drop(read_fd);
             std::process::Command::new("newuidmap")
                 .arg(format!("{}", Pid::parent()))

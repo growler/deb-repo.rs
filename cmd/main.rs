@@ -4,13 +4,11 @@ use {
     debrepo::{
         cli::{Source, Vendor},
         exec::{unshare_root, unshare_user_ns},
-        Constraint, Dependency, HttpCachingTransportProvider,
-        HttpTransportProvider, Manifest, TransportProvider, Version,
+        version::{Constraint, Dependency, Version},
+        HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
     },
-    futures::stream::{StreamExt, TryStreamExt},
     smol::fs,
-    std::path::PathBuf,
-    std::{iter, process::ExitCode},
+    std::{iter, num::NonZero, path::PathBuf, process::ExitCode},
     tracing::level_filters::LevelFilter,
     tracing_subscriber::{filter::EnvFilter, fmt},
 };
@@ -46,7 +44,7 @@ pub struct App {
         value_name = "NUM",
         default_value = "20"
     )]
-    limit: usize,
+    concurrency: NonZero<usize>,
 
     /// Target architecture
     #[arg(global = true, short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
@@ -98,6 +96,9 @@ enum Commands {
     /// Lists packages
     #[command(name = "list")]
     List,
+    /// Updates lock file
+    #[command(name = "lock")]
+    Lock,
     // #[command(name = "search")]
     // Search {
     //     #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
@@ -182,54 +183,28 @@ impl AsyncCommand for Init {
         };
         let transport = conf.transport().await?;
         let mut mf = match &self.cmd {
-            InitCommands::InitFromSource(cmd) => Manifest::from_sources(
-                &conf.arch,
-                iter::once(&cmd.source),
-                comment,
-                conf.limit,
-                transport.as_ref(),
-            )
-            .await
-            .map_err(|e| anyhow!("failed to add source: {e}"))?,
+            InitCommands::InitFromSource(cmd) => {
+                Manifest::from_sources(&conf.arch, iter::once(&cmd.source).cloned(), comment)
+            }
             InitCommands::InitFromVendor(cmd) => {
                 let sources = cmd.vendor.sources_for(
-                    cmd.suite.as_deref()
+                    cmd.suite
+                        .as_deref()
                         .unwrap_or_else(|| cmd.vendor.defailt_suite()),
                 );
-                Manifest::from_sources(
-                    &conf.arch,
-                    sources.iter(),
-                    comment,
-                    conf.limit,
-                    transport.as_ref(),
-                )
-                .await
-                .map_err(|e| anyhow!("failed to add sources: {e}"))?
+                Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment)
             }
         };
-        for req in match &self.cmd {
-            InitCommands::InitFromSource(cmd) => cmd
-                .requirements
-                .iter()
-                .map(|s| {
-                    s.parse::<Dependency<String>>()
-                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-            InitCommands::InitFromVendor(cmd) => cmd
-                .vendor
-                .default_requirements()
-                .iter()
-                .map(|s| {
-                    s.parse::<Dependency<String>>()
-                        .map_err(|e| anyhow!("failed to parse requirement '{s}': {e}"))
-                })
-                .collect::<Result<Vec<_>>>()?,
-        } {
-            mf.add_requirement("", &req, None::<String>)
-                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))?;
+        match &self.cmd {
+            InitCommands::InitFromSource(cmd) => {
+                mf.add_requirements(None, cmd.requirements.iter(), None::<&str>)?
+            }
+            InitCommands::InitFromVendor(cmd) => {
+                mf.add_requirements(None, cmd.vendor.default_requirements(), None::<&str>)?
+            }
         }
-        mf.update_recipes(conf.limit, transport.as_ref()).await?;
+        mf.update_recipes(conf.concurrency, transport.as_ref())
+            .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -257,39 +232,14 @@ struct Drop {
     recipe: Option<String>,
     /// Package name or package version set
     #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
-    name: Vec<Constraint<String>>,
+    cons: Vec<Constraint<String>>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Drop {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        let recipes = self
-            .recipe
-            .as_ref()
-            .map(|s| vec![s.to_string()])
-            .unwrap_or_else(|| mf.recipes().map(|s| s.into()).collect::<Vec<String>>());
-        for recipe in recipes.into_iter() {
-            self.name.iter().try_for_each(|con| {
-                mf.drop_constraint(&recipe, con)
-                    .map_err(|e| anyhow!("invalid manifest: failed to drop constraint: {e}"))
-                // if self.requirements_only.unwrap_or(false) {
-                //     mf.remove_requirement(&recipe, con)
-                //         .map_err(|e| anyhow!("invalid manifest: failed to drop requirement: {e}"))
-                // } else if self.constraints_only.unwrap_or(false) {
-                //     mf.remove_constraint(&recipe, &con)
-                //         .map_err(|e| anyhow!("invalid manifest: failed to drop constraint: {e}"))
-                // } else {
-                //     mf.remove_requirement(&recipe, con)
-                //         .or_else(|_| mf.remove_constraint(&recipe, con))
-                //         .map_err(|e| {
-                //             anyhow!(
-                //                 "invalid manifest: failed to drop requirement or constraint: {e}"
-                //             )
-                //         })
-                // }
-            })?;
-        }
+        mf.drop_constraints(self.recipe.as_deref(), self.cons.iter())?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -309,15 +259,13 @@ struct Include {
 impl AsyncCommand for Include {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        let recipe = self.recipe.clone().unwrap_or_default();
-        let mut comment = self.comment.clone();
-        self.reqs.iter().try_for_each(|req| {
-            mf.add_requirement(&recipe, req, comment.take())
-                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
-        })?;
-        mf.update_recipes(conf.limit, conf.transport().await?.as_ref())
-            .await
-            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
+        mf.add_requirements(
+            self.recipe.as_deref(),
+            self.reqs.iter(),
+            self.comment.as_deref(),
+        )?;
+        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -337,12 +285,13 @@ struct Exclude {
 impl AsyncCommand for Exclude {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        let recipe = self.recipe.clone().unwrap_or_default();
-        let mut comment = self.comment.clone();
-        self.reqs.iter().try_for_each(|con| {
-            mf.add_constraint(&recipe, con, comment.take())
-                .map_err(|e| anyhow!("invalid manifest: failed to add requirement: {e}"))
-        })?;
+        mf.add_constraints(
+            self.recipe.as_deref(),
+            self.reqs.iter(),
+            self.comment.as_deref(),
+        )?;
+        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -387,6 +336,35 @@ impl AsyncCommand for Update {
 }
 
 #[derive(Parser)]
+struct Lock {}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Lock {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+            .await
+            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
+        mf.store(&conf.manifest).await?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct Search {
+    #[arg(value_name = "PATTERN")]
+    recipe: Vec<String>,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Search {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
 struct List {
     /// The recipe name to build (default is the primary nameless recipe)
     #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
@@ -396,30 +374,16 @@ struct List {
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for List {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        // let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
-        //     Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
-        // } else {
-        //     Box::new(HttpRepoBuilder::new(conf.insecure))
-        // };
-        // let mut universe = manifest
-        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
-        //     .await?;
-        // let (reqs, cons) =
-        //     manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
-        // let mut solution = universe.solve(reqs, cons).map_err(|conflict| {
-        //     anyhow!(
-        //         "failed to solve dependencies: {}",
-        //         universe.display_conflict(conflict)
-        //     )
-        // })?;
-        // solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
-        // let mut out = std::io::stdout().lock();
-        // pretty_print_packages(
-        //     &mut out,
-        //     solution.iter().map(|s| universe.package(*s).unwrap()),
-        //     false,
-        // )?;
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+            .await
+            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
+        let mut pkgs = mf
+            .recipe_packages(self.recipe.as_deref())?
+            .collect::<Vec<_>>();
+        pkgs.sort_by_key(|&pkg| pkg.name());
+        let mut out = std::io::stdout().lock();
+        pretty_print_packages(&mut out, pkgs, false)?;
         Ok(())
     }
 }
@@ -457,7 +421,7 @@ impl AsyncCommand for Extract {
                 .extract_recipe(
                     &manifest,
                     self.recipe.as_deref(),
-                    conf.limit,
+                    conf.concurrency,
                     conf.transport().await?.as_ref(),
                 )
                 .await?;
@@ -725,240 +689,6 @@ fn pretty_print_packages<'a, W: std::io::Write>(
 //     Ok(desc)
 // }
 
-// async fn cmd(cli: App) -> Result<ExitCode> {
-//     match cli.cmd {
-//         Command::Fetch {
-//             arch: a,
-//             origin,
-//             out,
-//             distr,
-//             comp,
-//         } => {
-//             let start = std::time::Instant::now();
-//             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
-//             let release = repo.fetch_release(&distr).await?;
-//             let (path, size, hash) = release
-//                 .packages_file(&comp, &a)
-//                 .ok_or_else(|| anyhow!("Packages file for {} {} not found", &a, &comp))?;
-//             match out {
-//                 None => {
-//                     repo.copy_verify_unpack(async_std::io::stdout(), &path, size, hash)
-//                         .await
-//                 }
-//                 Some(out) => {
-//                     let out = async_std::fs::File::create(out).await?;
-//                     repo.copy_verify_unpack(out, &path, size, hash).await
-//                 }
-//             }?;
-//             println!("fetched in {:?}", start.elapsed());
-//             Ok(ExitCode::SUCCESS)
-//         }
-//         Command::Search {
-//             arch,
-//             origin,
-//             distr,
-//             comp,
-//             name,
-//         } => {
-//             let start = std::time::Instant::now();
-//             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
-//             let release = repo
-//                 .fetch_verify_release_with_keys(&distr, [debrepo::DEBIAN_KEYRING])
-//                 .await?;
-//             let components = if &comp == "all" {
-//                 release.components().collect::<Vec<&'_ str>>()
-//             } else {
-//                 comp.split(',').map(|s| s.trim()).collect::<Vec<&'_ str>>()
-//             };
-//             let packages = join_all(
-//                 components
-//                     .iter()
-//                     .map(|comp| release.fetch_packages(comp, &arch)),
-//             )
-//             .await
-//             .into_iter()
-//             .collect::<io::Result<Vec<_>>>()?;
-//             let universe = Universe::new(&arch, packages)?;
-//             let re = regex::RegexBuilder::new(&name)
-//                 .case_insensitive(true)
-//                 .build()?;
-//             let mut out = std::io::stdout().lock();
-//             match pretty_print_packages(
-//                 &mut out,
-//                 universe
-//                     .packages()
-//                     .map(|p| -> Package { p.into() })
-//                     .filter(|p| re.is_match(p.name) || re.is_match(p.desc)),
-//                 true,
-//             )? {
-//                 0 => {
-//                     println!("not found in {:?}", start.elapsed());
-//                     Ok(ExitCode::FAILURE)
-//                 }
-//                 n => {
-//                     println!("found {} in {:?}", n, start.elapsed());
-//                     Ok(ExitCode::SUCCESS)
-//                 }
-//             }
-//         }
-//         Command::Solve {
-//             arch,
-//             origin,
-//             distr,
-//             comp,
-//             print_graph,
-//             fetch,
-//             extract,
-//             target,
-//             limit,
-//             reqs,
-//         } => {
-//             let start = std::time::Instant::now();
-//             let requirements = reqs
-//                 .iter()
-//                 .map(|s| Dependency::try_from(s.as_ref()).map_err(|err| err.into()))
-//                 .collect::<Result<Vec<_>>>()?;
-//             let repo: DebRepo = HttpDebRepo::new(&origin).await?.into();
-//             let release = repo.fetch_release(&distr).await?;
-//             let components = if &comp == "all" {
-//                 release.components().collect::<Vec<&'_ str>>()
-//             } else {
-//                 comp.split(',').map(|s| s.trim()).collect::<Vec<&'_ str>>()
-//             };
-//             let packages = join_all(
-//                 components
-//                     .iter()
-//                     .map(|comp| release.fetch_packages(comp, &arch)),
-//             )
-//             .await
-//             .into_iter()
-//             .collect::<io::Result<Vec<_>>>()?;
-//             let mut universe = Universe::new(&arch, packages)?;
-//             match universe.solve(requirements, std::iter::empty()) {
-//                 Ok(mut solution) => {
-//                     if extract {
-//                         let fs = debrepo::LocalFileSystem::new(
-//                             &target,
-//                             nix::unistd::Uid::effective().is_root(),
-//                         )
-//                         .await?;
-//                         let mut control_file: Vec<MutableControlStanza> = vec![];
-//                         let mut stream = FuturesUnordered::new();
-//                         let mut pending = solution.into_iter();
-//                         for _ in 0..limit {
-//                             if let Some(id) = pending.next() {
-//                                 stream.push(extract_repo_package(&universe, id, &fs));
-//                             }
-//                         }
-//                         while let Some(result) = stream.next().await {
-//                             match result {
-//                                 Ok(mut stanza) => {
-//                                     stanza.set("Status", "install ok unpacked");
-//                                     stanza.sort_fields_deb_order();
-//                                     control_file.push(stanza)
-//                                 }
-//                                 Err(err) => return Err(err),
-//                             }
-//                             if let Some(id) = pending.next() {
-//                                 stream.push(extract_repo_package(&universe, id, &fs));
-//                             }
-//                         }
-//                         control_file.sort_by(|a, b| {
-//                             a.field("Package").unwrap().cmp(b.field("Package").unwrap())
-//                         });
-//                         {
-//                             let mut target = PathBuf::from(&target);
-//                             target.push("var/lib/dpkg");
-//                             fs::create_dir_all(&target).await?;
-//                             target.push("status");
-//                             let mut out = fs::File::create(target).await?;
-//                             for i in control_file.into_iter() {
-//                                 out.write_all(format!("{}", &i).as_bytes()).await?;
-//                                 out.write_all(&[b'\n']).await?;
-//                             }
-//                         };
-//
-//                         println!("solved and fetched in {:?}", start.elapsed());
-//                     } else if fetch {
-//                         let mut stream = FuturesUnordered::new();
-//                         let mut pending = solution.into_iter();
-//                         for _ in 0..limit {
-//                             if let Some(id) = pending.next() {
-//                                 stream.push(copy_repo_package(&universe, id, &target));
-//                             }
-//                         }
-//                         while let Some(result) = stream.next().await {
-//                             match result {
-//                                 Ok((_, name, size)) => println!("{} {}", name, size),
-//                                 Err(err) => println!("Failed to download: {}", err),
-//                             }
-//                             if let Some(id) = pending.next() {
-//                                 stream.push(copy_repo_package(&universe, id, &target));
-//                             }
-//                         }
-//                         println!("solved and fetched in {:?}", start.elapsed());
-//                     } else {
-//                         use petgraph::dot::{Config, Dot};
-//                         let mut out = std::io::stdout().lock();
-//                         if let Some(format) = print_graph {
-//                             let graph = universe.dependency_graph(&mut solution);
-//                             if format.eq_ignore_ascii_case("dot") {
-//                                 println!(
-//                                     "{:?}",
-//                                     Dot::with_attr_getters(
-//                                         &graph,
-//                                         &[Config::EdgeNoLabel, Config::NodeNoLabel],
-//                                         &|_, _| "".to_owned(),
-//                                         &|_, id| format!(
-//                                             "label = \"{}\"",
-//                                             universe.display_solvable(id.0)
-//                                         )
-//                                     )
-//                                 );
-//                             } else {
-//                                 let ordered = petgraph::algo::kosaraju_scc(&graph)
-//                                     .into_iter()
-//                                     .flat_map(|g| g.into_iter());
-//                                 for id in ordered {
-//                                     println!("{}", universe.display_solvable(id));
-//                                     let mut has_deps = false;
-//                                     for (i, dep) in graph.neighbors(id).enumerate() {
-//                                         if i == 0 {
-//                                             print!(" {}", universe.display_solvable(dep));
-//                                             has_deps = true;
-//                                         } else {
-//                                             print!(", {}", universe.display_solvable(dep));
-//                                         }
-//                                     }
-//                                     if has_deps {
-//                                         println!("");
-//                                     }
-//                                 }
-//                             }
-//                         } else {
-//                             pretty_print_packages(
-//                                 &mut out,
-//                                 universe
-//                                     .sorted_solution(&mut solution)
-//                                     .into_iter()
-//                                     .map(|s| -> Package { universe.package(s).unwrap().into() }),
-//                                 false,
-//                             )?;
-//                             println!("solved in {:?}", start.elapsed());
-//                         }
-//                     };
-//                     Ok(ExitCode::SUCCESS)
-//                 }
-//                 Err(conflict) => {
-//                     println!("{}", universe.display_conflict(conflict));
-//                     Ok(ExitCode::FAILURE)
-//                 }
-//             }
-//         }
-//     }
-// }
-//
-
 impl App {
     async fn transport(&self) -> Result<Box<dyn TransportProvider>> {
         if let Some(cache) = &self.cache_dir {
@@ -1013,7 +743,9 @@ fn main() -> ExitCode {
         app.cache_dir = app.cache_dir.clone().or_else(|| {
             if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
                 Some(PathBuf::from(xdg))
-            } else { std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")) }
+            } else {
+                std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache"))
+            }
             .map(|base| base.join("debrepo"))
         });
     } else {

@@ -279,11 +279,10 @@ impl AsyncRead for DebEntryReaderInner {
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut reader = self.inner.lock().map_err(|err| {
-            io::Error::other(
-                format!("unexpected mutex error {}", err),
-            )
-        })?;
+        let mut reader = self
+            .inner
+            .lock()
+            .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
         Pin::new(&mut *reader).poll_read(ctx, buf)
     }
 }
@@ -499,9 +498,11 @@ impl DebReader {
                                 )
                                 .await
                                 .map_err(|err| {
-                                    io::Error::other(
-                                        format!("error creating file {}: {}", path.display(), err),
-                                    )
+                                    io::Error::other(format!(
+                                        "error creating file {}: {}",
+                                        path.display(),
+                                        err
+                                    ))
                                 })?,
                             Some((_, sum)) => {
                                 let mut hasher = HashingReader::<md5::Md5, _>::new(file);
@@ -517,14 +518,12 @@ impl DebReader {
                                     )
                                     .await
                                     .map_err(|err| {
-                                        io::Error::other(
-                                            format!(
-                                                "error creating config file {} {}: {}",
-                                                path.display(),
-                                                mode,
-                                                err
-                                            ),
-                                        )
+                                        io::Error::other(format!(
+                                            "error creating config file {} {}: {}",
+                                            path.display(),
+                                            mode,
+                                            err
+                                        ))
                                     })?;
                                 let hash = hasher.into_hash();
                                 sum.replace(hash.into());
@@ -601,11 +600,10 @@ impl DebReader {
 impl Stream for DebReader {
     type Item = Result<DebEntry>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut reader = self.inner.lock().map_err(|err| {
-            io::Error::other(
-                format!("unexpected mutex error {}", err),
-            )
-        })?;
+        let mut reader = self
+            .inner
+            .lock()
+            .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
         match task::ready!(Pin::new(&mut *reader).poll_next(ctx)) {
             None => Poll::Ready(None),
             Some(Err(err)) => Poll::Ready(Some(Err(err))),

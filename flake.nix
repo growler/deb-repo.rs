@@ -8,6 +8,37 @@
         };
     };
     outputs = {self, nixpkgs, rust-overlay, flake-utils}: flake-utils.lib.eachDefaultSystem (system: let
+        cargo-debstatus-source = {
+          lib,
+          fetchFromGitHub,
+          rustPlatform,
+        }:
+        rustPlatform.buildRustPackage rec {
+          pname = "cargo-debstatus";
+          version = "0.6.5";
+
+          src = fetchFromGitHub {
+            owner = "kpcyrd";
+            repo = "cargo-debstatus";
+            rev = "v${version}";
+            hash = "sha256-Z14rvF0jZ+MYIxFoc0nwYgRzPJVCwzFwdjzw6kJ6PP4=";
+          };
+
+          cargoHash = "sha256-3NUqZrDfCxCfNSc3FxWsc5Gd5um26cu/2EmFDRzkZuQ=";
+
+          doCheck = false;
+
+          meta = with lib; {
+            description = "cargo-tree for debian packaging.";
+            mainProgram = "cargo-debstatus";
+            homepage = "https://github.com/kpcyrd/cargo-debstatus";
+            license = with licenses; [
+              mit
+              asl20
+              gpl3Plus
+            ];
+          };
+        };
         cargo-afl-source = {
           lib,
           fetchFromGitHub,
@@ -50,6 +81,7 @@
                 (import rust-overlay) 
                 (final: prev: {
                     cargo-afl = final.callPackage cargo-afl-source {};
+                    cargo-debstatus = final.callPackage cargo-debstatus-source {};
                 })
             ];
         };
@@ -65,6 +97,7 @@
         nativeBuildInputs = with pkgs; [ 
             # aflplusplus
             # cargo-afl
+            cargo-debstatus
             cargo-show-asm
             cargo-expand
             cargo-bloat
@@ -84,6 +117,9 @@
             valgrind
             gdb
         ];
+        rust-debian-stable = [ (pkgs.rust-bin.stable."1.86.0".default.override {
+          extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];
+        })];
         rust-stable = [ (pkgs.rust-bin.stable.latest.default.override {
           extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];
         })];
@@ -103,6 +139,7 @@
         } // params;
     in rec {
         inherit self pkgs;
+        devShells.debian-stable = pkgs.mkShell (shell rust-debian-stable { name = "deb-repo-stable"; });
         devShells.stable = pkgs.mkShell (shell rust-stable { name = "deb-repo-stable"; });
         devShells.nightly = pkgs.mkShell (shell rust-nightly { name = "deb-repo-nightly"; });
         devShell = devShells.stable;

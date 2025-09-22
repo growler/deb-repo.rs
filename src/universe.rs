@@ -98,7 +98,7 @@ struct Solvable<'a> {
     arch: ArchId,
     name: NameId,
     pkgs: u32,
-    prio: u16,
+    prio: u32,
     version: Version<&'a str>,
     package: &'a Package<'a>,
 }
@@ -206,7 +206,7 @@ impl<'a> UniverseIndex<'a> {
     fn add_package(
         &mut self,
         pkgs: u32,
-        prio: u16,
+        prio: u32,
         required: &mut Vec<NameId>,
         package: &'a Package<'a>,
     ) -> Result<(), ParseError> {
@@ -329,8 +329,15 @@ impl<'a> UniverseIndex<'a> {
     }
 }
 
+struct SmolAsyncRuntime;
+impl resolvo::runtime::AsyncRuntime for SmolAsyncRuntime {
+    fn block_on<F: std::future::Future>(&self, f: F) -> F::Output {
+        smol::block_on(f)
+    }
+}
+
 pub struct Universe {
-    inner: resolvo::Solver<InnerUniverse>,
+    inner: resolvo::Solver<InnerUniverse, SmolAsyncRuntime>,
 }
 
 impl Universe {
@@ -388,7 +395,8 @@ impl Universe {
                     },
                 }
                 .try_build()?,
-            ),
+            )
+            .with_runtime(SmolAsyncRuntime),
         })
     }
     pub fn solve<R, Id, Ic>(
@@ -448,10 +456,26 @@ impl Universe {
     pub fn sorted_solution(&self, solution: &[PackageId]) -> (Vec<PackageId>, Vec<PackageId>) {
         self.inner.provider().sorted_solution(solution)
     }
-    pub fn package(&self, solvable: PackageId) -> Option<&Package<'_>> {
-        self.inner
-            .provider()
-            .with_index(|i| i.solvables.get(solvable.to_index()).map(|s| s.package))
+    pub fn package<Id>(&self, solvable: Id) -> Option<&Package<'_>>
+    where
+        Id: IntoId<PackageId>,
+    {
+        self.inner.provider().with_index(|i| {
+            i.solvables
+                .get(solvable.into_id().to_index())
+                .map(|s| s.package)
+        })
+    }
+    pub fn package_with_source(&self, solvable: PackageId) -> Option<(usize, &Package<'_>)> {
+        self.inner.provider().with_index(|i| {
+            i.solvables.get(solvable.to_index()).and_then(|s| {
+                self.inner.provider().with_packages(|packages| {
+                    packages
+                        .get(s.pkgs as usize)
+                        .map(|p| (p.source(), s.package))
+                })
+            })
+        })
     }
     pub fn display_conflict(
         &self,
@@ -467,11 +491,21 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables.iter().map(|s| s.package))
     }
-    pub fn package_source(&self, solvable: PackageId) -> Option<usize> {
+    pub fn package_index_file(&self, solvable: PackageId) -> Option<usize> {
         self.inner
             .provider()
             .with_index(|i| i.solvables.get(solvable.to_index()))
             .map(|p| p.pkgs as usize)
+    }
+    pub fn package_source(&self, solvable: PackageId) -> Option<usize> {
+        self.inner
+            .provider()
+            .with_index(|i| i.solvables.get(solvable.to_index()))
+            .and_then(|p| {
+                self.inner
+                    .provider()
+                    .with_packages(|packages| packages.get(p.pkgs as usize).map(|p| p.source()))
+            })
     }
     pub async fn package_file(
         &self,
@@ -946,7 +980,7 @@ impl DependencyProvider for InnerUniverse {
                     if Some(sid) == vs.selfref || !solvable.arch.satisfies(&vs.arch) {
                         // always exclude self-referencing dependencies
                         // and always exclude dependencies with not suitable arch
-                        false 
+                        false
                     } else {
                         let sname = u.index.names[vs.name].name;
                         ((solvable.name == vs.name && (solvable.version.satisfies(&vs.range)))
@@ -1055,7 +1089,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src, None).expect("failed to parse test source")]
+                    vec![Packages::new($src, 0, None).expect("failed to parse test source")]
                         .into_iter(),
                 )
                 .unwrap();

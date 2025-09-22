@@ -6,7 +6,7 @@ use std::{
     ops::Index,
 };
 
-pub(crate) trait IntoId<Id> {
+pub trait IntoId<Id> {
     fn into_id(self) -> Id;
 }
 pub(crate) trait ToIndex {
@@ -62,6 +62,11 @@ impl<T: ToIndex> From<UpdateResult<T>> for usize {
 
 macro_rules! id_type {
     ($name:ident) => {
+        impl IntoId<$name> for u32 {
+            fn into_id(self) -> $name {
+                $name(self)
+            }
+        }
         impl IntoId<$name> for usize {
             fn into_id(self) -> $name {
                 $name(self as u32)

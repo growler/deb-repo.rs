@@ -19,7 +19,8 @@ impl FSTransportProvider {
         let res = {
             let meta = fs::metadata(&base).await?;
             meta.is_dir()
-        }; if res {
+        };
+        if res {
             Ok(FSTransportProvider { base })
         } else {
             Err(io::Error::new(

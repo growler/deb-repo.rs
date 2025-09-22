@@ -8,12 +8,15 @@ use {
         },
         unistd::{chdir, execve, fork, mkdir, pipe, pivot_root, read, ForkResult, Gid, Pid, Uid},
     },
-    std::path::Path,
     std::{
         convert::Infallible,
         ffi::{CStr, CString, NulError},
         fmt, io,
-        os::{fd::AsFd, unix::process::CommandExt},
+        os::{
+            fd::{AsFd, AsRawFd},
+            unix::process::CommandExt,
+        },
+        path::Path,
         process::ExitCode,
     },
 };
@@ -121,20 +124,18 @@ impl SubIdEntry {
 pub fn unshare_user_ns() -> io::Result<()> {
     let uid = Uid::effective();
     let gid = Gid::effective();
-    let user = nix::unistd::User::from_uid(uid)?.ok_or_else(|| {
-        io::Error::other(
-            format!("user record not found for uid {}", uid),
-        )
-    })?;
+    let user = nix::unistd::User::from_uid(uid)?
+        .ok_or_else(|| io::Error::other(format!("user record not found for uid {}", uid)))?;
     let subuid = SubIdEntry::read_entries("/etc/subuid")?
         .find(|item| match item {
             Ok(item) => item.name == user.name,
             _ => true,
         })
         .unwrap_or_else(|| {
-            Err(io::Error::other(
-                format!("/etc/subuid entry not found for user {}", &user.name),
-            ))
+            Err(io::Error::other(format!(
+                "/etc/subuid entry not found for user {}",
+                &user.name
+            )))
         })?;
     let subgid = SubIdEntry::read_entries("/etc/subgid")?
         .find(|item| match item {
@@ -142,9 +143,10 @@ pub fn unshare_user_ns() -> io::Result<()> {
             _ => true,
         })
         .unwrap_or_else(|| {
-            Err(io::Error::other(
-                format!("/etc/subgid entry not found for user {}", &user.name),
-            ))
+            Err(io::Error::other(format!(
+                "/etc/subgid entry not found for user {}",
+                &user.name
+            )))
         })?;
     let mut newuid = std::process::Command::new("newuidmap");
     newuid.arg(Pid::this().to_string()).args([
@@ -169,7 +171,7 @@ pub fn unshare_user_ns() -> io::Result<()> {
         ForkResult::Child => {
             drop(write_fd);
             let mut buf = [0u8; 1];
-            _ = read(read_fd.as_fd(), &mut buf);
+            _ = read(read_fd.as_fd().as_raw_fd(), &mut buf);
             drop(read_fd);
             match newuid.status() {
                 Ok(code) if code.success() => {}
@@ -184,12 +186,14 @@ pub fn unshare_user_ns() -> io::Result<()> {
             drop(write_fd);
             match waitpid(child, None)? {
                 WaitStatus::Exited(_, 0) => Ok(()),
-                WaitStatus::Exited(_, code) => Err(io::Error::other(
-                    format!("failed to set uid/gid map (code {})", code),
-                )),
-                status => Err(io::Error::other(
-                    format!("failed to set uid/gid map ({:?})", status),
-                )),
+                WaitStatus::Exited(_, code) => Err(io::Error::other(format!(
+                    "failed to set uid/gid map (code {})",
+                    code
+                ))),
+                status => Err(io::Error::other(format!(
+                    "failed to set uid/gid map ({:?})",
+                    status
+                ))),
             }
         }
     }
@@ -360,14 +364,7 @@ where
     let pid = unsafe {
         clone(
             Box::new(&|| -> isize {
-                match exec_cmd(
-                    &root,
-                    &proc,
-                    dir.as_deref(),
-                    &cmd,
-                    &args,
-                    &env,
-                ) {
+                match exec_cmd(&root, &proc, dir.as_deref(), &cmd, &args, &env) {
                     Ok(_) => unreachable!(),
                     Err(err) => {
                         eprintln!("error while {}: {}", err.context, err.errno.desc());

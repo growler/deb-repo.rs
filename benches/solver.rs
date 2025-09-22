@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::{
-    control::ControlParser, hash::FileHash, universe::Universe, Dependency, HttpTransportProvider,
-    Package, Packages, TransportProvider,
+    control::ControlParser, hash::FileHash, universe::Universe, version::Dependency,
+    HttpTransportProvider, Package, Packages, TransportProvider,
 };
 use std::sync::Arc;
 
@@ -42,10 +42,12 @@ pub fn parse_benchmark(c: &mut Criterion) {
     g.bench_function("solve test", |b| {
         b.iter(|| {
             let packages =
-                Some(Packages::new(data.clone(), None).expect("failed to parse packages"));
+                Some(Packages::new(data.clone(), 0, None).expect("failed to parse packages"));
             let mut uni = Universe::new("amd64", packages.into_iter()).expect("universe");
             let _ = match uni.solve(
-                vec![Dependency::try_from("task-gnome-desktop | task-kde-desktop").unwrap()],
+                vec!["task-gnome-desktop | task-kde-desktop"
+                    .parse::<Dependency<String>>()
+                    .unwrap()],
                 vec![],
             ) {
                 Ok(solution) => solution,

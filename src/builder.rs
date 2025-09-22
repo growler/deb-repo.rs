@@ -4,7 +4,7 @@ use {
     futures_lite::io::AsyncWriteExt,
     iterator_ext::IteratorExt,
     smol::io,
-    std::sync::Arc,
+    std::{num::NonZero, sync::Arc},
 };
 
 pub struct Builder<FS: DeploymentFileSystem> {
@@ -19,10 +19,10 @@ impl<FS: DeploymentFileSystem + Send + Sync + 'static> Builder<FS> {
         &self,
         manifest: &Manifest,
         recipe: Option<&str>,
-        limit: usize,
+        concurrency: NonZero<usize>,
         transport: &dyn TransportProvider,
     ) -> io::Result<Vec<String>> {
-        let mut installed = stream::iter(manifest.installables(recipe.unwrap_or(""))?)
+        let mut installed = stream::iter(manifest.installables(recipe)?)
             .map_ok(|(source, path, size, hash)| async move {
                 let deb = source.deb_reader(path, size, hash, transport).await?;
                 tracing::trace!("Extracting package {}", path);
@@ -35,7 +35,7 @@ impl<FS: DeploymentFileSystem + Send + Sync + 'static> Builder<FS> {
                 ctrl.sort_fields_deb_order();
                 Ok::<_, io::Error>(ctrl)
             })
-            .try_buffer_unordered(limit)
+            .try_buffer_unordered(concurrency.into())
             .try_collect::<Vec<_>>()
             .await?;
         let essentials = installed

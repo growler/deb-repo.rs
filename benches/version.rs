@@ -1,5 +1,5 @@
-use criterion::{black_box, criterion_group, criterion_main, Criterion};
-use debrepo::Version;
+use criterion::{criterion_group, criterion_main, Criterion};
+use debrepo::version::Version;
 
 macro_rules! bench {
     ($c:expr, $left:tt $op:tt $right:tt) => {{
@@ -7,7 +7,7 @@ macro_rules! bench {
         let this = Version::from_str($left).unwrap();
         let that = Version::from_str($right).unwrap();
         $c.bench_function(&format!("benchmark {}", stringify!($left $op $right)), |b| b.iter(|| {
-            black_box({
+            std::hint::black_box({
                 &this $op &that
             });
         }));

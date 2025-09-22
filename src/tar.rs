@@ -4,6 +4,7 @@ use {
     std::{
         io::{Error, ErrorKind, Result},
         pin::{pin, Pin},
+        str::from_utf8,
         sync::{Arc, Mutex},
         task::{Context, Poll},
     },
@@ -554,7 +555,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             let size = this.header.size().and_then(|size| {
                                 if size as usize > PATH_MAX {
                                     Err(Error::new(
-                                        ErrorKind::InvalidFilename,
+                                        ErrorKind::InvalidData,
                                         format!("long filename exceeds {PATH_MAX} bytes"),
                                     ))
                                 } else {
@@ -900,8 +901,8 @@ fn ustar_path_name(name: &[u8; 100], prefix: &[u8; 155]) -> Result<Box<str>> {
     Ok(path.into_boxed_str())
 }
 fn path_name(name: &'_ [u8]) -> Result<&'_ str> {
-    str::from_utf8(null_terminated(name))
-        .map_err(|_| Error::new(ErrorKind::InvalidFilename, "invalid utf8 in file path"))
+    from_utf8(null_terminated(name))
+        .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid utf8 in file path"))
 }
 
 fn parse_octal(field: &'_ [u8]) -> std::result::Result<u64, &'_ [u8]> {

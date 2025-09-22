@@ -133,11 +133,52 @@ impl<V: Clone> From<Option<&Version<V>>> for VersionSet<Version<V>> {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+#[derive(Clone)]
 pub struct Constraint<R> {
     name: R,
     arch: Option<R>,
     range: VersionSet<Version<R>>,
+}
+
+impl<R> Serialize for Constraint<R>
+where
+    R: Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{}", self))
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for Constraint<String> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct ConstraintVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for ConstraintVisitor {
+            type Value = Constraint<String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a version constraint string like 'pkgname (= 1.2.3)' or 'pkgname:arch (>= 1.0)'"
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                use std::str::FromStr;
+                Constraint::<String>::from_str(v).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                use std::str::FromStr;
+                Constraint::<String>::from_str(v.as_str()).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_string(ConstraintVisitor)
+    }
 }
 
 impl<R> std::ops::Not for Constraint<R> {
@@ -231,7 +272,70 @@ where
     }
 }
 
-#[derive(Serialize, Deserialize, Clone)]
+impl std::str::FromStr for Constraint<String> {
+    type Err = ParseError;
+    fn from_str(src: &str) -> Result<Self, Self::Err> {
+        let mut parser = Parser {
+            inp: src.as_bytes(),
+        };
+        let dep = Constraint::parse_internal(&mut parser, true)?;
+        if parser.is_empty() {
+            Ok(dep.translate(
+                |a| a.to_string(),
+                |n| n.to_string(),
+                |v| v.translate(|s| s.to_string()),
+            ))
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
+}
+
+pub trait IntoConstraint<R> {
+    fn into_constraint(self) -> std::result::Result<Constraint<R>, ParseError>;
+}
+
+impl<R> IntoConstraint<R> for Constraint<R> {
+    fn into_constraint(self) -> std::result::Result<Constraint<R>, ParseError> {
+        Ok(self)
+    }
+}
+
+impl<R> IntoConstraint<R> for &Constraint<R>
+where
+    R: Clone,
+{
+    fn into_constraint(self) -> std::result::Result<Constraint<R>, ParseError> {
+        Ok(self.clone())
+    }
+}
+
+impl<S> IntoConstraint<String> for S where S: AsRef<str> {
+    fn into_constraint(self) -> std::result::Result<Constraint<String>, ParseError> {
+        self.as_ref().parse()
+    }
+}
+
+impl<R1> Constraint<R1> {
+    pub fn translate<R2, FA, FN, FV>(&self, ta: FA, tn: FN, tv: FV) -> Constraint<R2>
+    where
+        FA: FnMut(&R1) -> R2,
+        FN: FnMut(&R1) -> R2,
+        FV: FnMut(&Version<R1>) -> Version<R2>,
+    {
+        let ta = ta;
+        let mut tn = tn;
+        let mut tv = tv;
+        Constraint {
+            arch: self.arch.as_ref().map(ta),
+            name: tn(&self.name),
+            range: self.range.translate_internal(&mut tv),
+        }
+    }
+}
+
+
+#[derive(Clone)]
 pub enum Dependency<R> {
     Single(Constraint<R>),
     Union(SmallVec<[Constraint<R>; 2]>),
@@ -249,6 +353,47 @@ impl<R: Eq> PartialEq for Dependency<R> {
                 _ => false,
             },
         }
+    }
+}
+
+impl<R> Serialize for Dependency<R>
+where
+    R: Display,
+{
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        serializer.serialize_str(&format!("{}", self))
+    }
+}
+
+impl<'de> serde::de::Deserialize<'de> for Dependency<String> {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct DependencyVisitor;
+
+        impl<'de> serde::de::Visitor<'de> for DependencyVisitor {
+            type Value = Dependency<String>;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                write!(
+                    f,
+                    "a dependency string like 'pkgname (= 1.2.3)' or 'pkgname:arch (>= 1.0) | pkgother:arch'"
+                )
+            }
+
+            fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
+                use std::str::FromStr;
+                Dependency::<String>::from_str(v).map_err(serde::de::Error::custom)
+            }
+
+            fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
+                use std::str::FromStr;
+                Dependency::<String>::from_str(v.as_str()).map_err(serde::de::Error::custom)
+            }
+        }
+
+        deserializer.deserialize_string(DependencyVisitor)
     }
 }
 
@@ -295,21 +440,43 @@ impl<R: Display> fmt::Display for Dependency<R> {
     }
 }
 
-impl<R1> Constraint<R1> {
-    pub fn translate<R2, FA, FN, FV>(&self, ta: FA, tn: FN, tv: FV) -> Constraint<R2>
-    where
-        FA: FnMut(&R1) -> R2,
-        FN: FnMut(&R1) -> R2,
-        FV: FnMut(&Version<R1>) -> Version<R2>,
-    {
-        let ta = ta;
-        let mut tn = tn;
-        let mut tv = tv;
-        Constraint {
-            arch: self.arch.as_ref().map(ta),
-            name: tn(&self.name),
-            range: self.range.translate_internal(&mut tv),
-        }
+pub trait IntoDependency<R> {
+    fn into_dependency(self) -> std::result::Result<Dependency<R>, ParseError>;
+}
+
+impl<R> IntoDependency<R> for Dependency<R> {
+    fn into_dependency(self) -> std::result::Result<Dependency<R>, ParseError> {
+        Ok(self)
+    }
+}
+
+impl<R> IntoDependency<R> for &Dependency<R>
+where
+    R: Clone,
+{
+    fn into_dependency(self) -> std::result::Result<Dependency<R>, ParseError> {
+        Ok(self.clone())
+    }
+}
+
+impl<S> IntoDependency<String> for S where S: AsRef<str> {
+    fn into_dependency(self) -> std::result::Result<Dependency<String>, ParseError> {
+        self.as_ref().parse()
+    }
+}
+
+impl<R> IntoDependency<R> for Constraint<R> {
+    fn into_dependency(self) -> std::result::Result<Dependency<R>, ParseError> {
+        Ok(Dependency::Single(self))
+    }
+}
+
+impl<R> IntoDependency<R> for &Constraint<R>
+where
+    R: Clone,
+{
+    fn into_dependency(self) -> std::result::Result<Dependency<R>, ParseError> {
+        Ok(Dependency::Single(self.clone()))
     }
 }
 
@@ -333,7 +500,9 @@ where
                     .cloned()
                     .chain(
                         self.iter()
-                            .skip(i + 1).filter(|&dep| !dep.satisfies(con)).cloned(),
+                            .skip(i + 1)
+                            .filter(|&dep| !dep.satisfies(con))
+                            .cloned(),
                     )
                     .collect::<Vec<_>>();
                 return match result.len() {
@@ -404,7 +573,9 @@ where
                             .cloned()
                             .chain(
                                 deps.iter()
-                                    .skip(i + 1).filter(|&dep| !dep.satisfies(con)).cloned(),
+                                    .skip(i + 1)
+                                    .filter(|&dep| !dep.satisfies(con))
+                                    .cloned(),
                             )
                             .collect::<SmallVec<[_; 2]>>();
                         return match result.len() {
@@ -1084,40 +1255,6 @@ impl<'a> Iterator for ParsedConstraintIterator<'a> {
                 }
                 err => Some(err),
             }
-        }
-    }
-}
-
-impl std::str::FromStr for Constraint<String> {
-    type Err = ParseError;
-    fn from_str(src: &str) -> Result<Self, Self::Err> {
-        let mut parser = Parser {
-            inp: src.as_bytes(),
-        };
-        let dep = Constraint::parse_internal(&mut parser, true)?;
-        if parser.is_empty() {
-            Ok(dep.translate(
-                |a| a.to_string(),
-                |n| n.to_string(),
-                |v| v.translate(|s| s.to_string()),
-            ))
-        } else {
-            Err("unexpected remaining input".into())
-        }
-    }
-}
-
-impl<'a> TryFrom<&'a str> for Constraint<&'a str> {
-    type Error = ParseError;
-    fn try_from(src: &'a str) -> Result<Self, Self::Error> {
-        let mut parser = Parser {
-            inp: src.as_bytes(),
-        };
-        let dep = Constraint::parse_internal(&mut parser, true)?;
-        if parser.is_empty() {
-            Ok(dep)
-        } else {
-            Err("unexpected remaining input".into())
         }
     }
 }

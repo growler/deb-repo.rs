@@ -735,23 +735,19 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                 this.digester.update(&buf[0..size]);
                 *this.read += size as u64;
                 if this.read > this.size {
-                    Err(std::io::Error::other(
-                        format!(
-                            "unexpected stream size {} (expected {})",
-                            this.read, this.size
-                        ),
-                    ))
+                    Err(std::io::Error::other(format!(
+                        "unexpected stream size {} (expected {})",
+                        this.read, this.size
+                    )))
                 } else {
                     Ok(size)
                 }
             } else if this.read < this.size {
                 // size == 0, EOF
-                Err(std::io::Error::other(
-                    format!(
-                        "unexpected stream size {} (expected {})",
-                        this.read, this.size
-                    ),
-                ))
+                Err(std::io::Error::other(format!(
+                    "unexpected stream size {} (expected {})",
+                    this.read, this.size
+                )))
             } else if this.read == this.size {
                 // size == 0, EOF
                 *this.read += 1;
@@ -759,13 +755,11 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                 if this.digest == &digest {
                     Ok(0)
                 } else {
-                    Err(std::io::Error::other(
-                        format!(
-                            "unexpected stream digest `{}` (expected `{}`)",
-                            hex::encode(&digest),
-                            hex::encode(&this.digest),
-                        ),
-                    ))
+                    Err(std::io::Error::other(format!(
+                        "unexpected stream digest `{}` (expected `{}`)",
+                        hex::encode(&digest),
+                        hex::encode(&this.digest),
+                    )))
                 }
             } else {
                 // size = 0, EOF
