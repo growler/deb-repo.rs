@@ -61,6 +61,7 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
     data: D,
 ) -> std::io::Result<()> {
     use smol::{fs, io};
+    use std::os::unix::fs::PermissionsExt;
     let dir = path
         .as_ref()
         .parent()
@@ -70,7 +71,10 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
         .file_name()
         .and_then(|s| s.to_str())
         .ok_or_else(|| io::Error::other("invalid file name"))?;
-    let tmp = tempfile::NamedTempFile::with_prefix_in(file_name, dir)
+    let tmp = tempfile::Builder::new()
+        .permissions(std::fs::Permissions::from_mode(0o644))
+        .prefix(file_name)
+        .tempfile_in(dir)
         .map_err(|err| io::Error::other(format!("Failed to create temporary file: {}", err)))?
         .into_temp_path();
     let mut tmp_file = fs::OpenOptions::new()

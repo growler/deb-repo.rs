@@ -307,7 +307,6 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 
 pub struct Packages {
     prio: u32,
-    source: u32,
     inner: PackagesInner,
 }
 
@@ -339,24 +338,22 @@ impl Packages {
     pub fn prio(&self) -> u32 {
         self.prio
     }
-    pub fn source(&self) -> usize {
-        self.source as usize
-    }
-    pub fn new_from_bytes<S>(data: S, source: u32, prio: Option<u32>) -> Result<Self, ParseError>
-    where
-        Arc<str>: From<String>,
-        S: AsRef<[u8]>,
+    pub(crate) fn new_from_bytes<D>(
+        data: D,
+        prio: Option<u32>,
+    ) -> Result<Self, ParseError> 
+    where 
+        Vec<u8>: From<D>,
     {
-        let s = String::from_utf8(data.as_ref().to_vec())
+        let s = String::from_utf8(data.into())
             .map_err(|err| ParseError::from(format!("Invalid UTF-8: {}", err)))?;
-        Self::new(s.into_boxed_str(), source, prio)
+        Self::new(s.into_boxed_str(), prio)
     }
-    pub fn new<S>(data: S, source: u32, prio: Option<u32>) -> Result<Self, ParseError>
+    pub fn new<S>(data: S, prio: Option<u32>) -> Result<Self, ParseError>
     where
         Arc<str>: From<S>,
     {
         Ok(Packages {
-            source,
             prio: prio.unwrap_or(500),
             inner: PackagesInnerTryBuilder {
                 data: Arc::<str>::from(data),
@@ -387,14 +384,14 @@ impl Packages {
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(inp.to_owned().into_boxed_str(), 0, None)
+        Self::new(inp.to_owned().into_boxed_str(), None)
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(inp.into_boxed_str(), 0, None)
+        Self::new(inp.into_boxed_str(), None)
     }
 }
 
@@ -405,7 +402,6 @@ impl TryFrom<Vec<u8>> for Packages {
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into_boxed_str(),
-            0,
             None,
         )
     }

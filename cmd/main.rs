@@ -84,6 +84,9 @@ enum Commands {
     /// Extract system to a target directory
     #[command(name = "extract")]
     Extract,
+    /// Extract system to a target directory
+    #[command(name = "build")]
+    Build,
     /// Include a package or packages into the recipe  
     #[command(name = "include")]
     Include,
@@ -96,41 +99,12 @@ enum Commands {
     /// Lists packages
     #[command(name = "list")]
     List,
+    /// Lists packages
+    #[command(name = "search")]
+    Search,
     /// Updates lock file
     #[command(name = "lock")]
     Lock,
-    // #[command(name = "search")]
-    // Search {
-    //     #[arg(short, long, value_name = "ARCH", default_value = default_arch())]
-    //     arch: String,
-    //     /// Origin repository URL
-    //     #[arg(
-    //         short = 'u',
-    //         long = "url",
-    //         value_name = "URL",
-    //         default_value = "https://ftp.debian.org/debian/"
-    //     )]
-    //     origin: String,
-    //     /// Distribution name
-    //     #[arg(
-    //         short = 'd',
-    //         long = "distr",
-    //         value_name = "DISTR",
-    //         default_value = "sid"
-    //     )]
-    //     distr: String,
-    //     /// Component
-    //     #[arg(
-    //         short = 'c',
-    //         long = "component",
-    //         value_name = "COMPONENT",
-    //         default_value = "all"
-    //     )]
-    //     comp: String,
-    //     /// name
-    //     #[arg(value_name = "NAME")]
-    //     name: String,
-    // },
 }
 
 #[derive(Parser)]
@@ -203,8 +177,7 @@ impl AsyncCommand for Init {
                 mf.add_requirements(None, cmd.vendor.default_requirements(), None::<&str>)?
             }
         }
-        mf.update_recipes(conf.concurrency, transport.as_ref())
-            .await?;
+        mf.resolve(conf.concurrency, transport.as_ref()).await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -218,28 +191,34 @@ struct Drop {
         long = "requirements-only",
         conflicts_with = "constraints_only"
     )]
-    requirements_only: Option<bool>,
+    requirements_only: bool,
     /// Specify to drop only constraints
     #[arg(
         short = 'C',
         long = "constraints-only",
         conflicts_with = "requirements_only"
     )]
-    constraints_only: Option<bool>,
-    /// The recipe name to modify (by default drop from all recipes).
-    /// Use "" to specify the primary recipe.
+    constraints_only: bool,
+    /// The recipe name to modify.
     #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
     recipe: Option<String>,
     /// Package name or package version set
-    #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
-    cons: Vec<Constraint<String>>,
+    #[arg(value_name = "CONSTRAINT")]
+    cons: Vec<String>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Drop {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.drop_constraints(self.recipe.as_deref(), self.cons.iter())?;
+        if !self.constraints_only {
+            mf.drop_requirements(self.recipe.as_deref(), self.cons.iter())?;
+        }
+        if !self.requirements_only {
+            mf.drop_constraints(self.recipe.as_deref(), self.cons.iter())?;
+        }
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -264,7 +243,7 @@ impl AsyncCommand for Include {
             self.reqs.iter(),
             self.comment.as_deref(),
         )?;
-        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
             .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
@@ -290,7 +269,7 @@ impl AsyncCommand for Exclude {
             self.reqs.iter(),
             self.comment.as_deref(),
         )?;
-        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
             .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
@@ -304,34 +283,6 @@ struct Update {}
 impl AsyncCommand for Update {
     async fn exec(&self, conf: &App) -> Result<()> {
         Ok(())
-        // let manifest =
-        //     Manifest::from_reader(async_std::fs::File::open(&conf.manifest).await?).await?;
-        // let repo_builder =
-        //     HttpCachingRepoBuilder::new(conf.insecure, conf.cache.clone().into()).await?;
-        // let mut universe = manifest
-        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
-        //     .await?;
-        // match universe.Solve(
-        //     manifest.requirements().cloned(),
-        //     manifest.constraints().cloned(),
-        // ) {
-        //     Ok(mut solution) => {
-        //         solution.sort_by_key(|&pkg| universe.package(pkg).unwrap().name());
-        //         let mut out = std::io::stdout().lock();
-        //         pretty_print_packages(
-        //             &mut out,
-        //             solution
-        //                 .into_iter()
-        //                 .map(|s| -> Package { universe.package(s).unwrap().into() }),
-        //             false,
-        //         )?;
-        //         Ok(())
-        //     }
-        //     Err(conflict) => Err(anyhow!(
-        //         "failed to solve dependencies: {}",
-        //         universe.display_conflict(conflict)
-        //     )),
-        // }
     }
 }
 
@@ -342,9 +293,8 @@ struct Lock {}
 impl AsyncCommand for Lock {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
-            .await
-            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -352,20 +302,52 @@ impl AsyncCommand for Lock {
 
 #[derive(Parser)]
 struct Search {
+    #[arg(short = 'p', long = "names-only")]
+    names_only: bool,
     #[arg(value_name = "PATTERN")]
-    recipe: Vec<String>,
+    pattern: Vec<String>,
 }
 
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Search {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
+        let res = self
+            .pattern
+            .iter()
+            .map(|p| {
+                regex::RegexBuilder::new(p)
+                    .unicode(true)
+                    .case_insensitive(true)
+                    .build()
+                    .map_err(|err| anyhow!("invalid regex: {}", err))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let mut pkgs = mf
+            .packages()
+            .filter_map(|p| {
+                res.iter()
+                    .any(|re| {
+                        re.is_match(p.name())
+                            || (!self.names_only
+                                && re.is_match(p.field("Description").unwrap_or("")))
+                    })
+                    .then_some(p)
+            })
+            .collect::<Vec<_>>();
+        pkgs.sort_by_key(|&pkg| pkg.name());
+        let mut out = std::io::stdout().lock();
+        pretty_print_packages(&mut out, pkgs, false)?;
         Ok(())
     }
 }
 
 #[derive(Parser)]
 struct List {
+    #[arg(short = 'e', long = "only-essential", hide = true)]
+    only_essential: bool,
     /// The recipe name to build (default is the primary nameless recipe)
     #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
     recipe: Option<String>,
@@ -375,15 +357,64 @@ struct List {
 impl AsyncCommand for List {
     async fn exec(&self, conf: &App) -> Result<()> {
         let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.update_recipes(conf.concurrency, conf.transport().await?.as_ref())
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
             .await
             .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
         let mut pkgs = mf
             .recipe_packages(self.recipe.as_deref())?
+            .filter_map(|p| {
+                if self.only_essential {
+                    p.essential().then_some(p)
+                } else {
+                    Some(p)
+                }
+            })
             .collect::<Vec<_>>();
         pkgs.sort_by_key(|&pkg| pkg.name());
         let mut out = std::io::stdout().lock();
         pretty_print_packages(&mut out, pkgs, false)?;
+        mf.store(&conf.manifest).await?;
+        Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct Build {
+    /// The recipe name to build (default is the primary nameless recipe)
+    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
+    recipe: Option<String>,
+    /// The target directory
+    #[arg(short, long, value_name = "PATH")]
+    path: PathBuf,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Build {
+    fn init(&self, _opts: &App) -> Result<()> {
+        if !nix::unistd::Uid::effective().is_root() {
+            unshare_user_ns()?;
+        }
+        unshare_root()?;
+        Ok(())
+    }
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        fs::create_dir_all(&self.path).await?;
+        let fs = std::sync::Arc::new(
+            debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
+                .await?,
+        );
+        {
+            let builder = debrepo::builder::Builder::new(&fs);
+            builder
+                .build(
+                    &manifest,
+                    self.recipe.as_deref(),
+                    conf.concurrency,
+                    conf.transport().await?.as_ref(),
+                )
+                .await?;
+        }
         Ok(())
     }
 }

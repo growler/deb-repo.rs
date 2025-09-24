@@ -15,24 +15,18 @@
 use {
     crate::{
         control::{ControlStanza, ParseError},
-        parse_size,
+        hash::FileHash,
+        matches_path, parse_size,
     },
     chrono::{DateTime, Utc},
     iterator_ext::IteratorExt,
+    itertools::Itertools,
     ouroboros::self_referencing,
     smallvec::SmallVec,
-    std::borrow::Cow,
 };
 
 pub struct Release {
     inner: ReleaseInner,
-}
-
-#[derive(Clone)]
-pub(crate) struct ReleaseFile<'a> {
-    pub path: Cow<'a, str>,
-    pub hash: Cow<'a, str>,
-    pub size: u64,
 }
 
 impl Release {
@@ -45,73 +39,80 @@ impl Release {
     pub fn is_empty(&self) -> bool {
         self.inner.with_data(|d| d.is_empty())
     }
-    pub(crate) fn files<F>(
-        &self,
-        hash_field_name: &'static str,
-        mut filter: F,
-    ) -> Result<impl Iterator<Item = Result<ReleaseFile<'_>, ParseError>>, ParseError>
-    where
-        F: FnMut(&str) -> bool,
+    pub(crate) fn files<'a, S: AsRef<str>>(
+        &'a self,
+        components: &'a [S],
+        hash_name: &str,
+        arch: &'a str,
+        ext: Option<&'a str>,
+    ) -> Result<impl Iterator<Item = Result<(&'a str, FileHash, u64), ParseError>> + 'a, ParseError>
     {
-        let field = self.inner.with_control(|c| {
-            c.field(hash_field_name).ok_or_else(|| {
-                ParseError::from(format!(
-                    "Field {} not found in the release file",
-                    hash_field_name,
-                ))
+        let ext = ext.unwrap_or(".xz");
+        let release_components = self.field("Components").unwrap_or("");
+        if components.iter().any(|c| {
+            !release_components
+                .split_ascii_whitespace()
+                .any(|rc| {
+                    rc.split('/').last().map(|s| s == c.as_ref()).unwrap_or(false)
+                })
+        }) {
+            return Err(ParseError::from(format!(
+                "Component(s) {} not found in release components: {}",
+                components
+                    .iter()
+                    .map(|s| s.as_ref())
+                    .filter(|s| !release_components
+                        .split_ascii_whitespace()
+                        .any(|rc| rc == *s))
+                    .join(", "),
+                release_components
+            )));
+        }
+        self
+            .field(hash_name).ok_or_else(|| {
+                ParseError::from(format!("Field {} not found in the release file", hash_name,))
             })
-        })?;
-        Ok(field
-            .lines()
-            .map(|l| l.trim())
-            .filter(|l| l != &"")
-            .map(|line| {
-                let parts: SmallVec<[&'_ str; 3]> = line.split_ascii_whitespace().collect();
-                if let [digest, size, path] = parts[..] {
-                    Ok((digest, size, path))
-                } else {
-                    Err(ParseError::from(format!("Invalid release line: {}", line)))
-                }
+            .map(|field| {
+                field
+                    .lines()
+                    .map(|l| l.trim())
+                    .filter(|l| l != &"")
+                    .map(|line| {
+                        let parts: SmallVec<[&'_ str; 3]> = line.split_ascii_whitespace().collect();
+                        if let [digest, size, path] = parts[..] {
+                            Ok((digest, size, path))
+                        } else {
+                            Err(ParseError::from(format!("Invalid release line: {}", line)))
+                        }
+                    })
+                    .map_ok(move |(digest, size, path)| {
+                        components
+                            .iter()
+                            .filter_map(move |comp| {
+                                let comp = comp.as_ref();
+                                if matches_path!(path, [ comp "/binary-" arch "/Packages" ext ]) {
+                                    Some((digest, size, path))
+                                } else {
+                                    None
+                                }
+                            })
+                    })
+                    .try_flatten()
+                    .and_then(|(digest, size, path)| {
+                        let size = parse_size(size.as_bytes()).map_err(|err| {
+                            ParseError::from(format!("invalid size: {:?} {}", size, err))
+                        })?;
+                        let hash = FileHash::try_from(digest).map_err(|err| {
+                            ParseError::from(format!("invalid hash: {} {}", digest, err))
+                        })?;
+                        Ok::<_, ParseError>((
+                            path,
+                            hash,
+                            size,
+                        ))
+                    })
             })
-            .try_filter_map(move |(digest, size, path)| {
-                if filter(path) {
-                    let size = parse_size(size.as_bytes()).map_err(|err| {
-                        ParseError::from(format!("Invalid size: {:?} {}", size, err))
-                    })?;
-                    Ok(Some(ReleaseFile {
-                        path: path.into(),
-                        hash: digest.into(),
-                        size,
-                    }))
-                } else {
-                    Ok(None)
-                }
-            }))
     }
-    // pub async fn fetch_packages(&self, component: &str, arch: &str) -> io::Result<Packages> {
-    //     let (path, size, hash) = self.packages_file(component, arch).ok_or_else(|| {
-    //         io::Error::new(
-    //             io::ErrorKind::InvalidData,
-    //             format!(
-    //                 "File {}/binary-{}/Packages(.xz|.gz)? not found in release",
-    //                 component, arch
-    //             ),
-    //         )
-    //     })?;
-    //     let release = String::from_utf8(self.repo.fetch_verify_unpack(&path, size, hash).await?)
-    //         .map_err(|err| {
-    //             io::Error::new(
-    //                 io::ErrorKind::InvalidData,
-    //                 format!("Invalid release file: {}", err),
-    //             )
-    //         })?;
-    //     Ok(Packages::new(release.into_boxed_str()).map_err(|err| {
-    //         io::Error::new(
-    //             io::ErrorKind::InvalidData,
-    //             format!("Invalid release file: {}", err),
-    //         )
-    //     })?)
-    // }
     fn field(&self, name: &str) -> Option<&str> {
         self.inner.with_control(|ctrl| ctrl.field(name).map(|s| s))
     }

@@ -466,15 +466,14 @@ impl Universe {
                 .map(|s| s.package)
         })
     }
-    pub fn package_with_source(&self, solvable: PackageId) -> Option<(usize, &Package<'_>)> {
+    pub fn package_with_idx<Id>(&self, solvable: Id) -> Option<(u32, &Package<'_>)>
+    where
+        Id: IntoId<PackageId>,
+    {
         self.inner.provider().with_index(|i| {
-            i.solvables.get(solvable.to_index()).and_then(|s| {
-                self.inner.provider().with_packages(|packages| {
-                    packages
-                        .get(s.pkgs as usize)
-                        .map(|p| (p.source(), s.package))
-                })
-            })
+            i.solvables
+                .get(solvable.into_id().to_index())
+                .map(|s| (s.pkgs, s.package))
         })
     }
     pub fn display_conflict(
@@ -496,16 +495,6 @@ impl Universe {
             .provider()
             .with_index(|i| i.solvables.get(solvable.to_index()))
             .map(|p| p.pkgs as usize)
-    }
-    pub fn package_source(&self, solvable: PackageId) -> Option<usize> {
-        self.inner
-            .provider()
-            .with_index(|i| i.solvables.get(solvable.to_index()))
-            .and_then(|p| {
-                self.inner
-                    .provider()
-                    .with_packages(|packages| packages.get(p.pkgs as usize).map(|p| p.source()))
-            })
     }
     pub async fn package_file(
         &self,
@@ -1089,7 +1078,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src, 0, None).expect("failed to parse test source")]
+                    vec![Packages::new($src, None).expect("failed to parse test source")]
                         .into_iter(),
                 )
                 .unwrap();

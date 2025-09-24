@@ -3,10 +3,12 @@ use smol::{
     io,
     prelude::*,
 };
-use std::{os::unix::fs::PermissionsExt, sync::Arc, time::SystemTime};
 use std::{
+    os::unix::fs::PermissionsExt,
     os::unix::{self, fs::DirBuilderExt},
     path::{Path, PathBuf},
+    sync::Arc,
+    time::SystemTime,
 };
 
 #[async_trait::async_trait]
@@ -16,10 +18,15 @@ pub trait DeploymentFile: Send + Sync {
         P: AsRef<Path> + Send;
 }
 
+pub trait DeploymentRoot: Send + Sync {
+    fn path(&self) -> io::Result<&'_ Path>;
+}
+
 /// Defines a file system interface to deploy packages.
 #[async_trait::async_trait]
 pub trait DeploymentFileSystem: Send + Sync {
     type File: DeploymentFile;
+    type Root: DeploymentRoot;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
     async fn create_dir<P>(&self, path: P, uid: u32, gid: u32, mode: u32) -> io::Result<()>
     where
@@ -81,6 +88,7 @@ pub trait DeploymentFileSystem: Send + Sync {
         R: io::AsyncRead + Unpin + Send,
         P: AsRef<Path> + Send;
     async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()>;
+    async fn root(&self) -> io::Result<Self::Root>;
 }
 
 #[derive(Clone, Debug)]
@@ -221,9 +229,20 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
     }
 }
 
+pub struct LocalRoot {
+    root: PathBuf,
+}
+
+impl DeploymentRoot for LocalRoot {
+    fn path(&self) -> io::Result<&'_ Path> {
+        Ok(&self.root)
+    }
+}
+
 #[async_trait::async_trait]
 impl DeploymentFileSystem for LocalFileSystem {
     type File = LocalFile;
+    type Root = LocalRoot;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -402,6 +421,11 @@ impl DeploymentFileSystem for LocalFileSystem {
         let target = self.target_path(path.as_ref())?;
         fs::remove_file(target).await
     }
+    async fn root(&self) -> io::Result<Self::Root> {
+        Ok(LocalRoot {
+            root: self.root.to_path_buf(),
+        })
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -458,9 +482,17 @@ impl DeploymentFile for FileListItem {
     }
 }
 
+pub struct FileListRoot;
+impl DeploymentRoot for FileListRoot {
+    fn path(&self) -> io::Result<&'_ Path> {
+        Err(io::Error::other("FileList is not a real filesystem"))
+    }
+}
+
 #[async_trait::async_trait]
 impl DeploymentFileSystem for FileList {
     type File = FileListItem;
+    type Root = FileListRoot;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -547,5 +579,8 @@ impl DeploymentFileSystem for FileList {
             .unwrap()
             .insert(format!("!{}", path.as_ref().as_os_str().to_string_lossy(),));
         Ok(())
+    }
+    async fn root(&self) -> io::Result<Self::Root> {
+        Ok(FileListRoot)
     }
 }

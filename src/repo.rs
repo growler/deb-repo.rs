@@ -8,27 +8,8 @@ use {
     async_trait::async_trait,
     futures_lite::io::{AsyncRead, AsyncReadExt, BufReader},
     smol::io,
-    std::{path::Path, pin::Pin},
+    std::pin::Pin,
 };
-
-pub enum KeyMaterial<'a> {
-    Key(&'a [u8]),
-    KeyFile(&'a Path),
-}
-
-impl KeyMaterial<'_> {
-    fn import_into(&self, ctx: &mut gpgme::Context) -> io::Result<()> {
-        match self {
-            KeyMaterial::Key(data) => {
-                ctx.import(*data)?;
-            }
-            KeyMaterial::KeyFile(path) => {
-                ctx.import(std::fs::File::open(path)?)?;
-            }
-        }
-        Ok(())
-    }
-}
 
 /// Debian repository provider abstraction.
 ///

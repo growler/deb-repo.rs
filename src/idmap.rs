@@ -9,6 +9,11 @@ use std::{
 pub trait IntoId<Id> {
     fn into_id(self) -> Id;
 }
+impl<T> IntoId<T> for T {
+    fn into_id(self) -> T {
+        self
+    }
+}
 pub(crate) trait ToIndex {
     fn to_index(&self) -> usize;
 }
@@ -21,12 +26,6 @@ impl IntoId<u32> for usize {
 impl ToIndex for u32 {
     fn to_index(&self) -> usize {
         *self as usize
-    }
-}
-
-impl IntoId<usize> for usize {
-    fn into_id(self) -> usize {
-        self
     }
 }
 impl ToIndex for usize {

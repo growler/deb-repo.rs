@@ -9,17 +9,18 @@ use {
         unistd::{chdir, execve, fork, mkdir, pipe, pivot_root, read, ForkResult, Gid, Pid, Uid},
     },
     std::{
-        convert::Infallible,
         ffi::{CStr, CString, NulError},
         fmt, io,
         os::{
             fd::{AsFd, AsRawFd},
             unix::process::CommandExt,
         },
-        path::Path,
+        path::{Path, PathBuf},
         process::ExitCode,
     },
 };
+
+const STACK_SIZE: usize = 64 * 1024;
 
 pub type Result<T> = std::result::Result<T, ExecError>;
 
@@ -55,19 +56,128 @@ impl<T> ErrnoContext<T> for nix::Result<T> {
         }
     }
 }
-
 impl From<nix::errno::Errno> for ExecError {
     fn from(errno: nix::errno::Errno) -> ExecError {
         Self { errno, context: "" }
     }
 }
-
 impl From<NulError> for ExecError {
     fn from(_err: NulError) -> ExecError {
         Self {
             errno: nix::errno::Errno::EINVAL,
             context: "invalid string supplied as argument",
         }
+    }
+}
+impl From<ExecError> for io::Error {
+    fn from(err: ExecError) -> io::Error {
+        io::Error::from_raw_os_error(err.errno as i32)
+    }
+}
+
+pub struct Command {
+    cmd: CString,
+    cwd: Option<PathBuf>,
+    args: Vec<CString>,
+    env: Vec<CString>,
+}
+impl Command {
+    pub fn new<C, D, Ia, Ie>(
+        cmd: C,
+        cwd: Option<D>,
+        args: Ia,
+        env: Ie,
+    ) -> std::result::Result<Self, NulError>
+    where
+        C: AsRef<Path>,
+        D: Into<PathBuf>,
+        Ia: IntoIterator,
+        Ia::Item: AsRef<str>,
+        Ie: IntoIterator,
+        Ie::Item: AsRef<str>,
+    {
+        const PATH_ENV: &str = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
+        let mut env: Vec<CString> = env
+            .into_iter()
+            .map(|s| CString::new(s.as_ref().as_bytes()))
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        let has_path = env.iter().any(|s| s.as_bytes().starts_with(b"PATH="));
+        if !has_path {
+            env.push(CString::new(PATH_ENV).unwrap());
+        }
+        let cmd = CString::new(cmd.as_ref().as_os_str().as_encoded_bytes())?;
+        Ok(Self {
+            env,
+            cmd: cmd.clone(),
+            cwd: cwd.map(|d| d.into()),
+            args: std::iter::once(Ok(cmd))
+                .chain(
+                    args.into_iter()
+                        .map(|s| CString::new(s.as_ref().as_bytes())),
+                )
+                .collect::<std::result::Result<Vec<_>, _>>()?,
+        })
+    }
+    fn run(&self) -> Result<()> {
+        let mut stack = vec![0u8; STACK_SIZE];
+        let pid = unsafe {
+            if let Some(cwd) = self.cwd.as_ref() {
+                chdir(cwd).context("changing working directory")?;
+            }
+            clone(
+                Box::new(&|| -> isize {
+                    match execve(&self.cmd, &self.args, &self.env).context("executing command") {
+                        Ok(_) => unreachable!(),
+                        Err(err) => {
+                            eprintln!("error while {}: {}", err.context, err.errno.desc());
+                            -1
+                        }
+                    }
+                }),
+                &mut stack,
+                CloneFlags::CLONE_PTRACE
+                    | CloneFlags::CLONE_NEWUTS
+                    | CloneFlags::CLONE_NEWPID
+                    | CloneFlags::CLONE_NEWNET
+                    | CloneFlags::CLONE_NEWIPC
+                    | CloneFlags::CLONE_NEWNS,
+                Some(nix::sys::signal::Signal::SIGCHLD as i32),
+            )
+        }?;
+        loop {
+            if let WaitStatus::Exited(_, code) = waitpid(pid, None)? {
+                if code == 0 {
+                    break;
+                } else {
+                    return Err(nix::errno::Errno::from_raw(code).into());
+                }
+            }
+        }
+        Ok(())
+    }
+}
+impl std::fmt::Debug for Command {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Command")
+            .field("cmd", &self.cmd)
+            .field("cwd", &self.cwd)
+            .field(
+                "args",
+                &self
+                    .args
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>(),
+            )
+            .field(
+                "env",
+                &self
+                    .env
+                    .iter()
+                    .map(|s| s.to_string_lossy())
+                    .collect::<Vec<_>>(),
+            )
+            .finish()
     }
 }
 
@@ -199,14 +309,7 @@ pub fn unshare_user_ns() -> io::Result<()> {
     }
 }
 
-fn exec_cmd<As: AsRef<CStr>, Es: AsRef<CStr>>(
-    root: &CStr,
-    proc: &CStr,
-    cwd: Option<&CStr>,
-    cmd: &CStr,
-    args: &[As],
-    env: &[Es],
-) -> Result<Infallible> {
+fn exec_commands(root: &CStr, proc: &CStr, cmds: &[Command]) -> Result<()> {
     mount(
         Some("none"),
         "/",
@@ -260,10 +363,10 @@ fn exec_cmd<As: AsRef<CStr>, Es: AsRef<CStr>>(
     )
     .context("mounting /run")?;
     mkdir("/run/lock", Mode::from_bits(0o1777u32).unwrap()).context("mkdir /tmp")?;
-    if let Some(cwd) = cwd {
-        chdir(cwd).context("changing working directory")?;
+    for exec in cmds.iter() {
+        exec.run()?;
     }
-    execve(cmd, args, env).context("executing command")
+    Ok(())
 }
 
 /// Execute a command inside a freshly created set of Linux namespaces with a pivoted root.
@@ -313,59 +416,19 @@ fn exec_cmd<As: AsRef<CStr>, Es: AsRef<CStr>>(
 /// - `args`: Additional arguments (excluding `argv[0]`).
 /// - `dir`: Optional working directory (relative to the new root) to `chdir` into before exec.
 /// - `env`: Optional environment entries of the form `KEY=VALUE`. If `PATH` is missing, a default is added.
-pub fn exec<Rp, Dp, Cp, A, E>(
-    root: Rp,
-    cmd: Cp,
-    args: A,
-    dir: Option<Dp>,
-    env: Option<E>,
-) -> Result<ExitCode>
+pub fn exec<Rp>(root: Rp, cmds: &[Command]) -> Result<ExitCode>
 where
     Rp: AsRef<Path>,
-    Dp: AsRef<Path>,
-    Cp: AsRef<Path>,
-    A: IntoIterator,
-    A::Item: AsRef<str>,
-    E: IntoIterator,
-    E::Item: AsRef<str>,
 {
     let proc = CString::new(root.as_ref().join("proc").as_os_str().as_encoded_bytes())?;
     let root = CString::new(root.as_ref().as_os_str().as_encoded_bytes())?;
-    let dir = dir
-        .as_ref()
-        .map(|d| CString::new(d.as_ref().as_os_str().as_encoded_bytes()))
-        .transpose()?;
-    let cmd = CString::new(cmd.as_ref().as_os_str().as_encoded_bytes())?;
-    let args = std::iter::once(Ok::<_, ExecError>(cmd.clone()))
-        .chain(
-            args.into_iter()
-                .map(|s| CString::new(s.as_ref().as_bytes()).map_err(Into::into)),
-        )
-        .collect::<std::result::Result<Vec<_>, _>>()?;
 
-    const PATH_ENV: &str = "PATH=/sbin:/bin:/usr/sbin:/usr/bin";
-
-    let env: Vec<CString> = match env {
-        Some(e) => {
-            let mut v = e
-                .into_iter()
-                .map(|s| CString::new(s.as_ref().as_bytes()))
-                .collect::<std::result::Result<Vec<_>, _>>()?;
-            let has_path = v.iter().any(|s| s.as_bytes().starts_with(b"PATH="));
-            if !has_path {
-                v.push(CString::new(PATH_ENV)?);
-            }
-            v
-        }
-        _ => vec![CString::new(PATH_ENV)?],
-    };
-
-    let mut stack = vec![0u8; 32768];
+    let mut stack = vec![0u8; STACK_SIZE];
     let pid = unsafe {
         clone(
             Box::new(&|| -> isize {
-                match exec_cmd(&root, &proc, dir.as_deref(), &cmd, &args, &env) {
-                    Ok(_) => unreachable!(),
+                match exec_commands(&root, &proc, cmds) {
+                    Ok(_) => 0,
                     Err(err) => {
                         eprintln!("error while {}: {}", err.context, err.errno.desc());
                         -1
@@ -394,13 +457,12 @@ where
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn dpkg<Rp, A, E>(root: Rp, args: A, env: Option<E>) -> Result<ExitCode>
+pub fn dpkg<A, E>(args: A, env: E) -> std::result::Result<Command, NulError>
 where
-    Rp: AsRef<Path>,
     A: IntoIterator,
     A::Item: AsRef<str>,
     E: IntoIterator,
     E::Item: AsRef<str>,
 {
-    exec(root, "/usr/bin/dpkg", args, None::<&str>, env)
+    Command::new("/usr/bin/dpkg", None::<&str>, args, env)
 }

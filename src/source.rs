@@ -1,13 +1,19 @@
 use {
     crate::{
-        control::MutableControlStanza, deb::DebReader, hash::FileHash, Packages, Release,
+        control::MutableControlStanza, deb::DebReader, hash::FileHash, release::Release,
         TransportProvider,
     },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::{Args, ValueEnum},
+    futures::{future::try_join_all, AsyncReadExt},
+    iterator_ext::IteratorExt,
+    itertools::Itertools,
     serde::{Deserialize, Serialize},
-    smol::io,
-    std::path::{Path, PathBuf},
+    smol::{fs, io, lock::Semaphore},
+    std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    },
 };
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
@@ -22,11 +28,11 @@ pub enum Vendor {
 
 #[macro_export]
 macro_rules! source {
-    ($url:tt $suite:tt $first:tt $( $comp:expr )* ) => {
+    ($url:tt [ $( $suite:expr )* ] [ $( $comp:expr )* ] ) => {
         Source {
             url: ($url).into(),
-            suite: ($suite).into(),
-            components: vec![($first).into() $(, ($comp).into() )* ],
+            suites: vec![$( ($suite).into() ,)* ],
+            components: vec![$(($comp).into() ,)* ],
             ..Default::default()
         }
     }
@@ -50,27 +56,29 @@ impl Vendor {
     pub fn sources_for<S: AsRef<str>>(&self, suite: S) -> Vec<Source> {
         let suite = suite.as_ref();
         match self {
+            Vendor::Devuan => vec![
+                source! {"http://deb.devuan.org/merged/" [
+                    suite
+                    format!("{}-updates", suite)
+                    format!("{}-security", suite)
+                ] [ "main" ]},
+            ],
             Vendor::Debian => vec![
-                source! {"https://ftp.debian.org/debian/" suite "main"}
+                source! {"https://ftp.debian.org/debian/" [ 
+                    suite
+                    format!("{}-updates", suite)
+                    format!("{}-backports", suite)
+                ] [ "main" ]}
                     .with_snapshots("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"),
-                source! {"https://ftp.debian.org/debian/" { format!("{}-updates", suite) } "main"}
-                    .with_snapshots("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"),
-                source! {"https://ftp.debian.org/debian/" { format!("{}-backports", suite) } "main"}
-                    .with_snapshots("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"),
-                source! {"https://security.debian.org/debian-security/" { format!("{}-security", suite) } "main"}
+                source! {"https://security.debian.org/debian-security/" [ format!("{}-security", suite) ] [ "main" ]}
                     .with_snapshots("https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"),
             ],
             Vendor::Ubuntu => {
                 vec![
-                    source! {"https://archive.ubuntu.com/ubuntu/" suite "main" "universe"}
+                    source! {"https://archive.ubuntu.com/ubuntu/" [ suite ] [ "main" "universe" ]}
                         .with_snapshots("https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/")
                 ]
             }
-            Vendor::Devuan => vec![
-                source! {"http://deb.devuan.org/merged/" suite "main"},
-                source! {"http://deb.devuan.org/merged/" { format!("{}-updates", suite) } "main"},
-                source! {"http://deb.devuan.org/merged/" { format!("{}-security", suite) } "main"},
-            ],
         }
     }
 }
@@ -108,10 +116,50 @@ fn default_components() -> Vec<String> {
     vec!["main".to_string()]
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum SignedBy {
+    #[default]
+    Builtin,
     Key(String),
     Keyring(PathBuf),
+}
+
+impl SignedBy {
+    pub const MAX_KEY_SIZE: usize = 64 * 1024; // 64 KiB
+    async fn import_into(&self, ctx: &mut gpgme::Context) -> io::Result<()> {
+        match self {
+            Self::Builtin => {
+                ctx.import(DEBIAN_KEYRING)?;
+            }
+            Self::Key(key) => {
+                ctx.import(key.as_bytes())?;
+            }
+            Self::Keyring(path) => {
+                let size = fs::metadata(path).await.and_then(|md| {
+                    if md.is_file() {
+                        let size = md.len();
+                        if size <= Self::MAX_KEY_SIZE as u64 {
+                            Ok(size)
+                        } else {
+                            Err(io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                "the key file is too large",
+                            ))
+                        }
+                    } else {
+                        Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "the key is not a regular file",
+                        ))
+                    }
+                })?;
+                let mut buf = Vec::with_capacity(size as usize);
+                fs::File::open(path).await?.read_to_end(&mut buf).await?;
+                ctx.import(buf)?;
+            }
+        }
+        Ok(())
+    }
 }
 
 impl From<&Path> for SignedBy {
@@ -132,6 +180,7 @@ impl serde::ser::Serialize for SignedBy {
         S: serde::Serializer,
     {
         match self {
+            SignedBy::Builtin => serializer.serialize_none(),
             SignedBy::Key(s) => serializer.serialize_str(s),
             SignedBy::Keyring(s) => serializer.serialize_str(&s.to_string_lossy()),
         }
@@ -141,6 +190,7 @@ impl serde::ser::Serialize for SignedBy {
 impl From<&SignedBy> for String {
     fn from(s: &SignedBy) -> Self {
         match s {
+            SignedBy::Builtin => "builtin".to_string(),
             SignedBy::Key(s) => s.clone(),
             SignedBy::Keyring(s) => s.to_string_lossy().into_owned(),
         }
@@ -517,6 +567,18 @@ impl clap::builder::TypedValueParser for SourceHashKindValueParser {
     }
 }
 
+#[derive(Clone, Serialize, Deserialize, Debug)]
+pub(crate) struct RepositoryIndexFile {
+    pub(crate) path: String,
+    pub(crate) hash: FileHash,
+    pub(crate) size: u64,
+}
+impl RepositoryIndexFile {
+    pub fn new(path: String, hash: FileHash, size: u64) -> Self {
+        Self { path, hash, size }
+    }
+}
+
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 #[group(required = true, multiple = true)]
@@ -550,7 +612,7 @@ pub struct Source {
 
     /// Suite or codename (i.e. "focal", "buster", "stable", "testing", "unstable", etc.)
     #[arg(value_name = "SUITE or CODENAME")]
-    pub suite: String,
+    pub suites: Vec<String>,
 
     /// Space separated list of components (i.e. "main", "contrib", "non-free", etc.)
     #[arg(value_name = "COMPONENT")]
@@ -566,6 +628,11 @@ pub struct Source {
     )]
     #[serde(default, skip_serializing_if = "SourceHashKind::is_sha256")]
     pub hash: SourceHashKind,
+
+    /// Index files extension (default is .xz, empty for the unpacked)
+    #[arg(long = "extension", value_name = ".EXT")]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ext: Option<String>,
 
     /// Source priority (higher number means higher priority)
     #[arg(long = "priority", value_name = "N")]
@@ -607,9 +674,10 @@ impl Source {
     }
     pub async fn fetch_unsigned_release<T: TransportProvider + ?Sized>(
         &self,
+        suite: &str,
         transport: &T,
-    ) -> std::io::Result<(Release, String, u64, FileHash)> {
-        let path = format!("dists/{}/Release", self.suite);
+    ) -> std::io::Result<(Release, String, FileHash, u64)> {
+        let path = format!("dists/{}/Release", suite);
         transport
             .fetch_hash(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
@@ -622,22 +690,22 @@ impl Source {
                     Release::try_from(buf)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
                     path,
-                    size,
                     hash,
+                    size,
                 ))
             })
     }
-    fn verify_signed_release(&self, data: Vec<u8>) -> io::Result<Release> {
+    async fn verify_signed_release(&self, data: Vec<u8>) -> io::Result<Release> {
         let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
         let tempdir = tempfile::tempdir()?;
         ctx.set_engine_home_dir(tempdir.path().as_os_str().as_encoded_bytes())?;
         ctx.set_flag("auto-key-retrieve", "0")?;
 
-        ctx.import(DEBIAN_KEYRING)?;
-
-        // for key in keys {
-        //     key.import_into(&mut ctx)?
-        // }
+        self.signed_by
+            .as_ref()
+            .unwrap_or(&SignedBy::Builtin)
+            .import_into(&mut ctx)
+            .await?;
 
         let mut plaintext = Vec::new();
         let verify_result = ctx.verify_opaque(data, &mut plaintext)?;
@@ -654,11 +722,12 @@ impl Source {
         Release::try_from(plaintext)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
     }
-    pub async fn fetch_signed_release<T: TransportProvider>(
+    pub async fn fetch_signed_release<T: TransportProvider + ?Sized>(
         &self,
+        suite: &str,
         transport: &T,
-    ) -> std::io::Result<(Release, String, u64, FileHash)> {
-        let path = format!("dists/{}/InRelease", self.suite);
+    ) -> std::io::Result<(Release, String, FileHash, u64)> {
+        let path = format!("dists/{}/InRelease", suite);
         let (data, size, hash) = transport
             .fetch_hash(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
@@ -666,7 +735,7 @@ impl Source {
                 Self::MAX_RELEASE_SIZE,
             )
             .await?;
-        Ok((self.verify_signed_release(data)?, path, size, hash))
+        Ok((self.verify_signed_release(data).await?, path, hash, size))
     }
     pub async fn fetch_signed_release_by_hash<T: TransportProvider>(
         &self,
@@ -682,33 +751,55 @@ impl Source {
                 hash,
             )
             .await?;
-        self.verify_signed_release(data)
+        self.verify_signed_release(data).await
     }
-    pub(crate) async fn fetch_packages_index<T: TransportProvider + ?Sized>(
+    pub(crate) async fn file_by_hash<'a, T>(
         &self,
-        source: u32,
-        path: &str,
-        size: u64,
-        hash: &FileHash,
         transport: &T,
-    ) -> io::Result<Packages> {
+        file: &RepositoryIndexFile,
+    ) -> io::Result<Box<[u8]>>
+    where
+        T: TransportProvider + ?Sized,
+    {
         transport
             .fetch_verify_unpack(
-                &format!(
-                    "{}/dists/{}/{}",
-                    self.url.trim_end_matches('/'),
-                    self.suite,
-                    path
-                ),
-                size,
-                hash,
+                &format!("{}/{}", &self.url, &file.path),
+                file.size,
+                &file.hash,
                 Self::MAX_PACKAGE_SIZE,
             )
             .await
-            .and_then(|buf| {
-                Packages::new_from_bytes(buf, source, self.priority)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })
+            .map(|s| s.into_boxed_slice())
+    }
+    pub(crate) async fn files<'a, T: TransportProvider + ?Sized>(
+        &'a self,
+        arch: &str,
+        sem: &Arc<Semaphore>,
+        transport: &T,
+    ) -> Result<Vec<(RepositoryIndexFile, Vec<RepositoryIndexFile>)>, io::Error> {
+        try_join_all(self.suites.iter().map(|s| async move {
+            let sem = Arc::clone(sem);
+            let _permit = sem.acquire().await;
+            let (rel, path, hash, size) = if self.allow_insecure() {
+                self.fetch_unsigned_release(s, transport).await?
+            } else {
+                self.fetch_signed_release(s, transport).await?
+            };
+            let pkgs_ind = rel
+                .files(
+                    &self.components,
+                    self.hash.name(),
+                    arch,
+                    self.ext.as_deref(),
+                )?
+                .map_err(Into::into)
+                .map_ok(|(path, hash, size)| {
+                    RepositoryIndexFile::new(format!("dists/{}/{}", s, path), hash, size)
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            Ok::<_, io::Error>((RepositoryIndexFile::new(path, hash, size), pkgs_ind))
+        }))
+        .await
     }
     pub async fn deb_reader<T: TransportProvider + ?Sized>(
         &self,
@@ -731,7 +822,7 @@ impl From<&Source> for MutableControlStanza {
     fn from(src: &Source) -> Self {
         let mut cs = MutableControlStanza::parse("Types: deb\n").unwrap();
         cs.set("URIs", src.url.clone());
-        cs.set("Suites", src.suite.clone());
+        cs.set("Suites", src.suites.join(" "));
         cs.set("Components", src.components.join(" "));
         if !src.arch.is_empty() {
             cs.set("Architectures", src.arch.join(" "));

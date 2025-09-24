@@ -310,7 +310,10 @@ where
     }
 }
 
-impl<S> IntoConstraint<String> for S where S: AsRef<str> {
+impl<S> IntoConstraint<String> for S
+where
+    S: AsRef<str>,
+{
     fn into_constraint(self) -> std::result::Result<Constraint<String>, ParseError> {
         self.as_ref().parse()
     }
@@ -333,7 +336,6 @@ impl<R1> Constraint<R1> {
         }
     }
 }
-
 
 #[derive(Clone)]
 pub enum Dependency<R> {
@@ -459,7 +461,10 @@ where
     }
 }
 
-impl<S> IntoDependency<String> for S where S: AsRef<str> {
+impl<S> IntoDependency<String> for S
+where
+    S: AsRef<str>,
+{
     fn into_dependency(self) -> std::result::Result<Dependency<String>, ParseError> {
         self.as_ref().parse()
     }
