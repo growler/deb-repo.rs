@@ -1,4 +1,4 @@
-pub use crate::source::{Source, Vendor};
+pub use crate::source::Source;
 use {
     crate::version::{Constraint, Dependency},
     std::str::FromStr,

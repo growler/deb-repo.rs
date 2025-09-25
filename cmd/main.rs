@@ -1,16 +1,10 @@
 use {
-    anyhow::{anyhow, Result},
-    clap::{Parser, Subcommand},
-    debrepo::{
-        cli::{Source, Vendor},
+    anyhow::{anyhow, Result}, clap::{Parser, Subcommand}, debrepo::{
+        cli::{Source},
         exec::{unshare_root, unshare_user_ns},
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
-    },
-    smol::fs,
-    std::{iter, num::NonZero, path::PathBuf, process::ExitCode},
-    tracing::level_filters::LevelFilter,
-    tracing_subscriber::{filter::EnvFilter, fmt},
+    }, futures::AsyncWriteExt, itertools::Itertools, smol::fs, std::{num::NonZero, path::PathBuf, process::ExitCode}, tracing::level_filters::LevelFilter, tracing_subscriber::{filter::EnvFilter, fmt}
 };
 
 #[async_trait::async_trait(?Send)]
@@ -25,20 +19,15 @@ pub trait AsyncCommand {
 #[derive(Parser)]
 pub struct App {
     /// Turns off all output except errors
-    #[arg(global = true, short, long)]
+    #[arg(short, long)]
     quiet: bool,
 
     /// Turns on debugging output (repeat -d for more)
-    #[arg(global = true, short, long, action = clap::ArgAction::Count)]
+    #[arg(short, long, action = clap::ArgAction::Count)]
     debug: u8,
-
-    /// Manifest file
-    #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE)]
-    manifest: PathBuf,
 
     /// Number of concurrent downloads
     #[arg(
-        global = true,
         short = 'n',
         long = "downloads",
         value_name = "NUM",
@@ -47,23 +36,50 @@ pub struct App {
     concurrency: NonZero<usize>,
 
     /// Target architecture
-    #[arg(global = true, short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
+    #[arg(long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
     arch: String,
 
     /// HTTP download cache directory
-    #[arg(long = "cache-dir", value_name = "DIR", conflicts_with = "no_cache")]
+    #[arg(
+        long = "cache-dir",
+        value_name = "DIR",
+        conflicts_with = "no_cache",
+        display_order = 0
+    )]
     pub cache_dir: Option<PathBuf>,
 
-    #[arg(long = "no-cache", conflicts_with = "cache_dir")]
+    /// Disable caching downloaded files
+    #[arg(
+        long = "no-cache",
+        conflicts_with = "cache_dir",
+        display_order = 0,
+        action,
+        display_order = 0
+    )]
     pub no_cache: bool,
 
     /// Do not verify Release files by default (not recommended)
-    #[arg(short = 'K', long = "no-verify")]
+    #[arg(
+        short = 'K',
+        long = "no-verify",
+        display_order = 0,
+        action
+    )]
     pub insecure_release: bool,
 
     /// Skip the connection verification (not recommended)
-    #[arg(short = 'k', long = "insecure", action)]
+    #[arg(
+        short = 'k',
+        long = "insecure",
+        action,
+        display_order = 0,
+        action
+    )]
     pub insecure: bool,
+
+    /// Manifest file
+    #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE, display_order = 0)]
+    manifest: PathBuf,
 
     #[command(subcommand)]
     cmd: Commands,
@@ -73,7 +89,7 @@ pub struct App {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new manifest file
-    #[command(name = "init")]
+    #[command(name = "init", next_display_order = 200)]
     Init,
     /// Fetch artefact
     #[command(name = "fetch", hide = true)]
@@ -102,6 +118,9 @@ enum Commands {
     /// Lists packages
     #[command(name = "search")]
     Search,
+    /// Show package description
+    #[command(name = "show")]
+    Show,
     /// Updates lock file
     #[command(name = "lock")]
     Lock,
@@ -113,71 +132,30 @@ pub struct Init {
     #[arg(long)]
     pub force: bool,
 
-    #[command(subcommand)]
-    cmd: InitCommands,
-}
-
-#[derive(Subcommand)]
-enum InitCommands {
-    /// Initialize manifest for a source definition
-    #[command(name = "from-source")]
-    InitFromSource(InitFromSource),
-    /// Initialize manifest for a known vendor (Debian, Devuan, Ubuntu)
-    #[command(name = "from-vendor")]
-    InitFromVendor(InitFromVendor),
-}
-
-#[derive(Parser, Default)]
-pub struct InitFromSource {
     /// Package to add
     #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
     requirements: Vec<String>,
+
     /// Source definition
     #[command(flatten)]
     source: Source,
 }
 
-#[derive(Parser, Default)]
-pub struct InitFromVendor {
-    /// Vendor
-    pub vendor: Vendor,
-
-    /// Suite
-    pub suite: Option<String>,
-}
-
 #[async_trait::async_trait(?Send)]
 impl AsyncCommand for Init {
     async fn exec(&self, conf: &App) -> Result<()> {
-        let comment = match &self.cmd {
-            InitCommands::InitFromSource(_) => None,
-            InitCommands::InitFromVendor(cmd) => {
-                Some(format!("default manifest file for {}", &cmd.vendor))
+        let (sources, packages, comment) = if let Some((sources, mut packages)) = self.source.as_vendor() {
+            if !self.requirements.is_empty() {
+               packages.extend(self.requirements.iter().cloned());
+                packages = packages.into_iter().unique().collect();
             }
+            (sources, packages, Some(format!("default manifest file for {}", &self.source.url)) )
+        } else {
+            (vec![self.source.clone()], self.requirements.clone(), None)
         };
-        let transport = conf.transport().await?;
-        let mut mf = match &self.cmd {
-            InitCommands::InitFromSource(cmd) => {
-                Manifest::from_sources(&conf.arch, iter::once(&cmd.source).cloned(), comment)
-            }
-            InitCommands::InitFromVendor(cmd) => {
-                let sources = cmd.vendor.sources_for(
-                    cmd.suite
-                        .as_deref()
-                        .unwrap_or_else(|| cmd.vendor.defailt_suite()),
-                );
-                Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment)
-            }
-        };
-        match &self.cmd {
-            InitCommands::InitFromSource(cmd) => {
-                mf.add_requirements(None, cmd.requirements.iter(), None::<&str>)?
-            }
-            InitCommands::InitFromVendor(cmd) => {
-                mf.add_requirements(None, cmd.vendor.default_requirements(), None::<&str>)?
-            }
-        }
-        mf.resolve(conf.concurrency, transport.as_ref()).await?;
+        let mut mf = Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment);
+        mf.add_requirements(None, packages.iter(), None::<&str>)?;
+        mf.resolve(conf.concurrency.into(), conf.transport().await?.as_ref()).await?;
         mf.store(&conf.manifest).await?;
         Ok(())
     }
@@ -341,6 +319,29 @@ impl AsyncCommand for Search {
         let mut out = std::io::stdout().lock();
         pretty_print_packages(&mut out, pkgs, false)?;
         Ok(())
+    }
+}
+
+#[derive(Parser)]
+struct Show {
+    #[arg(value_name = "PACKAGE")]
+    package: String,
+}
+
+#[async_trait::async_trait(?Send)]
+impl AsyncCommand for Show {
+    async fn exec(&self, conf: &App) -> Result<()> {
+        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+            .await?;
+        let pkg = mf.packages().find(|p| self.package == p.name());
+        if let Some(pkg) = pkg {
+            let mut out = async_io::Async::new(std::io::stdout().lock())?;
+            out.write_all(pkg.src().as_bytes()).await?;
+            Ok(())
+        } else {
+            Err(anyhow!("package {} not found", &self.package))
+        }
     }
 }
 

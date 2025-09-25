@@ -641,7 +641,7 @@ impl<'a> ControlParser<'a> {
                 return Err(format!("Invalid field name {}", self.quote_err()).into());
             }
         }
-        Err(format!("Unterminated field name {}", self.quote_err()).into())
+        Err(format!("unterminated field name {}", self.quote_err()).into())
     }
     fn field_value(&mut self) -> Result<&'a str, ParseError> {
         let mut inp = self.src.as_bytes();
@@ -655,8 +655,7 @@ impl<'a> ControlParser<'a> {
             }
         }
         // let start = inp;
-        let mut pos = 1 + memchr::memchr(b'\n', inp)
-            .ok_or_else(|| ParseError::from(format!("Unterminated field {}", self.quote_err())))?;
+        let mut pos = memchr::memchr(b'\n', inp).map_or_else(|| inp.len(), |p| p + 1);
         inp = &inp[pos..];
         // rest
         loop {

@@ -26,6 +26,7 @@ path = "cmd/tar.rs"
 
 [dependencies]
 anyhow = "1"
+async-io = "2.6.0"
 async-lock = "3.4.1"
 async-trait = "0.1"
 base64 = "0.22"

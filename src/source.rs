@@ -4,7 +4,7 @@ use {
         TransportProvider,
     },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
-    clap::{Args, ValueEnum},
+    clap::{Args},
     futures::{future::try_join_all, AsyncReadExt},
     iterator_ext::IteratorExt,
     itertools::Itertools,
@@ -17,100 +17,6 @@ use {
 };
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
-
-#[derive(Clone, Default)]
-pub enum Vendor {
-    #[default]
-    Debian,
-    Devuan,
-    Ubuntu,
-}
-
-#[macro_export]
-macro_rules! source {
-    ($url:tt [ $( $suite:expr )* ] [ $( $comp:expr )* ] ) => {
-        Source {
-            url: ($url).into(),
-            suites: vec![$( ($suite).into() ,)* ],
-            components: vec![$(($comp).into() ,)* ],
-            ..Default::default()
-        }
-    }
-}
-
-impl Vendor {
-    pub fn defailt_suite(&self) -> &str {
-        match self {
-            Vendor::Debian => "trixie",
-            Vendor::Devuan => "daedalus",
-            Vendor::Ubuntu => "noble",
-        }
-    }
-    pub fn default_requirements(&self) -> &[&'static str] {
-        match self {
-            Vendor::Debian => &["apt", "ca-certificates"],
-            Vendor::Ubuntu => &["apt", "ca-certificates"],
-            Vendor::Devuan => &["apt", "ca-certificates", "devuan-keyring"],
-        }
-    }
-    pub fn sources_for<S: AsRef<str>>(&self, suite: S) -> Vec<Source> {
-        let suite = suite.as_ref();
-        match self {
-            Vendor::Devuan => vec![
-                source! {"http://deb.devuan.org/merged/" [
-                    suite
-                    format!("{}-updates", suite)
-                    format!("{}-security", suite)
-                ] [ "main" ]},
-            ],
-            Vendor::Debian => vec![
-                source! {"https://ftp.debian.org/debian/" [ 
-                    suite
-                    format!("{}-updates", suite)
-                    format!("{}-backports", suite)
-                ] [ "main" ]}
-                    .with_snapshots("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"),
-                source! {"https://security.debian.org/debian-security/" [ format!("{}-security", suite) ] [ "main" ]}
-                    .with_snapshots("https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"),
-            ],
-            Vendor::Ubuntu => {
-                vec![
-                    source! {"https://archive.ubuntu.com/ubuntu/" [ suite ] [ "main" "universe" ]}
-                        .with_snapshots("https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/")
-                ]
-            }
-        }
-    }
-}
-
-impl std::fmt::Display for Vendor {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::Debian => write!(f, "debian"),
-            Self::Devuan => write!(f, "devuan"),
-            Self::Ubuntu => write!(f, "ubuntu"),
-        }
-    }
-}
-
-impl ValueEnum for Vendor {
-    fn value_variants<'a>() -> &'a [Self] {
-        &[Self::Debian, Self::Devuan, Self::Ubuntu]
-    }
-    fn to_possible_value(&self) -> Option<clap::builder::PossibleValue> {
-        Some(match self {
-            Self::Debian => clap::builder::PossibleValue::new("debian")
-                .help("Use Debian as the vendor")
-                .alias("Debian"),
-            Self::Devuan => clap::builder::PossibleValue::new("devuan")
-                .help("Use Devuan as the vendor")
-                .alias("Devuan"),
-            Self::Ubuntu => clap::builder::PossibleValue::new("ubuntu")
-                .help("Use Ubuntu as the vendor")
-                .alias("Ubuntu"),
-        })
-    }
-}
 
 fn default_components() -> Vec<String> {
     vec!["main".to_string()]
@@ -583,8 +489,12 @@ impl RepositoryIndexFile {
 #[serde(deny_unknown_fields)]
 #[group(required = true, multiple = true)]
 pub struct Source {
+    /// Repository URL
+    #[arg(value_name = "URL")]
+    pub url: String,
+
     /// Only include listed architecture
-    #[arg(long = "arch", value_name = "ARCH", value_delimiter = ',')]
+    #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
 
@@ -606,16 +516,12 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
 
-    /// Repository URL
-    #[arg(value_name = "URL")]
-    pub url: String,
-
     /// Suite or codename (i.e. "focal", "buster", "stable", "testing", "unstable", etc.)
-    #[arg(value_name = "SUITE or CODENAME")]
+    #[arg(short = 's', long = "suite", value_name = "SUITE", num_args = 1, action = clap::ArgAction::Set)]
     pub suites: Vec<String>,
 
     /// Space separated list of components (i.e. "main", "contrib", "non-free", etc.)
-    #[arg(value_name = "COMPONENT")]
+    #[arg(short = 'c', long = "components", value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 
@@ -815,6 +721,104 @@ impl Source {
                 hash,
             )
             .await
+    }
+    pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {
+        match self.url.to_ascii_lowercase().as_str() {
+            "debian" => {
+                const DEFAULT_SUITE: &str = "trixie";
+                let mut source = self.clone();
+                let mut security: Option<Source> = None;
+                source.url = "https://ftp.debian.org/debian/".to_string();
+                if self.snapshot.is_none() {
+                    source.snapshots = Some(
+                        "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/".to_string(),
+                    );
+                }
+                if self.components.is_empty() {
+                    source.components = vec!["main".to_string()];
+                }
+                if self.suites.len() < 2 {
+                    let s = if self.suites.is_empty() {
+                        DEFAULT_SUITE
+                    } else {
+                        self.suites[0].as_str()
+                    };
+                    if s != "sid" && s != "unstable" {
+                        source.suites = ["", "-updates", "-backports"]
+                            .iter()
+                            .map(|f| format!("{}{}", s, f))
+                            .collect();
+                        security = Some(Source {
+                            url: "https://security.debian.org/debian-security/".to_string(),
+                            suites: vec![format!("{}-security", s)],
+                            snapshots: Some(
+                                "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
+                                    .to_string(),
+                            ),
+                            ..source.clone()
+                        });
+                    }
+                }
+                let mut sources = vec![source];
+                sources.extend(security);
+                Some((sources, vec!["ca-certificates".to_string()]))
+            }
+            "ubuntu" => {
+                const DEFAULT_SUITE: &str = "noble";
+                let mut source = self.clone();
+                source.url = "https://archive.ubuntu.com/ubuntu/".to_string();
+                if self.snapshot.is_none() {
+                    source.snapshots =
+                        Some("https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/".to_string());
+                }
+                if self.components.is_empty() {
+                    source.components = vec!["main".to_string(), "universe".to_string()];
+                }
+                if self.suites.len() < 2 {
+                    let s = if self.suites.is_empty() {
+                        DEFAULT_SUITE
+                    } else {
+                        self.suites[0].as_str()
+                    };
+                    source.suites = ["", "-updates", "-backports", "-security"]
+                        .iter()
+                        .map(|f| format!("{}{}", s, f))
+                        .collect();
+                }
+                Some((vec![source], vec!["ca-certificates".to_string()]))
+            }
+            "devuan" => {
+                const DEFAULT_SUITE: &str = "daedalus";
+                let mut source = self.clone();
+                source.url = "http://deb.devuan.org/merged/".to_string();
+                source.snapshots = None;
+                Some("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/".to_string());
+                if self.components.is_empty() {
+                    source.components = vec!["main".to_string()];
+                }
+                if self.suites.len() < 2 {
+                    let s = if self.suites.is_empty() {
+                        DEFAULT_SUITE
+                    } else {
+                        self.suites[0].as_str()
+                    };
+                    if s != "ceres"
+                        && s != "unstable"
+                        && !s.chars().next().map_or(false, |c| c.is_ascii_digit())
+                    {
+                        source.suites = ["", "-updates", "-backports", "-security"]
+                            .iter()
+                            .map(|f| format!("{}{}", s, f))
+                            .collect();
+                    }
+                }
+                Some((
+                    vec![source],
+                    vec!["ca-certificates".to_string(), "devuan-keyring".to_string()],
+                ))
+            }
+            _ => None,
+        }
     }
 }
 
