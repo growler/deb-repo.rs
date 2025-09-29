@@ -52,7 +52,7 @@ impl Release {
         if components.iter().any(|c| {
             !release_components.split_ascii_whitespace().any(|rc| {
                 rc.split('/')
-                    .last()
+                    .next_back()
                     .map(|s| s == c.as_ref())
                     .unwrap_or(false)
             })
@@ -109,7 +109,7 @@ impl Release {
             })
     }
     fn field(&self, name: &str) -> Option<&str> {
-        self.inner.with_control(|ctrl| ctrl.field(name).map(|s| s))
+        self.inner.with_control(|ctrl| ctrl.field(name))
     }
     pub fn codename(&self) -> Option<&str> {
         self.field("Codename")
@@ -147,6 +147,7 @@ impl Release {
         Ok(Release {
             inner: ReleaseInnerTryBuilder {
                 data,
+                #[allow(clippy::borrowed_box)]
                 control_builder: |data: &'_ Box<str>| {
                     ControlStanza::parse(data.as_ref()).map_err(|err| {
                         ParseError::from(format!("error parsing release file: {}", err))

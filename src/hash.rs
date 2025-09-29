@@ -168,9 +168,9 @@ impl FileHash {
     }
     pub fn hash(kind: &str, data: &[u8]) -> Option<Self> {
         match kind {
-            "MD5sum" => Some(Hash::<md5::Md5>::hash(data).into()),
-            "SHA256" => Some(Hash::<sha2::Sha256>::hash(data).into()),
-            "SHA512" => Some(Hash::<sha2::Sha512>::hash(data).into()),
+            "MD5sum" => Some(Hash::<md5::Md5>::from_bytes(data).into()),
+            "SHA256" => Some(Hash::<sha2::Sha256>::from_bytes(data).into()),
+            "SHA512" => Some(Hash::<sha2::Sha512>::from_bytes(data).into()),
             _ => None,
         }
     }
@@ -190,7 +190,7 @@ impl FileHash {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             [HEX[(c >> 4) as usize], HEX[(c & 0x0f) as usize]]
         }
-        while hash.len() > 0 {
+        while !hash.is_empty() {
             buffer.push_str(unsafe { str::from_utf8_unchecked(&hexadecimal(hash[0])) });
             if levels > 0 {
                 buffer.push('/');
@@ -272,7 +272,7 @@ pub struct Hash<D: HashAlgo> {
 }
 
 impl<D: HashAlgo> Hash<D> {
-    pub fn hash(data: &[u8]) -> Self {
+    pub fn from_bytes(data: &[u8]) -> Self {
         let mut hasher = D::default();
         hasher.update(data);
         Hash {
@@ -818,12 +818,8 @@ mod tests {
 
         assert_eq!(expected_digest, expected_digest1);
 
-        let expected_digest2 = expected_digest.clone();
-        assert_eq!(expected_digest, expected_digest2);
-
         let cursor = Cursor::new(data);
-        let mut reader =
-            VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.clone().into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.into());
 
         let mut buf = vec![0; size.try_into().unwrap()];
         let n = reader.read(&mut buf).await.unwrap() as u64;
@@ -846,8 +842,7 @@ mod tests {
         let incorrect_digest = Sha256::digest(b"incorrect");
 
         let cursor = Cursor::new(data);
-        let mut reader =
-            VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest.clone().into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest.into());
 
         let mut buf = vec![0; size.try_into().unwrap()];
         let n = reader.read(&mut buf).await.unwrap() as u64;
@@ -869,8 +864,7 @@ mod tests {
         let expected_digest = hasher.finalize();
 
         let cursor = Cursor::new(data);
-        let mut reader =
-            VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.clone().into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.into());
 
         let mut buf = vec![0; data.len()];
         let n = reader.read(&mut buf).await.unwrap();

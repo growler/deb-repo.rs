@@ -29,6 +29,7 @@ pub trait DeploymentRoot {
 }
 
 /// Defines a file system interface to deploy packages.
+#[allow(clippy::too_many_arguments)]
 #[async_trait::async_trait(?Send)]
 pub trait DeploymentFileSystem {
     type File: DeploymentFile;

@@ -280,11 +280,14 @@ pub(crate) struct InternResult<IdType, Value> {
     id: IdType,
     val: Value,
 }
-impl<IdType, Value> InternResult<IdType, Value> {
+impl<IdType, Value> InternResult<IdType, Value>
+where
+    IdType: Copy,
+{
     pub(crate) fn into_ref(self) -> Value {
         self.val
     }
-    pub(crate) fn as_id(self) -> IdType {
+    pub(crate) fn as_id(&self) -> IdType {
         self.id
     }
 }

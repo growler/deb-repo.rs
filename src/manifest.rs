@@ -141,7 +141,7 @@ impl Manifest {
             doc,
             hash: None,
             file: ManifestFile {
-                sources: sources,
+                sources,
                 specs: KVList::new(),
             },
             lock: LockFile {
@@ -462,7 +462,7 @@ impl Manifest {
                 .and_then(|r| r.as_table_mut())
                 .expect("a table of specs")
                 .entry(spec_name)
-                .or_insert_with(|| toml_edit::table())
+                .or_insert_with(toml_edit::table)
                 .as_table_mut()
                 .expect("a vaild table")
                 .entry(kind)
@@ -486,7 +486,7 @@ impl Manifest {
             if let Some(comment) = comment.take() {
                 item.decor_mut().set_prefix(format!("{comment}\n    "));
             } else {
-                item.decor_mut().set_prefix(format!("\n    "));
+                item.decor_mut().set_prefix("\n    ".to_string());
             }
             arr.push_formatted(item);
         }
@@ -774,7 +774,7 @@ impl Manifest {
                 };
                 if let Some(spec) = tbl {
                     if let Some(extends) = extends.as_deref() {
-                        spec["extends"] = toml_edit::value(extends).into();
+                        spec["extends"] = toml_edit::value(extends);
                     } else {
                         spec.remove("extends");
                     }
@@ -793,17 +793,15 @@ impl Manifest {
             locked_sources
                 .iter()
                 .enumerate()
-                .map(|(i, locked_source)| {
+                .flat_map(|(i, locked_source)| {
                     locked_source
                         .as_ref()
                         .expect("a locked source")
                         .suites
                         .iter()
-                        .map(|s| s.packages.iter())
-                        .flatten()
+                        .flat_map(|s| s.packages.iter())
                         .map(move |f| (i, f))
                 })
-                .flatten()
                 .map(|(i, file)| async move {
                     self.file.sources[i]
                         .file_by_hash(transport, file)
@@ -938,7 +936,7 @@ impl Manifest {
             } else {
                 &self.lock.sources
             };
-            self.make_universe(&locked_sources, concurrency, transport)
+            self.make_universe(locked_sources, concurrency, transport)
                 .await?
         };
         if self.lock.specs.iter_values().any(Option::is_none) {
@@ -1112,8 +1110,8 @@ impl LockedSource {
                 .await?
                 .into_iter()
                 .map(|(rel, pkgs)| LockedSuite {
-                    release: rel.into(),
-                    packages: pkgs.into_iter().map(|p| p.into()).collect(),
+                    release: rel,
+                    packages: pkgs.into_iter().collect(),
                 })
                 .collect(),
         })
@@ -1365,7 +1363,7 @@ impl<'de> Deserialize<'de> for KVList<Spec> {
                         }
                         other => {
                             let key = valid_spec_name(other).map_err(A::Error::custom)?;
-                            if Self::has_name(&out, &key) {
+                            if Self::has_name(&out, key) {
                                 return Err(A::Error::custom(format!(
                                     "duplicate spec name: {other}"
                                 )));

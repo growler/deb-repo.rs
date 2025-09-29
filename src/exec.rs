@@ -120,8 +120,6 @@ where
         .chain(std::iter::once(std::ptr::null_mut()))
         .collect();
 
-    static EMPTY_CSTR: &CStr = unsafe { CStr::from_bytes_with_nul_unchecked(b"\0") };
-
     let ppidfd = pidfd_open(getpid(), PidfdFlags::empty()).map_err(io::Error::from)?;
     let mut ppidfd_flags = fcntl_getfd(&ppidfd)?;
     ppidfd_flags.insert(FdFlags::CLOEXEC);
@@ -182,7 +180,7 @@ where
             let envp: *const *mut libc::c_char = environ as *const *mut libc::c_char;
             libc::execveat(
                 fd_raw,
-                EMPTY_CSTR.as_ptr(),
+                c"".as_ptr(),
                 argv.as_ptr(),
                 envp,
                 libc::AT_EMPTY_PATH,
@@ -201,7 +199,7 @@ where
             libc::_exit(code);
         },
         _child => {
-            return Ok(unsafe { OwnedFd::from_raw_fd(pidfd) });
+            Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
         }
     }
 }
@@ -258,7 +256,7 @@ macro_rules! helper {
                 }
             )*
                 Some(cmd) => {
-                    Err(std::io::Error::other(format!("unknwon command {}", cmd.display())))
+                    Err(std::io::Error::other(format!("unknwon command {}", cmd.to_string_lossy())))
                 }
                 None => {
                     Err(std::io::Error::other("no command"))
@@ -318,7 +316,7 @@ where
 {
     fn spawn(h: &H) -> io::Result<Helper> {
         let args = h.as_argv();
-        spawn_helper(H::NAME, args, H::UNSHARE).map(|s| Helper(s))
+        spawn_helper(H::NAME, args, H::UNSHARE).map(Helper)
     }
     fn exec(args: ArgsOs) -> io::Result<()> {
         let args: Vec<String> = args
@@ -361,7 +359,7 @@ where
             .ok_or_else(|| io::Error::other("helper: expects an fd param"))
             .and_then(|s| {
                 s.into_string().map_err(|err| {
-                    io::Error::other(format!("helper: invalid fd param: {}", err.display()))
+                    io::Error::other(format!("helper: invalid fd param: {}", err.to_string_lossy()))
                 })
             })
             .and_then(|s| {

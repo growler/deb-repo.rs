@@ -173,6 +173,11 @@ impl<FS: DeploymentFileSystem + Clone + Send + Sync + 'static> SimpleBuilder<FS>
         }
     }
 }
+impl<FS: DeploymentFileSystem + Clone + Send + Sync + 'static> Default for SimpleBuilder<FS> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct BuildRunner {
@@ -240,6 +245,7 @@ impl ExecHelper for BuildRunner {
         let mut f = std::fs::OpenOptions::new()
             .mode(0o755)
             .create(true)
+            .truncate(true)
             .write(true)
             .open("usr/sbin/policy-rc.d")?;
         f.write_all(b"#!/bin/sh\nexit 101\n")?;
@@ -261,7 +267,7 @@ impl ExecHelper for BuildRunner {
             .args(
                 ["--force-depends", "--configure"]
                     .iter()
-                    .map(|s| *s)
+                    .copied()
                     .chain(self.essentials.iter().map(|s| s.as_str())),
             )
             .status()?;

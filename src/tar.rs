@@ -308,12 +308,12 @@ enum Entry {
 
 #[derive(Debug, PartialEq, Eq)]
 enum State {
-    HEADER,
-    EXTENSION((u32, Kind)),
-    ENTRY,
-    PADDING,
-    EOF,
-    EOFF,
+    Header,
+    Extension((u32, Kind)),
+    Entry,
+    Padding,
+    Eof,
+    Eoff,
 }
 use State::*;
 
@@ -333,7 +333,7 @@ impl ExtensionBuffer {
         }
     }
     unsafe fn upto(&mut self, n: usize) -> &mut [u8] {
-        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr() as *mut u8, n)
+        std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), n)
     }
     unsafe fn remaining_buf(&mut self) -> &mut [u8] {
         let remaining = self.buf.spare_capacity_mut();
@@ -439,7 +439,7 @@ fn entry_name_link(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<(Box
 impl<R: AsyncRead + Send> TarReaderInner<R> {
     fn new(r: R) -> Self {
         Self {
-            state: HEADER,
+            state: Header,
             pos: 0,
             nxt: BLOCK_SIZE as u64,
             ext: None,
@@ -456,7 +456,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
         loop {
             // println!("st={:?} pos={} nxt={}", *this.state, *this.pos, *this.nxt);
             match this.state {
-                HEADER => {
+                Header => {
                     let remaining = *this.nxt - *this.pos;
                     let n = {
                         let filled = BLOCK_SIZE - remaining as usize;
@@ -477,7 +477,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     }
                     if this.header.is_zero() {
                         *this.nxt += BLOCK_SIZE as u64;
-                        *this.state = EOF;
+                        *this.state = Eof;
                         continue;
                     }
                     let kind = this.header.entry_type().map_err(|t| {
@@ -492,7 +492,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             let path_name = entry_name(this.header, this.exts)?;
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
                                 *this.nxt += BLOCK_SIZE as u64;
-                                *this.state = HEADER;
+                                *this.state = Header;
                                 Entry::Directory(TarDirectory {
                                     size,
                                     mode: this.header.mode()?,
@@ -503,7 +503,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                                 })
                             } else {
                                 *this.nxt += size;
-                                *this.state = ENTRY;
+                                *this.state = Entry;
                                 Entry::File {
                                     size,
                                     mode: this.header.mode()?,
@@ -518,7 +518,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         Kind::Directory if !this.header.is_old() => {
                             let size = this.header.size()?;
                             *this.nxt += BLOCK_SIZE as u64;
-                            *this.state = HEADER;
+                            *this.state = Header;
                             let path_name = entry_name(this.header, this.exts)?;
                             Ok(Entry::Directory(TarDirectory {
                                 size,
@@ -531,7 +531,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         }
                         Kind::Link => {
                             *this.nxt += BLOCK_SIZE as u64;
-                            *this.state = HEADER;
+                            *this.state = Header;
                             let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
                             Ok(Entry::Link(TarLink {
                                 path_name,
@@ -540,7 +540,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         }
                         Kind::Symlink if !this.header.is_old() => {
                             *this.nxt += BLOCK_SIZE as u64;
-                            *this.state = HEADER;
+                            *this.state = Header;
                             let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
                             Ok(Entry::Symlink(TarSymlink {
                                 mode: this.header.mode()?,
@@ -562,7 +562,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                                     Ok(n)
                                 }
                             })?;
-                            *this.state = EXTENSION((size as u32, kind));
+                            *this.state = Extension((size as u32, kind));
                             let padded = padded_size(size as u64);
                             *this.nxt += padded;
                             if size > BLOCK_SIZE {
@@ -576,7 +576,7 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         )),
                     }));
                 }
-                EXTENSION((size, kind)) => {
+                Extension((size, kind)) => {
                     let (ext, reader) = (&mut this.ext, &mut this.reader);
                     let n = if *size as usize <= BLOCK_SIZE {
                         let remaining = *this.nxt - *this.pos;
@@ -613,11 +613,11 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                             _ => unreachable!(),
                         });
                         *this.nxt += BLOCK_SIZE as u64;
-                        *this.state = HEADER;
+                        *this.state = Header;
                     }
                     continue;
                 }
-                PADDING => {
+                Padding => {
                     let remaining = *this.nxt - *this.pos;
                     let (hdr, reader) = (&mut this.header, &mut this.reader);
                     let n = match ready_opt!(
@@ -632,11 +632,11 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     *this.pos += n;
                     if remaining == n {
                         *this.nxt = *this.pos + BLOCK_SIZE as u64;
-                        *this.state = HEADER;
+                        *this.state = Header;
                     }
                     continue;
                 }
-                ENTRY => {
+                Entry => {
                     // skipping a entry
                     let nxt = padded_size(*this.nxt);
                     let remaining =
@@ -665,11 +665,11 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                     if *this.pos == nxt {
                         this.ext.take();
                         *this.nxt = *this.pos + BLOCK_SIZE as u64;
-                        *this.state = HEADER;
+                        *this.state = Header;
                     }
                     continue;
                 }
-                EOF => {
+                Eof => {
                     let remaining = *this.nxt - *this.pos;
                     let filled = BLOCK_SIZE - remaining as usize;
                     let (hdr, reader) = (&mut this.header, &mut this.reader);
@@ -685,17 +685,17 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         continue;
                     }
                     return Poll::Ready(if hdr.is_zero() {
-                        *this.state = EOFF;
+                        *this.state = Eoff;
                         None
                     } else {
-                        *this.state = EOFF;
+                        *this.state = Eoff;
                         Some(Err(Error::new(
                             ErrorKind::InvalidData,
                             "unexpected data after first zero block",
                         )))
                     });
                 }
-                EOFF => {
+                Eoff => {
                     return Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
                         "unexpected read after EOF",
@@ -866,10 +866,10 @@ impl<R: AsyncRead + Send> AsyncRead for TarRegularFile<R> {
             let nxt = padded_size(*inner.nxt);
             if *inner.pos == nxt {
                 *inner.nxt = nxt + BLOCK_SIZE as u64;
-                *inner.state = HEADER;
+                *inner.state = Header;
             } else {
                 *inner.nxt = nxt;
-                *inner.state = PADDING;
+                *inner.state = Padding;
             }
             n
         }))

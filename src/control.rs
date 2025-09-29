@@ -209,6 +209,9 @@ impl MutableControlStanza {
             .map(|field| field.name.len() + 1 + field.value.len())
             .sum()
     }
+    pub fn is_empty(&self) -> bool {
+        self.inner.with_fields(|fields| fields.is_empty())
+    }
     /// Returns the value of the `name` field if it is present in the stanza
     pub fn field(&self, name: &str) -> Option<&str> {
         self.inner.with_fields(|fields| {

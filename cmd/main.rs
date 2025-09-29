@@ -154,7 +154,7 @@ impl Command for Init {
                 };
             let mut mf = Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment);
             mf.add_requirements(&DEFAULT_SPEC_NAME, packages.iter(), None::<&str>)?;
-            mf.resolve(conf.concurrency.into(), conf.transport().await?.as_ref())
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
             Ok(())
@@ -254,7 +254,7 @@ impl Command for Exclude {
 struct Update {}
 
 impl Command for Update {
-    fn exec(&self, conf: &App) -> Result<()> {
+    fn exec(&self, _conf: &App) -> Result<()> {
         Ok(())
     }
 }
@@ -301,14 +301,12 @@ impl Command for Search {
                 .collect::<Result<Vec<_>>>()?;
             let mut pkgs = mf
                 .packages()
-                .filter_map(|p| {
-                    res.iter()
-                        .any(|re| {
-                            re.is_match(p.name())
-                                || (!self.names_only
-                                    && re.is_match(p.field("Description").unwrap_or("")))
-                        })
-                        .then_some(p)
+                .filter(|p| {
+                    res.iter().any(|re| {
+                        re.is_match(p.name())
+                            || (!self.names_only
+                                && re.is_match(p.field("Description").unwrap_or("")))
+                    })
                 })
                 .collect::<Vec<_>>();
             pkgs.sort_by_key(|&pkg| pkg.name());
@@ -361,13 +359,7 @@ impl Command for List {
                 .map_err(|e| anyhow!("failed to update specs: {e}"))?;
             let mut pkgs = mf
                 .spec_packages(&self.spec)?
-                .filter_map(|p| {
-                    if self.only_essential {
-                        p.essential().then_some(p)
-                    } else {
-                        Some(p)
-                    }
-                })
+                .filter(|p| !self.only_essential || p.essential())
                 .collect::<Vec<_>>();
             pkgs.sort_by_key(|&pkg| pkg.name());
             let mut out = std::io::stdout().lock();
@@ -489,7 +481,7 @@ struct Fetch {
 }
 
 impl Command for Fetch {
-    fn exec(&self, conf: &App) -> Result<()> {
+    fn exec(&self, _conf: &App) -> Result<()> {
         // let start = std::time::Instant::now();
         // let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
         // let release = if self.verify {

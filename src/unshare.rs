@@ -92,7 +92,7 @@ impl Argv for UnshareUserNs {
         .map(|s| s.into())
     }
     fn from_argv<S: AsRef<str>>(args: &[S]) -> io::Result<Self> {
-        let mut args = args.into_iter().map(|s| s.as_ref());
+        let mut args = args.iter().map(|s| s.as_ref());
         fn err<T>(name: &'static str) -> io::Result<T> {
             Err(io::Error::other(format!("helper: missing {}", name)))
         }
@@ -189,9 +189,9 @@ fn get_user_name(uid: Uid) -> Option<String> {
         let name = unsafe { CStr::from_ptr(pwd.pw_name) }
             .to_string_lossy()
             .into_owned();
-        return Some(name);
+        Some(name)
     } else {
-        return None;
+        None
     }
 }
 

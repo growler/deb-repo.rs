@@ -668,7 +668,7 @@ impl Source {
             .await?;
         self.verify_signed_release(data).await
     }
-    pub(crate) async fn file_by_hash<'a, T>(
+    pub(crate) async fn file_by_hash<T>(
         &self,
         transport: &T,
         file: &RepositoryFile,
@@ -686,8 +686,8 @@ impl Source {
             .await
             .map(|s| s.into_boxed_slice())
     }
-    pub(crate) async fn files<'a, T: TransportProvider + ?Sized>(
-        &'a self,
+    pub(crate) async fn files<T: TransportProvider + ?Sized>(
+        &self,
         arch: &str,
         sem: &Arc<Semaphore>,
         transport: &T,
@@ -801,7 +801,6 @@ impl Source {
                 let mut source = self.clone();
                 source.url = "http://deb.devuan.org/merged/".to_string();
                 source.snapshots = None;
-                Some("https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/".to_string());
                 if self.components.is_empty() {
                     source.components = vec!["main".to_string()];
                 }
@@ -813,7 +812,7 @@ impl Source {
                     };
                     if s != "ceres"
                         && s != "unstable"
-                        && !s.chars().next().map_or(false, |c| c.is_ascii_digit())
+                        && !s.chars().next().is_some_and(|c| c.is_ascii_digit())
                     {
                         source.suites = ["", "-updates", "-backports", "-security"]
                             .iter()
