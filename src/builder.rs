@@ -1,11 +1,11 @@
 use {
     crate::{
         control::MutableControlStanza,
-        deployfs::{DeploymentFileSystem, DeploymentRoot},
+        deployfs::DeploymentFileSystem,
         exec::{ExecHelper, HelperExitStatus, WithSerde},
         manifest::Manifest,
         source::RepositoryFile,
-        Source, TransportProvider,
+        LocalFileSystem, Source, TransportProvider,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     futures_lite::io::AsyncWriteExt,
@@ -27,29 +27,119 @@ use {
 };
 
 #[async_trait::async_trait(?Send)]
-pub trait Builder<FS: DeploymentFileSystem> {
-    async fn merge_deb_content<'a, T>(
-        &self,
-        source: &'a Source,
+pub trait UnpackStrategy<FS: DeploymentFileSystem + ?Sized> {
+    async fn unpack_deb<T>(
+        source: &Source,
         transport: &T,
-        package: &'a RepositoryFile,
+        package: &RepositoryFile,
         fs: &FS,
     ) -> io::Result<MutableControlStanza>
     where
         T: TransportProvider + ?Sized;
-    async fn build_tree<'a, I, T>(
+}
+
+pub struct Parallel;
+
+#[async_trait::async_trait(?Send)]
+impl<FS> UnpackStrategy<FS> for Parallel
+where
+    FS: DeploymentFileSystem + Send + Sync + Clone + 'static,
+{
+    async fn unpack_deb<T>(
+        source: &Source,
+        transport: &T,
+        package: &RepositoryFile,
+        fs: &FS,
+    ) -> io::Result<MutableControlStanza>
+    where
+        T: TransportProvider + Send + Sync + ?Sized,
+    {
+        let deb = source
+            .deb_reader(&package.path, package.size, &package.hash, transport)
+            .await?;
+        let fs = fs.clone();
+        blocking::unblock(move || smol::block_on(async { deb.extract_to(&fs).await })).await
+    }
+}
+
+pub struct Local;
+
+#[async_trait::async_trait(?Send)]
+impl<FS> UnpackStrategy<FS> for Local
+where
+    FS: DeploymentFileSystem + ?Sized,
+{
+    async fn unpack_deb<T>(
+        source: &Source,
+        transport: &T,
+        package: &RepositoryFile,
+        fs: &FS,
+    ) -> io::Result<MutableControlStanza>
+    where
+        T: TransportProvider + ?Sized,
+    {
+        let deb = source
+            .deb_reader(&package.path, package.size, &package.hash, transport)
+            .await?;
+        deb.extract_to(fs).await
+    }
+}
+
+pub trait Mounter: Serialize + for<'de> Deserialize<'de> {
+    fn mount_root(&self) -> io::Result<PathBuf>;
+}
+
+#[async_trait::async_trait(?Send)]
+pub trait NewBuilder
+where
+    Self: Sized,
+{
+    type FileSystem: DeploymentFileSystem + ?Sized;
+    type Unpack: UnpackStrategy<Self::FileSystem>;
+    type Mounter: Mounter;
+    fn mounter(&self, fs: &Self::FileSystem) -> io::Result<Self::Mounter>;
+    async fn build<'a, S, T>(
+        &self,
+        manifest: &Manifest,
+        spec: &Option<S>,
+        concurrency: NonZero<usize>,
+        transport: &T,
+        fs: &Self::FileSystem,
+    ) -> io::Result<()>
+    where
+        T: TransportProvider + ?Sized,
+        S: AsRef<str>,
+    {
+        let installables = manifest
+            .installables(spec)?
+            .collect::<io::Result<Vec<_>>>()?;
+        let essentials = self
+            .unpack_debs(installables, concurrency, transport, fs)
+            .await?;
+        let mounter = self.mounter(fs)?;
+        let runner = NewBuildRunner::<Self>::new(essentials, mounter);
+        if !runner.run().await?.is_success() {
+            Err(io::Error::other("failed to build tree"))
+        } else {
+            Ok(())
+        }
+    }
+    async fn unpack_debs<'a, I, T>(
         &self,
         packages: I,
         concurrency: NonZero<usize>,
         transport: &T,
-        fs: &FS,
+        fs: &Self::FileSystem,
     ) -> io::Result<Vec<String>>
     where
         I: IntoIterator<Item = (&'a Source, &'a RepositoryFile)> + 'a,
         T: TransportProvider + ?Sized,
     {
         let mut installed = stream::iter(packages.into_iter().map(|(source, file)| async move {
-            let mut ctrl = self.merge_deb_content(source, transport, file, fs).await?;
+            let mut ctrl = <Self::Unpack as UnpackStrategy<Self::FileSystem>>::unpack_deb(
+                source, transport, file, fs,
+            )
+            .await?;
             let mut essential = ctrl
                 .field("Essential")
                 .map(|v| v.eq_ignore_ascii_case("yes"))
@@ -109,126 +199,41 @@ pub trait Builder<FS: DeploymentFileSystem> {
         }
         Ok(essentials)
     }
-    async fn build<T, S>(
-        &self,
-        manifest: &Manifest,
-        spec: &Option<S>,
-        concurrency: NonZero<usize>,
-        transport: &T,
-        fs: &FS,
-    ) -> io::Result<()>
-    where
-        T: TransportProvider + ?Sized,
-        S: AsRef<str>,
-    {
-        let installables = manifest
-            .installables(spec)?
-            .collect::<io::Result<Vec<_>>>()?;
-        let essentials = self
-            .build_tree(installables, concurrency, transport, fs)
-            .await?;
-        let root = fs.root().await?.path()?.to_path_buf();
-        let runner = BuildRunner::new(root, essentials.clone());
-        if !runner.run().await?.is_success() {
-            Err(io::Error::other("failed to build tree"))
-        } else {
-            Ok(())
-        }
-    }
-}
-
-#[async_trait::async_trait(?Send)]
-impl<FS> Builder<FS> for SimpleBuilder<FS>
-where
-    FS: DeploymentFileSystem + Clone + Send + Sync + 'static,
-{
-    async fn merge_deb_content<'a, T>(
-        &self,
-        source: &'a Source,
-        transport: &T,
-        package: &'a RepositoryFile,
-        fs: &FS,
-    ) -> io::Result<MutableControlStanza>
-    where
-        T: TransportProvider + ?Sized,
-    {
-        let deb = source
-            .deb_reader(&package.path, package.size, &package.hash, transport)
-            .await?;
-        let fs = fs.clone();
-        let ctrl =
-            blocking::unblock(move || smol::block_on(async { deb.extract_to(&fs).await })).await?;
-        Ok(ctrl)
-    }
-}
-
-pub struct SimpleBuilder<FS: DeploymentFileSystem> {
-    _phantom: std::marker::PhantomData<FS>,
-}
-
-impl<FS: DeploymentFileSystem + Clone + Send + Sync + 'static> SimpleBuilder<FS> {
-    pub fn new() -> Self {
-        Self {
-            _phantom: std::marker::PhantomData,
-        }
-    }
-}
-impl<FS: DeploymentFileSystem + Clone + Send + Sync + 'static> Default for SimpleBuilder<FS> {
-    fn default() -> Self {
-        Self::new()
-    }
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct BuildRunner {
-    root: PathBuf,
+pub struct NewBuildRunner<B: NewBuilder> {
     essentials: Vec<String>,
+    mounter: B::Mounter,
 }
 
-impl BuildRunner {
-    pub fn new(root: PathBuf, essentials: impl IntoIterator<Item = String>) -> Self {
+impl<B: NewBuilder> NewBuildRunner<B> {
+    fn new(essentials: Vec<String>, mounter: B::Mounter) -> Self {
         Self {
-            root,
-            essentials: essentials.into_iter().collect(),
+            essentials,
+            mounter,
         }
     }
-    pub async fn run(&self) -> io::Result<HelperExitStatus> {
+    async fn run(&self) -> io::Result<HelperExitStatus> {
         self.spawn()?.status().await
     }
 }
 
-fn mkdirat_if_not_exist<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, mode: Mode) -> io::Result<()> {
-    mkdirat(&dirfd, path, mode).map_or_else(
-        |op| match op {
-            Errno::EXIST => Ok(()),
-            err => Err(io::Error::from(err)),
-        },
-        |_| Ok(()),
-    )
-}
-
-impl ExecHelper for BuildRunner {
-    const NAME: &'static str = "builder";
-    const UNSHARE: bool = true;
-    type PassParam = WithSerde;
-    fn exec(mut self) -> std::io::Result<()> {
-        use std::io::Write;
+impl<B> NewBuildRunner<B>
+where
+    B: NewBuilder,
+{
+    fn pivot_root(&self) -> io::Result<()> {
+        let root = self.mounter.mount_root()?;
         let root_dfd = openat(
             CWD,
-            &self.root,
+            &root,
             OFlags::DIRECTORY | OFlags::RDONLY,
             Mode::empty(),
         )?;
         mkdirat_if_not_exist(&root_dfd, "dev", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "proc", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "run", Mode::from_raw_mode(0o755))?;
-        make_mountpoint(&root_dfd)?;
-        let root_dfd = openat(
-            CWD,
-            &self.root,
-            OFlags::DIRECTORY | OFlags::RDONLY,
-            Mode::empty(),
-        )?;
         mount_dev(&root_dfd)?;
         mount_pts(&root_dfd)?;
         mount_proc(&root_dfd)?;
@@ -236,12 +241,15 @@ impl ExecHelper for BuildRunner {
         fchdir(&root_dfd)?;
         pivot_root(".", ".")?;
         unmount(".", UnmountFlags::DETACH)?;
+        Ok(())
+    }
+
+    fn configure(&self) -> io::Result<()> {
+        use std::io::Write;
         let env = [
             ("DEBIAN_FRONTEND", "noninteractive"),
             ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
         ];
-        self.essentials
-            .retain(|s| s != "base-files" && s != "base-passwd");
         let mut f = std::fs::OpenOptions::new()
             .mode(0o755)
             .create(true)
@@ -265,10 +273,12 @@ impl ExecHelper for BuildRunner {
             .env_clear()
             .envs(env)
             .args(
-                ["--force-depends", "--configure"]
-                    .iter()
-                    .copied()
-                    .chain(self.essentials.iter().map(|s| s.as_str())),
+                ["--force-depends", "--configure"].iter().copied().chain(
+                    self.essentials
+                        .iter()
+                        .map(|s| s.as_str())
+                        .filter(|s| *s != "base-files" && *s != "base-passwd"),
+                ),
             )
             .status()?;
         Command::new("/usr/bin/dpkg")
@@ -280,6 +290,65 @@ impl ExecHelper for BuildRunner {
         Ok(())
     }
 }
+
+impl<B> ExecHelper for NewBuildRunner<B>
+where
+    B: NewBuilder,
+{
+    const NAME: &'static str = "build";
+    const UNSHARE: bool = true;
+    type PassParam = WithSerde;
+
+    fn exec(self) -> std::io::Result<()> {
+        unshare_root()?;
+        self.pivot_root()?;
+        self.configure()
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+pub struct LocalMounter {
+    root: PathBuf,
+}
+
+impl Mounter for LocalMounter {
+    fn mount_root(&self) -> io::Result<PathBuf> {
+        let root_dfd = openat(
+            CWD,
+            &self.root,
+            OFlags::DIRECTORY | OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        make_mountpoint(&root_dfd)?;
+        Ok(self.root.clone())
+    }
+}
+
+pub struct NewLocalBuilder {}
+
+impl NewBuilder for NewLocalBuilder {
+    type FileSystem = LocalFileSystem;
+    type Unpack = Parallel;
+    type Mounter = LocalMounter;
+    fn mounter(&self, fs: &Self::FileSystem) -> io::Result<Self::Mounter> {
+        Ok(LocalMounter {
+            root: fs.root().to_owned(),
+        })
+    }
+}
+
+pub type NewLocalBuildRunner = NewBuildRunner<NewLocalBuilder>;
+
+fn mkdirat_if_not_exist<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, mode: Mode) -> io::Result<()> {
+    mkdirat(&dirfd, path, mode).map_or_else(
+        |op| match op {
+            Errno::EXIST => Ok(()),
+            err => Err(io::Error::from(err)),
+        },
+        |_| Ok(()),
+    )
+}
+
 pub fn unshare_root() -> io::Result<()> {
     mount_change(
         "/",

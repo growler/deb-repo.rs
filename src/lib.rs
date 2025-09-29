@@ -24,7 +24,7 @@ pub mod version;
 
 pub use {
     arch::DEFAULT_ARCH,
-    deployfs::{DeploymentFile, DeploymentFileSystem, DeploymentRoot, FileList, LocalFileSystem},
+    deployfs::{DeploymentFile, DeploymentFileSystem, FileList, LocalFileSystem},
     fsrepo::FSTransportProvider,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::{Manifest, DEFAULT_SPEC_NAME},

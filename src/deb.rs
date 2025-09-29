@@ -330,7 +330,7 @@ impl DebReader {
             _ => TarReader::new(Box::pin(r)),
         }
     }
-    pub async fn extract_to<FS: crate::DeploymentFileSystem>(
+    pub async fn extract_to<FS: crate::DeploymentFileSystem + ?Sized>(
         mut self,
         fs: &FS,
     ) -> Result<MutableControlStanza> {

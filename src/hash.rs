@@ -191,7 +191,9 @@ impl FileHash {
             [HEX[(c >> 4) as usize], HEX[(c & 0x0f) as usize]]
         }
         while !hash.is_empty() {
-            buffer.push_str(unsafe { str::from_utf8_unchecked(&hexadecimal(hash[0])) });
+            let d = hexadecimal(hash[0]);
+            buffer.push(d[0] as char);
+            buffer.push(d[1] as char);
             if levels > 0 {
                 buffer.push('/');
                 levels -= 1;

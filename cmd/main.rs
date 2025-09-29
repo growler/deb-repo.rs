@@ -2,7 +2,7 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        builder::{BuildRunner, Builder, SimpleBuilder},
+        builder::{NewBuilder, NewLocalBuilder},
         cli::Source,
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
@@ -395,7 +395,7 @@ impl Command for Build {
                     .await?;
 
             {
-                let builder = SimpleBuilder::<debrepo::LocalFileSystem>::new();
+                let builder = NewLocalBuilder {};
                 builder
                     .build(
                         &manifest,
@@ -434,20 +434,18 @@ impl Command for Extract {
             let fs =
                 debrepo::LocalFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await?;
-            // let fs = std::sync::Arc::new(debrepo::FileList::new());
-            {
-                let builder = SimpleBuilder::<debrepo::LocalFileSystem>::new();
-                builder
-                    .build_tree(
-                        manifest
-                            .installables(&self.spec)?
-                            .collect::<std::io::Result<Vec<_>>>()?,
-                        conf.concurrency,
-                        conf.transport().await?.as_ref(),
-                        &fs,
-                    )
-                    .await?;
-            }
+            let installables = manifest
+                .installables(&self.spec)?
+                .collect::<std::io::Result<Vec<_>>>()?;
+            let builder = NewLocalBuilder {};
+            builder
+                .unpack_debs(
+                    installables,
+                    conf.concurrency,
+                    conf.transport().await?.as_ref(),
+                    &fs,
+                )
+                .await?;
             Ok(())
         })
     }
@@ -640,7 +638,7 @@ fn init_logging(quiet: bool, debug: u8) {
 debrepo::helper! {
     fn helper_main "deb-repo-helper" [
         debrepo::exec::UnshareUserNs,
-        BuildRunner,
+        debrepo::builder::NewLocalBuildRunner,
     ]
 }
 
