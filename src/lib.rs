@@ -18,19 +18,20 @@ mod repo;
 mod source;
 pub mod tar;
 pub mod universe;
+mod unshare;
 pub mod version;
 // mod caching;
 
 pub use {
     arch::DEFAULT_ARCH,
-    deployfs::{DeploymentFile, DeploymentFileSystem, FileList, LocalFileSystem},
+    deployfs::{DeploymentFile, DeploymentFileSystem, DeploymentRoot, FileList, LocalFileSystem},
     fsrepo::FSTransportProvider,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
-    manifest::Manifest,
+    manifest::{Manifest, DEFAULT_SPEC_NAME},
     packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::TransportProvider,
-    source::{SignedBy, Snapshot, Source},
+    source::{RepositoryFile, SignedBy, Snapshot, Source},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {

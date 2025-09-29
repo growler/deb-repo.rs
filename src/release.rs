@@ -50,11 +50,12 @@ impl Release {
         let ext = ext.unwrap_or(".xz");
         let release_components = self.field("Components").unwrap_or("");
         if components.iter().any(|c| {
-            !release_components
-                .split_ascii_whitespace()
-                .any(|rc| {
-                    rc.split('/').last().map(|s| s == c.as_ref()).unwrap_or(false)
-                })
+            !release_components.split_ascii_whitespace().any(|rc| {
+                rc.split('/')
+                    .last()
+                    .map(|s| s == c.as_ref())
+                    .unwrap_or(false)
+            })
         }) {
             return Err(ParseError::from(format!(
                 "Component(s) {} not found in release components: {}",
@@ -68,8 +69,8 @@ impl Release {
                 release_components
             )));
         }
-        self
-            .field(hash_name).ok_or_else(|| {
+        self.field(hash_name)
+            .ok_or_else(|| {
                 ParseError::from(format!("Field {} not found in the release file", hash_name,))
             })
             .map(|field| {
@@ -86,16 +87,14 @@ impl Release {
                         }
                     })
                     .map_ok(move |(digest, size, path)| {
-                        components
-                            .iter()
-                            .filter_map(move |comp| {
-                                let comp = comp.as_ref();
-                                if matches_path!(path, [ comp "/binary-" arch "/Packages" ext ]) {
-                                    Some((digest, size, path))
-                                } else {
-                                    None
-                                }
-                            })
+                        components.iter().filter_map(move |comp| {
+                            let comp = comp.as_ref();
+                            if matches_path!(path, [ comp "/binary-" arch "/Packages" ext ]) {
+                                Some((digest, size, path))
+                            } else {
+                                None
+                            }
+                        })
                     })
                     .try_flatten()
                     .and_then(|(digest, size, path)| {
@@ -105,11 +104,7 @@ impl Release {
                         let hash = FileHash::try_from(digest).map_err(|err| {
                             ParseError::from(format!("invalid hash: {} {}", digest, err))
                         })?;
-                        Ok::<_, ParseError>((
-                            path,
-                            hash,
-                            size,
-                        ))
+                        Ok::<_, ParseError>((path, hash, size))
                     })
             })
     }

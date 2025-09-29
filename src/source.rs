@@ -4,7 +4,7 @@ use {
         TransportProvider,
     },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
-    clap::{Args},
+    clap::Args,
     futures::{future::try_join_all, AsyncReadExt},
     iterator_ext::IteratorExt,
     itertools::Itertools,
@@ -474,14 +474,23 @@ impl clap::builder::TypedValueParser for SourceHashKindValueParser {
 }
 
 #[derive(Clone, Serialize, Deserialize, Debug)]
-pub(crate) struct RepositoryIndexFile {
+pub struct RepositoryFile {
     pub(crate) path: String,
     pub(crate) hash: FileHash,
     pub(crate) size: u64,
 }
-impl RepositoryIndexFile {
+impl RepositoryFile {
     pub fn new(path: String, hash: FileHash, size: u64) -> Self {
         Self { path, hash, size }
+    }
+    pub fn path(&self) -> &str {
+        &self.path
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn hash(&self) -> &FileHash {
+        &self.hash
     }
 }
 
@@ -662,7 +671,7 @@ impl Source {
     pub(crate) async fn file_by_hash<'a, T>(
         &self,
         transport: &T,
-        file: &RepositoryIndexFile,
+        file: &RepositoryFile,
     ) -> io::Result<Box<[u8]>>
     where
         T: TransportProvider + ?Sized,
@@ -682,7 +691,7 @@ impl Source {
         arch: &str,
         sem: &Arc<Semaphore>,
         transport: &T,
-    ) -> Result<Vec<(RepositoryIndexFile, Vec<RepositoryIndexFile>)>, io::Error> {
+    ) -> Result<Vec<(RepositoryFile, Vec<RepositoryFile>)>, io::Error> {
         try_join_all(self.suites.iter().map(|s| async move {
             let sem = Arc::clone(sem);
             let _permit = sem.acquire().await;
@@ -700,10 +709,10 @@ impl Source {
                 )?
                 .map_err(Into::into)
                 .map_ok(|(path, hash, size)| {
-                    RepositoryIndexFile::new(format!("dists/{}/{}", s, path), hash, size)
+                    RepositoryFile::new(format!("dists/{}/{}", s, path), hash, size)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
-            Ok::<_, io::Error>((RepositoryIndexFile::new(path, hash, size), pkgs_ind))
+            Ok::<_, io::Error>((RepositoryFile::new(path, hash, size), pkgs_ind))
         }))
         .await
     }

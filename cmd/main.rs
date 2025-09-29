@@ -1,19 +1,24 @@
 use {
-    anyhow::{anyhow, Result}, clap::{Parser, Subcommand}, debrepo::{
-        cli::{Source},
-        exec::{unshare_root, unshare_user_ns},
+    anyhow::{anyhow, Result},
+    clap::{Parser, Subcommand},
+    debrepo::{
+        builder::{BuildRunner, Builder, SimpleBuilder},
+        cli::Source,
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
-    }, futures::AsyncWriteExt, itertools::Itertools, smol::fs, std::{num::NonZero, path::PathBuf, process::ExitCode}, tracing::level_filters::LevelFilter, tracing_subscriber::{filter::EnvFilter, fmt}
+        DEFAULT_SPEC_NAME,
+    },
+    futures::AsyncWriteExt,
+    itertools::Itertools,
+    smol::fs,
+    std::{num::NonZero, path::PathBuf, process::ExitCode},
+    tracing::level_filters::LevelFilter,
+    tracing_subscriber::{filter::EnvFilter, fmt},
 };
 
-#[async_trait::async_trait(?Send)]
 #[enum_dispatch::enum_dispatch]
-pub trait AsyncCommand {
-    fn init(&self, _conf: &App) -> Result<()> {
-        Ok(())
-    }
-    async fn exec(&self, conf: &App) -> Result<()>;
+pub trait Command {
+    fn exec(&self, conf: &App) -> Result<()>;
 }
 
 #[derive(Parser)]
@@ -59,22 +64,11 @@ pub struct App {
     pub no_cache: bool,
 
     /// Do not verify Release files by default (not recommended)
-    #[arg(
-        short = 'K',
-        long = "no-verify",
-        display_order = 0,
-        action
-    )]
+    #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
     pub insecure_release: bool,
 
     /// Skip the connection verification (not recommended)
-    #[arg(
-        short = 'k',
-        long = "insecure",
-        action,
-        display_order = 0,
-        action
-    )]
+    #[arg(short = 'k', long = "insecure", action, display_order = 0, action)]
     pub insecure: bool,
 
     /// Manifest file
@@ -85,7 +79,7 @@ pub struct App {
     cmd: Commands,
 }
 
-#[enum_dispatch::enum_dispatch(AsyncCommand)]
+#[enum_dispatch::enum_dispatch(Command)]
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a new manifest file
@@ -103,13 +97,13 @@ enum Commands {
     /// Extract system to a target directory
     #[command(name = "build")]
     Build,
-    /// Include a package or packages into the recipe  
+    /// Include a package or packages into the spec
     #[command(name = "include")]
     Include,
-    /// Exlicitly exclude a package or packages from the recipe  
+    /// Exlicitly exclude a package or packages from the spec
     #[command(name = "exclude")]
     Exclude,
-    /// Remove a package or packages from the recipe
+    /// Remove a package or packages from the spec requirements or constraints
     #[command(name = "drop")]
     Drop,
     /// Lists packages
@@ -141,23 +135,30 @@ pub struct Init {
     source: Source,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Init {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let (sources, packages, comment) = if let Some((sources, mut packages)) = self.source.as_vendor() {
-            if !self.requirements.is_empty() {
-               packages.extend(self.requirements.iter().cloned());
-                packages = packages.into_iter().unique().collect();
-            }
-            (sources, packages, Some(format!("default manifest file for {}", &self.source.url)) )
-        } else {
-            (vec![self.source.clone()], self.requirements.clone(), None)
-        };
-        let mut mf = Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment);
-        mf.add_requirements(None, packages.iter(), None::<&str>)?;
-        mf.resolve(conf.concurrency.into(), conf.transport().await?.as_ref()).await?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for Init {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let (sources, packages, comment) =
+                if let Some((sources, mut packages)) = self.source.as_vendor() {
+                    if !self.requirements.is_empty() {
+                        packages.extend(self.requirements.iter().cloned());
+                        packages = packages.into_iter().unique().collect();
+                    }
+                    (
+                        sources,
+                        packages,
+                        Some(format!("default manifest file for {}", &self.source.url)),
+                    )
+                } else {
+                    (vec![self.source.clone()], self.requirements.clone(), None)
+                };
+            let mut mf = Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment);
+            mf.add_requirements(&DEFAULT_SPEC_NAME, packages.iter(), None::<&str>)?;
+            mf.resolve(conf.concurrency.into(), conf.transport().await?.as_ref())
+                .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
@@ -177,89 +178,83 @@ struct Drop {
         conflicts_with = "requirements_only"
     )]
     constraints_only: bool,
-    /// The recipe name to modify.
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    /// The spec name to modify.
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
     /// Package name or package version set
     #[arg(value_name = "CONSTRAINT")]
     cons: Vec<String>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Drop {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        if !self.constraints_only {
-            mf.drop_requirements(self.recipe.as_deref(), self.cons.iter())?;
-        }
-        if !self.requirements_only {
-            mf.drop_constraints(self.recipe.as_deref(), self.cons.iter())?;
-        }
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for Drop {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            if !self.constraints_only {
+                mf.drop_requirements(&self.spec, self.cons.iter())?;
+            }
+            if !self.requirements_only {
+                mf.drop_constraints(&self.spec, self.cons.iter())?;
+            }
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
 #[derive(Parser)]
 struct Include {
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
     #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
     comment: Option<String>,
     #[arg(value_name = "REQUIREMENT", value_parser = debrepo::cli::DependencyParser)]
     reqs: Vec<Dependency<String>>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Include {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.add_requirements(
-            self.recipe.as_deref(),
-            self.reqs.iter(),
-            self.comment.as_deref(),
-        )?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for Include {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.add_requirements(&self.spec, self.reqs.iter(), self.comment.as_deref())?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
 #[derive(Parser)]
 struct Exclude {
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
     #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
     comment: Option<String>,
     #[arg(value_name = "CONSTRAINT", value_parser = debrepo::cli::ConstraintParser)]
     reqs: Vec<Constraint<String>>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Exclude {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.add_constraints(
-            self.recipe.as_deref(),
-            self.reqs.iter(),
-            self.comment.as_deref(),
-        )?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for Exclude {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.add_constraints(&self.spec, self.reqs.iter(), self.comment.as_deref())?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
 #[derive(Parser)]
 struct Update {}
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Update {
-    async fn exec(&self, conf: &App) -> Result<()> {
+impl Command for Update {
+    fn exec(&self, conf: &App) -> Result<()> {
         Ok(())
     }
 }
@@ -267,14 +262,15 @@ impl AsyncCommand for Update {
 #[derive(Parser)]
 struct Lock {}
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Lock {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for Lock {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
@@ -286,39 +282,40 @@ struct Search {
     pattern: Vec<String>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Search {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        let res = self
-            .pattern
-            .iter()
-            .map(|p| {
-                regex::RegexBuilder::new(p)
-                    .unicode(true)
-                    .case_insensitive(true)
-                    .build()
-                    .map_err(|err| anyhow!("invalid regex: {}", err))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let mut pkgs = mf
-            .packages()
-            .filter_map(|p| {
-                res.iter()
-                    .any(|re| {
-                        re.is_match(p.name())
-                            || (!self.names_only
-                                && re.is_match(p.field("Description").unwrap_or("")))
-                    })
-                    .then_some(p)
-            })
-            .collect::<Vec<_>>();
-        pkgs.sort_by_key(|&pkg| pkg.name());
-        let mut out = std::io::stdout().lock();
-        pretty_print_packages(&mut out, pkgs, false)?;
-        Ok(())
+impl Command for Search {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            let res = self
+                .pattern
+                .iter()
+                .map(|p| {
+                    regex::RegexBuilder::new(p)
+                        .unicode(true)
+                        .case_insensitive(true)
+                        .build()
+                        .map_err(|err| anyhow!("invalid regex: {}", err))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            let mut pkgs = mf
+                .packages()
+                .filter_map(|p| {
+                    res.iter()
+                        .any(|re| {
+                            re.is_match(p.name())
+                                || (!self.names_only
+                                    && re.is_match(p.field("Description").unwrap_or("")))
+                        })
+                        .then_some(p)
+                })
+                .collect::<Vec<_>>();
+            pkgs.sort_by_key(|&pkg| pkg.name());
+            let mut out = std::io::stdout().lock();
+            pretty_print_packages(&mut out, pkgs, false)?;
+            Ok(())
+        })
     }
 }
 
@@ -328,20 +325,21 @@ struct Show {
     package: String,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Show {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await?;
-        let pkg = mf.packages().find(|p| self.package == p.name());
-        if let Some(pkg) = pkg {
-            let mut out = async_io::Async::new(std::io::stdout().lock())?;
-            out.write_all(pkg.src().as_bytes()).await?;
-            Ok(())
-        } else {
-            Err(anyhow!("package {} not found", &self.package))
-        }
+impl Command for Show {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
+            let pkg = mf.packages().find(|p| self.package == p.name());
+            if let Some(pkg) = pkg {
+                let mut out = async_io::Async::new(std::io::stdout().lock())?;
+                out.write_all(pkg.src().as_bytes()).await?;
+                Ok(())
+            } else {
+                Err(anyhow!("package {} not found", &self.package))
+            }
+        })
     }
 }
 
@@ -349,237 +347,117 @@ impl AsyncCommand for Show {
 struct List {
     #[arg(short = 'e', long = "only-essential", hide = true)]
     only_essential: bool,
-    /// The recipe name to build (default is the primary nameless recipe)
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    /// The spec name to list installables from
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for List {
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
-            .await
-            .map_err(|e| anyhow!("failed to update recipes: {e}"))?;
-        let mut pkgs = mf
-            .recipe_packages(self.recipe.as_deref())?
-            .filter_map(|p| {
-                if self.only_essential {
-                    p.essential().then_some(p)
-                } else {
-                    Some(p)
-                }
-            })
-            .collect::<Vec<_>>();
-        pkgs.sort_by_key(|&pkg| pkg.name());
-        let mut out = std::io::stdout().lock();
-        pretty_print_packages(&mut out, pkgs, false)?;
-        mf.store(&conf.manifest).await?;
-        Ok(())
+impl Command for List {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+                .await
+                .map_err(|e| anyhow!("failed to update specs: {e}"))?;
+            let mut pkgs = mf
+                .spec_packages(&self.spec)?
+                .filter_map(|p| {
+                    if self.only_essential {
+                        p.essential().then_some(p)
+                    } else {
+                        Some(p)
+                    }
+                })
+                .collect::<Vec<_>>();
+            pkgs.sort_by_key(|&pkg| pkg.name());
+            let mut out = std::io::stdout().lock();
+            pretty_print_packages(&mut out, pkgs, false)?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
     }
 }
 
 #[derive(Parser)]
 struct Build {
-    /// The recipe name to build (default is the primary nameless recipe)
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    /// The spec name to build
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
     /// The target directory
     #[arg(short, long, value_name = "PATH")]
     path: PathBuf,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Build {
-    fn init(&self, _opts: &App) -> Result<()> {
-        if !nix::unistd::Uid::effective().is_root() {
-            unshare_user_ns()?;
-        }
-        unshare_root()?;
-        Ok(())
-    }
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        fs::create_dir_all(&self.path).await?;
-        let fs = std::sync::Arc::new(
-            debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
-                .await?,
-        );
-        {
-            let builder = debrepo::builder::Builder::new(&fs);
-            builder
-                .build(
-                    &manifest,
-                    self.recipe.as_deref(),
-                    conf.concurrency,
-                    conf.transport().await?.as_ref(),
-                )
-                .await?;
-        }
-        Ok(())
+impl Command for Build {
+    fn exec(&self, conf: &App) -> Result<()> {
+        let _user_ns_unshared = match debrepo::exec::UnshareUserNs::unshare() {
+            None => false,
+            Some(Ok(())) => true,
+            Some(Err(err)) => return Err(err.into()),
+        };
+        smol::block_on(async move {
+            let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            fs::create_dir_all(&self.path).await?;
+            let fs =
+                debrepo::LocalFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                    .await?;
+
+            {
+                let builder = SimpleBuilder::<debrepo::LocalFileSystem>::new();
+                builder
+                    .build(
+                        &manifest,
+                        &self.spec,
+                        conf.concurrency,
+                        conf.transport().await?.as_ref(),
+                        &fs,
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
     }
 }
 
 #[derive(Parser)]
 struct Extract {
-    /// The recipe name to build (default is the primary nameless recipe)
-    #[arg(short = 'r', long = "recipe", value_name = "RECIPE")]
-    recipe: Option<String>,
+    /// The spec name to extract
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
     /// The target directory
     #[arg(short, long, value_name = "PATH")]
     path: PathBuf,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Extract {
-    fn init(&self, _opts: &App) -> Result<()> {
-        if !nix::unistd::Uid::effective().is_root() {
-            unshare_user_ns()?;
-        }
-        unshare_root()?;
-        Ok(())
-    }
-    async fn exec(&self, conf: &App) -> Result<()> {
-        let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-        fs::create_dir_all(&self.path).await?;
-        let fs = std::sync::Arc::new(
-            debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
-                .await?,
-        );
-        // let fs = std::sync::Arc::new(debrepo::FileList::new());
-        {
-            let builder = debrepo::builder::Builder::new(&fs);
-            builder
-                .extract_recipe(
-                    &manifest,
-                    self.recipe.as_deref(),
-                    conf.concurrency,
-                    conf.transport().await?.as_ref(),
-                )
-                .await?;
-        }
-        // std::sync::Arc::into_inner(fs)
-        //     .unwrap()
-        //     .keep(&self.path)
-        //     .await?;
-        // let manifest = Manifest::from_file(&conf.manifest).await?;
-        // let repo_builder: Box<dyn DebRepoBuilder> = if let Some(cache) = &conf.cache_dir {
-        //     Box::new(HttpCachingRepoBuilder::new(conf.insecure, cache.clone()).await?)
-        // } else {
-        //     Box::new(HttpRepoBuilder::new(conf.insecure))
-        // };
-        // let mut universe = manifest
-        //     .fetch_universe(&conf.arch, &repo_builder, conf.limit)
-        //     .await?;
-        // let (reqs, cons) =
-        //     manifest.requirements_for(self.recipe.as_ref().map(|s| s.as_ref()).unwrap_or(""))?;
-        // let solution = universe.solve(reqs, cons).map_err(|conflict| {
-        //     anyhow!(
-        //         "failed to solve dependencies: {}",
-        //         universe.display_conflict(conflict)
-        //     )
-        // })?;
-        // let essentials = solution
-        //     .iter()
-        //     .filter_map(|id| {
-        //         universe.package(*id).and_then(|pkg| {
-        //             if pkg.essential() {
-        //                 Some(pkg.name())
-        //             } else {
-        //                 None
-        //             }
-        //         })
-        //     })
-        //     .collect::<Vec<_>>();
-        // fs::create_dir_all(&self.path).await?;
-        // let fs = debrepo::LocalFileSystem::new(&self.path, nix::unistd::Uid::effective().is_root())
-        //     .await?;
-        // let mut control_file = stream::iter(solution.iter().cloned())
-        //     .map(|id| {
-        //         let (deb, package) = (
-        //             universe.deb_reader(id),
-        //             universe.package(id).unwrap().raw_full_name(),
-        //         );
-        //         let fs = fs.clone();
-        //         async move {
-        //             match deb.await {
-        //                 Ok(deb) => {
-        //                     tracing::info!("unpacking {}...", package);
-        //                     let mut stanza = async_std::task::block_on(deb.extract_to(&fs))?;
-        //                     stanza.set("Status", "install ok unpacked");
-        //                     stanza.sort_fields_deb_order();
-        //                     Ok::<_, anyhow::Error>(stanza)
-        //                 }
-        //                 Err(err) => {
-        //                     tracing::error!("failed to unpack {}: {}", package, err);
-        //                     Err(err.into())
-        //                 }
-        //             }
-        //         }
-        //     })
-        //     .buffer_unordered(conf.limit)
-        //     .try_collect::<Vec<_>>()
-        //     .await?;
-        // control_file.sort_by(|a, b| a.field("Package").unwrap().cmp(b.field("Package").unwrap()));
-        // fs.create_dir_all("etc/apt", 0, 0, 0o755u32).await?;
-        // {
-        //     let sources: Vec<u8> = manifest
-        //         .sources()
-        //         .map(|s| s.into())
-        //         .collect::<MutableControlFile>()
-        //         .into();
-        //     fs.create_file(
-        //         sources.as_slice(),
-        //         Some("etc/apt/sources.list"),
-        //         0,
-        //         0,
-        //         0o644,
-        //         None,
-        //         Some(sources.len()),
-        //     )
-        //     .await?;
-        // }
-        // fs.create_dir_all("var/lib/dpkg", 0, 0, 0o755u32).await?;
-        // {
-        //     let size = control_file.iter().map(|i| i.len() + 1).sum();
-        //     let mut status = Vec::<u8>::with_capacity(size);
-        //     for i in control_file.into_iter() {
-        //         status.write_all(format!("{}", &i).as_bytes()).await?;
-        //         status.write_all(&[b'\n']).await?;
-        //     }
-        //     fs.create_file(
-        //         status.as_slice(),
-        //         Some("var/lib/dpkg/status"),
-        //         0,
-        //         0,
-        //         0o644,
-        //         None,
-        //         Some(size),
-        //     )
-        //     .await?;
-        // }
-        // fs.create_dir_all("usr/sbin", 0, 0, 0o755u32).await?;
-        // fs.create_file(
-        //     b"#!/bin/sh\nexit 101\n".as_slice(),
-        //     Some("usr/sbin/policy-rc.d"),
-        //     0,
-        //     0,
-        //     0o755,
-        //     None,
-        //     None,
-        // )
-        // .await?;
-        // let env = ["DEBIAN_FRONTEND=noninteractive"];
-        // dpkg(
-        //     &self.path,
-        //     ["--force-depends", "--configure"]
-        //         .iter()
-        //         .chain(essentials.iter()),
-        //     Some(&env),
-        // )?;
-        // dpkg(&self.path, ["--configure", "-a"], Some(&env))?;
-        // fs.remove_file("usr/sbin/policy-rc.d").await?;
-        Ok(())
+impl Command for Extract {
+    fn exec(&self, conf: &App) -> Result<()> {
+        let _user_ns_unshared = match debrepo::exec::UnshareUserNs::unshare() {
+            None => false,
+            Some(Ok(())) => true,
+            Some(Err(err)) => return Err(err.into()),
+        };
+        smol::block_on(async move {
+            let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            fs::create_dir_all(&self.path).await?;
+            let fs =
+                debrepo::LocalFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                    .await?;
+            // let fs = std::sync::Arc::new(debrepo::FileList::new());
+            {
+                let builder = SimpleBuilder::<debrepo::LocalFileSystem>::new();
+                builder
+                    .build_tree(
+                        manifest
+                            .installables(&self.spec)?
+                            .collect::<std::io::Result<Vec<_>>>()?,
+                        conf.concurrency,
+                        conf.transport().await?.as_ref(),
+                        &fs,
+                    )
+                    .await?;
+            }
+            Ok(())
+        })
     }
 }
 
@@ -610,9 +488,8 @@ struct Fetch {
     comp: String,
 }
 
-#[async_trait::async_trait(?Send)]
-impl AsyncCommand for Fetch {
-    async fn exec(&self, conf: &App) -> Result<()> {
+impl Command for Fetch {
+    fn exec(&self, conf: &App) -> Result<()> {
         // let start = std::time::Instant::now();
         // let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
         // let release = if self.verify {
@@ -768,7 +645,15 @@ fn init_logging(quiet: bool, debug: u8) {
         .init();
 }
 
+debrepo::helper! {
+    fn helper_main "deb-repo-helper" [
+        debrepo::exec::UnshareUserNs,
+        BuildRunner,
+    ]
+}
+
 fn main() -> ExitCode {
+    helper_main();
     let mut app = App::parse();
     init_logging(app.quiet, app.debug);
     if !app.no_cache {
@@ -783,11 +668,7 @@ fn main() -> ExitCode {
     } else {
         app.cache_dir = None;
     }
-    if let Err(err) = app.cmd.init(&app) {
-        eprintln!("{}", err);
-        return ExitCode::FAILURE;
-    }
-    match smol::block_on(app.cmd.exec(&app)) {
+    match app.cmd.exec(&app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
             println!("{}", err);

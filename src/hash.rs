@@ -174,6 +174,32 @@ impl FileHash {
             _ => None,
         }
     }
+    pub fn store_name(&self, prefix: Option<&str>, mut levels: usize) -> String {
+        let mut hash = match self {
+            FileHash::MD5sum(b) => b.as_ref(),
+            FileHash::SHA256(b) => b.as_ref(),
+            FileHash::SHA512(b) => b.as_ref(),
+        };
+        let total_len = prefix.map_or(0, |p| p.len() + 1) + hash.len() * 2 + levels;
+        let mut buffer = String::with_capacity(total_len);
+        if let Some(p) = prefix {
+            buffer.push_str(p);
+            buffer.push('/');
+        }
+        const fn hexadecimal(c: u8) -> [u8; 2] {
+            const HEX: &[u8; 16] = b"0123456789abcdef";
+            [HEX[(c >> 4) as usize], HEX[(c & 0x0f) as usize]]
+        }
+        while hash.len() > 0 {
+            buffer.push_str(unsafe { str::from_utf8_unchecked(&hexadecimal(hash[0])) });
+            if levels > 0 {
+                buffer.push('/');
+                levels -= 1;
+            }
+            hash = &hash[1..];
+        }
+        buffer
+    }
 }
 
 impl TryFrom<&str> for FileHash {

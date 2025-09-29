@@ -1,30 +1,36 @@
+use rustix::{
+    fd::AsFd,
+    fs::{
+        chown, chownat, fallocate, fchown, futimens, symlinkat, utimensat, AtFlags, FallocateFlags,
+        Gid, Timespec, Timestamps, Uid, CWD, UTIME_OMIT,
+    },
+};
 use smol::{
     fs::{self, unix::OpenOptionsExt},
     io,
     prelude::*,
 };
 use std::{
-    os::unix::fs::PermissionsExt,
-    os::unix::{self, fs::DirBuilderExt},
+    os::unix::fs::{DirBuilderExt, PermissionsExt},
     path::{Path, PathBuf},
     sync::Arc,
-    time::SystemTime,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
-#[async_trait::async_trait]
-pub trait DeploymentFile: Send + Sync {
+#[async_trait::async_trait(?Send)]
+pub trait DeploymentFile {
     async fn persist<P>(self, path: P) -> io::Result<()>
     where
-        P: AsRef<Path> + Send;
+        P: AsRef<Path>;
 }
 
-pub trait DeploymentRoot: Send + Sync {
+pub trait DeploymentRoot {
     fn path(&self) -> io::Result<&'_ Path>;
 }
 
 /// Defines a file system interface to deploy packages.
-#[async_trait::async_trait]
-pub trait DeploymentFileSystem: Send + Sync {
+#[async_trait::async_trait(?Send)]
+pub trait DeploymentFileSystem {
     type File: DeploymentFile;
     type Root: DeploymentRoot;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
@@ -96,7 +102,6 @@ pub struct LocalFileSystem {
     root: Arc<Path>,
     chown_allowed: bool,
 }
-unsafe impl Sync for LocalFileSystem {}
 
 fn clean_path(target: &Path) -> io::Result<&Path> {
     let target = if target.has_root() {
@@ -138,9 +143,9 @@ pub struct LocalFile {
     path: PathBuf,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DeploymentFile for LocalFile {
-    async fn persist<P: AsRef<Path> + Send>(self, path: P) -> io::Result<()> {
+    async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         let to = self.base.as_ref().join(clean_path(path.as_ref())?);
         if to == self.path {
             Ok(())
@@ -196,21 +201,43 @@ impl DeploymentFile for LocalFile {
     }
 }
 
+fn mtime_to_ts(ts: &SystemTime) -> Timestamps {
+    Timestamps {
+        last_modification: match ts.duration_since(UNIX_EPOCH) {
+            Ok(d) => Timespec {
+                tv_sec: d.as_secs() as i64,
+                tv_nsec: d.subsec_nanos() as i64,
+            },
+            Err(d) => {
+                let d = d.duration();
+                Timespec {
+                    tv_sec: -(d.as_secs() as i64),
+                    tv_nsec: -(d.subsec_nanos() as i64),
+                }
+            }
+        },
+        last_access: Timespec {
+            tv_sec: 0,
+            tv_nsec: UTIME_OMIT,
+        },
+    }
+}
+
 fn mkdir(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
     let mut builder = std::fs::DirBuilder::new();
     builder.mode(mode);
     builder.create(path)?;
     if let Some((uid, gid)) = owner {
-        std::os::unix::fs::chown(path, Some(uid), Some(gid))?
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(Into::into)
+    } else {
+        Ok(())
     }
-    Ok(())
 }
 
 fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
     if path.is_dir() {
         return Ok(());
     }
-
     match mkdir(path, owner, mode) {
         Ok(()) => Ok(()),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
@@ -239,7 +266,7 @@ impl DeploymentRoot for LocalRoot {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DeploymentFileSystem for LocalFileSystem {
     type File = LocalFile;
     type Root = LocalRoot;
@@ -293,7 +320,7 @@ impl DeploymentFileSystem for LocalFileSystem {
         })
         .await
     }
-    async fn symlink<P: AsRef<Path> + Send, Q: AsRef<Path> + Send>(
+    async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         target: P,
         path: Q,
@@ -302,23 +329,27 @@ impl DeploymentFileSystem for LocalFileSystem {
         mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         let link = self.target_path(path.as_ref())?;
-        {
-            let link = link.clone();
-            let target = target.as_ref().to_owned();
-            blocking::unblock(move || unix::fs::symlink(&target, &link)).await?;
-        }
-        if self.chown_allowed {
-            let link = link.clone();
-            blocking::unblock(move || std::os::unix::fs::lchown(&link, Some(uid), Some(gid)))
-                .await?;
-        }
-        if let Some(mtime) = mtime {
-            blocking::unblock(move || {
-                filetime::set_symlink_file_times(link.as_os_str(), mtime.into(), mtime.into())
-            })
-            .await?;
-        }
-        Ok(())
+        let target = target.as_ref().to_owned();
+        let chown_allowed = self.chown_allowed;
+        blocking::unblock(move || {
+            symlinkat(target, CWD, &link)?;
+            if chown_allowed {
+                chownat(
+                    CWD,
+                    &link,
+                    Some(Uid::from_raw(uid)),
+                    Some(Gid::from_raw(gid)),
+                    AtFlags::SYMLINK_NOFOLLOW,
+                )?;
+            }
+            if let Some(mtime) = mtime {
+                utimensat(CWD, link, &mtime_to_ts(&mtime), AtFlags::SYMLINK_NOFOLLOW)
+            } else {
+                Ok(())
+            }
+        })
+        .await
+        .map_err(Into::into)
     }
     async fn hardlink<P: AsRef<Path> + Send, Q: AsRef<Path> + Send>(
         &self,
@@ -378,40 +409,28 @@ impl DeploymentFileSystem for LocalFileSystem {
                 })?;
             (file, tmp)
         };
-        use std::os::unix::io::AsRawFd;
-        let raw_fd = file.as_raw_fd();
         if let Some(size) = size {
             if size > 0 {
-                let raw_fd =
-                    unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd).as_raw_fd() };
+                let fd = file.as_fd().try_clone_to_owned()?;
                 blocking::unblock(move || {
-                    nix::fcntl::fallocate(
-                        raw_fd,
-                        nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
-                        0,
-                        size as i64,
-                    )
-                    .map_err(|err| {
-                        let err = io::Error::from_raw_os_error(err as i32);
-                        io::Error::new(
-                            err.kind(),
-                            format!("failed to allocate file space: {}", err),
-                        )
-                    })
+                    fallocate(&fd, FallocateFlags::KEEP_SIZE, 0, size as u64)
                 })
                 .await?;
             }
         }
-        if self.chown_allowed {
-            let raw_fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(raw_fd) };
-            blocking::unblock(move || std::os::unix::fs::fchown(raw_fd, Some(uid), Some(gid)))
-                .await?;
-        }
         io::copy(r, &mut file).await?;
-        if let Some(mtime) = mtime {
-            let path = path.clone();
-            blocking::unblock(move || filetime::set_file_mtime(&path, mtime.into())).await?;
-        }
+        let chown_allowed = self.chown_allowed;
+        blocking::unblock(move || {
+            if chown_allowed {
+                fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+            }
+            if let Some(mtime) = mtime {
+                futimens(&file, &mtime_to_ts(&mtime))
+            } else {
+                Ok(())
+            }
+        })
+        .await?;
         Ok(LocalFile {
             base: Arc::clone(&self.root),
             path,
@@ -467,9 +486,9 @@ pub struct FileListItem {
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DeploymentFile for FileListItem {
-    async fn persist<P: AsRef<Path> + Send>(self, path: P) -> io::Result<()> {
+    async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -489,7 +508,7 @@ impl DeploymentRoot for FileListRoot {
     }
 }
 
-#[async_trait::async_trait]
+#[async_trait::async_trait(?Send)]
 impl DeploymentFileSystem for FileList {
     type File = FileListItem;
     type Root = FileListRoot;

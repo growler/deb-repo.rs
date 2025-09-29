@@ -338,11 +338,8 @@ impl Packages {
     pub fn prio(&self) -> u32 {
         self.prio
     }
-    pub(crate) fn new_from_bytes<D>(
-        data: D,
-        prio: Option<u32>,
-    ) -> Result<Self, ParseError> 
-    where 
+    pub(crate) fn new_from_bytes<D>(data: D, prio: Option<u32>) -> Result<Self, ParseError>
+    where
         Vec<u8>: From<D>,
     {
         let s = String::from_utf8(data.into())

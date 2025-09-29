@@ -1,9 +1,9 @@
 use {
     crate::{
-        hash::{self, FileHash, Hash},
+        hash::{self, Hash},
         packages::Package,
         repo::TransportProvider,
-        source::{RepositoryIndexFile, Source},
+        source::{RepositoryFile, Source},
         universe::Universe,
         version::{Constraint, Dependency, IntoConstraint, IntoDependency},
         Packages,
@@ -33,8 +33,10 @@ pub struct Manifest {
     universe: Option<(Vec<usize>, Box<Universe>)>,
 }
 
+pub const DEFAULT_SPEC_NAME: Option<&str> = None;
+
 /// Manifest is a declarative description of Debian-based tree, including sources
-/// and package recipes, with a lock file that pins exact repository indices and
+/// and package specs, with a lock file that pins exact repository indices and
 /// artifacts for reproducible installs.
 ///
 /// `Manifest` provies a high-level API for creating, editing, locking, and persisting
@@ -48,13 +50,12 @@ pub struct Manifest {
 /// Data model:
 /// - Sources (user-defined): Debian repository endpoints and hashing scheme.
 ///   Locked sources record exact Release/Packages index paths, sizes, and hashes.
-/// - Recipes (user-defined): named sets of constraints.
+/// - Specs (user-defined): named sets of constraints.
 ///   - include: requested packages (with optional version constraints)
 ///   - exclude: constraints to forbid specific versions/packages
-///   - extends: a recipe can extend another; cycles are rejected at load time
-///   - The default recipe has the empty name "" (displayed as "<default>").
-/// - Locked recipes (generated): deterministic list of installables
-///   (repository path, size, hash) plus a recipe-level SHA-256 derived from
+///   - extends: a spec can extend another; cycles are rejected at load time
+/// - Locked specs (generated): deterministic list of installables
+///   (repository path, size, hash) plus a spec-level SHA-256 derived from
 ///   the selected package hashes.
 ///
 /// Example (simplified):
@@ -65,7 +66,7 @@ pub struct Manifest {
 ///     let arch = "amd64";
 ///     // Load manifest
 ///     let mut m = debrepo::Manifest::from_file("Manifest.toml", debrepo::DEFAULT_ARCH).await?;
-///     // Solve dependencies and lock recipes
+///     // Solve dependencies and lock specs
 ///     m.resolve(8, transport).await?;
 ///     // Persist both Manifest.toml and Manifest.<arch>.lock
 ///     m.store("Manifest.toml").await?;
@@ -89,18 +90,18 @@ impl Manifest {
             );
         }
         doc["source"] = toml_edit::array();
-        doc["recipe"] = toml_edit::table();
+        doc["spec"] = toml_edit::table();
         Manifest {
             arch: arch.to_string(),
             doc,
             hash: None,
             file: ManifestFile {
                 sources: Vec::new(),
-                recipes: KVList::new(),
+                specs: KVList::new(),
             },
             lock: LockFile {
                 sources: Vec::default(),
-                recipes: KVList::new(),
+                specs: KVList::new(),
             },
             lock_updated: false,
             universe: None,
@@ -134,18 +135,18 @@ impl Manifest {
             arr.push(table);
         }
         doc["source"] = arr.into();
-        doc["recipe"] = toml_edit::table();
+        doc["spec"] = toml_edit::table();
         Manifest {
             arch: arch.to_string(),
             doc,
             hash: None,
             file: ManifestFile {
                 sources: sources,
-                recipes: KVList::new(),
+                specs: KVList::new(),
             },
             lock: LockFile {
                 sources: locked,
-                recipes: KVList::new(),
+                specs: KVList::new(),
             },
             lock_updated: false,
             universe: None,
@@ -168,7 +169,7 @@ impl Manifest {
                 format!("failed to parse manifest: {}", err),
             )
         })?;
-        manifest.verify_recipes_graph()?;
+        manifest.verify_specs_graph()?;
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -176,7 +177,7 @@ impl Manifest {
             )
         })?;
         doc.entry("source").or_insert(toml_edit::array());
-        doc.entry("recipe").or_insert(toml_edit::table());
+        doc.entry("spec").or_insert(toml_edit::table());
         let hash = r.into_hash();
         let arch = arch.to_string();
         let lock_file_path = path.as_ref().with_extension(format!("{}.lock", &arch));
@@ -204,7 +205,7 @@ impl Manifest {
                     #[serde(with = "hash::serde::base64")]
                     hash: Hash<sha2::Sha256>,
                     sources: Vec<Option<LockedSource>>,
-                    recipes: KVList<Option<LockedRecipe>>,
+                    specs: KVList<Option<LockedSpec>>,
                 }
                 r.take(Self::MAX_LOCK_FILE_SIZE)
                     .read_to_end(&mut buf)
@@ -213,14 +214,14 @@ impl Manifest {
                     .map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("failed to parse locked recipe: {}", err),
+                            format!("failed to parse locked spec: {}", err),
                         )
                     })
                     .map(|lock| {
                         if lock.hash == hash && lock.arch == arch {
                             Some(LockFile {
                                 sources: lock.sources,
-                                recipes: lock.recipes,
+                                specs: lock.specs,
                             })
                         } else {
                             None
@@ -230,7 +231,7 @@ impl Manifest {
         }?
         .unwrap_or_else(|| LockFile {
             sources: manifest.sources.iter().map(|_| None).collect(),
-            recipes: manifest.recipes.iter_keys().map(|n| (n, None)).collect(),
+            specs: manifest.specs.iter_keys().map(|n| (n, None)).collect(),
         });
         Ok(Manifest {
             arch: arch.to_string(),
@@ -244,7 +245,7 @@ impl Manifest {
     }
     fn lock_is_uptodate(&self) -> bool {
         self.lock.sources.iter().all(|s| s.is_some())
-            && self.lock.recipes.iter_values().all(|r| r.is_some())
+            && self.lock.specs.iter_values().all(|r| r.is_some())
     }
     fn mark_file_updated(&mut self) {
         self.hash.take();
@@ -300,24 +301,18 @@ impl Manifest {
         }
         Ok(())
     }
-    pub fn recipes_names(&self) -> impl Iterator<Item = &str> {
-        self.file.recipes.iter_keys().map(|s| match s {
+    pub fn spec_names(&self) -> impl Iterator<Item = &str> {
+        self.file.specs.iter_keys().map(|s| match s {
             "" => "<default>",
             s => s,
         })
     }
-    fn locked_recipe(&self, recipe_name: Option<&str>) -> io::Result<&LockedRecipe> {
-        let name = recipe_name.unwrap_or("");
+    fn locked_spec(&self, spec_name: &str) -> io::Result<&LockedSpec> {
         self.lock
-            .recipes
+            .specs
             .iter()
-            .find_map(|(n, r)| (n == name).then_some(r.as_ref().expect("call resolve first")))
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "recipe {} not found",
-                    recipe_name.unwrap_or("<default>")
-                ))
-            })
+            .find_map(|(n, r)| (n == spec_name).then_some(r.as_ref().expect("call resolve first")))
+            .ok_or_else(|| io::Error::other(format!("spec \"{}\" not found", spec_name)))
     }
     pub fn add_source<C: AsRef<str>, T: TransportProvider + ?Sized>(
         &mut self,
@@ -334,7 +329,7 @@ impl Manifest {
         self.lock.sources.push(None);
         self.push_decorated_table("source", source, comment, true);
         self.mark_file_updated();
-        self.lock.recipes.iter_values_mut().for_each(|r| *r = None);
+        self.lock.specs.iter_values_mut().for_each(|r| *r = None);
         self.mark_lock_updated();
         Ok(())
     }
@@ -353,7 +348,7 @@ impl Manifest {
                     .and_then(|r| r.as_array_of_tables_mut())
                     .expect("invalid manifest structure");
                 arr.remove(i);
-                self.lock.recipes.iter_values_mut().for_each(|r| *r = None);
+                self.lock.specs.iter_values_mut().for_each(|r| *r = None);
                 self.mark_file_updated();
                 self.lock.sources.remove(i);
                 self.lock_updated = true;
@@ -365,58 +360,51 @@ impl Manifest {
             )),
         }
     }
-    pub fn installables<'a>(
+    pub fn installables<'a, S: AsRef<str>>(
         &'a self,
-        recipe: Option<&'a str>,
-    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, &'a str, u64, &'a FileHash)>> + 'a>
-    {
-        let recipe = recipe.unwrap_or("");
+        spec: &'a Option<S>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + 'a> {
+        let spec = spec.as_ref().map_or_else(|| "", |s| s.as_ref());
         let i = self
             .file
-            .recipes
+            .specs
             .iter_keys()
-            .position(|name| name == recipe)
+            .position(|name| name == spec)
             .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::NotFound,
-                    format!("recipe {} not found", recipe),
-                )
+                io::Error::new(io::ErrorKind::NotFound, format!("spec {} not found", spec))
             })?;
-        let locked = self.lock.recipes[i].as_ref().ok_or_else(|| {
+        let locked = self.lock.specs[i].as_ref().ok_or_else(|| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!(
-                    "no solution for recipe \"{}\", update manifest lock",
-                    recipe
-                ),
+                format!("no solution for spec \"{}\", update manifest lock", spec),
             )
         })?;
         Ok(locked.installables.iter().map(move |p| {
             let src = self.file.sources.get(p.src as usize).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
-                    format!("invalid source index {} in recipe {}", p.src, recipe),
+                    format!("invalid source index {} in spec {}", p.src, spec),
                 )
             })?;
-            Ok::<_, io::Error>((src, p.path.as_str(), p.size, &p.hash))
+            Ok::<_, io::Error>((src, &p.file))
         }))
     }
     fn requirements_for<'a>(
         &'a self,
-        mut r: &'a Recipe,
+        mut r: &'a Spec,
     ) -> (Vec<Dependency<String>>, Vec<Constraint<String>>) {
         let mut reqs = r.include.clone();
         let mut cons = r.exclude.iter().cloned().map(|c| !c).collect_vec();
-        while let Some(extends) = r.extends.as_deref().and_then(|n| self.file.recipes.get(n)) {
+        while let Some(extends) = r.extends.as_deref().and_then(|n| self.file.specs.get(n)) {
             r = extends;
             reqs.extend(r.include.iter().cloned());
             cons.extend(r.exclude.iter().cloned().map(|c| !c));
         }
         (reqs, cons)
     }
-    fn drop_locked_recipes(&mut self, recipe: usize) {
-        for recipe in self.file.descendants(recipe).into_iter() {
-            self.lock.recipes[recipe] = None;
+    fn drop_locked_specs(&mut self, spec: usize) {
+        for spec in self.file.descendants(spec).into_iter() {
+            self.lock.specs[spec] = None;
         }
     }
     fn push_decorated_table<T: Serialize, C: AsRef<str>>(
@@ -452,7 +440,7 @@ impl Manifest {
     }
     fn push_decorated_items<T, I, C>(
         &mut self,
-        recipe_name: &str,
+        spec_name: &str,
         kind: &str,
         items: I,
         comment: Option<C>,
@@ -461,19 +449,19 @@ impl Manifest {
         T: ToString,
         C: AsRef<str>,
     {
-        let arr = if recipe_name.is_empty() {
+        let arr = if spec_name.is_empty() {
             self.doc
-                .get_mut("recipe")
+                .get_mut("spec")
                 .and_then(|r| r.as_table_mut())
-                .expect("a table of recipes")
+                .expect("a table of specs")
                 .entry(kind)
                 .or_insert_with(|| toml_edit::Array::new().into())
         } else {
             self.doc
-                .get_mut("recipe")
+                .get_mut("spec")
                 .and_then(|r| r.as_table_mut())
-                .expect("a table of recipes")
-                .entry(recipe_name)
+                .expect("a table of specs")
+                .entry(spec_name)
                 .or_insert_with(|| toml_edit::table())
                 .as_table_mut()
                 .expect("a vaild table")
@@ -481,7 +469,7 @@ impl Manifest {
                 .or_insert_with(|| toml_edit::Array::new().into())
         }
         .as_array_mut()
-        .expect("a list of recipe items");
+        .expect("a list of spec items");
         if arr.is_empty() {
             arr.set_trailing("\n");
             arr.set_trailing_comma(true);
@@ -503,35 +491,36 @@ impl Manifest {
             arr.push_formatted(item);
         }
     }
-    pub fn add_requirements<C, S, I>(
+    pub fn add_requirements<C, S, I, N>(
         &mut self,
-        recipe_name: Option<&str>,
+        spec_name: &Option<N>,
         reqs: I,
         comment: Option<C>,
     ) -> io::Result<()>
     where
         C: AsRef<str>,
+        N: AsRef<str>,
         I: IntoIterator<Item = S>,
         S: IntoDependency<String>,
     {
-        let recipe_name = recipe_name.unwrap_or("");
-        let recipe = self
+        let spec_name = spec_name.as_ref().map_or_else(|| "", |s| s.as_ref());
+        let spec = self
             .file
-            .recipes_mut()
-            .find_position(|(n, _)| *n == recipe_name)
+            .specs_mut()
+            .find_position(|(n, _)| *n == spec_name)
             .map(|(i, _)| i);
-        match recipe {
+        match spec {
             Some(i) => {
                 let mut reqs = reqs
                     .into_iter()
                     .map(|s| s.into_dependency())
-                    .try_filter(|r| Ok(self.file.recipes[i].include.iter().all(|d| d != r)))
+                    .try_filter(|r| Ok(self.file.specs[i].include.iter().all(|d| d != r)))
                     .collect::<Result<Vec<_>, _>>()?;
                 if !reqs.is_empty() {
-                    self.push_decorated_items(recipe_name, "include", &reqs, comment);
-                    self.file.recipes[i].include.append(&mut reqs);
+                    self.push_decorated_items(spec_name, "include", &reqs, comment);
+                    self.file.specs[i].include.append(&mut reqs);
                     self.mark_file_updated();
-                    self.drop_locked_recipes(i);
+                    self.drop_locked_specs(i);
                     self.mark_lock_updated();
                 }
             }
@@ -540,50 +529,52 @@ impl Manifest {
                     .into_iter()
                     .map(|s| s.into_dependency())
                     .collect::<Result<Vec<_>, _>>()?;
-                self.push_decorated_items(recipe_name, "include", &reqs, comment);
-                let r = Recipe {
+                self.push_decorated_items(spec_name, "include", &reqs, comment);
+                let r = Spec {
                     extends: None,
                     include: reqs,
                     exclude: Vec::new(),
                 };
-                self.file.recipes.push(recipe_name, r);
+                self.file.specs.push(spec_name, r);
                 self.mark_file_updated();
-                self.lock.recipes.push(recipe_name, None);
+                self.lock.specs.push(spec_name, None);
                 self.mark_lock_updated();
             }
         }
         Ok(())
     }
-    pub fn drop_requirements<I, S>(&mut self, recipe_name: Option<&str>, reqs: I) -> io::Result<()>
+    pub fn drop_requirements<I, S, N>(&mut self, spec_name: &Option<N>, reqs: I) -> io::Result<()>
     where
         I: IntoIterator<Item = S>,
         S: IntoDependency<String>,
+        N: AsRef<str>,
     {
-        let recipe_name = recipe_name
-            .map_or_else(|| Ok(""), valid_recipe_name)
+        let spec_name = spec_name
+            .as_ref()
+            .map_or_else(|| Ok(""), |s| valid_spec_name(s.as_ref()))
             .map_err(io::Error::other)?;
-        let recipe = self
+        let spec = self
             .file
-            .recipes_mut()
-            .find_position(|(n, _)| *n == recipe_name);
-        match recipe {
+            .specs_mut()
+            .find_position(|(n, _)| *n == spec_name);
+        match spec {
             Some((i, (_, r))) => {
                 if r.include.is_empty() {
                     return Ok(());
                 }
-                let tbl = if recipe_name.is_empty() {
+                let tbl = if spec_name.is_empty() {
                     self.doc
-                        .get_mut("recipe")
+                        .get_mut("spec")
                         .and_then(|r| r.as_table_mut())
-                        .expect("a table of recipes")
+                        .expect("a table of specs")
                 } else {
                     self.doc
-                        .get_mut("recipe")
+                        .get_mut("spec")
                         .and_then(|r| r.as_table_mut())
-                        .expect("a table of recipes")
-                        .get_mut(recipe_name)
+                        .expect("a table of specs")
+                        .get_mut(spec_name)
                         .and_then(|t| t.as_table_mut())
-                        .expect("a valid recipe record")
+                        .expect("a valid spec record")
                 };
                 let arr = tbl
                     .get_mut("include")
@@ -602,12 +593,12 @@ impl Manifest {
                 }
                 if updated {
                     if r.exclude.is_empty() && r.include.is_empty() {
-                        self.drop_recipe(recipe_name)?;
+                        self.drop_spec(spec_name)?;
                     } else {
                         if r.include.is_empty() {
                             tbl.remove("include");
                         }
-                        self.drop_locked_recipes(i);
+                        self.drop_locked_specs(i);
                     }
                     self.mark_file_updated();
                     self.mark_lock_updated();
@@ -616,43 +607,45 @@ impl Manifest {
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("recipe {} not found", recipe_name),
+                    format!("spec {} not found", spec_name),
                 ));
             }
         }
         Ok(())
     }
-    pub fn add_constraints<C, S, I>(
+    pub fn add_constraints<C, S, I, N>(
         &mut self,
-        recipe_name: Option<&str>,
+        spec_name: &Option<N>,
         reqs: I,
         comment: Option<C>,
     ) -> io::Result<()>
     where
         C: AsRef<str>,
+        N: AsRef<str>,
         I: IntoIterator<Item = S>,
         S: IntoConstraint<String>,
     {
-        let recipe_name = recipe_name
-            .map_or_else(|| Ok(""), valid_recipe_name)
+        let spec_name = spec_name
+            .as_ref()
+            .map_or_else(|| Ok(""), |s| valid_spec_name(s.as_ref()))
             .map_err(io::Error::other)?;
-        let recipe = self
+        let spec = self
             .file
-            .recipes_mut()
-            .find_position(|(n, _)| *n == recipe_name)
+            .specs_mut()
+            .find_position(|(n, _)| *n == spec_name)
             .map(|(i, _)| i);
-        match recipe {
+        match spec {
             Some(i) => {
                 let mut reqs = reqs
                     .into_iter()
                     .map(|s| s.into_constraint())
-                    .try_filter(|r| Ok(self.file.recipes[i].exclude.iter().all(|d| d != r)))
+                    .try_filter(|r| Ok(self.file.specs[i].exclude.iter().all(|d| d != r)))
                     .collect::<Result<Vec<_>, _>>()?;
                 if !reqs.is_empty() {
-                    self.push_decorated_items(recipe_name, "exclude", &reqs, comment);
-                    self.file.recipes[i].exclude.append(&mut reqs);
+                    self.push_decorated_items(spec_name, "exclude", &reqs, comment);
+                    self.file.specs[i].exclude.append(&mut reqs);
                     self.mark_file_updated();
-                    self.drop_locked_recipes(i);
+                    self.drop_locked_specs(i);
                     self.mark_lock_updated();
                 }
             }
@@ -661,50 +654,52 @@ impl Manifest {
                     .into_iter()
                     .map(|s| s.into_constraint())
                     .collect::<Result<Vec<_>, _>>()?;
-                self.push_decorated_items(recipe_name, "exclude", &reqs, comment);
-                let r = Recipe {
+                self.push_decorated_items(spec_name, "exclude", &reqs, comment);
+                let r = Spec {
                     extends: None,
                     include: Vec::new(),
                     exclude: reqs,
                 };
-                self.file.recipes.push(recipe_name, r);
+                self.file.specs.push(spec_name, r);
                 self.mark_file_updated();
-                self.lock.recipes.push(recipe_name, None);
+                self.lock.specs.push(spec_name, None);
                 self.mark_lock_updated();
             }
         }
         Ok(())
     }
-    pub fn drop_constraints<I, S>(&mut self, recipe_name: Option<&str>, reqs: I) -> io::Result<()>
+    pub fn drop_constraints<I, S, N>(&mut self, spec_name: &Option<N>, reqs: I) -> io::Result<()>
     where
         I: IntoIterator<Item = S>,
         S: IntoConstraint<String>,
+        N: AsRef<str>,
     {
-        let recipe_name = recipe_name
-            .map_or_else(|| Ok(""), valid_recipe_name)
+        let spec_name = spec_name
+            .as_ref()
+            .map_or_else(|| Ok(""), |s| valid_spec_name(s.as_ref()))
             .map_err(io::Error::other)?;
-        let recipe = self
+        let spec = self
             .file
-            .recipes_mut()
-            .find_position(|(n, _)| *n == recipe_name);
-        match recipe {
+            .specs_mut()
+            .find_position(|(n, _)| *n == spec_name);
+        match spec {
             Some((i, (_, r))) => {
                 if r.exclude.is_empty() {
                     return Ok(());
                 }
-                let tbl = if recipe_name.is_empty() {
+                let tbl = if spec_name.is_empty() {
                     self.doc
-                        .get_mut("recipe")
+                        .get_mut("spec")
                         .and_then(|r| r.as_table_mut())
-                        .expect("a table of recipes")
+                        .expect("a table of specs")
                 } else {
                     self.doc
-                        .get_mut("recipe")
+                        .get_mut("spec")
                         .and_then(|r| r.as_table_mut())
-                        .expect("a table of recipes")
-                        .get_mut(recipe_name)
+                        .expect("a table of specs")
+                        .get_mut(spec_name)
                         .and_then(|t| t.as_table_mut())
-                        .expect("a valid recipe record")
+                        .expect("a valid spec record")
                 };
                 let arr = tbl
                     .get_mut("exclude")
@@ -723,12 +718,12 @@ impl Manifest {
                 }
                 if updated {
                     if r.exclude.is_empty() && r.include.is_empty() {
-                        self.drop_recipe(recipe_name)?;
+                        self.drop_spec(spec_name)?;
                     } else {
                         if r.exclude.is_empty() {
                             tbl.remove("exclude");
                         }
-                        self.drop_locked_recipes(i);
+                        self.drop_locked_specs(i);
                     }
                     self.mark_file_updated();
                     self.mark_lock_updated();
@@ -737,51 +732,51 @@ impl Manifest {
             None => {
                 return Err(io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("recipe {} not found", recipe_name),
+                    format!("spec {} not found", spec_name),
                 ));
             }
         }
         Ok(())
     }
-    fn drop_recipe(&mut self, recipe_name: &str) -> io::Result<()> {
+    fn drop_spec(&mut self, spec_name: &str) -> io::Result<()> {
         let idx = self
-            .recipes_names()
-            .find_position(|n| *n == recipe_name)
+            .spec_names()
+            .find_position(|n| *n == spec_name)
             .map(|(i, _)| i)
-            .ok_or_else(|| io::Error::other(format!("recipe {recipe_name} not found")))?;
-        self.drop_locked_recipes(idx);
-        let (_, recipe) = self.file.recipes.remove(idx);
-        let extends = recipe.extends;
-        self.lock.recipes.remove(idx);
+            .ok_or_else(|| io::Error::other(format!("spec {spec_name} not found")))?;
+        self.drop_locked_specs(idx);
+        let (_, spec) = self.file.specs.remove(idx);
+        let extends = spec.extends;
+        self.lock.specs.remove(idx);
         let tbl = self
             .doc
-            .get_mut("recipe")
+            .get_mut("spec")
             .and_then(|r| r.as_table_mut())
             .expect("invalid manifest structure");
-        if recipe_name.is_empty() {
+        if spec_name.is_empty() {
             tbl.remove("include");
             tbl.remove("exclude");
             tbl.remove("extends");
         } else {
-            tbl.remove(recipe_name);
+            tbl.remove(spec_name);
         }
-        for (n, r) in self.file.recipes_mut() {
-            if Some(recipe_name) == r.extends.as_deref() {
+        for (n, r) in self.file.specs_mut() {
+            if Some(spec_name) == r.extends.as_deref() {
                 r.extends = extends.clone();
                 let tbl = if n.is_empty() {
-                    self.doc.get_mut("recipe").and_then(|r| r.as_table_mut())
+                    self.doc.get_mut("spec").and_then(|r| r.as_table_mut())
                 } else {
                     self.doc
-                        .get_mut("recipe")
+                        .get_mut("spec")
                         .and_then(|r| r.as_table_mut())
                         .and_then(|r| r.get_mut(n))
                         .and_then(|t| t.as_table_mut())
                 };
-                if let Some(recipe) = tbl {
+                if let Some(spec) = tbl {
                     if let Some(extends) = extends.as_deref() {
-                        recipe["extends"] = toml_edit::value(extends).into();
+                        spec["extends"] = toml_edit::value(extends).into();
                     } else {
-                        recipe.remove("extends");
+                        spec.remove("extends");
                     }
                 }
             }
@@ -854,20 +849,20 @@ impl Manifest {
         ))
         .await
     }
-    fn solve_recipes(
+    fn solve_specs(
         &self,
         pkgs_idx: &[usize],
         universe: &mut Universe,
-    ) -> io::Result<KVList<Option<LockedRecipe>>> {
+    ) -> io::Result<KVList<Option<LockedSpec>>> {
         self.file
-            .recipes
+            .specs
             .iter()
-            .zip(self.lock.recipes.iter())
+            .zip(self.lock.specs.iter())
             .map(|((rn, r), (ln, l))| {
                 if rn != ln {
                     panic!("inconsistent manifest state");
                 }
-                // do not recalculate already locked recipes
+                // do not recalculate already locked specs
                 if l.is_some() {
                     return Ok((ln, l.clone()));
                 }
@@ -878,7 +873,7 @@ impl Manifest {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
                             format!(
-                                "failed to solve recipe {}:\n{}",
+                                "failed to solve spec {}:\n{}",
                                 rn,
                                 universe.display_conflict(conflict)
                             ),
@@ -907,17 +902,19 @@ impl Manifest {
                                     })?;
                                 hasher.update(hash.as_ref());
                                 Ok(LockedPackage {
-                                    path: path.to_string(),
+                                    file: RepositoryFile {
+                                        path: path.to_string(),
+                                        size,
+                                        hash,
+                                    },
                                     idx: solvable.into(),
                                     src: src as u32,
-                                    size,
-                                    hash,
                                 })
                             })
                             .collect::<io::Result<Vec<_>>>()?;
                         Ok((
                             ln,
-                            Some(LockedRecipe {
+                            Some(LockedSpec {
                                 hash: hasher.finalize_fixed().into(),
                                 installables,
                             }),
@@ -944,8 +941,8 @@ impl Manifest {
             self.make_universe(&locked_sources, concurrency, transport)
                 .await?
         };
-        if self.lock.recipes.iter_values().any(Option::is_none) {
-            self.lock.recipes = self.solve_recipes(&pkgs_idx, universe.as_mut())?;
+        if self.lock.specs.iter_values().any(Option::is_none) {
+            self.lock.specs = self.solve_specs(&pkgs_idx, universe.as_mut())?;
             self.mark_lock_updated();
         };
         if let Some(locked_sources) = locked_sources {
@@ -962,11 +959,15 @@ impl Manifest {
             .expect("call resolve first")
             .packages()
     }
-    pub fn recipe_packages<'a>(
+    pub fn spec_packages<'a, N: AsRef<str>>(
         &'a self,
-        recipe_name: Option<&str>,
+        spec_name: &Option<N>,
     ) -> io::Result<impl Iterator<Item = &'a Package<'a>>> {
-        let locked = self.locked_recipe(recipe_name)?;
+        let spec_name = spec_name
+            .as_ref()
+            .map_or_else(|| Ok(""), |s| valid_spec_name(s.as_ref()))
+            .map_err(io::Error::other)?;
+        let locked = self.locked_spec(spec_name)?;
         let universe = self
             .universe
             .as_ref()
@@ -982,7 +983,7 @@ impl Manifest {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct Recipe {
+struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     extends: Option<String>,
 
@@ -999,8 +1000,8 @@ struct ManifestFile {
     #[serde(default, rename = "source", skip_serializing_if = "Vec::is_empty")]
     sources: Vec<Source>,
 
-    #[serde(default, rename = "recipe", skip_serializing_if = "KVList::is_empty")]
-    recipes: KVList<Recipe>,
+    #[serde(default, rename = "spec", skip_serializing_if = "KVList::is_empty")]
+    specs: KVList<Spec>,
 }
 
 #[derive(PartialEq, Eq, Clone, Copy)]
@@ -1011,11 +1012,8 @@ enum DFSNodeState {
 }
 
 impl ManifestFile {
-    fn recipes(&self) -> impl Iterator<Item = (&'_ str, &'_ Recipe)> {
-        self.recipes.iter()
-    }
-    fn recipes_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut Recipe)> {
-        self.recipes.iter_mut()
+    fn specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut Spec)> {
+        self.specs.iter_mut()
     }
     fn descendants(&self, id: usize) -> Vec<usize> {
         let mut result = Vec::new();
@@ -1026,20 +1024,20 @@ impl ManifestFile {
                 continue;
             }
             result.push(curr);
-            for (i, (_, r)) in self.recipes.iter().enumerate() {
-                if r.extends.as_deref() == Some(self.recipes.key_at(curr)) {
+            for (i, (_, r)) in self.specs.iter().enumerate() {
+                if r.extends.as_deref() == Some(self.specs.key_at(curr)) {
                     queue.push_back(i);
                 }
             }
         }
         result
     }
-    fn verify_recipes_graph(&self) -> io::Result<()> {
+    fn verify_specs_graph(&self) -> io::Result<()> {
         use DFSNodeState::*;
-        let mut state: HashMap<&str, DFSNodeState> = HashMap::with_capacity(self.recipes.len());
-        let mut stack: Vec<&str> = Vec::with_capacity(self.recipes.len());
+        let mut state: HashMap<&str, DFSNodeState> = HashMap::with_capacity(self.specs.len());
+        let mut stack: Vec<&str> = Vec::with_capacity(self.specs.len());
 
-        for key in self.recipes.iter_keys() {
+        for key in self.specs.iter_keys() {
             if state.get(key).copied().unwrap_or(Unvisited) == Unvisited {
                 self.dfs(key, &mut state, &mut stack)?;
             }
@@ -1056,12 +1054,12 @@ impl ManifestFile {
         state.insert(node, Visited);
         stack.push(node);
 
-        if let Some(next) = self.recipes.get(node).and_then(|r| r.extends.as_deref()) {
+        if let Some(next) = self.specs.get(node).and_then(|r| r.extends.as_deref()) {
             match state.get(next).copied().unwrap_or(Unvisited) {
                 Unvisited => {
-                    if !self.recipes.contains_key(next) {
+                    if !self.specs.contains_key(next) {
                         return Err(io::Error::other(format!(
-                            "recipe {} extends missing ({})",
+                            "spec {} extends missing ({})",
                             node, next
                         )));
                     }
@@ -1075,7 +1073,7 @@ impl ManifestFile {
                         .map(|s| s.to_string())
                         .collect();
                     return Err(io::Error::other(format!(
-                        "recipes form a cycle: {}",
+                        "specs form a cycle: {}",
                         cycle.join(" <- ")
                     )));
                 }
@@ -1091,8 +1089,8 @@ impl ManifestFile {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct LockedSuite {
-    release: RepositoryIndexFile,
-    packages: Vec<RepositoryIndexFile>,
+    release: RepositoryFile,
+    packages: Vec<RepositoryFile>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1122,17 +1120,17 @@ impl LockedSource {
     }
 }
 
-fn valid_recipe_name(s: &str) -> Result<&str, String> {
+fn valid_spec_name(s: &str) -> Result<&str, String> {
     if s.is_empty()
         || s.chars()
             .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
     {
         Err(format!(
-            "invalid recipe name \"{}\", only alphanumeric characters, '-' and '_' are allowed",
+            "invalid spec name \"{}\", only alphanumeric characters, '-' and '_' are allowed",
             s
         ))
     } else if ["include", "exclude", "extends"].contains(&s) {
-        Err(format!("invalid recipe name \"{}\"", s))
+        Err(format!("invalid spec name \"{}\"", s))
     } else {
         Ok(s)
     }
@@ -1143,14 +1141,13 @@ fn valid_recipe_name(s: &str) -> Result<&str, String> {
 struct LockedPackage {
     src: u32,
     idx: u32,
-    path: String,
-    size: u64,
-    hash: FileHash,
+    #[serde(flatten)]
+    file: RepositoryFile,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
-struct LockedRecipe {
+struct LockedSpec {
     #[serde(with = "crate::hash::serde::base64")]
     hash: Hash<sha2::Sha256>,
 
@@ -1161,7 +1158,7 @@ struct LockedRecipe {
 #[serde(deny_unknown_fields)]
 struct LockFile {
     sources: Vec<Option<LockedSource>>,
-    recipes: KVList<Option<LockedRecipe>>,
+    specs: KVList<Option<LockedSpec>>,
 }
 
 struct KVList<R>(Vec<(String, R)>);
@@ -1277,7 +1274,7 @@ impl<R> std::ops::IndexMut<usize> for KVList<R> {
     }
 }
 
-impl Serialize for KVList<Recipe> {
+impl Serialize for KVList<Spec> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -1306,24 +1303,24 @@ impl Serialize for KVList<Recipe> {
     }
 }
 
-impl<'de> Deserialize<'de> for KVList<Recipe> {
+impl<'de> Deserialize<'de> for KVList<Spec> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::de::Deserializer<'de>,
     {
-        struct RecipesVisitor;
+        struct SpecsVisitor;
 
-        impl RecipesVisitor {
+        impl SpecsVisitor {
             fn has_name<T>(v: &[(String, T)], n: &str) -> bool {
                 v.iter().any(|(k, _)| k == n)
             }
         }
 
-        impl<'de> serde::de::Visitor<'de> for RecipesVisitor {
-            type Value = KVList<Recipe>;
+        impl<'de> serde::de::Visitor<'de> for SpecsVisitor {
+            type Value = KVList<Spec>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a default recipe and a map of named recipes")
+                f.write_str("a default spec and a map of named specs")
             }
 
             fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
@@ -1331,7 +1328,7 @@ impl<'de> Deserialize<'de> for KVList<Recipe> {
                 A: serde::de::MapAccess<'de>,
             {
                 use serde::de::Error;
-                let mut out: Vec<(String, Recipe)> =
+                let mut out: Vec<(String, Spec)> =
                     Vec::with_capacity(access.size_hint().unwrap_or(0));
 
                 #[derive(Default)]
@@ -1367,37 +1364,37 @@ impl<'de> Deserialize<'de> for KVList<Recipe> {
                             set_once!(def.exclude, v, "exclude");
                         }
                         other => {
-                            let key = valid_recipe_name(other).map_err(A::Error::custom)?;
+                            let key = valid_spec_name(other).map_err(A::Error::custom)?;
                             if Self::has_name(&out, &key) {
                                 return Err(A::Error::custom(format!(
-                                    "duplicate recipe name: {other}"
+                                    "duplicate spec name: {other}"
                                 )));
                             }
-                            let recipe = access.next_value::<Recipe>()?;
-                            out.push((key.to_string(), recipe));
+                            let spec = access.next_value::<Spec>()?;
+                            out.push((key.to_string(), spec));
                         }
                     }
                 }
 
                 if def.extends.is_some() || def.include.is_some() || def.exclude.is_some() {
-                    let default_recipe = Recipe {
+                    let default_spec = Spec {
                         extends: def.extends,
                         include: def.include.unwrap_or_default(),
                         exclude: def.exclude.unwrap_or_default(),
                     };
 
-                    out.push(("".to_string(), default_recipe));
+                    out.push(("".to_string(), default_spec));
                 }
 
                 Ok(KVList(out))
             }
         }
 
-        deserializer.deserialize_map(RecipesVisitor)
+        deserializer.deserialize_map(SpecsVisitor)
     }
 }
 
-impl Serialize for KVList<Option<LockedRecipe>> {
+impl Serialize for KVList<Option<LockedSpec>> {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: serde::Serializer,
@@ -1406,30 +1403,30 @@ impl Serialize for KVList<Option<LockedRecipe>> {
 
         let mut map = serializer.serialize_map(Some(self.0.len()))?;
         for (k, v) in self.iter() {
-            map.serialize_entry(k, v.as_ref().expect("a locked recipe"))?;
+            map.serialize_entry(k, v.as_ref().expect("a locked spec"))?;
         }
         map.end()
     }
 }
 
-impl<'de> Deserialize<'de> for KVList<Option<LockedRecipe>> {
+impl<'de> Deserialize<'de> for KVList<Option<LockedSpec>> {
     fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
     where
         D: serde::de::Deserializer<'de>,
     {
-        struct RecipesVisitor;
+        struct SpecsVisitor;
 
-        impl RecipesVisitor {
+        impl SpecsVisitor {
             fn has_name<T>(v: &[(String, T)], n: &str) -> bool {
                 v.iter().any(|(k, _)| k == n)
             }
         }
 
-        impl<'de> serde::de::Visitor<'de> for RecipesVisitor {
-            type Value = KVList<Option<LockedRecipe>>;
+        impl<'de> serde::de::Visitor<'de> for SpecsVisitor {
+            type Value = KVList<Option<LockedSpec>>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-                f.write_str("a map of locked recipes")
+                f.write_str("a map of locked specs")
             }
 
             fn visit_map<A>(self, mut access: A) -> std::result::Result<Self::Value, A::Error>
@@ -1437,21 +1434,21 @@ impl<'de> Deserialize<'de> for KVList<Option<LockedRecipe>> {
                 A: serde::de::MapAccess<'de>,
             {
                 use serde::de::Error;
-                let mut out: Vec<(String, Option<LockedRecipe>)> =
+                let mut out: Vec<(String, Option<LockedSpec>)> =
                     Vec::with_capacity(access.size_hint().unwrap_or(0));
 
                 while let Some(key) = access.next_key::<String>()? {
                     if Self::has_name(&out, &key) {
-                        return Err(A::Error::custom(format!("duplicate recipe name: {key}")));
+                        return Err(A::Error::custom(format!("duplicate spec name: {key}")));
                     }
-                    let recipe = access.next_value::<LockedRecipe>()?;
-                    out.push((key, Some(recipe)));
+                    let spec = access.next_value::<LockedSpec>()?;
+                    out.push((key, Some(spec)));
                 }
 
                 Ok(KVList(out))
             }
         }
 
-        deserializer.deserialize_map(RecipesVisitor)
+        deserializer.deserialize_map(SpecsVisitor)
     }
 }
