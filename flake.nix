@@ -39,48 +39,11 @@
             ];
           };
         };
-        cargo-afl-source = {
-          lib,
-          fetchFromGitHub,
-          aflplusplus,
-          rustPlatform,
-        }:
-        rustPlatform.buildRustPackage {
-          pname = "cargo-afl";
-          version = "0.16.0-rc.0";
-
-          src = fetchFromGitHub {
-            owner = "rust-fuzz";
-            repo = "afl.rs";
-            rev = "ea1ca87123a42538db5550adc402c3a84536fb47";
-            fetchSubmodules = false;
-            hash = "sha256-AHzAvjA63nRuZ2vd3fRmwhrzCZlky5bWMgVImsw/DUw=";
-          };
-
-          buildInputs = [
-            aflplusplus
-          ];
-
-          cargoHash = "sha256-W+Y/KZjuQZfXTbCx1mSJ0hZXoJYzDxAbyH1GwsdaDMA=";
-
-          doCheck = false;
-
-          meta = with lib; {
-            description = "Command line helpers for fuzzing with AFL++";
-            mainProgram = "cargo-afl";
-            homepage = "https://github.com/rust-fuzz/cargo-afl";
-            license = with licenses; [
-              mit
-              asl20
-            ];
-          };
-        };
         pkgs = import nixpkgs {
             inherit system;
             overlays = [ 
                 (import rust-overlay) 
                 (final: prev: {
-                    cargo-afl = final.callPackage cargo-afl-source {};
                     cargo-debstatus = final.callPackage cargo-debstatus-source {};
                 })
             ];
@@ -95,8 +58,6 @@
             clang
         ]);
         nativeBuildInputs = with pkgs; [ 
-            # aflplusplus
-            # cargo-afl
             cargo-debstatus
             cargo-show-asm
             cargo-expand
@@ -114,8 +75,6 @@
             sequoia-sqv
 
             pkg-config 
-            valgrind
-            gdb
         ];
         rust-debian-stable = [ (pkgs.rust-bin.stable."1.86.0".default.override {
           extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];
@@ -132,9 +91,7 @@
             ]);
             shellHook = ''
             export RUST_BACKTRACE=1
-            # export PKG_CONFIG_ALL_STATIC=1
             export RUSTFLAGS="-C link-args=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2";
-            # export LIBCLANG_PATH="${pkgs.llvmPackages.libclang.lib}/lib";
             '';
         } // params;
     in rec {

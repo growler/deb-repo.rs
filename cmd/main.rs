@@ -391,9 +391,8 @@ impl Command for Build {
         smol::block_on(async move {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
-            let fs =
-                debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
-                    .await?;
+            let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                .await?;
 
             {
                 let builder = HostBuilder {};
@@ -432,9 +431,8 @@ impl Command for Extract {
         smol::block_on(async move {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
-            let fs =
-                debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
-                    .await?;
+            let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                .await?;
             let installables = manifest
                 .installables(&self.spec)?
                 .collect::<std::io::Result<Vec<_>>>()?;

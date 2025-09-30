@@ -228,6 +228,7 @@ where
 {
     fn pivot_root(&self) -> io::Result<()> {
         let root_dfd = self.mounter.mount_root()?;
+        fchdir(&root_dfd)?;
         mkdirat_if_not_exist(&root_dfd, "dev", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "proc", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "run", Mode::from_raw_mode(0o755))?;
@@ -235,7 +236,6 @@ where
         mount_pts(&root_dfd)?;
         mount_proc(&root_dfd)?;
         mount_run(&root_dfd)?;
-        fchdir(&root_dfd)?;
         pivot_root(".", ".")?;
         unmount(".", UnmountFlags::DETACH)?;
         Ok(())
@@ -278,14 +278,20 @@ where
                 .env_clear()
                 .envs(env)
                 .args(["--force-depends", "--configure", "base-passwd"])
-                .status()?;
+                .status()?
+                .success()
+                .then_some(())
+                .ok_or_else(|| io::Error::other("command failed"))?;
         }
         if base_files {
             Command::new("/usr/bin/dpkg")
                 .env_clear()
                 .envs(env)
                 .args(["--force-depends", "--configure", "base-files"])
-                .status()?;
+                .status()?
+                .success()
+                .then_some(())
+                .ok_or_else(|| io::Error::other("command failed"))?;
         }
         if !essential_pkgs.is_empty() {
             Command::new("/usr/bin/dpkg")
@@ -296,13 +302,19 @@ where
                         .iter()
                         .chain(essential_pkgs.iter()),
                 )
-                .status()?;
+                .status()?
+                .success()
+                .then_some(())
+                .ok_or_else(|| io::Error::other("command failed"))?;
         }
         Command::new("/usr/bin/dpkg")
             .env_clear()
             .envs(env)
             .args(["--configure", "-a"])
-            .status()?;
+            .status()?
+            .success()
+            .then_some(())
+            .ok_or_else(|| io::Error::other("command failed"))?;
         std::fs::remove_file("usr/sbin/policy-rc.d")?;
         Ok(())
     }
@@ -395,13 +407,12 @@ fn make_mountpoint(dfd: &OwnedFd) -> io::Result<()> {
 fn mount_dev(dfd: &OwnedFd) -> io::Result<()> {
     let fsfd = fsopen("tmpfs", FsOpenFlags::FSOPEN_CLOEXEC)?;
     fsconfig_set_string(&fsfd, "size", "1024M")?;
+    fsconfig_set_string(&fsfd, "mode", "0755")?;
     fsconfig_create(&fsfd)?;
     let mountfd = fsmount(
         &fsfd,
         FsMountFlags::empty(),
-        MountAttrFlags::MOUNT_ATTR_NOSUID
-            | MountAttrFlags::MOUNT_ATTR_NOEXEC
-            | MountAttrFlags::MOUNT_ATTR_RELATIME,
+        MountAttrFlags::MOUNT_ATTR_NOSUID | MountAttrFlags::MOUNT_ATTR_NOEXEC,
     )?;
     move_mount(
         mountfd,
@@ -410,13 +421,47 @@ fn mount_dev(dfd: &OwnedFd) -> io::Result<()> {
         "dev",
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )?;
-    let dev_fd = openat(
+    let dev_dfd = openat(
         dfd,
         "dev",
         OFlags::RDONLY | OFlags::DIRECTORY,
         Mode::empty(),
     )?;
-    mkdirat(&dev_fd, "pts", Mode::from_raw_mode(0o755))?;
+    mkdirat(&dev_dfd, "pts", Mode::from_raw_mode(0o755))?;
+    static LINKS: [(&str, &str); 6] = [
+        ("pts/ptmx", "ptmx"),
+        ("pts/0", "console"),
+        ("/proc/kcore", "core"),
+        ("/proc/self/fd/0", "stdin"),
+        ("/proc/self/fd/1", "stdout"),
+        ("/proc/self/fd/2", "stderr"),
+    ];
+    for (target, path) in LINKS {
+        symlinkat(target, &dev_dfd, path)?;
+    }
+    static DEVICES: [&str; 6] = ["null", "zero", "full", "random", "urandom", "tty"];
+    let host_dfd = openat(
+        CWD,
+        "/dev",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?;
+    for name in DEVICES {
+        let target_fd = openat(
+            &dev_dfd,
+            name,
+            OFlags::CREATE | OFlags::CLOEXEC | OFlags::RDONLY,
+            Mode::from_raw_mode(0o700),
+        )?;
+        let mnt_fd = open_tree(&host_dfd, name, OpenTreeFlags::OPEN_TREE_CLONE)?;
+        move_mount(
+            &mnt_fd,
+            "",
+            &target_fd,
+            "",
+            MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
+        )?;
+    }
     Ok(())
 }
 fn mount_pts(dfd: &OwnedFd) -> io::Result<()> {
@@ -432,20 +477,13 @@ fn mount_pts(dfd: &OwnedFd) -> io::Result<()> {
             | MountAttrFlags::MOUNT_ATTR_NOEXEC
             | MountAttrFlags::MOUNT_ATTR_RELATIME,
     )?;
-    let dev_dfd = openat(
-        dfd,
-        "dev",
-        OFlags::RDONLY | OFlags::DIRECTORY,
-        Mode::empty(),
-    )?;
     move_mount(
         mountfd,
         "",
-        &dev_dfd,
-        "pts",
+        dfd,
+        "dev/pts",
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )?;
-    symlinkat("pts/ptmx", &dev_dfd, "ptmx")?;
     Ok(())
 }
 fn mount_proc(dfd: &OwnedFd) -> io::Result<()> {
