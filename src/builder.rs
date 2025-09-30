@@ -2,10 +2,10 @@ use {
     crate::{
         control::MutableControlStanza,
         deployfs::DeploymentFileSystem,
-        exec::{ExecHelper, HelperExitStatus, WithSerde},
+        helper::{ExecHelper, HelperExitStatus, UnshareUserNs, WithSerde},
         manifest::Manifest,
         source::RepositoryFile,
-        LocalFileSystem, Source, TransportProvider,
+        HostFileSystem, Source, TransportProvider,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     futures_lite::io::AsyncWriteExt,
@@ -38,10 +38,10 @@ pub trait UnpackStrategy<FS: DeploymentFileSystem + ?Sized> {
         T: TransportProvider + ?Sized;
 }
 
-pub struct Parallel;
+pub struct MulitThreaded;
 
 #[async_trait::async_trait(?Send)]
-impl<FS> UnpackStrategy<FS> for Parallel
+impl<FS> UnpackStrategy<FS> for MulitThreaded
 where
     FS: DeploymentFileSystem + Send + Sync + Clone + 'static,
 {
@@ -58,14 +58,14 @@ where
             .deb_reader(&package.path, package.size, &package.hash, transport)
             .await?;
         let fs = fs.clone();
-        blocking::unblock(move || smol::block_on(async { deb.extract_to(&fs).await })).await
+        blocking::unblock(move || smol::block_on(deb.extract_to(&fs))).await
     }
 }
 
-pub struct Local;
+pub struct SingleThreaded;
 
 #[async_trait::async_trait(?Send)]
-impl<FS> UnpackStrategy<FS> for Local
+impl<FS> UnpackStrategy<FS> for SingleThreaded
 where
     FS: DeploymentFileSystem + ?Sized,
 {
@@ -86,11 +86,11 @@ where
 }
 
 pub trait Mounter: Serialize + for<'de> Deserialize<'de> {
-    fn mount_root(&self) -> io::Result<PathBuf>;
+    fn mount_root(&self) -> io::Result<OwnedFd>;
 }
 
 #[async_trait::async_trait(?Send)]
-pub trait NewBuilder
+pub trait Builder
 where
     Self: Sized,
 {
@@ -98,6 +98,9 @@ where
     type Unpack: UnpackStrategy<Self::FileSystem>;
     type Mounter: Mounter;
     fn mounter(&self, fs: &Self::FileSystem) -> io::Result<Self::Mounter>;
+    fn unshare_user_ns() -> Option<io::Result<()>> {
+        UnshareUserNs::unshare()
+    }
     async fn build<'a, S, T>(
         &self,
         manifest: &Manifest,
@@ -117,7 +120,7 @@ where
             .unpack_debs(installables, concurrency, transport, fs)
             .await?;
         let mounter = self.mounter(fs)?;
-        let runner = NewBuildRunner::<Self>::new(essentials, mounter);
+        let runner = BuildRunner::<Self>::new(essentials, mounter);
         if !runner.run().await?.is_success() {
             Err(io::Error::other("failed to build tree"))
         } else {
@@ -202,12 +205,12 @@ where
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct NewBuildRunner<B: NewBuilder> {
+pub(crate) struct BuildRunner<B: Builder> {
     essentials: Vec<String>,
     mounter: B::Mounter,
 }
 
-impl<B: NewBuilder> NewBuildRunner<B> {
+impl<B: Builder> BuildRunner<B> {
     fn new(essentials: Vec<String>, mounter: B::Mounter) -> Self {
         Self {
             essentials,
@@ -219,18 +222,12 @@ impl<B: NewBuilder> NewBuildRunner<B> {
     }
 }
 
-impl<B> NewBuildRunner<B>
+impl<B> BuildRunner<B>
 where
-    B: NewBuilder,
+    B: Builder,
 {
     fn pivot_root(&self) -> io::Result<()> {
-        let root = self.mounter.mount_root()?;
-        let root_dfd = openat(
-            CWD,
-            &root,
-            OFlags::DIRECTORY | OFlags::RDONLY,
-            Mode::empty(),
-        )?;
+        let root_dfd = self.mounter.mount_root()?;
         mkdirat_if_not_exist(&root_dfd, "dev", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "proc", Mode::from_raw_mode(0o755))?;
         mkdirat_if_not_exist(&root_dfd, "run", Mode::from_raw_mode(0o755))?;
@@ -259,28 +256,48 @@ where
         f.write_all(b"#!/bin/sh\nexit 101\n")?;
         f.flush()?;
         drop(f);
-        Command::new("/usr/bin/dpkg")
-            .env_clear()
-            .envs(env)
-            .args(["--force-depends", "--configure", "base-passwd"])
-            .status()?;
-        Command::new("/usr/bin/dpkg")
-            .env_clear()
-            .envs(env)
-            .args(["--force-depends", "--configure", "base-files"])
-            .status()?;
-        Command::new("/usr/bin/dpkg")
-            .env_clear()
-            .envs(env)
-            .args(
-                ["--force-depends", "--configure"].iter().copied().chain(
-                    self.essentials
+        let (base_passwd, base_files, essential_pkgs) = self.essentials.iter().fold(
+            (
+                false,
+                false,
+                Vec::<&str>::with_capacity(self.essentials.len()),
+            ),
+            |(base_passwd, base_files, mut pkgs), pkg| {
+                if pkg == "base-files" {
+                    (base_passwd, true, pkgs)
+                } else if pkg == "base-passwd" {
+                    (true, base_files, pkgs)
+                } else {
+                    pkgs.push(pkg);
+                    (base_passwd, base_files, pkgs)
+                }
+            },
+        );
+        if base_passwd {
+            Command::new("/usr/bin/dpkg")
+                .env_clear()
+                .envs(env)
+                .args(["--force-depends", "--configure", "base-passwd"])
+                .status()?;
+        }
+        if base_files {
+            Command::new("/usr/bin/dpkg")
+                .env_clear()
+                .envs(env)
+                .args(["--force-depends", "--configure", "base-files"])
+                .status()?;
+        }
+        if !essential_pkgs.is_empty() {
+            Command::new("/usr/bin/dpkg")
+                .env_clear()
+                .envs(env)
+                .args(
+                    ["--force-depends", "--configure"]
                         .iter()
-                        .map(|s| s.as_str())
-                        .filter(|s| *s != "base-files" && *s != "base-passwd"),
-                ),
-            )
-            .status()?;
+                        .chain(essential_pkgs.iter()),
+                )
+                .status()?;
+        }
         Command::new("/usr/bin/dpkg")
             .env_clear()
             .envs(env)
@@ -291,9 +308,9 @@ where
     }
 }
 
-impl<B> ExecHelper for NewBuildRunner<B>
+impl<B> ExecHelper for BuildRunner<B>
 where
-    B: NewBuilder,
+    B: Builder,
 {
     const NAME: &'static str = "build";
     const UNSHARE: bool = true;
@@ -307,12 +324,12 @@ where
 }
 
 #[derive(Serialize, Deserialize)]
-pub struct LocalMounter {
+pub struct HostMounter {
     root: PathBuf,
 }
 
-impl Mounter for LocalMounter {
-    fn mount_root(&self) -> io::Result<PathBuf> {
+impl Mounter for HostMounter {
+    fn mount_root(&self) -> io::Result<OwnedFd> {
         let root_dfd = openat(
             CWD,
             &self.root,
@@ -320,24 +337,28 @@ impl Mounter for LocalMounter {
             Mode::empty(),
         )?;
         make_mountpoint(&root_dfd)?;
-        Ok(self.root.clone())
+        let root_dfd = openat(
+            CWD,
+            &self.root,
+            OFlags::DIRECTORY | OFlags::RDONLY,
+            Mode::empty(),
+        )?;
+        Ok(root_dfd)
     }
 }
 
-pub struct NewLocalBuilder {}
+pub struct HostBuilder {}
 
-impl NewBuilder for NewLocalBuilder {
-    type FileSystem = LocalFileSystem;
-    type Unpack = Parallel;
-    type Mounter = LocalMounter;
+impl Builder for HostBuilder {
+    type FileSystem = HostFileSystem;
+    type Unpack = MulitThreaded;
+    type Mounter = HostMounter;
     fn mounter(&self, fs: &Self::FileSystem) -> io::Result<Self::Mounter> {
-        Ok(LocalMounter {
+        Ok(HostMounter {
             root: fs.root().to_owned(),
         })
     }
 }
-
-pub type NewLocalBuildRunner = NewBuildRunner<NewLocalBuilder>;
 
 fn mkdirat_if_not_exist<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, mode: Mode) -> io::Result<()> {
     mkdirat(&dirfd, path, mode).map_or_else(

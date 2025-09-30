@@ -484,7 +484,7 @@ where
     }
 }
 
-pub(crate) trait DropConstraint<C> {
+pub trait DropConstraint<C> {
     fn drop_constraint(&self, con: &C) -> Option<Option<Self>>
     where
         Self: Sized;

@@ -93,7 +93,7 @@ pub trait DeploymentFileSystem {
 }
 
 #[derive(Clone, Debug)]
-pub struct LocalFileSystem {
+pub struct HostFileSystem {
     root: Arc<Path>,
     chown_allowed: bool,
 }
@@ -120,7 +120,7 @@ fn clean_path(target: &Path) -> io::Result<&Path> {
     Ok(target)
 }
 
-impl LocalFileSystem {
+impl HostFileSystem {
     pub async fn new<P: AsRef<Path>>(root: P, allow_chown: bool) -> io::Result<Self> {
         let root = fs::canonicalize(root.as_ref()).await?;
         Ok(Self {
@@ -136,13 +136,13 @@ impl LocalFileSystem {
     }
 }
 
-pub struct LocalFile {
+pub struct HostFile {
     base: Arc<Path>,
     path: PathBuf,
 }
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentFile for LocalFile {
+impl DeploymentFile for HostFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         let to = self.base.as_ref().join(clean_path(path.as_ref())?);
         if to == self.path {
@@ -255,8 +255,8 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
 }
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentFileSystem for LocalFileSystem {
-    type File = LocalFile;
+impl DeploymentFileSystem for HostFileSystem {
+    type File = HostFile;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -418,7 +418,7 @@ impl DeploymentFileSystem for LocalFileSystem {
             }
         })
         .await?;
-        Ok(LocalFile {
+        Ok(HostFile {
             base: Arc::clone(&self.root),
             path,
         })

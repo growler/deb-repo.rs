@@ -20,10 +20,6 @@ path = "cmd/main.rs"
 name = "tar-test"
 path = "cmd/tar.rs"
 
-[[bin]]
-name = "mount-test"
-path = "cmd/test.rs"
-
 [dependencies]
 anyhow = "1"
 async-io = "2.6.0"

@@ -6,9 +6,9 @@ pub mod cli;
 pub mod control;
 pub mod deb;
 mod deployfs;
-pub mod exec;
 mod fsrepo;
 pub mod hash;
+mod helper;
 mod httprepo;
 mod idmap;
 mod manifest;
@@ -18,14 +18,14 @@ mod repo;
 mod source;
 pub mod tar;
 pub mod universe;
-mod unshare;
 pub mod version;
 // mod caching;
 
 pub use {
     arch::DEFAULT_ARCH,
-    deployfs::{DeploymentFile, DeploymentFileSystem, FileList, LocalFileSystem},
+    deployfs::{DeploymentFile, DeploymentFileSystem, FileList, HostFileSystem},
     fsrepo::FSTransportProvider,
+    helper::maybe_run_helper,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::{Manifest, DEFAULT_SPEC_NAME},
     packages::{InstallPriority, Package, Packages},

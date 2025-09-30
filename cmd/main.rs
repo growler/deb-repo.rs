@@ -2,8 +2,9 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        builder::{NewBuilder, NewLocalBuilder},
+        builder::{Builder, HostBuilder},
         cli::Source,
+        maybe_run_helper,
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
         DEFAULT_SPEC_NAME,
@@ -382,7 +383,7 @@ struct Build {
 
 impl Command for Build {
     fn exec(&self, conf: &App) -> Result<()> {
-        let _user_ns_unshared = match debrepo::exec::UnshareUserNs::unshare() {
+        let _user_ns_unshared = match HostBuilder::unshare_user_ns() {
             None => false,
             Some(Ok(())) => true,
             Some(Err(err)) => return Err(err.into()),
@@ -391,11 +392,11 @@ impl Command for Build {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
             let fs =
-                debrepo::LocalFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await?;
 
             {
-                let builder = NewLocalBuilder {};
+                let builder = HostBuilder {};
                 builder
                     .build(
                         &manifest,
@@ -423,7 +424,7 @@ struct Extract {
 
 impl Command for Extract {
     fn exec(&self, conf: &App) -> Result<()> {
-        let _user_ns_unshared = match debrepo::exec::UnshareUserNs::unshare() {
+        let _user_ns_unshared = match HostBuilder::unshare_user_ns() {
             None => false,
             Some(Ok(())) => true,
             Some(Err(err)) => return Err(err.into()),
@@ -432,12 +433,12 @@ impl Command for Extract {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
             let fs =
-                debrepo::LocalFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await?;
             let installables = manifest
                 .installables(&self.spec)?
                 .collect::<std::io::Result<Vec<_>>>()?;
-            let builder = NewLocalBuilder {};
+            let builder = HostBuilder {};
             builder
                 .unpack_debs(
                     installables,
@@ -617,8 +618,7 @@ fn init_logging(quiet: bool, debug: u8) {
         .with_default_directive(default_level.into())
         .from_env_lossy()
         .add_directive("polling=warn".parse().unwrap())
-        .add_directive("isahc::wire=warn".parse().unwrap())
-        .add_directive("async_std=warn".parse().unwrap());
+        .add_directive("isahc::wire=warn".parse().unwrap());
 
     let base_format = fmt::format()
         .without_time()
@@ -635,15 +635,8 @@ fn init_logging(quiet: bool, debug: u8) {
         .init();
 }
 
-debrepo::helper! {
-    fn helper_main "deb-repo-helper" [
-        debrepo::exec::UnshareUserNs,
-        debrepo::builder::NewLocalBuildRunner,
-    ]
-}
-
 fn main() -> ExitCode {
-    helper_main();
+    maybe_run_helper::<HostBuilder>();
     let mut app = App::parse();
     init_logging(app.quiet, app.debug);
     if !app.no_cache {
