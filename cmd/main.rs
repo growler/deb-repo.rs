@@ -2,9 +2,8 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        builder::{Builder, HostBuilder},
         cli::Source,
-        maybe_run_helper,
+        sandbox::{maybe_run_sandbox, HostSandboxExecutor},
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
         DEFAULT_SPEC_NAME,
@@ -92,9 +91,6 @@ enum Commands {
     /// Update lock file
     #[command(name = "update")]
     Update,
-    /// Extract system to a target directory
-    #[command(name = "extract")]
-    Extract,
     /// Extract system to a target directory
     #[command(name = "build")]
     Build,
@@ -383,66 +379,19 @@ struct Build {
 
 impl Command for Build {
     fn exec(&self, conf: &App) -> Result<()> {
-        let _user_ns_unshared = match HostBuilder::unshare_user_ns() {
-            None => false,
-            Some(Ok(())) => true,
-            Some(Err(err)) => return Err(err.into()),
-        };
         smol::block_on(async move {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
             let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                 .await?;
-
-            {
-                let builder = HostBuilder {};
-                builder
-                    .build(
-                        &manifest,
-                        &self.spec,
-                        conf.concurrency,
-                        conf.transport().await?.as_ref(),
-                        &fs,
-                    )
-                    .await?;
-            }
-            Ok(())
-        })
-    }
-}
-
-#[derive(Parser)]
-struct Extract {
-    /// The spec name to extract
-    #[arg(short = 's', long = "spec", value_name = "SPEC")]
-    spec: Option<String>,
-    /// The target directory
-    #[arg(short, long, value_name = "PATH")]
-    path: PathBuf,
-}
-
-impl Command for Extract {
-    fn exec(&self, conf: &App) -> Result<()> {
-        let _user_ns_unshared = match HostBuilder::unshare_user_ns() {
-            None => false,
-            Some(Ok(())) => true,
-            Some(Err(err)) => return Err(err.into()),
-        };
-        smol::block_on(async move {
-            let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-            fs::create_dir_all(&self.path).await?;
-            let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
-                .await?;
-            let installables = manifest
-                .installables(&self.spec)?
-                .collect::<std::io::Result<Vec<_>>>()?;
-            let builder = HostBuilder {};
-            builder
-                .unpack_debs(
-                    installables,
+            let builder = HostSandboxExecutor::new(&self.path);
+            manifest
+                .build(
+                    &self.spec,
                     conf.concurrency,
                     conf.transport().await?.as_ref(),
                     &fs,
+                    builder
                 )
                 .await?;
             Ok(())
@@ -634,7 +583,7 @@ fn init_logging(quiet: bool, debug: u8) {
 }
 
 fn main() -> ExitCode {
-    maybe_run_helper::<HostBuilder>();
+    maybe_run_sandbox::<HostSandboxExecutor>();
     let mut app = App::parse();
     init_logging(app.quiet, app.debug);
     if !app.no_cache {

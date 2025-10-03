@@ -1,5 +1,6 @@
 use {
     crate::{
+        builder::{Executor},
         hash::{self, Hash},
         packages::Package,
         repo::TransportProvider,
@@ -17,8 +18,7 @@ use {
     iterator_ext::IteratorExt,
     itertools::Itertools,
     serde::{Deserialize, Serialize},
-    smol::lock::Semaphore,
-    smol::{fs::File, io},
+    smol::{fs::File, io, lock::Semaphore},
     std::{collections::HashMap, num::NonZero, path::Path, pin::pin, sync::Arc},
     toml_edit::{self, DocumentMut},
 };
@@ -169,7 +169,7 @@ impl Manifest {
                 format!("failed to parse manifest: {}", err),
             )
         })?;
-        manifest.verify_specs_graph()?;
+        manifest.specs_order()?;
         let mut doc = text.parse::<toml_edit::DocumentMut>().map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -359,6 +359,31 @@ impl Manifest {
                 format!("source {} not found", source.url),
             )),
         }
+    }
+    pub fn essentials<'a, S: AsRef<str>>(
+        &'a self,
+        spec: &'a Option<S>,
+    ) -> io::Result<impl Iterator<Item = io::Result<&'a str>> + 'a> {
+        let spec = spec.as_ref().map_or_else(|| "", |s| s.as_ref());
+        let i = self
+            .file
+            .specs
+            .iter_keys()
+            .position(|name| name == spec)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::NotFound, format!("spec {} not found", spec))
+            })?;
+        let locked = self.lock.specs[i].as_ref().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("no solution for spec \"{}\", update manifest lock", spec),
+            )
+        })?;
+        Ok(locked
+            .installables
+            .iter()
+            .filter(|p| p.essential)
+            .map(move |p| Ok::<_, io::Error>(p.name.as_ref())))
     }
     pub fn installables<'a, S: AsRef<str>>(
         &'a self,
@@ -852,74 +877,68 @@ impl Manifest {
         pkgs_idx: &[usize],
         universe: &mut Universe,
     ) -> io::Result<KVList<Option<LockedSpec>>> {
-        self.file
-            .specs
-            .iter()
-            .zip(self.lock.specs.iter())
-            .map(|((rn, r), (ln, l))| {
-                if rn != ln {
-                    panic!("inconsistent manifest state");
-                }
-                // do not recalculate already locked specs
-                if l.is_some() {
-                    return Ok((ln, l.clone()));
-                }
-                let (reqs, cons) = self.requirements_for(r);
-                universe
-                    .solve(reqs, cons)
-                    .map_err(|conflict| {
+        use digest::{FixedOutput, Update};
+        let mut locked = KVList::<Option<LockedSpec>>::with_capacity(self.file.specs.len());
+        for i in 0..self.file.specs.len() {
+            locked.push(self.file.specs.key_at(i), None);
+        }
+        // specs are resolved in order, so it is possible to
+        // keep only the difference in the lock file. however,
+        // that would require to track two lists between specs,
+        // both added and removed. not worth the complexity for now.
+        for spec_id in self.file.specs_order()?.into_iter() {
+            if let Some(l) = &self.lock.specs[spec_id] {
+                locked[spec_id] = Some(l.clone());
+                continue;
+            }
+            let spec = &self.file.specs[spec_id];
+            let (reqs, cons) = self.requirements_for(spec);
+            let mut solvables = universe.solve(reqs, cons).map_err(|conflict| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "failed to solve spec {}:\n{}",
+                        self.file.specs.key_at(spec_id),
+                        universe.display_conflict(conflict)
+                    ),
+                )
+            })?;
+            solvables.sort_unstable();
+            let mut hasher = sha2::Sha256::default();
+            let installables = solvables
+                .into_iter()
+                .map(|solvable| {
+                    let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
+                    let src = pkgs_idx[pkgs as usize];
+                    let hash_kind = self.file.sources.get(src).unwrap().hash.name();
+                    let essential = pkg.essential();
+                    let name = pkg.name().to_string();
+                    let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
                         io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!(
-                                "failed to solve spec {}:\n{}",
-                                rn,
-                                universe.display_conflict(conflict)
-                            ),
+                            format!("failed to parse package {}: {}", pkg.name(), err),
                         )
+                    })?;
+                    hasher.update(hash.as_ref());
+                    Ok(LockedPackage {
+                        file: RepositoryFile {
+                            path: path.to_string(),
+                            size,
+                            hash,
+                        },
+                        idx: solvable.into(),
+                        src: src as u32,
+                        name,
+                        essential,
                     })
-                    .and_then(|mut solvables| {
-                        use digest::{FixedOutput, Update};
-                        solvables.sort();
-                        let mut hasher = sha2::Sha256::default();
-                        let installables = solvables
-                            .into_iter()
-                            .map(|solvable| {
-                                let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
-                                let src = pkgs_idx[pkgs as usize];
-                                let hash_kind = self.file.sources.get(src).unwrap().hash.name();
-                                let (path, size, hash) =
-                                    pkg.repo_file(hash_kind).map_err(|err| {
-                                        io::Error::new(
-                                            io::ErrorKind::InvalidData,
-                                            format!(
-                                                "failed to parse package {}: {}",
-                                                pkg.name(),
-                                                err
-                                            ),
-                                        )
-                                    })?;
-                                hasher.update(hash.as_ref());
-                                Ok(LockedPackage {
-                                    file: RepositoryFile {
-                                        path: path.to_string(),
-                                        size,
-                                        hash,
-                                    },
-                                    idx: solvable.into(),
-                                    src: src as u32,
-                                })
-                            })
-                            .collect::<io::Result<Vec<_>>>()?;
-                        Ok((
-                            ln,
-                            Some(LockedSpec {
-                                hash: hasher.finalize_fixed().into(),
-                                installables,
-                            }),
-                        ))
-                    })
-            })
-            .collect()
+                })
+                .collect::<io::Result<Vec<_>>>()?;
+            locked[spec_id] = Some(LockedSpec {
+                hash: hasher.finalize_fixed().into(),
+                installables,
+            });
+        }
+        Ok(locked)
     }
     pub async fn resolve<T: TransportProvider + ?Sized>(
         &mut self,
@@ -977,6 +996,22 @@ impl Manifest {
                 .expect("inconsistent manifest, call resolve first")
         }))
     }
+    pub async fn build<T, S, E>(
+        &self,
+        spec: &Option<S>,
+        concurrency: NonZero<usize>,
+        transport: &T,
+        fs: &E::Filesystem,
+        executor: E,
+    ) -> io::Result<()>
+    where
+        T: TransportProvider + ?Sized,
+        E: Executor,
+        S: AsRef<str>,
+    {
+        let installables = self.installables(spec)?.collect::<io::Result<Vec<_>>>()?;
+        crate::builder::build(None, installables, concurrency, transport, fs, executor).await
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -1030,56 +1065,66 @@ impl ManifestFile {
         }
         result
     }
-    fn verify_specs_graph(&self) -> io::Result<()> {
+    fn specs_order(&self) -> io::Result<Vec<usize>> {
         use DFSNodeState::*;
-        let mut state: HashMap<&str, DFSNodeState> = HashMap::with_capacity(self.specs.len());
-        let mut stack: Vec<&str> = Vec::with_capacity(self.specs.len());
+        let mut state: HashMap<usize, DFSNodeState> = HashMap::with_capacity(self.specs.len());
+        let mut stack: Vec<usize> = Vec::with_capacity(self.specs.len());
+        let mut order: Vec<usize> = Vec::with_capacity(self.specs.len());
 
-        for key in self.specs.iter_keys() {
-            if state.get(key).copied().unwrap_or(Unvisited) == Unvisited {
-                self.dfs(key, &mut state, &mut stack)?;
+        for (id, key) in self.specs.iter_keys().enumerate() {
+            if state.get(&id).copied().unwrap_or(Unvisited) == Unvisited {
+                self.dfs(id, key, &mut state, &mut stack, &mut order)?;
             }
         }
-        Ok(())
+        Ok(order)
     }
     fn dfs<'a>(
         &'a self,
+        id: usize,
         node: &'a str,
-        state: &mut HashMap<&'a str, DFSNodeState>,
-        stack: &mut Vec<&'a str>,
+        state: &mut HashMap<usize, DFSNodeState>,
+        stack: &mut Vec<usize>,
+        order: &mut Vec<usize>,
     ) -> io::Result<()> {
         use DFSNodeState::*;
-        state.insert(node, Visited);
-        stack.push(node);
+        state.insert(id, Visited);
+        stack.push(id);
 
-        if let Some(next) = self.specs.get(node).and_then(|r| r.extends.as_deref()) {
-            match state.get(next).copied().unwrap_or(Unvisited) {
-                Unvisited => {
-                    if !self.specs.contains_key(next) {
-                        return Err(io::Error::other(format!(
-                            "spec {} extends missing ({})",
-                            node, next
-                        )));
-                    }
-                    self.dfs(next, state, stack)?;
-                }
-                Visited => {
-                    let start_idx = stack.iter().rposition(|&s| s == next).unwrap_or(0);
-                    let cycle: Vec<String> = stack[start_idx..]
-                        .iter()
-                        .copied()
-                        .map(|s| s.to_string())
-                        .collect();
+        if let Some(name) = self.specs[id].extends.as_deref() {
+            match self.specs.iter_keys().enumerate().find(|(_, n)| *n == name) {
+                None => {
                     return Err(io::Error::other(format!(
-                        "specs form a cycle: {}",
-                        cycle.join(" <- ")
-                    )));
+                        "spec {} extends missing ({})",
+                        node, name,
+                    )))
                 }
-                Done => {}
+                Some((extends_id, extends_name)) => {
+                    match state.get(&extends_id).copied().unwrap_or(Unvisited) {
+                        Unvisited => {
+                            self.dfs(extends_id, extends_name, state, stack, order)?;
+                        }
+                        Visited => {
+                            let start_idx =
+                                stack.iter().rposition(|&s| s == extends_id).unwrap_or(0);
+                            let cycle: Vec<String> = stack[start_idx..]
+                                .iter()
+                                .copied()
+                                .map(|id| self.specs.key_at(id).to_string())
+                                .collect();
+                            return Err(io::Error::other(format!(
+                                "specs form a cycle: {}",
+                                cycle.join(" <- ")
+                            )));
+                        }
+                        Done => {}
+                    }
+                }
             }
         }
+
         stack.pop();
-        state.insert(node, Done);
+        state.insert(id, Done);
+        order.push(id);
         Ok(())
     }
 }
@@ -1139,6 +1184,9 @@ fn valid_spec_name(s: &str) -> Result<&str, String> {
 struct LockedPackage {
     src: u32,
     idx: u32,
+    name: String,
+    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
+    essential: bool,
     #[serde(flatten)]
     file: RepositoryFile,
 }
@@ -1178,6 +1226,9 @@ impl<R> KVList<R> {
     fn new() -> Self {
         Self(Vec::new())
     }
+    fn with_capacity(cap: usize) -> Self {
+        Self(Vec::with_capacity(cap))
+    }
     fn is_empty(&self) -> bool {
         self.0.is_empty()
     }
@@ -1204,6 +1255,9 @@ impl<R> KVList<R> {
     }
     fn key_at(&self, pos: usize) -> &'_ str {
         self.0[pos].0.as_str()
+    }
+    fn set_at(&mut self, pos: usize, k: String, v: R) {
+        self.0[pos] = (k, v);
     }
     fn contains_key(&self, k: &str) -> bool {
         self.iter().any(|(n, _)| n == k)

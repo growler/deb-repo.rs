@@ -140,6 +140,9 @@ impl<'a> ControlStanza<'a> {
     pub fn fields(&self) -> impl Iterator<Item = &'_ ControlField<'a>> {
         self.fields.iter()
     }
+    pub fn len(&self) -> usize {
+        self.src.len()
+    }
 }
 
 /// Represents the single mutable Debian Control Stanza (a.k.a. Paragraph)

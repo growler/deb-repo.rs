@@ -17,8 +17,14 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
+use crate::{control::MutableControlStanza, RepositoryFile, Source, TransportProvider};
+
 #[async_trait::async_trait(?Send)]
 pub trait DeploymentFile {
+    async fn persist(self) -> io::Result<()>;
+}
+#[async_trait::async_trait(?Send)]
+pub trait DeploymentTempFile {
     async fn persist<P>(self, path: P) -> io::Result<()>
     where
         P: AsRef<Path>;
@@ -29,6 +35,7 @@ pub trait DeploymentFile {
 #[async_trait::async_trait(?Send)]
 pub trait DeploymentFileSystem {
     type File: DeploymentFile;
+    type TempFile: DeploymentTempFile;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
     async fn create_dir<P>(&self, path: P, uid: u32, gid: u32, mode: u32) -> io::Result<()>
     where
@@ -79,7 +86,7 @@ pub trait DeploymentFileSystem {
     async fn create_file<R, P>(
         &self,
         r: R,
-        path: Option<P>,
+        path: P,
         uid: u32,
         gid: u32,
         mode: u32,
@@ -89,7 +96,32 @@ pub trait DeploymentFileSystem {
     where
         R: io::AsyncRead + Unpin + Send,
         P: AsRef<Path> + Send;
+    async fn create_temp_file<R>(
+        &self,
+        r: R,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: Option<SystemTime>,
+        size: Option<usize>,
+    ) -> io::Result<Self::TempFile>
+    where
+        R: io::AsyncRead + Unpin + Send;
     async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()>;
+    async fn import_deb<T>(
+        &self,
+        source: &Source,
+        transport: &T,
+        file: &RepositoryFile,
+    ) -> io::Result<MutableControlStanza>
+    where
+        T: TransportProvider + ?Sized,
+    {
+        let deb = source
+            .deb_reader(&file.path, file.size, &file.hash, transport)
+            .await?;
+        deb.extract_to(self).await
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -131,70 +163,72 @@ impl HostFileSystem {
     fn target_path(&self, target: &Path) -> io::Result<PathBuf> {
         Ok(self.root.join(clean_path(target)?))
     }
-    pub(crate) fn root(&self) -> &Path {
-        self.root.as_ref()
-    }
 }
 
-pub struct HostFile {
-    base: Arc<Path>,
-    path: PathBuf,
-}
+pub struct HostFile {}
 
 #[async_trait::async_trait(?Send)]
 impl DeploymentFile for HostFile {
+    async fn persist(self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+pub struct HostTempFile {
+    base: Arc<Path>,
+    path: tempfile::TempPath,
+}
+
+#[async_trait::async_trait(?Send)]
+impl DeploymentTempFile for HostTempFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         let to = self.base.as_ref().join(clean_path(path.as_ref())?);
-        if to == self.path {
-            Ok(())
-        } else {
-            use std::os::unix::fs::MetadataExt;
-            let rename = if let Some(to_dir) = to.parent() {
-                if let Ok(to_md) = fs::metadata(&to_dir).await {
-                    let from_md = fs::metadata(&self.path).await.map_err(|e| {
-                        io::Error::new(
-                            e.kind(),
-                            format!("failed to get metadata for {:?}: {}", to_dir.as_os_str(), e),
-                        )
-                    })?;
-                    from_md.dev() == to_md.dev()
-                } else {
-                    false
-                }
-            } else {
-                false
-            };
-            if rename {
-                fs::rename(&self.path, &to).await.map_err(|e| {
+        use std::os::unix::fs::MetadataExt;
+        let rename = if let Some(to_dir) = to.parent() {
+            if let Ok(to_md) = fs::metadata(&to_dir).await {
+                let from_md = fs::metadata(&self.path).await.map_err(|e| {
                     io::Error::new(
                         e.kind(),
-                        format!(
-                            "failed to rename {:?} to {:?}: {}",
-                            self.path.as_os_str(),
-                            to.as_os_str(),
-                            e
-                        ),
-                    )
-                })
-            } else {
-                fs::copy(&self.path, &to).await.map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!(
-                            "failed to copy {:?} to {:?}: {}",
-                            self.path.as_os_str(),
-                            &to,
-                            e
-                        ),
+                        format!("failed to get metadata for {:?}: {}", to_dir.as_os_str(), e),
                     )
                 })?;
-                fs::remove_file(&self.path).await.map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to remove {:?}: {}", self.path.as_os_str(), e),
-                    )
-                })
+                from_md.dev() == to_md.dev()
+            } else {
+                false
             }
+        } else {
+            false
+        };
+        if rename {
+            fs::rename(&self.path, &to).await.map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to rename {:?} to {:?}: {}",
+                        self.path.as_os_str(),
+                        to.as_os_str(),
+                        e
+                    ),
+                )
+            })
+        } else {
+            fs::copy(&self.path, &to).await.map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to copy {:?} to {:?}: {}",
+                        self.path.as_os_str(),
+                        &to,
+                        e
+                    ),
+                )
+            })?;
+            fs::remove_file(&self.path).await.map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("failed to remove {:?}: {}", self.path.as_os_str(), e),
+                )
+            })
         }
     }
 }
@@ -257,6 +291,7 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
 #[async_trait::async_trait(?Send)]
 impl DeploymentFileSystem for HostFileSystem {
     type File = HostFile;
+    type TempFile = HostTempFile;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -347,55 +382,79 @@ impl DeploymentFileSystem for HostFileSystem {
         let to = self.target_path(to.as_ref())?;
         fs::hard_link(from, to).await
     }
+    async fn create_temp_file<R: io::AsyncRead + Unpin + Send>(
+        &self,
+        r: R,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: Option<SystemTime>,
+        size: Option<usize>,
+    ) -> io::Result<Self::TempFile> {
+        let root = self.root.clone();
+        let (file, path) = blocking::unblock(move || {
+            tempfile::Builder::new()
+                .permissions(fs::Permissions::from_mode(mode))
+                .tempfile_in(&root)
+                .and_then(|f| Ok(f.into_parts()))
+        })
+        .await?;
+        let mut file: smol::fs::File = if let Some(size) = size {
+            if size > 0 {
+                blocking::unblock(move || {
+                    fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)
+                        .and_then(|_| Ok(file))
+                })
+                .await
+            } else {
+                Ok(file)
+            }
+        } else {
+            Ok(file)
+        }?
+        .into();
+        io::copy(r, &mut file).await?;
+        file.flush().await?;
+        let chown_allowed = self.chown_allowed;
+        blocking::unblock(move || {
+            if chown_allowed {
+                fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
+            }
+            if let Some(mtime) = mtime {
+                futimens(&file, &mtime_to_ts(&mtime))
+            } else {
+                Ok(())
+            }
+        })
+        .await?;
+        Ok(HostTempFile {
+            base: Arc::clone(&self.root),
+            path,
+        })
+    }
     async fn create_file<R: io::AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
         &self,
         r: R,
-        path: Option<P>,
+        path: P,
         uid: u32,
         gid: u32,
         mode: u32,
         mtime: Option<SystemTime>,
         size: Option<usize>,
     ) -> io::Result<Self::File> {
-        let (mut file, path) = if let Some(path) = path {
-            let target = self.target_path(path.as_ref())?;
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .open(&target)
-                .await
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to create file {:?}: {}", target.as_os_str(), e),
-                    )
-                })?;
-            (file, target)
-        } else {
-            let root = self.root.clone();
-            let tmp = blocking::unblock(move || {
-                tempfile::Builder::new()
-                    .permissions(fs::Permissions::from_mode(mode))
-                    .tempfile_in(&root)
-                    .map(|f| f.into_temp_path())
-                    .and_then(|f| f.keep().map_err(|e| e.into()))
-            })
-            .await?;
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .truncate(true)
-                .mode(mode)
-                .open(&tmp)
-                .await
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to create file {:?}: {}", tmp.as_os_str(), e),
-                    )
-                })?;
-            (file, tmp)
-        };
+        let path = self.target_path(path.as_ref())?;
+        let mut file = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+            .await
+            .map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("failed to create file {}: {}", path.display(), e),
+                )
+            })?;
         if let Some(size) = size {
             if size > 0 {
                 let fd = file.as_fd().try_clone_to_owned()?;
@@ -418,14 +477,26 @@ impl DeploymentFileSystem for HostFileSystem {
             }
         })
         .await?;
-        Ok(HostFile {
-            base: Arc::clone(&self.root),
-            path,
-        })
+        Ok(HostFile {})
     }
     async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()> {
         let target = self.target_path(path.as_ref())?;
         fs::remove_file(target).await
+    }
+    async fn import_deb<T>(
+        &self,
+        source: &Source,
+        transport: &T,
+        file: &RepositoryFile,
+    ) -> io::Result<MutableControlStanza>
+    where
+        T: TransportProvider + ?Sized,
+    {
+        let deb = source
+            .deb_reader(&file.path, file.size, &file.hash, transport)
+            .await?;
+        let fs = self.clone();
+        blocking::unblock(move || smol::block_on(deb.extract_to(&fs))).await
     }
 }
 
@@ -460,16 +531,15 @@ impl FileList {
     }
 }
 
-pub struct FileListItem {
+pub struct FileListTempFile {
     uid: u32,
     gid: u32,
     mode: u32,
     size: u64,
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
-
 #[async_trait::async_trait(?Send)]
-impl DeploymentFile for FileListItem {
+impl DeploymentTempFile for FileListTempFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {} {}",
@@ -483,9 +553,18 @@ impl DeploymentFile for FileListItem {
     }
 }
 
+pub struct FileListFile {}
+#[async_trait::async_trait(?Send)]
+impl DeploymentFile for FileListFile {
+    async fn persist(self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 #[async_trait::async_trait(?Send)]
 impl DeploymentFileSystem for FileList {
-    type File = FileListItem;
+    type File = FileListFile;
+    type TempFile = FileListTempFile;
     async fn create_dir<P: AsRef<Path> + Send>(
         &self,
         path: P,
@@ -547,10 +626,28 @@ impl DeploymentFileSystem for FileList {
         ));
         Ok(())
     }
+    async fn create_temp_file<R: io::AsyncRead + Unpin + Send>(
+        &self,
+        r: R,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        _mtime: Option<SystemTime>,
+        _size: Option<usize>,
+    ) -> io::Result<Self::TempFile> {
+        let size = io::copy(r, &mut io::sink()).await?;
+        Ok(FileListTempFile {
+            mode,
+            uid,
+            gid,
+            size,
+            out: Arc::clone(&self.out),
+        })
+    }
     async fn create_file<R: io::AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
         &self,
         r: R,
-        _path: Option<P>,
+        path: P,
         uid: u32,
         gid: u32,
         mode: u32,
@@ -558,13 +655,15 @@ impl DeploymentFileSystem for FileList {
         _size: Option<usize>,
     ) -> io::Result<Self::File> {
         let size = io::copy(r, &mut io::sink()).await?;
-        Ok(FileListItem {
+        self.out.lock().unwrap().insert(format!(
+            "{} {:o} {} {} {}",
+            path.as_ref().as_os_str().to_string_lossy(),
             mode,
             uid,
             gid,
-            size,
-            out: Arc::clone(&self.out),
-        })
+            size
+        ));
+        Ok(FileListFile {})
     }
     async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()> {
         self.out

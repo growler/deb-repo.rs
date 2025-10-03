@@ -8,13 +8,13 @@ pub mod deb;
 mod deployfs;
 mod fsrepo;
 pub mod hash;
-mod helper;
 mod httprepo;
 mod idmap;
 mod manifest;
 mod packages;
 mod release;
 mod repo;
+pub mod sandbox;
 mod source;
 pub mod tar;
 pub mod universe;
@@ -23,14 +23,16 @@ pub mod version;
 
 pub use {
     arch::DEFAULT_ARCH,
-    deployfs::{DeploymentFile, DeploymentFileSystem, FileList, HostFileSystem},
+    deployfs::{
+        DeploymentFile, DeploymentFileSystem, DeploymentTempFile, FileList, HostFileSystem,
+    },
     fsrepo::FSTransportProvider,
-    helper::maybe_run_helper,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::{Manifest, DEFAULT_SPEC_NAME},
     packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::TransportProvider,
+    sandbox::maybe_run_sandbox,
     source::{RepositoryFile, SignedBy, Snapshot, Source},
 };
 

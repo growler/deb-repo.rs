@@ -1,7 +1,7 @@
 use {
     crate::{
         control::MutableControlStanza,
-        deployfs::DeploymentFile,
+        deployfs::{DeploymentFile, DeploymentTempFile},
         hash::HashingReader,
         parse_size,
         tar::{TarEntry, TarLink, TarReader},
@@ -336,7 +336,7 @@ impl DebReader {
     ) -> Result<MutableControlStanza> {
         let mut installed_files: Vec<String> = vec![];
         let mut ctrl: MutableControlStanza;
-        let mut ctrl_files: Vec<(String, FS::File)> = vec![];
+        let mut ctrl_files: Vec<(String, FS::TempFile)> = vec![];
         let mut ctrl_files_list = String::new();
         let mut conf_files: Vec<(String, Option<String>)> = vec![];
         let multiarch: Option<&str>;
@@ -388,9 +388,8 @@ impl DebReader {
                             file.read_to_string(&mut buf).await?;
                             conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
                             let file = fs
-                                .create_file(
+                                .create_temp_file(
                                     buf.as_bytes(),
-                                    None::<PathBuf>,
                                     uid,
                                     gid,
                                     mode,
@@ -401,9 +400,8 @@ impl DebReader {
                             ctrl_files.push((filename, file));
                         } else {
                             let file = fs
-                                .create_file(
+                                .create_temp_file(
                                     file,
-                                    None::<PathBuf>,
                                     uid,
                                     gid,
                                     mode,
@@ -489,7 +487,7 @@ impl DebReader {
                             None => fs
                                 .create_file(
                                     &mut file,
-                                    Some(&path),
+                                    &path,
                                     uid,
                                     gid,
                                     mode,
@@ -509,7 +507,7 @@ impl DebReader {
                                 let file = fs
                                     .create_file(
                                         &mut hasher,
-                                        Some(&path),
+                                        &path,
                                         uid,
                                         gid,
                                         mode,
@@ -530,7 +528,7 @@ impl DebReader {
                                 file
                             }
                         }
-                        .persist(path)
+                        .persist()
                         .await?;
                     }
                     TarEntry::Symlink(link) => {
@@ -565,7 +563,7 @@ impl DebReader {
             let target_name = ctrl_base.join(target_name);
             fs.create_file(
                 buf.as_bytes(),
-                Some(&target_name),
+                &target_name,
                 0,
                 0,
                 0o644,
@@ -573,7 +571,7 @@ impl DebReader {
                 Some(buf.len()),
             )
             .await?
-            .persist(target_name)
+            .persist()
             .await?;
         }
         if !conf_files.is_empty() {
