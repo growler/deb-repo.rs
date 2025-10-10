@@ -42,7 +42,7 @@ hex = "0.4"
 isahc = { version = "1", default-features = false, features = [ "http2" ] }
 iterator-ext = "0.2"
 itertools = "0.13"
-libc = "0.2.176"
+libc = "0.2"
 macro_rules_attribute = "0.2"
 md-5 = "0.10"
 memchr = "2"
@@ -52,7 +52,7 @@ petgraph = { version = "0.8", default-features = false, features = [ "graphmap" 
 pin-project = "1"
 regex = "1.11"
 resolvo = "0.10.0"
-rustix = { version = "1.1.2", features = [ "fs", "pipe", "thread", "mount" ] }
+rustix = { version = "1", features = [ "fs", "pipe", "thread", "mount" ] }
 serde = { version = "1.0.219", features = ["derive"] }
 sha2 = "0.10"
 smallvec = { version = "1.13", features = ["serde", "union"] }

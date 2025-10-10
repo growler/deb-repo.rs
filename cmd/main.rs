@@ -379,19 +379,19 @@ struct Build {
 
 impl Command for Build {
     fn exec(&self, conf: &App) -> Result<()> {
+        let builder = HostSandboxExecutor::new(&self.path)?;
         smol::block_on(async move {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
             let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                 .await?;
-            let builder = HostSandboxExecutor::new(&self.path);
             manifest
                 .build(
                     &self.spec,
                     conf.concurrency,
                     conf.transport().await?.as_ref(),
                     &fs,
-                    builder
+                    builder,
                 )
                 .await?;
             Ok(())

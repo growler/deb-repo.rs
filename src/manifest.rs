@@ -1,6 +1,6 @@
 use {
     crate::{
-        builder::{Executor},
+        builder::Executor,
         hash::{self, Hash},
         packages::Package,
         repo::TransportProvider,

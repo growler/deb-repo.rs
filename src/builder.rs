@@ -70,9 +70,8 @@ impl<E: Executor> BuildJob<E> {
             executor.exec_cmd(
                 "/usr/bin/dpkg",
                 ["--force-depends", "--configure"]
-                    .iter()
-                    .chain(essential_pkgs.iter())
-                    .map(|s| *s),
+                    .into_iter()
+                    .chain(essential_pkgs.iter().copied()),
             )?;
         }
         executor.exec_cmd("/usr/bin/dpkg", ["--configure", "-a"])?;
@@ -83,6 +82,9 @@ impl<E: Executor> BuildJob<E> {
 #[async_trait::async_trait(?Send)]
 pub trait Executor {
     type Filesystem: DeploymentFileSystem + ?Sized;
+    fn setup(&mut self) -> io::Result<()> {
+        Ok(())
+    }
     async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
         Ok(())
     }

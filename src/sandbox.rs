@@ -5,29 +5,30 @@ use {
     },
     clone3::Clone3,
     rustix::{
-        fd::{AsFd, AsRawFd, FromRawFd, OwnedFd},
+        fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         fs::{mkdirat, openat, readlinkat, symlinkat, Mode, OFlags, Uid, CWD},
-        io::{dup, fcntl_getfd, fcntl_setfd, Errno, FdFlags},
+        io::{dup, dup2, fcntl_getfd, fcntl_setfd, Errno, FdFlags},
         mount::{
             fsconfig_create, fsconfig_set_string, fsmount, fsopen, mount_change, move_mount,
             open_tree, unmount, FsMountFlags, FsOpenFlags, MountAttrFlags, MountPropagationFlags,
             MoveMountFlags, OpenTreeFlags, UnmountFlags,
         },
         path::Arg,
-        pipe,
+        pipe::{self, pipe},
         process::{
             fchdir, getegid, geteuid, getpid, pidfd_open, pivot_root, waitid, PidfdFlags, WaitId,
             WaitIdOptions,
         },
-        thread::Pid,
+        thread::{unshare_unsafe, UnshareFlags},
     },
     serde::{Deserialize, Serialize},
     std::{
         borrow::Cow,
+        convert::Infallible,
         ffi::{CStr, OsStr, OsString},
         io::{self, Write},
         iter::once,
-        os::unix::ffi::OsStrExt,
+        os::unix::{ffi::OsStrExt, process::CommandExt},
         path::{Path, PathBuf},
         process::Command,
         sync::OnceLock,
@@ -41,11 +42,14 @@ pub struct HostSandboxExecutor {
 }
 
 impl HostSandboxExecutor {
-    pub fn new<P: AsRef<Path>>(root: P) -> Self {
-        Self {
+    pub fn new<P: AsRef<Path>>(root: P) -> io::Result<Self> {
+        if !geteuid().is_root() {
+            unshare_user_ns(std::iter::empty::<&str>())?;
+        }
+        Ok(Self {
             root: root.as_ref().to_path_buf(),
             env: Vec::new(),
-        }
+        })
     }
 }
 
@@ -97,7 +101,7 @@ impl SandboxExecutor for HostSandboxExecutor {
     where
         E: FnOnce(&Self, BuildJob<Self>) -> io::Result<OwnedFd>,
     {
-        spawner(&self, job)
+        spawner(self, job)
     }
     fn setup_rootfs(&mut self) -> io::Result<OwnedFd> {
         let dfd = openat(
@@ -235,10 +239,9 @@ impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
     {
         let pid = self.runner.spawn(job.with_executor::<E>(), |runner, job| {
             let (rfd, wfd) = pipe::pipe()?;
-            let mut flags = fcntl_getfd(&rfd)?;
-            flags.remove(FdFlags::CLOEXEC);
-            fcntl_setfd(&rfd, flags)?;
-            let pid_fd = spawn_sandbox(once(rfd.as_raw_fd().to_string()), true)?;
+            set_cloexec(&wfd, true)?;
+            let pid_fd = spawn_helper("runner", once(rfd.as_raw_fd().to_string()), true)?;
+            drop(rfd);
             let wr: std::fs::File = wfd.into();
             OutJob {
                 executor: runner,
@@ -247,7 +250,7 @@ impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
             .write_to(wr)?;
             Ok(pid_fd)
         })?;
-        SandboxStatus(pid).status().await.and_then(|status| {
+        HelperStatus(pid).status().await.and_then(|status| {
             if status.is_success() {
                 Ok(())
             } else {
@@ -259,7 +262,8 @@ impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
         })
     }
 }
-fn run_sandbox<E: SandboxExecutor>(rd: std::fs::File) -> io::Result<()> {
+fn run_sandbox<E: SandboxExecutor>(mut args: std::env::ArgsOs) -> io::Result<()> {
+    let rd: std::fs::File = args.fd_arg().map(Into::into)?;
     unshare_root()?;
     let mut job = InJob::<E, BuildJob<E>>::read_from(rd)?;
     let root_dfd = job.executor.setup_rootfs()?;
@@ -284,31 +288,22 @@ pub fn maybe_run_sandbox<E: SandboxExecutor>() {
         Some(name) => name.to_os_string(),
         None => return,
     };
-    name.push("-sandbox");
+    name.push("-");
     let name = init_sandbox_name(name);
     let mut args = std::env::args_os();
     let arg0 = args.next();
-    if arg0.is_none() || arg0.as_ref().unwrap() != &name {
+    if arg0.is_none() {
         return;
     }
-    match args
-        .next()
-        .ok_or_else(|| io::Error::other("sandbox: expects an fd param"))
-        .and_then(|s| {
-            s.into_string().map_err(|err| {
-                io::Error::other(format!(
-                    "sandbox: invalid fd param: {}",
-                    err.to_string_lossy()
-                ))
-            })
-        })
-        .and_then(|s| {
-            s.parse::<i32>()
-                .map_err(|err| io::Error::other(format!("helper: failed to parse fd: {}", err)))
-        })
-        .and_then(|fd| Ok(unsafe { OwnedFd::from_raw_fd(fd) }.into()))
-        .and_then(|fd| run_sandbox::<E>(fd))
-    {
+    let arg0 = arg0.as_ref().unwrap().as_bytes();
+    if !arg0.starts_with(name.as_bytes()) {
+        return;
+    }
+    match match &arg0[name.len()..] {
+        b"uidmap" => unshare_user_ns_helper(args),
+        b"runner" => run_sandbox::<E>(args),
+        _ => Err(io::Error::other("unknown helper command")),
+    } {
         Ok(()) => std::process::exit(0),
         Err(err) => {
             {
@@ -465,9 +460,9 @@ fn mount_run(dfd: &OwnedFd) -> io::Result<()> {
     Ok(())
 }
 
-struct SandboxExitStatus(i32);
+struct HelperExitStatus(i32);
 
-impl SandboxExitStatus {
+impl HelperExitStatus {
     pub fn is_success(&self) -> bool {
         self.0 == 0
     }
@@ -476,22 +471,22 @@ impl SandboxExitStatus {
     }
 }
 
-impl From<SandboxExitStatus> for i32 {
-    fn from(status: SandboxExitStatus) -> Self {
+impl From<HelperExitStatus> for i32 {
+    fn from(status: HelperExitStatus) -> Self {
         status.code()
     }
 }
 
-impl std::fmt::Display for SandboxExitStatus {
+impl std::fmt::Display for HelperExitStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         write!(f, "{}", self.0)
     }
 }
 
-struct SandboxStatus(OwnedFd);
+struct HelperStatus(OwnedFd);
 
-impl SandboxStatus {
-    async fn status(&self) -> io::Result<SandboxExitStatus> {
+impl HelperStatus {
+    async fn status(&self) -> io::Result<HelperExitStatus> {
         let pidfd = dup(self.0.as_fd())?;
         let file = std::fs::File::from(pidfd);
         let afd = smol::Async::new(file)?;
@@ -502,7 +497,35 @@ impl SandboxStatus {
             match waitid(WaitId::PidFd(self.0.as_fd()), WaitIdOptions::EXITED) {
                 Ok(Some(status)) => {
                     if let Some(code) = status.exit_status() {
-                        break Ok(SandboxExitStatus(code));
+                        break Ok(HelperExitStatus(code));
+                    }
+                    if let Some(sig) = status.terminating_signal() {
+                        break Err(io::Error::other(format!(
+                            "sandbox killed by signal {}",
+                            sig
+                        )));
+                    }
+                    break Err(io::Error::other("sandbox terminated (unknown status)"));
+                }
+                Ok(None) => {
+                    continue;
+                }
+                Err(Errno::INTR) => continue,
+                Err(err) => {
+                    break Err(io::Error::other(format!(
+                        "error waiting for sandbox: {}",
+                        err
+                    )))
+                }
+            }
+        }
+    }
+    fn status_sync(&self) -> io::Result<HelperExitStatus> {
+        loop {
+            match waitid(WaitId::PidFd(self.0.as_fd()), WaitIdOptions::EXITED) {
+                Ok(Some(status)) => {
+                    if let Some(code) = status.exit_status() {
+                        break Ok(HelperExitStatus(code));
                     }
                     if let Some(sig) = status.terminating_signal() {
                         break Err(io::Error::other(format!(
@@ -527,28 +550,26 @@ impl SandboxStatus {
     }
 }
 
-fn spawn_sandbox<A>(args: A, needs_unshare: bool) -> io::Result<OwnedFd>
+fn spawn_helper<I>(name: &str, args: I, unshare: bool) -> io::Result<OwnedFd>
 where
-    A: IntoIterator,
-    A::Item: Arg,
+    I: IntoIterator,
+    I::Item: Arg,
 {
-    let uid_map = (needs_unshare && !geteuid().is_root())
-        .then(|| UidMap::new())
-        .transpose()?;
-
-    let name = SANDBOX_COMMAND_NAME
+    let mut argv0 = SANDBOX_COMMAND_NAME
         .get()
-        .expect("sandbox command name is not initialized");
+        .expect("sandbox command name is not initialized")
+        .clone();
+    argv0.push(name);
 
-    let args: Vec<Cow<'_, CStr>> = once(Arg::into_c_str(name))
-        .chain(args.into_iter().map(|s| s.into_c_str()))
+    let args = once(Arg::into_c_str(&argv0))
+        .chain(args.into_iter().map(Arg::into_c_str))
         .collect::<Result<Vec<_>, Errno>>()?;
 
-    let argv: Vec<*mut libc::c_char> = args
+    let argv = args
         .iter()
-        .map(|s| s.as_ptr() as *mut libc::c_char)
-        .chain(std::iter::once(std::ptr::null_mut()))
-        .collect();
+        .map(|a| a.as_ptr() as *mut libc::c_char)
+        .chain(once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
 
     let ppidfd = pidfd_open(getpid(), PidfdFlags::empty()).map_err(io::Error::from)?;
     let mut ppidfd_flags = fcntl_getfd(&ppidfd)?;
@@ -571,29 +592,17 @@ where
     let fd_raw = fd.as_raw_fd();
     let mut pidfd = -1;
 
-    let mut sem: Option<(OwnedFd, OwnedFd)> = None;
-    let mut sem_rd = -1;
-
     let mut clone = Clone3::default();
     clone
         .flag_pidfd(&mut pidfd)
         .exit_signal(rustix::process::Signal::CHILD.as_raw() as u64);
-    if needs_unshare {
+    if unshare {
         clone
             .flag_newnet()
             .flag_newipc()
             .flag_newpid()
             .flag_newuts()
             .flag_newns();
-        if uid_map.is_some() {
-            clone.flag_newuser();
-            let (rfd, wfd) = pipe::pipe()?;
-            let mut flags = fcntl_getfd(&rfd)?;
-            flags.remove(FdFlags::CLOEXEC);
-            fcntl_setfd(&rfd, flags)?;
-            sem_rd = rfd.as_raw_fd();
-            sem = Some((rfd, wfd));
-        }
     }
 
     match unsafe { clone.call()? } {
@@ -616,52 +625,28 @@ where
                     }
                 }
             }
-            if sem_rd >= 0 {
-                let mut b = 0u8;
-                if libc::read(sem_rd, &mut b as *mut u8 as *mut libc::c_void, 1) != 1 {
-                    static ERR_MSG: &[u8] = b"read failed\n";
-                    let _ = libc::write(
-                        libc::STDERR_FILENO,
-                        ERR_MSG.as_ptr() as *const _,
-                        ERR_MSG.len(),
-                    );
-                    libc::_exit(127);
-                }
-                libc::close(sem_rd);
-            }
             extern "C" {
-                static mut environ: *mut *mut libc::c_char;
+                static mut environ: *const *mut libc::c_char;
             }
-            let envp: *const *mut libc::c_char = environ as *const *mut libc::c_char;
             libc::execveat(
                 fd_raw,
                 c"".as_ptr(),
                 argv.as_ptr(),
-                envp,
+                environ,
                 libc::AT_EMPTY_PATH,
             );
-            static ERR_MSG: &[u8] = b"execveat failed\n";
-            let err = *libc::__errno_location();
+            static ERR_MSG: &str = concat!(stringify!($name), " failed\n");
             let _ = libc::write(
                 libc::STDERR_FILENO,
                 ERR_MSG.as_ptr() as *const _,
                 ERR_MSG.len(),
             );
-            let code = match err {
+            libc::_exit(match *libc::__errno_location() {
                 libc::EACCES | libc::EPERM => 126,
                 _ => 127,
-            };
-            libc::_exit(code);
+            });
         },
-        child => {
-            if let Some((rfd, wfd)) = sem {
-                drop(rfd);
-                uid_map.unwrap().map_uid(&Pid::from_raw(child).unwrap())?;
-                let mut f: std::fs::File = wfd.into();
-                f.write(&[1u8])?;
-            }
-            Ok(unsafe { OwnedFd::from_raw_fd(pidfd) })
-        }
+        _ => Ok(unsafe { OwnedFd::from_raw_fd(pidfd) }),
     }
 }
 
@@ -674,19 +659,159 @@ fn init_sandbox_name(name: OsString) -> &'static OsStr {
     SANDBOX_COMMAND_NAME.get().unwrap()
 }
 
-fn initial_buf_size(sysconf_name: libc::c_int, fallback: usize) -> usize {
-    unsafe {
-        let n = libc::sysconf(sysconf_name);
-        if n > 0 {
-            n as usize
-        } else {
-            fallback
+fn set_cloexec(fd: impl AsFd, cloexec: bool) -> io::Result<()> {
+    let mut flags = fcntl_getfd(&fd)?;
+    if cloexec {
+        flags.insert(FdFlags::CLOEXEC);
+    } else {
+        flags.remove(FdFlags::CLOEXEC);
+    }
+    fcntl_setfd(&fd, flags).map_err(Into::into)
+}
+
+struct EnvironIter<'a> {
+    env: *mut *mut libc::c_char,
+    phantom: std::marker::PhantomData<&'a str>,
+}
+impl<'a> EnvironIter<'a> {
+    fn new() -> Self {
+        extern "C" {
+            static mut environ: *mut *mut libc::c_char;
+        }
+        Self {
+            env: unsafe { environ },
+            phantom: std::marker::PhantomData,
+        }
+    }
+}
+impl<'a> Iterator for EnvironIter<'a> {
+    type Item = Cow<'a, CStr>;
+    fn next(&mut self) -> Option<Self::Item> {
+        unsafe {
+            if (*self.env).is_null() {
+                None
+            } else {
+                let item = CStr::from_ptr(*self.env);
+                self.env = self.env.add(1);
+                Some(item.into())
+            }
         }
     }
 }
 
+pub fn unshare_user_ns<I>(env: I) -> io::Result<Infallible>
+where
+    I: IntoIterator,
+    I::Item: Arg,
+{
+    let proc_fd = openat(
+        CWD,
+        "/proc/self",
+        OFlags::RDONLY | OFlags::DIRECTORY,
+        Mode::empty(),
+    )?;
+    let exec_fd = openat(
+        &proc_fd,
+        "exe",
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+    )?;
+    let exec_fd_raw = exec_fd.as_raw_fd();
+    let (rd, mut wd) = pipe()?;
+    set_cloexec(&mut wd, true)?;
+    let status = HelperStatus(spawn_helper(
+        "uidmap",
+        [rd.as_raw_fd().to_string(), proc_fd.as_raw_fd().to_string()],
+        false,
+    )?);
+    drop(rd);
+    drop(proc_fd);
+    unsafe { unshare_unsafe(UnshareFlags::NEWUSER) }?;
+    rustix::io::write(&wd, &[0u8; 1])?;
+    drop(wd);
+    status.status_sync().and_then(|status| {
+        status.is_success().then_some(()).ok_or_else(|| {
+            io::Error::other(format!(
+                "failed to setup uid/gid map: exited with code {}",
+                status
+            ))
+        })
+    })?;
+    let args = std::env::args_os()
+        .map(|s| s.into_c_str())
+        .collect::<Result<Vec<_>, Errno>>()?;
+    let argv = args
+        .iter()
+        .map(|arg| arg.as_ptr() as *mut libc::c_char)
+        .chain(once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+    let environ = EnvironIter::<'_>::new()
+        .map(Ok)
+        .chain(env.into_iter().map(|a| a.into_c_str()))
+        .collect::<Result<Vec<_>, _>>()?;
+    let envp = environ
+        .iter()
+        .map(|e| e.as_ptr() as *mut libc::c_char)
+        .chain(once(std::ptr::null_mut()))
+        .collect::<Vec<_>>();
+    unsafe {
+        libc::execveat(
+            exec_fd_raw,
+            c"".as_ptr(),
+            argv.as_ptr(),
+            envp.as_ptr(),
+            libc::AT_EMPTY_PATH,
+        )
+    };
+    // execveat failed
+    Err(io::Error::last_os_error())
+}
+
+trait FdArg {
+    fn fd_arg(&mut self) -> io::Result<OwnedFd>;
+}
+
+impl FdArg for std::env::ArgsOs {
+    fn fd_arg(&mut self) -> io::Result<OwnedFd> {
+        self.next()
+            .ok_or_else(|| io::Error::other("missing fd argument"))
+            .and_then(|s| {
+                s.into_string().map_err(|err| {
+                    io::Error::other(format!("invalid fd argument: {}", err.to_string_lossy()))
+                })
+            })
+            .and_then(|s| {
+                s.parse::<i32>()
+                    .map_err(|err| io::Error::other(format!("failed to parse fd: {}", err)))
+            })
+            .map(|fd| unsafe { OwnedFd::from_raw_fd(fd) })
+    }
+}
+
+fn unshare_user_ns_helper(mut args: std::env::ArgsOs) -> io::Result<()> {
+    rustix::io::read(args.fd_arg()?, &mut [0u8; 0])?;
+    let dfd = args.fd_arg()?;
+    openat(
+        &dfd,
+        "uid_map",
+        OFlags::RDONLY | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|err| io::Error::other(format!("failed to open <0>/uid_map: {}", err)))?;
+    let uid_map = UidMap::new()?;
+    uid_map.map_uid(&dfd)?;
+    Ok(())
+}
+
 fn get_user_name(uid: Uid) -> Option<String> {
-    let buf_len = initial_buf_size(libc::_SC_GETPW_R_SIZE_MAX, 2048);
+    let buf_len = unsafe {
+        let n = libc::sysconf(libc::_SC_GETPW_R_SIZE_MAX);
+        if n > 0 {
+            n as usize
+        } else {
+            2048
+        }
+    };
 
     let mut pwd: libc::passwd = unsafe { std::mem::zeroed() };
     let mut result: *mut libc::passwd = std::ptr::null_mut();
@@ -749,30 +874,48 @@ impl UidMap {
             subgid_count: subgid.count,
         })
     }
-    fn map_uid(&self, pid: &Pid) -> io::Result<()> {
-        match Command::new("newuidmap")
-            .arg(pid.to_string())
-            .arg("0")
-            .arg(self.uid.to_string())
-            .arg("1")
-            .arg("1")
-            .arg(self.subuid_start.to_string())
-            .arg(self.subuid_count.to_string())
-            .status()
+    fn map_uid(&self, dfd: impl AsFd) -> io::Result<()> {
+        fn cmd(name: &str, dfd: i32, uid: u32, map_start: u32, map_count: u32) -> Command {
+            let mut cmd = Command::new(name);
+            cmd.arg("fd:0")
+                .arg("0")
+                .arg(uid.to_string())
+                .arg("1")
+                .arg("1")
+                .arg(map_start.to_string())
+                .arg(map_count.to_string());
+            unsafe {
+                cmd.pre_exec(move || {
+                    let dfd = OwnedFd::from_raw_fd(dfd);
+                    let mut fd = OwnedFd::from_raw_fd(0);
+                    dup2(dfd, &mut fd)?;
+                    let _ = fd.into_raw_fd();
+                    Ok(())
+                })
+            };
+            cmd
+        }
+        match cmd(
+            "newuidmap",
+            dfd.as_fd().as_raw_fd(),
+            self.uid,
+            self.subuid_start,
+            self.subuid_count,
+        )
+        .status()
         {
             Ok(status) if status.success() => (),
             Ok(_) => return Err(io::Error::other("failed to run newuidmap")),
             Err(err) => return Err(err),
         };
-        match Command::new("newgidmap")
-            .arg(pid.to_string())
-            .arg("0")
-            .arg(self.gid.to_string())
-            .arg("1")
-            .arg("1")
-            .arg(self.subgid_start.to_string())
-            .arg(self.subgid_count.to_string())
-            .status()
+        match cmd(
+            "newgidmap",
+            dfd.as_fd().as_raw_fd(),
+            self.gid,
+            self.subgid_start,
+            self.subgid_count,
+        )
+        .status()
         {
             Ok(status) if status.success() => Ok(()),
             Ok(_) => Err(io::Error::other("failed to run newgidmap")),

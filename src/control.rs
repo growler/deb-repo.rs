@@ -140,6 +140,7 @@ impl<'a> ControlStanza<'a> {
     pub fn fields(&self) -> impl Iterator<Item = &'_ ControlField<'a>> {
         self.fields.iter()
     }
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.src.len()
     }

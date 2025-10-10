@@ -396,14 +396,13 @@ impl DeploymentFileSystem for HostFileSystem {
             tempfile::Builder::new()
                 .permissions(fs::Permissions::from_mode(mode))
                 .tempfile_in(&root)
-                .and_then(|f| Ok(f.into_parts()))
+                .map(|f| f.into_parts())
         })
         .await?;
         let mut file: smol::fs::File = if let Some(size) = size {
             if size > 0 {
                 blocking::unblock(move || {
-                    fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)
-                        .and_then(|_| Ok(file))
+                    fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64).map(|_| file)
                 })
                 .await
             } else {
