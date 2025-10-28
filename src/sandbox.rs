@@ -28,9 +28,9 @@ use {
         ffi::{CStr, OsStr, OsString},
         io::{self, Write},
         iter::once,
-        os::unix::{ffi::OsStrExt, process::CommandExt},
+        os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
         path::{Path, PathBuf},
-        process::Command,
+        process::{Command, Stdio},
         sync::OnceLock,
     },
 };
@@ -79,6 +79,22 @@ impl Executor for HostSandboxExecutor {
         );
         Ok(())
     }
+    fn write_file<P: AsRef<Path>, C: AsRef<str>>(
+        &self,
+        path: P,
+        mode: u32,
+        content: C,
+    ) -> io::Result<()> {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(mode)
+            .open(path.as_ref())
+            .and_then(|mut f| f.write_all(content.as_ref().as_bytes()))
+    }
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        std::fs::remove_file(path.as_ref())
+    }
     fn exec_cmd<I, A, C>(&self, cmd: C, args: I) -> io::Result<()>
     where
         I: IntoIterator<Item = A>,
@@ -86,6 +102,7 @@ impl Executor for HostSandboxExecutor {
         C: AsRef<OsStr>,
     {
         Command::new(cmd)
+            .stdout(Stdio::inherit())
             .env_clear()
             .envs(self.env.iter().map(|(k, v)| (k, v)))
             .args(args)
@@ -94,6 +111,30 @@ impl Executor for HostSandboxExecutor {
             .then_some(())
             .ok_or_else(|| io::Error::other("command failed"))
     }
+    fn exec_script<S>(&self, script: S) -> io::Result<()>
+    where
+        S: AsRef<str> + Send + 'static,
+    {
+        let mut child = Command::new("/bin/sh")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .env_clear()
+            .envs(self.env.iter().map(|(k, v)| (k, v)))
+            .arg("-s")
+            .spawn()?;
+        let mut stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| io::Error::other("failed to open stdin"))?;
+        std::thread::spawn(move || {
+            let _ = stdin.write_all(script.as_ref().as_bytes());
+        });
+        child
+            .wait()?
+            .success()
+            .then_some(())
+            .ok_or_else(|| io::Error::other("script failed"))
+    }
 }
 
 impl SandboxExecutor for HostSandboxExecutor {
@@ -101,7 +142,7 @@ impl SandboxExecutor for HostSandboxExecutor {
     where
         E: FnOnce(&Self, BuildJob<Self>) -> io::Result<OwnedFd>,
     {
-        spawner(self, job)
+        spawner(&self, job)
     }
     fn setup_rootfs(&mut self) -> io::Result<OwnedFd> {
         let dfd = openat(
@@ -204,10 +245,10 @@ where
 #[async_trait::async_trait(?Send)]
 impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
     type Filesystem = E::Filesystem;
-    async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
+    async fn prepare_tree(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
         unimplemented!()
     }
-    async fn process_changes(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
+    async fn process_changes(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
         unimplemented!()
     }
     fn env<K, V>(&mut self, _k: K, _v: V) -> io::Result<()>
@@ -231,6 +272,23 @@ impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
         A: AsRef<OsStr>,
         C: AsRef<OsStr>,
     {
+        unimplemented!()
+    }
+    fn exec_script<S>(&self, _script: S) -> io::Result<()>
+    where
+        S: AsRef<str>,
+    {
+        unimplemented!()
+    }
+    fn write_file<P: AsRef<Path>, C: AsRef<str>>(
+        &self,
+        _path: P,
+        _mode: u32,
+        _content: C,
+    ) -> io::Result<()> {
+        unimplemented!()
+    }
+    fn remove_file<P: AsRef<Path>>(&self, _path: P) -> io::Result<()> {
         unimplemented!()
     }
     async fn execute(&mut self, job: BuildJob<Self>) -> io::Result<()>
@@ -324,13 +382,14 @@ fn mkdirat_if_not_exist<P: Arg, Fd: AsFd>(dirfd: Fd, path: P, mode: Mode) -> io:
     )
 }
 
-fn unshare_root() -> io::Result<()> {
+pub fn unshare_root() -> io::Result<()> {
     mount_change(
         "/",
         MountPropagationFlags::PRIVATE | MountPropagationFlags::REC,
     )
     .map_err(Into::into)
 }
+
 fn mount_dev(dfd: &OwnedFd) -> io::Result<()> {
     let fsfd = fsopen("tmpfs", FsOpenFlags::FSOPEN_CLOEXEC)?;
     fsconfig_set_string(&fsfd, "size", "1024M")?;

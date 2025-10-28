@@ -1,19 +1,21 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::{
-    control::ControlParser, hash::FileHash, universe::Universe, version::Dependency,
+    control::ControlParser, hash::Hash, universe::Universe, version::Dependency,
     HttpTransportProvider, Package, Packages, TransportProvider,
 };
 use std::sync::Arc;
 
 async fn fetch_packages() -> Arc<str> {
-    let transport = HttpTransportProvider::new(false).await;
+    let transport = HttpTransportProvider::new(false);
     let uri = "https://snapshot.debian.org/archive/debian/20241201T025825Z/dists/bookworm/main/binary-amd64/Packages.xz";
     let size = 8788624;
-    let hash: FileHash = "2f674d057c5f274c5a863664a586ef62a0deb571993914ccfe4e2cd784a4840d"
-        .try_into()
-        .unwrap();
+    let hash = Hash::from_hex(
+        "SHA256",
+        "2f674d057c5f274c5a863664a586ef62a0deb571993914ccfe4e2cd784a4840d",
+    )
+    .unwrap();
     let data = transport
-        .fetch_verify_unpack(uri, size, &hash, 100_000_000)
+        .get_unpacked_bytes_verified(uri, size, &hash, 100_000_000)
         .await
         .expect("package downloaded");
     String::from_utf8(data).expect("correct utf-8").into()

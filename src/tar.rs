@@ -13,6 +13,7 @@ use {
 const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
 const PATH_MAX: usize = 4096;
+const PAX_HEADER_MAX_SIZE: usize = 1 * 1024 * 1024;
 
 macro_rules! ready {
     ($e:expr $(,)?) => {
@@ -68,6 +69,22 @@ impl Header {
         I: core::slice::SliceIndex<[u8], Output = [u8]>,
     {
         &self.record[range]
+    }
+    fn as_str<I>(&self, range: I) -> Result<Box<str>>
+    where
+        I: core::slice::SliceIndex<[u8], Output = [u8]>,
+    {
+        from_utf8(self.buf(range))
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
+            .map(|p| p.to_string().into_boxed_str())
+    }
+    fn as_null_terminated_str<I>(&self, range: I) -> Result<Box<str>>
+    where
+        I: core::slice::SliceIndex<[u8], Output = [u8]>,
+    {
+        from_utf8(null_terminated(self.buf(range)))
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
+            .map(|p| p.to_string().into_boxed_str())
     }
     fn kind(&self) -> HeaderKind<'_> {
         let gnu = unsafe { self.cast::<GnuHeader>() };
@@ -163,6 +180,8 @@ enum Kind {
     Directory = b'5',
     GNULongLink = b'K',
     GNULongName = b'L',
+    PAXLocal = b'x',
+    PAXGlobal = b'g',
 }
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -173,6 +192,8 @@ impl std::fmt::Display for Kind {
             Self::Directory => "directory",
             Self::GNULongName => "GNU long name extension",
             Self::GNULongLink => "GNU long link extension",
+            Self::PAXLocal => "PAX next file extension",
+            Self::PAXGlobal => "PAX global extension",
         })
     }
 }
@@ -190,6 +211,8 @@ impl Kind {
             v if v == Kind::Directory.byte() => Ok(Kind::Directory),
             v if v == Kind::GNULongName.byte() => Ok(Kind::GNULongName),
             v if v == Kind::GNULongLink.byte() => Ok(Kind::GNULongName),
+            v if v == Kind::PAXLocal.byte() => Ok(Kind::PAXLocal),
+            v if v == Kind::PAXGlobal.byte() => Ok(Kind::PAXGlobal),
             v => Err(v),
         }
     }
@@ -317,9 +340,59 @@ enum State {
 }
 use State::*;
 
+struct PosixExtension {
+    inner: Box<str>,
+}
+impl PosixExtension {
+    fn iter(&self) -> PaxExtensionIter<'_> {
+        PaxExtensionIter { ext: &self.inner }
+    }
+}
+struct PaxExtensionIter<'a> {
+    ext: &'a str,
+}
+impl<'a> Iterator for PaxExtensionIter<'a> {
+    type Item = (&'a str, &'a str);
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.ext.is_empty() {
+            return None;
+        }
+        let space_pos = self.ext.find(' ')?;
+        let len: usize = self.ext[..space_pos].parse().ok()?;
+        let record = &self.ext[..len];
+        self.ext = &self.ext[len..];
+        let eq_pos = record.find('=')?;
+        Some((&record[space_pos + 1..eq_pos], &record[eq_pos + 1..len - 1]))
+    }
+}
+
+impl From<Box<str>> for PosixExtension {
+    fn from(s: Box<str>) -> Self {
+        Self { inner: s }
+    }
+}
+impl std::ops::Deref for PosixExtension {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
+}
+
 enum ExtensionHeader {
     LongName(Box<str>),
     LongLink(Box<str>),
+    PosixExtension(PosixExtension),
+}
+
+impl std::ops::Deref for ExtensionHeader {
+    type Target = str;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            ExtensionHeader::LongName(name) => &name,
+            ExtensionHeader::LongLink(name) => &name,
+            ExtensionHeader::PosixExtension(pax) => &pax,
+        }
+    }
 }
 
 struct ExtensionBuffer {
@@ -331,6 +404,22 @@ impl ExtensionBuffer {
         ExtensionBuffer {
             buf: Vec::<u8>::with_capacity(size),
         }
+    }
+    fn as_str<I>(&self, range: I) -> Result<Box<str>>
+    where
+        I: core::slice::SliceIndex<[u8], Output = [u8]>,
+    {
+        from_utf8(&self.buf[range])
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
+            .map(|p| p.to_string().into_boxed_str())
+    }
+    fn as_null_terminated_str<I>(&self, range: I) -> Result<Box<str>>
+    where
+        I: core::slice::SliceIndex<[u8], Output = [u8]>,
+    {
+        from_utf8(null_terminated(&self.buf[range]))
+            .map_err(|_| Error::new(ErrorKind::InvalidData, "invalid UTF-8"))
+            .map(|p| p.to_string().into_boxed_str())
     }
     unsafe fn upto(&mut self, n: usize) -> &mut [u8] {
         std::slice::from_raw_parts_mut(self.buf.as_mut_ptr(), n)
@@ -345,7 +434,7 @@ impl ExtensionBuffer {
 }
 
 #[pin_project]
-struct TarReaderInner<R: AsyncRead + Send> {
+struct TarReaderInner<'a, R: AsyncRead + Send + 'a> {
     // current position in the stream
     pos: u64,
     // end of the current record being processed
@@ -356,17 +445,20 @@ struct TarReaderInner<R: AsyncRead + Send> {
     ext: Option<ExtensionBuffer>,
     // list of the current extended headers
     exts: Vec<ExtensionHeader>,
+    // list of the global extended headers
+    globs: Vec<PosixExtension>,
     // the current record buffer
     header: Header,
     #[pin]
     reader: R,
+    marker: std::marker::PhantomData<&'a ()>,
 }
 
-pub struct TarReader<R: AsyncRead + Send> {
-    inner: Arc<Mutex<Pin<Box<TarReaderInner<R>>>>>,
+pub struct TarReader<'a, R: AsyncRead + Send + 'a> {
+    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
 }
 
-impl<R: AsyncRead + Send> TarReader<R> {
+impl<'a, R: AsyncRead + Send + 'a> TarReader<'a, R> {
     pub fn new(r: R) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Box::pin(TarReaderInner::new(r)))),
@@ -393,7 +485,7 @@ pub struct TarDirectory {
     gid: u32,
     size: u64,
 }
-pub struct TarRegularFile<R: AsyncRead + Send> {
+pub struct TarRegularFile<'a, R: AsyncRead + Send + 'a> {
     path_name: Box<str>,
     size: u64,
     mode: u32,
@@ -401,42 +493,78 @@ pub struct TarRegularFile<R: AsyncRead + Send> {
     uid: u32,
     gid: u32,
     eof: u64,
-    inner: Arc<Mutex<Pin<Box<TarReaderInner<R>>>>>,
+    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
 }
-pub enum TarEntry<R: AsyncRead + Send> {
-    File(TarRegularFile<R>),
+pub enum TarEntry<'a, R: AsyncRead + Send + 'a> {
+    File(TarRegularFile<'a, R>),
     Link(TarLink),
     Symlink(TarSymlink),
     Directory(TarDirectory),
 }
 
 fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>> {
-    let gnu_path = exts.drain(..).fold(None, |p, e| match e {
+    let long_path = exts.drain(..).fold(None, |p, e| match e {
         ExtensionHeader::LongName(name) => Some(name),
+        ExtensionHeader::PosixExtension(ext) => {
+            for (key, val) in ext.iter() {
+                if key == "path" {
+                    return Some(val.to_string().into_boxed_str());
+                }
+            }
+            p
+        }
         _ => p,
     });
     match hdr.kind() {
-        HeaderKind::Gnu(hdr) => Ok(gnu_path.map_or_else(|| hdr.path_name(), Ok)?),
+        HeaderKind::Gnu(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
         HeaderKind::Ustar(hdr) => hdr.path_name(),
         HeaderKind::Old(hdr) => hdr.link_name(),
     }
 }
 fn entry_name_link(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<(Box<str>, Box<str>)> {
-    let (gnu_path, gnu_link) = exts.drain(..).fold((None, None), |(p, l), e| match e {
+    let (long_path, long_link) = exts.drain(..).fold((None, None), |(p, l), e| match e {
         ExtensionHeader::LongName(name) => (Some(name), l),
         ExtensionHeader::LongLink(name) => (p, Some(name)),
+        ExtensionHeader::PosixExtension(ext) => {
+            let mut np = p;
+            let mut nl = l;
+            for (key, val) in ext.iter() {
+                if key == "path" {
+                    np = Some(val.to_string().into_boxed_str());
+                } else if key == "linkpath" {
+                    nl = Some(val.to_string().into_boxed_str());
+                }
+            }
+            (np, nl)
+        }
     });
     match hdr.kind() {
         HeaderKind::Gnu(hdr) => Ok((
-            gnu_path.map_or_else(|| hdr.path_name(), Ok)?,
-            gnu_link.map_or_else(|| hdr.link_name(), Ok)?,
+            long_path.map_or_else(|| hdr.path_name(), Ok)?,
+            long_link.map_or_else(|| hdr.link_name(), Ok)?,
         )),
         HeaderKind::Ustar(hdr) => Ok((hdr.path_name()?, hdr.link_name()?)),
         HeaderKind::Old(hdr) => Ok((hdr.path_name()?, hdr.link_name()?)),
     }
 }
 
-impl<R: AsyncRead + Send> TarReaderInner<R> {
+fn ext_as_path(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Result<Box<str>> {
+    if size <= BLOCK_SIZE {
+        hdr.as_null_terminated_str(..size)
+    } else {
+        ext.as_ref().unwrap().as_null_terminated_str(..size)
+    }
+}
+fn ext_as_str(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Result<Box<str>> {
+    if size <= BLOCK_SIZE {
+        hdr.as_str(..size)
+    } else {
+        ext.as_ref().unwrap().as_str(..size)
+    }
+    .map(|p| p.to_string().into_boxed_str())
+}
+
+impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
     fn new(r: R) -> Self {
         Self {
             state: Header,
@@ -444,8 +572,10 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
             nxt: BLOCK_SIZE as u64,
             ext: None,
             exts: Vec::new(),
+            globs: Vec::new(),
             header: Header::new(),
             reader: r,
+            marker: std::marker::PhantomData,
         }
     }
     fn poll_read_header(
@@ -551,6 +681,27 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                                 link_name,
                             }))
                         }
+                        Kind::PAXLocal | Kind::PAXGlobal if this.header.is_ustar() => {
+                            let size = this.header.size().and_then(|size| {
+                                if size as usize > PAX_HEADER_MAX_SIZE {
+                                    Err(Error::new(
+                                        ErrorKind::InvalidData,
+                                        format!(
+                                            "PAX extnesion exceeds {PAX_HEADER_MAX_SIZE} bytes"
+                                        ),
+                                    ))
+                                } else {
+                                    Ok(n)
+                                }
+                            })?;
+                            *this.state = Extension((size as u32, kind));
+                            let padded = padded_size(size as u64);
+                            *this.nxt += padded;
+                            if size > BLOCK_SIZE {
+                                this.ext.replace(ExtensionBuffer::new(padded as usize));
+                            }
+                            continue;
+                        }
                         Kind::GNULongName | Kind::GNULongLink if this.header.is_gnu() => {
                             let size = this.header.size().and_then(|size| {
                                 if size as usize > PATH_MAX {
@@ -600,18 +751,21 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
                         Ok(n as u64)
                     }?;
                     if *this.pos == *this.nxt {
-                        let path = if *size as usize <= BLOCK_SIZE {
-                            path_name(this.header.buf(..*size as usize))
-                        } else {
-                            path_name(&ext.as_mut().unwrap().buf[..*size as usize])
-                        }?
-                        .to_string()
-                        .into_boxed_str();
-                        this.exts.push(match kind {
-                            Kind::GNULongName => ExtensionHeader::LongName(path),
-                            Kind::GNULongLink => ExtensionHeader::LongLink(path),
+                        match kind {
+                            Kind::GNULongName => this.exts.push(ExtensionHeader::LongName(
+                                ext_as_path(&this.header, *size as usize, ext)?,
+                            )),
+                            Kind::GNULongLink => this.exts.push(ExtensionHeader::LongLink(
+                                ext_as_path(&this.header, *size as usize, ext)?,
+                            )),
+                            Kind::PAXLocal => this.exts.push(ExtensionHeader::PosixExtension(
+                                ext_as_str(&this.header, *size as usize, ext)?.into(),
+                            )),
+                            Kind::PAXGlobal => this
+                                .globs
+                                .push(ext_as_str(&this.header, *size as usize, ext)?.into()),
                             _ => unreachable!(),
-                        });
+                        };
                         *this.nxt += BLOCK_SIZE as u64;
                         *this.state = Header;
                     }
@@ -706,8 +860,8 @@ impl<R: AsyncRead + Send> TarReaderInner<R> {
     }
 }
 
-impl<R: AsyncRead + Send> Stream for TarReader<R> {
-    type Item = Result<TarEntry<R>>;
+impl<'a, R: AsyncRead + Send + 'a> Stream for TarReader<'a, R> {
+    type Item = Result<TarEntry<'a, R>>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut();
         let mut g = this.inner.lock().unwrap();
@@ -746,13 +900,13 @@ impl<R: AsyncRead + Send> Stream for TarReader<R> {
     }
 }
 
-impl<R: AsyncRead + Send> Stream for TarReaderInner<R> {
+impl<'a, R: AsyncRead + Send + 'a> Stream for TarReaderInner<'a, R> {
     type Item = Result<Entry>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.as_mut().poll_read_header(ctx)
     }
 }
-impl<R: AsyncRead + Send> TarEntry<R> {
+impl<'a, R: AsyncRead + Send + 'a> TarEntry<'a, R> {
     pub fn path(&'_ self) -> &'_ str {
         match self {
             Self::File(f) => &f.path_name,
@@ -763,7 +917,7 @@ impl<R: AsyncRead + Send> TarEntry<R> {
     }
 }
 
-impl<R: AsyncRead + Send> TarRegularFile<R> {
+impl<'a, R: AsyncRead + Send + 'a> TarRegularFile<'a, R> {
     pub fn size(&self) -> u64 {
         self.size
     }
@@ -832,7 +986,7 @@ impl TarDirectory {
     }
 }
 
-impl<R: AsyncRead + Send> AsyncRead for TarRegularFile<R> {
+impl<'a, R: AsyncRead + Send + 'a> AsyncRead for TarRegularFile<'a, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,

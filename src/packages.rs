@@ -4,7 +4,7 @@ use {
             ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
             ParseError,
         },
-        hash::FileHash,
+        hash::Hash,
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
@@ -121,7 +121,7 @@ impl<'a> std::fmt::Display for Package<'a> {
 }
 
 impl<'a> Package<'a> {
-    pub fn repo_file(&self, hash_field_name: &'static str) -> io::Result<(&'a str, u64, FileHash)> {
+    pub fn repo_file(&self, hash_field_name: &'static str) -> io::Result<(&'a str, u64, Hash)> {
         let (path, size, digest) = self
             .fields()
             .find_fields(("Filename", "Size", hash_field_name))
@@ -134,7 +134,7 @@ impl<'a> Package<'a> {
         Ok((
             path,
             crate::parse_size(size.as_bytes())?,
-            digest.try_into()?,
+            Hash::from_hex(hash_field_name, digest)?,
         ))
     }
     pub fn src(&self) -> &'a str {
@@ -318,7 +318,7 @@ impl Packages {
         &self,
         index: usize,
         hash_field_name: &'static str,
-    ) -> io::Result<(&str, u64, FileHash)> {
+    ) -> io::Result<(&str, u64, Hash)> {
         self.get(index)
             .ok_or_else(|| {
                 std::io::Error::new(

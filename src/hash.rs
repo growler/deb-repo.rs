@@ -1,12 +1,16 @@
 //! Digest verification
 
+use std::{
+    ffi::{OsStr, OsString},
+    path::{Path, PathBuf},
+};
+
+use base64::Engine;
 pub use digest::Output as HashOutput;
+use digest::OutputSizeUser;
 use {
-    ::serde::{
-        de::{self, Visitor},
-        Deserialize, Deserializer, Serialize, Serializer,
-    },
-    digest::FixedOutputReset,
+    ::serde::{Deserialize, Deserializer, Serialize, Serializer},
+    digest::{FixedOutput, FixedOutputReset},
     futures_lite::ready,
     pin_project::pin_project,
     smol::io::{AsyncRead, AsyncWrite},
@@ -14,573 +18,530 @@ use {
     std::{fmt, pin::Pin},
 };
 
-// pub enum HashRef<'a, H: HashAlgo> {
-//     Borrowed(&'a Hash<H>),
-//     Boxed(Box<Hash<H>>),
-// }
-//
-// impl<'a, H: HashAlgo> std::fmt::Debug for HashRef<'a, H> {
-//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-//         write!(f, "\"{}\"", hex::encode(self.as_ref()))
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> AsRef<Hash<H>> for HashRef<'a, H> {
-//     fn as_ref(&self) -> &Hash<H> {
-//         match self {
-//             HashRef::Borrowed(b) => b,
-//             HashRef::Boxed(b) => b.as_ref(),
-//         }
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> std::ops::Deref for HashRef<'a, H> {
-//     type Target = Hash<H>;
-//     fn deref(&self) -> &Self::Target {
-//         match self {
-//             HashRef::Borrowed(b) => b,
-//             HashRef::Boxed(b) => b.as_ref(),
-//         }
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> From<&'a Hash<H>> for HashRef<'a, H> {
-//     fn from(value: &'a Hash<H>) -> Self {
-//         HashRef::Borrowed(value)
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> From<Box<Hash<H>>> for HashRef<'a, H> {
-//     fn from(value: Box<Hash<H>>) -> Self {
-//         HashRef::Boxed(value)
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> From<Hash<H>> for HashRef<'a, H> {
-//     fn from(value: Hash<H>) -> Self {
-//         HashRef::Boxed(Box::new(value))
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> Clone for HashRef<'a, H> {
-//     fn clone(&self) -> Self {
-//         match self {
-//             HashRef::Borrowed(b) => HashRef::Borrowed(b),
-//             HashRef::Boxed(b) => HashRef::Boxed(b.clone()),
-//         }
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> From<&HashRef<'a, H>> for Hash<H> {
-//     fn from(hashref: &HashRef<'a, H>) -> Self {
-//         Hash {
-//             inner: match hashref {
-//                 HashRef::Borrowed(b) => b.inner.clone(),
-//                 HashRef::Boxed(b) => b.inner.clone(),
-//             },
-//         }
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> Eq for HashRef<'a, H> {}
-// impl<'a, H: HashAlgo> PartialEq for HashRef<'a, H> {
-//     fn eq(&self, other: &Self) -> bool {
-//         use std::ops::Deref;
-//         self.deref().eq(other.deref())
-//     }
-// }
-//
-// impl<'a, H: HashAlgo> HashRef<'a, H> {
-//     pub fn verifying_reader<R: Read + Unpin + Send>(
-//         &self,
-//         size: u64,
-//         reader: R,
-//     ) -> VerifyingReader<H, R> {
-//         VerifyingReader::new(reader, size, self.into())
-//     }
-//     pub fn hash(data: &[u8]) -> Self {
-//         let mut hasher = H::default();
-//         hasher.update(data);
-//         HashRef::Boxed(Box::new(Hash {
-//             inner: hasher.finalize_fixed(),
-//         }))
-//     }
-// }
+pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
+    const NAME: &'static str;
+    const SRI_NAME: &'static str;
+    fn hash(hash: HashOutput<Self>) -> Hash;
+    fn into_hash(mut self) -> Hash {
+        Self::hash(self.finalize_fixed_reset())
+    }
+}
 
-#[derive(Debug, Clone)]
-pub enum FileHash {
-    MD5sum(Hash<md5::Md5>),
-    SHA256(Hash<sha2::Sha256>),
-    SHA512(Hash<sha2::Sha512>),
-}
-impl AsRef<[u8]> for FileHash {
-    fn as_ref(&self) -> &[u8] {
-        match self {
-            FileHash::MD5sum(h) => h.as_ref(),
-            FileHash::SHA256(h) => h.as_ref(),
-            FileHash::SHA512(h) => h.as_ref(),
-        }
+impl HashAlgo for sha2::Sha256 {
+    const NAME: &'static str = "SHA256";
+    const SRI_NAME: &'static str = "sha256";
+    fn hash(hash: HashOutput<Self>) -> Hash {
+        Hash::SHA256(InnerHash { inner: hash })
     }
 }
-impl From<Hash<sha2::Sha512>> for FileHash {
-    fn from(value: Hash<sha2::Sha512>) -> Self {
-        FileHash::SHA512(value)
+impl HashAlgo for sha2::Sha512 {
+    const NAME: &'static str = "SHA512";
+    const SRI_NAME: &'static str = "sha512";
+    fn hash(hash: HashOutput<Self>) -> Hash {
+        Hash::SHA512(InnerHash { inner: hash })
     }
 }
-impl From<Hash<sha2::Sha256>> for FileHash {
-    fn from(value: Hash<sha2::Sha256>) -> Self {
-        FileHash::SHA256(value)
+impl HashAlgo for md5::Md5 {
+    const NAME: &'static str = "MD5sum";
+    const SRI_NAME: &'static str = "md5";
+    fn hash(hash: HashOutput<Self>) -> Hash {
+        Hash::MD5sum(InnerHash { inner: hash })
     }
 }
-impl From<Hash<md5::Md5>> for FileHash {
-    fn from(value: Hash<md5::Md5>) -> Self {
-        FileHash::MD5sum(value)
+impl HashAlgo for blake3::Hasher {
+    const NAME: &'static str = "Blake3";
+    const SRI_NAME: &'static str = "blake3";
+    fn hash(hash: HashOutput<Self>) -> Hash {
+        Hash::Blake3(InnerHash { inner: hash })
     }
 }
-impl std::ops::Deref for FileHash {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        match self {
-            FileHash::MD5sum(h) => h.as_ref(),
-            FileHash::SHA256(h) => h.as_ref(),
-            FileHash::SHA512(h) => h.as_ref(),
-        }
+
+#[derive(Clone)]
+pub struct InnerHash<D: HashAlgo> {
+    inner: HashOutput<D>,
+}
+
+impl<D: HashAlgo> std::fmt::Debug for InnerHash<D> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}({})", D::NAME, hex::encode(&self.inner))
     }
 }
-impl FileHash {
-    pub fn verifying_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
+
+impl<D: HashAlgo> PartialEq for InnerHash<D> {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_bytes() == other.as_bytes()
+    }
+}
+
+#[allow(dead_code)]
+impl<D: HashAlgo> InnerHash<D> {
+    const fn sri_hash_name() -> &'static str {
+        D::SRI_NAME
+    }
+    const fn hash_name() -> &'static str {
+        D::NAME
+    }
+    const fn sri_name(&self) -> &'static str {
+        D::SRI_NAME
+    }
+    const fn name(&self) -> &'static str {
+        D::NAME
+    }
+    fn size(&self) -> usize {
+        <D as OutputSizeUser>::output_size()
+    }
+    fn hash_size() -> usize {
+        <D as OutputSizeUser>::output_size()
+    }
+    fn as_bytes(&self) -> &[u8] {
+        &self.inner
+    }
+    fn hash(&self) -> Hash {
+        D::hash(self.inner.clone())
+    }
+    fn verifying_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
         &self,
         size: u64,
         reader: R,
-    ) -> Pin<Box<dyn AsyncRead + Send + 'b>> {
-        match self {
-            FileHash::MD5sum(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
-            FileHash::SHA256(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
-            FileHash::SHA512(h) => Box::pin(VerifyingReader::new(reader, size, h.clone())),
+    ) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
+    where
+        D: 'b,
+    {
+        Box::pin(VerifyingReader::<D, _>::new(
+            reader,
+            size,
+            self.inner.clone(),
+        ))
+    }
+    fn hashing_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
+        reader: R,
+    ) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
+    where
+        D: 'b,
+    {
+        Box::pin(HashingReader::<D, _>::new(reader))
+    }
+    fn hex_size() -> usize {
+        <D as OutputSizeUser>::output_size() * 2
+    }
+    fn from_hex(value: &str) -> std::io::Result<Self> {
+        if value.len() != Self::hex_size() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "invalid hex digest length {}, expected {}",
+                    value.len(),
+                    Self::hex_size()
+                ),
+            ));
+        }
+        let mut inner = HashOutput::<D>::default();
+        hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|err| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("error decoding hex digest: {}", err),
+            )
+        })?;
+        Ok(InnerHash { inner })
+    }
+    fn to_hex(&self) -> String {
+        hex::encode(&self.inner)
+    }
+    fn base64_size() -> usize {
+        base64::encoded_len(<D as OutputSizeUser>::output_size(), false).unwrap()
+    }
+    fn from_base64(value: &str) -> Result<Self, std::io::Error> {
+        let mut inner = HashOutput::<D>::default();
+        match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode_slice(value, &mut inner) {
+            Ok(n) if n == <D as OutputSizeUser>::output_size() => Ok(InnerHash { inner }),
+            Ok(n) => Err(base64::DecodeSliceError::DecodeError(
+                base64::DecodeError::InvalidLength(n),
+            )),
+            Err(err) => Err(err),
+        }
+        .map_err(|err| std::io::Error::other(format!("error decoding base64 digest: {}", err)))
+    }
+    fn to_base64(&self) -> String {
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.inner)
+    }
+    fn from_sri(value: &str) -> std::io::Result<Self> {
+        let mut parts = value.splitn(2, '-');
+        let name = parts
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing hash name"))?;
+        let b64 = parts
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing base64 digest"))?;
+        if name != D::SRI_NAME {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid hash name {}, expected {}", name, D::SRI_NAME),
+            ));
+        }
+        let mut inner = HashOutput::<D>::default();
+        match base64::engine::general_purpose::STANDARD.decode_slice(b64, &mut inner) {
+            Ok(n) if n == <D as OutputSizeUser>::output_size() => Ok(InnerHash { inner }),
+            Ok(n) => Err(base64::DecodeSliceError::DecodeError(
+                base64::DecodeError::InvalidLength(n),
+            )),
+            Err(err) => Err(err),
+        }
+        .map_err(|err| std::io::Error::other(format!("error decoding base64 digest: {}", err)))
+    }
+    fn to_sri(&self) -> String {
+        format!(
+            "{}-{}",
+            D::SRI_NAME,
+            base64::engine::general_purpose::STANDARD.encode(&self.inner)
+        )
+    }
+}
+impl<D: HashAlgo> AsRef<[u8]> for InnerHash<D> {
+    fn as_ref(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+impl<D: HashAlgo> From<HashOutput<D>> for InnerHash<D> {
+    fn from(value: HashOutput<D>) -> Self {
+        Self { inner: value }
+    }
+}
+impl<D: HashAlgo> From<InnerHash<D>> for HashOutput<D> {
+    fn from(value: InnerHash<D>) -> Self {
+        value.inner
+    }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum Hash {
+    MD5sum(InnerHash<md5::Md5>),
+    SHA256(InnerHash<sha2::Sha256>),
+    SHA512(InnerHash<sha2::Sha512>),
+    Blake3(InnerHash<blake3::Hasher>),
+}
+
+macro_rules! delegate {
+    ( $vis:vis fn $name:ident $(< $($gen:tt),* $(,)? >)?
+        (&self $(, $p:ident : $ty:ty)* $(,)?) -> $ret:ty $(where $($where:tt)* )? ) => {
+        $vis fn $name $(< $($gen),* >)? (&self $(, $p : $ty)*) -> $ret $(where $($where)* )? {
+            match self {
+                Self::MD5sum(h) => h.$name($($p),*),
+                Self::SHA256(h) => h.$name($($p),*),
+                Self::SHA512(h) => h.$name($($p),*),
+                Self::Blake3(h) => h.$name($($p),*),
+            }
+        }
+    };
+}
+
+macro_rules! delegate_block {
+    ( $var:expr => $test:ident $block:block or $err:expr ) => {
+        match $var {
+            val if val == InnerHash::<md5::Md5>::$test() => {
+                type D = ::md5::Md5;
+                $block
+            }
+            val if val == InnerHash::<sha2::Sha256>::$test() => {
+                type D = ::sha2::Sha256;
+                $block
+            }
+            val if val == InnerHash::<sha2::Sha512>::$test() => {
+                type D = ::sha2::Sha512;
+                $block
+            }
+            val if val == InnerHash::<blake3::Hasher>::$test() => {
+                type D = ::blake3::Hasher;
+                $block
+            }
+            err => $err(err),
+        }
+    };
+}
+
+impl Hash {
+    delegate! { pub fn size(&self) -> usize }
+    delegate! { pub fn name(&self) -> &'static str }
+    delegate! { pub fn as_bytes(&self) -> &[u8] }
+    delegate! { pub fn to_hex(&self) -> String }
+    delegate! { pub fn to_base64(&self) -> String }
+    delegate! { pub fn to_sri(&self) -> String }
+    delegate! { pub fn verifying_reader<'b, R>(
+            &self,
+            size: u64,
+            reader: R,
+        ) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
+        where
+            R: AsyncRead + Unpin + Send + 'b
+    }
+    pub fn hashing_reader_for<'b, R: AsyncRead + Send + Unpin + 'b>(
+        hash: &str,
+        reader: R,
+    ) -> std::io::Result<Pin<Box<dyn AsyncHashingRead + Send + 'b>>> {
+        delegate_block! { hash => hash_name {
+                Ok(Self::hashing_reader::<D, _>(reader))
+            } or |err| {
+                Err(std::io::Error::other(format!("hash {} not supported", err)))
+            }
         }
     }
-    pub fn name(&self) -> &'static str {
-        match self {
-            FileHash::MD5sum(_) => "MD5sum",
-            FileHash::SHA256(_) => "SHA256",
-            FileHash::SHA512(_) => "SHA512",
-        }
+    pub fn new_from_hash<D>(hash: HashOutput<D>) -> Self
+    where
+        D: HashAlgo,
+    {
+        D::hash(hash)
     }
-    pub fn hash(kind: &str, data: &[u8]) -> Option<Self> {
-        match kind {
-            "MD5sum" => Some(Hash::<md5::Md5>::from_bytes(data).into()),
-            "SHA256" => Some(Hash::<sha2::Sha256>::from_bytes(data).into()),
-            "SHA512" => Some(Hash::<sha2::Sha512>::from_bytes(data).into()),
-            _ => None,
-        }
+    pub fn hashing_reader<'b, D, R>(reader: R) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
+    where
+        D: HashAlgo + 'static,
+        R: AsyncRead + Send + Unpin + 'b,
+    {
+        InnerHash::<D>::hashing_reader(reader)
     }
-    pub fn store_name(&self, prefix: Option<&str>, mut levels: usize) -> String {
-        let mut hash = match self {
-            FileHash::MD5sum(b) => b.as_ref(),
-            FileHash::SHA256(b) => b.as_ref(),
-            FileHash::SHA512(b) => b.as_ref(),
-        };
-        let total_len = prefix.map_or(0, |p| p.len() + 1) + hash.len() * 2 + levels;
-        let mut buffer = String::with_capacity(total_len);
+    pub fn store_name<P: AsRef<Path>>(&self, prefix: Option<P>, mut levels: usize) -> PathBuf {
+        let pref = prefix.as_ref().map(|p| p.as_ref().as_os_str());
+        let total_len = pref.as_ref().map_or(0, |p| p.len() + 1) + self.size() * 2 + levels;
+        let mut buffer = OsString::with_capacity(total_len);
         if let Some(p) = prefix {
-            buffer.push_str(p);
-            buffer.push('/');
+            buffer.push(p.as_ref());
+            buffer.push("/");
         }
         const fn hexadecimal(c: u8) -> [u8; 2] {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             [HEX[(c >> 4) as usize], HEX[(c & 0x0f) as usize]]
         }
+        let mut hash = self.as_ref();
         while !hash.is_empty() {
             let d = hexadecimal(hash[0]);
-            buffer.push(d[0] as char);
-            buffer.push(d[1] as char);
+            buffer.push(unsafe { OsStr::from_encoded_bytes_unchecked(&d) });
             if levels > 0 {
-                buffer.push('/');
+                buffer.push("/");
                 levels -= 1;
             }
             hash = &hash[1..];
         }
-        buffer
+        buffer.into()
+    }
+    pub fn from_hex<S: AsRef<str>>(hash_name: &str, value: S) -> std::io::Result<Self> {
+        let value = value.as_ref();
+        delegate_block!(hash_name => hash_name {
+            Ok(InnerHash::<D>::from_hex(value)?.hash())
+        } or |err| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid digest length {}", err),
+            ))
+        })
+    }
+    pub fn from_base64<S: AsRef<str>>(hash_name: &str, value: S) -> std::io::Result<Self> {
+        let value = value.as_ref();
+        delegate_block!(hash_name => hash_name {
+            Ok(InnerHash::<D>::from_base64(value)?.hash())
+        } or |err| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid digest length {}", err),
+            ))
+        })
+    }
+    pub fn from_sri<S: AsRef<str>>(value: S) -> std::io::Result<Self> {
+        let value = value.as_ref();
+        let mut parts = value.splitn(2, '-');
+        let name = parts
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing hash name"))?;
+        let b64 = parts
+            .next()
+            .ok_or_else(|| std::io::Error::other("missing base64 digest"))?;
+        delegate_block!(name => sri_hash_name {
+            let mut inner = HashOutput::<D>::default();
+            let inner = match base64::engine::general_purpose::STANDARD.decode_slice(b64, &mut inner) {
+                Ok(n) if n == <D as OutputSizeUser>::output_size() => Ok(InnerHash::<D>{ inner }),
+                Ok(n) => Err(base64::DecodeSliceError::DecodeError(
+                    base64::DecodeError::InvalidLength(n),
+                )),
+                Err(err) => Err(err),
+            }
+            .map_err(|err| std::io::Error::other(format!("error decoding base64 digest: {}", err)))?;
+            Ok(inner.hash())
+        } or |err| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("hash {} not supported", err),
+            ))
+        })
     }
 }
-
-impl TryFrom<&str> for FileHash {
+impl AsRef<[u8]> for Hash {
+    delegate! { fn as_ref(&self) -> &[u8] }
+}
+impl std::fmt::Debug for Hash {
+    delegate! { fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result }
+}
+impl TryFrom<&str> for Hash {
     type Error = std::io::Error;
     fn try_from(value: &str) -> std::io::Result<Self> {
-        use digest::OutputSizeUser;
-        match value.len() {
-            c if c == md5::Md5::output_size() * 2 => {
-                Ok(FileHash::from(Hash::<md5::Md5>::try_from(value)?))
-            }
-            c if c == sha2::Sha256::output_size() * 2 => {
-                Ok(FileHash::from(Hash::<sha2::Sha256>::try_from(value)?))
-            }
-            c if c == sha2::Sha512::output_size() * 2 => {
-                Ok(FileHash::from(Hash::<sha2::Sha512>::try_from(value)?))
-            }
-            _ => Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid digest length {}", value.len()),
-            )),
-        }
+        Hash::from_sri(value)
+    }
+}
+impl From<Hash> for String {
+    fn from(value: Hash) -> Self {
+        value.to_sri()
+    }
+}
+impl From<&Hash> for String {
+    fn from(value: &Hash) -> Self {
+        value.to_sri()
     }
 }
 
-impl Serialize for FileHash {
+impl Serialize for Hash {
     fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
     where
         S: Serializer,
     {
-        let s = ::hex::encode(self.as_ref());
-        serializer.serialize_str(&s)
+        serde::sri::serialize(self, serializer)
     }
 }
 
-impl<'de> Deserialize<'de> for FileHash {
+impl<'de> Deserialize<'de> for Hash {
     fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
     where
         DE: Deserializer<'de>,
     {
-        struct DigestVisitor;
-
-        impl<'de> Visitor<'de> for DigestVisitor {
-            type Value = FileHash;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a hex encoded string representing the digest")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                TryFrom::<&str>::try_from(value)
-                    .map_err(|e| de::Error::custom(format!("error decoding hash: {}", e)))
-            }
-        }
-        deserializer.deserialize_str(DigestVisitor)
-    }
-}
-
-pub trait HashAlgo: FixedOutputReset + Default + Send {}
-
-impl HashAlgo for sha2::Sha256 {}
-impl HashAlgo for sha2::Sha512 {}
-impl HashAlgo for md5::Md5 {}
-
-#[derive(Default, Debug)]
-pub struct Hash<D: HashAlgo> {
-    inner: HashOutput<D>,
-}
-
-impl<D: HashAlgo> Hash<D> {
-    pub fn from_bytes(data: &[u8]) -> Self {
-        let mut hasher = D::default();
-        hasher.update(data);
-        Hash {
-            inner: hasher.finalize_fixed(),
-        }
-    }
-}
-
-impl<H: HashAlgo> AsRef<[u8]> for Hash<H> {
-    fn as_ref(&self) -> &[u8] {
-        &self.inner
-    }
-}
-
-impl<D: HashAlgo> Serialize for Hash<D> {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        self::serde::hex::serialize(self, serializer)
-    }
-}
-
-impl<'de, D: HashAlgo> Deserialize<'de> for Hash<D> {
-    fn deserialize<DE>(deserializer: DE) -> Result<Self, DE::Error>
-    where
-        DE: Deserializer<'de>,
-    {
-        struct DigestVisitor<T>(std::marker::PhantomData<T>);
-
-        impl<'de, T: HashAlgo> Visitor<'de> for DigestVisitor<T> {
-            type Value = Hash<T>;
-
-            fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
-                formatter.write_str("a hex encoded string representing the digest")
-            }
-
-            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
-            where
-                E: de::Error,
-            {
-                let mut inner = HashOutput::<T>::default();
-                hex::decode_to_slice(value, inner.as_mut_slice())
-                    .map_err(|e| de::Error::custom(format!("error decoding hash: {}", e)))?;
-                Ok(Hash { inner })
-            }
-        }
-        deserializer.deserialize_str(DigestVisitor(std::marker::PhantomData))
+        serde::sri::deserialize(deserializer)
     }
 }
 
 pub mod serde {
-    // Hexadecimal encoding (default). Accepts mixed case, outputs only lowercase.
+    use super::Hash;
+    pub mod sri {
+        use {
+            super::Hash,
+            ::serde::{
+                de::{self, Visitor},
+                Deserializer, Serializer,
+            },
+            std::fmt,
+        };
+
+        pub fn serialize<S>(value: &Hash, serializer: S) -> Result<S::Ok, S::Error>
+        where
+            S: Serializer,
+        {
+            serializer.serialize_str(&value.to_sri())
+        }
+
+        pub fn deserialize<'de, DE>(deserializer: DE) -> Result<Hash, DE::Error>
+        where
+            DE: Deserializer<'de>,
+        {
+            struct SriVisitor;
+
+            impl<'de> Visitor<'de> for SriVisitor {
+                type Value = Hash;
+
+                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                    write!(f, "an SRI digest",)
+                }
+
+                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+                where
+                    E: de::Error,
+                {
+                    Hash::from_sri(v)
+                        .map_err(|e| de::Error::custom(format!("error decoding SRI digest: {}", e)))
+                }
+            }
+
+            deserializer.deserialize_str(SriVisitor)
+        }
+        pub mod opt {
+            use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+            #[derive(Serialize, Deserialize)]
+            #[serde(transparent)]
+            struct WithSri(#[serde(with = "crate::hash::serde::sri")] super::Hash);
+
+            pub fn serialize<S>(
+                value: &Option<super::Hash>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mapped = value.as_ref().cloned().map(WithSri);
+                mapped.serialize(serializer)
+            }
+
+            pub fn deserialize<'de, De>(deserializer: De) -> Result<Option<super::Hash>, De::Error>
+            where
+                De: Deserializer<'de>,
+            {
+                let opt = Option::<WithSri>::deserialize(deserializer)?;
+                Ok(opt.map(|w| w.0))
+            }
+        }
+    }
     pub mod hex {
-        use crate::hash::{Hash, HashAlgo, HashOutput};
-        use serde::{
-            de::{self, Visitor},
-            Deserializer, Serializer,
-        };
-        use std::{fmt, marker::PhantomData};
+        use {super::Hash, ::serde::Serializer};
 
-        pub fn serialize<D, S>(value: &Hash<D>, serializer: S) -> Result<S::Ok, S::Error>
+        pub fn serialize<S>(value: &Hash, serializer: S) -> Result<S::Ok, S::Error>
         where
-            D: HashAlgo,
             S: Serializer,
         {
-            let s = ::hex::encode(value.inner.as_slice());
+            let s = ::hex::encode(value.as_ref());
             serializer.serialize_str(&s)
         }
 
-        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Hash<D>, DE::Error>
-        where
-            D: HashAlgo,
-            DE: Deserializer<'de>,
-        {
-            struct HexVisitor<T>(PhantomData<T>);
+        pub mod opt {
+            use serde::{Serialize, Serializer};
 
-            impl<'de, T: HashAlgo> Visitor<'de> for HexVisitor<T> {
-                type Value = Hash<T>;
+            #[derive(Serialize)]
+            #[serde(transparent)]
+            struct WithHex(#[serde(with = "crate::hash::serde::hex")] super::Hash);
 
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    write!(
-                        f,
-                        "a string with hex-encoded digest ({} hex chars)",
-                        T::output_size() * 2
-                    )
-                }
-
-                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    let mut inner = HashOutput::<T>::default();
-                    ::hex::decode_to_slice(v, inner.as_mut_slice())
-                        .map_err(|e| E::custom(format!("error decoding hex digest: {}", e)))?;
-                    Ok(Hash { inner })
-                }
+            pub fn serialize<S>(
+                value: &Option<super::Hash>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mapped = value.as_ref().cloned().map(WithHex);
+                mapped.serialize(serializer)
             }
-
-            deserializer.deserialize_str(HexVisitor::<D>(PhantomData))
         }
     }
 
-    // base64 URL-safe encoding
     pub mod base64 {
-        use crate::hash::{Hash, HashAlgo, HashOutput};
-        use ::base64::prelude::*;
-        use serde::{
-            de::{self, Visitor},
-            Deserializer, Serializer,
-        };
-        use std::{fmt, marker::PhantomData};
+        use {super::Hash, ::base64::prelude::*, ::serde::Serializer};
 
-        pub fn serialize<D, S>(value: &Hash<D>, serializer: S) -> Result<S::Ok, S::Error>
+        pub fn serialize<S>(value: &Hash, serializer: S) -> Result<S::Ok, S::Error>
         where
-            D: HashAlgo,
             S: Serializer,
         {
-            let s = ::base64::engine::general_purpose::URL_SAFE.encode(value.inner.as_slice());
+            let s = ::base64::engine::general_purpose::URL_SAFE.encode(value.as_ref());
             serializer.serialize_str(&s)
         }
 
-        pub fn deserialize<'de, D, DE>(deserializer: DE) -> Result<Hash<D>, DE::Error>
-        where
-            D: HashAlgo,
-            DE: Deserializer<'de>,
-        {
-            struct B64Visitor<T>(PhantomData<T>);
+        pub mod opt {
+            use serde::{Serialize, Serializer};
 
-            impl<'de, T: HashAlgo> Visitor<'de> for B64Visitor<T> {
-                type Value = Hash<T>;
+            #[derive(Serialize)]
+            #[serde(transparent)]
+            struct WithB64(#[serde(with = "crate::hash::serde::base64")] super::Hash);
 
-                fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
-                    write!(f, "a base64url encoded digest")
-                }
-
-                fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
-                where
-                    E: de::Error,
-                {
-                    let bytes = ::base64::engine::general_purpose::URL_SAFE
-                        .decode(v.as_bytes())
-                        .map_err(|e| {
-                            E::custom(format!("error decoding base64-url digest: {}", e))
-                        })?;
-
-                    if bytes.len() != T::output_size() {
-                        return Err(E::custom(format!(
-                            "invalid digest length {} (expected {})",
-                            bytes.len(),
-                            T::output_size()
-                        )));
-                    }
-
-                    let mut inner = HashOutput::<T>::default();
-                    inner.as_mut_slice().copy_from_slice(&bytes);
-                    Ok(Hash { inner })
-                }
-            }
-
-            deserializer.deserialize_str(B64Visitor::<D>(PhantomData))
-        }
-    }
-}
-
-impl<D: HashAlgo> std::ops::Deref for Hash<D> {
-    type Target = [u8];
-    fn deref(&self) -> &Self::Target {
-        &self.inner
-    }
-}
-
-impl<D: HashAlgo> Clone for Hash<D> {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
-    }
-}
-
-impl<This: HashAlgo, That: HashAlgo> PartialEq<Hash<That>> for Hash<This> {
-    fn eq(&self, other: &Hash<That>) -> bool {
-        This::output_size() == That::output_size()
-            && self.inner.as_slice() == other.inner.as_slice()
-    }
-}
-
-impl<D: HashAlgo> PartialEq<str> for Hash<D> {
-    fn eq(&self, other: &str) -> bool {
-        let mut digest = HashOutput::<D>::default();
-        match hex::decode_to_slice(other, digest.as_mut_slice()) {
-            Ok(_) => self.inner.eq(&digest),
-            Err(_) => false,
-        }
-    }
-}
-
-impl<D: HashAlgo> Hash<D> {
-    pub fn into_inner(self) -> HashOutput<D> {
-        self.inner
-    }
-}
-
-impl<D: HashAlgo> TryFrom<&str> for Hash<D> {
-    type Error = std::io::Error;
-    fn try_from(value: &str) -> std::io::Result<Self> {
-        let mut inner = HashOutput::<D>::default();
-        hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|e| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("Invalid digest: {}", e),
-            )
-        })?;
-        Ok(Hash { inner })
-    }
-}
-
-impl<D: HashAlgo> TryFrom<&[u8]> for Hash<D> {
-    type Error = std::io::Error;
-    fn try_from(value: &[u8]) -> std::io::Result<Self> {
-        if value.len() == D::output_size() {
-            Ok(Hash {
-                inner: HashOutput::<D>::from_slice(value).clone(),
-            })
-        } else {
-            Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!(
-                    "Invalid digest, expected exactly {} bytes",
-                    D::output_size()
-                ),
-            ))
-        }
-    }
-}
-
-fn path_for_hash(bytes: &[u8]) -> std::path::PathBuf {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-
-    let needs_sep = bytes.len() > 1;
-    let total_len = 2 * bytes.len() + usize::from(needs_sep);
-    let mut os = std::ffi::OsString::with_capacity(total_len);
-
-    let b0 = bytes[0];
-    let mut pair = [0u8; 2];
-    pair[0] = HEX[(b0 >> 4) as usize];
-    pair[1] = HEX[(b0 & 0x0f) as usize];
-    // Safety: HEX only contains ASCII; pair is always valid UTF-8
-    unsafe {
-        os.push(std::str::from_utf8_unchecked(&pair));
-    }
-
-    if needs_sep {
-        os.push(std::ffi::OsStr::new("/"));
-        for &b in &bytes[1..] {
-            pair[0] = HEX[(b >> 4) as usize];
-            pair[1] = HEX[(b & 0x0f) as usize];
-            // Safety: HEX only contains ASCII; pair is always valid UTF-8
-            unsafe {
-                os.push(std::str::from_utf8_unchecked(&pair));
+            pub fn serialize<S>(
+                value: &Option<super::Hash>,
+                serializer: S,
+            ) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mapped = value.as_ref().cloned().map(WithB64);
+                mapped.serialize(serializer)
             }
         }
-    }
-
-    std::path::PathBuf::from(os)
-}
-
-impl From<&FileHash> for std::path::PathBuf {
-    fn from(value: &FileHash) -> Self {
-        path_for_hash(value.as_ref())
-    }
-}
-
-impl<D: HashAlgo> From<&Hash<D>> for std::path::PathBuf {
-    fn from(value: &Hash<D>) -> Self {
-        path_for_hash(&value.inner)
-    }
-}
-
-impl<D: HashAlgo> From<Hash<D>> for Box<[u8]> {
-    fn from(value: Hash<D>) -> Self {
-        Vec::from(value.inner.as_slice()).into_boxed_slice()
-    }
-}
-
-impl<D: HashAlgo> From<Hash<D>> for String {
-    fn from(value: Hash<D>) -> Self {
-        hex::encode(&value.inner)
-    }
-}
-
-impl<D: HashAlgo> From<Hash<D>> for HashOutput<D> {
-    fn from(value: Hash<D>) -> Self {
-        value.inner
-    }
-}
-
-impl<D: HashAlgo> From<HashOutput<D>> for Hash<D> {
-    fn from(value: HashOutput<D>) -> Self {
-        Self { inner: value }
-    }
-}
-
-impl<D: HashAlgo> std::fmt::LowerHex for Hash<D> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
-        write!(f, "{}", hex::encode(&self.inner))
     }
 }
 
@@ -592,11 +553,11 @@ pub struct HashingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
     inner: R,
 }
 
-pub trait HashingRead: AsyncRead + Unpin {
-    fn hash_and_size(&mut self) -> (Box<[u8]>, u64);
+pub trait AsyncHashingRead: AsyncRead + Unpin {
+    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64);
 }
 
-impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
+impl<D: HashAlgo, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
             counter: 0,
@@ -604,26 +565,22 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingReader<D,
             inner: reader,
         }
     }
-    pub fn into_hash(self) -> Hash<D> {
-        Hash {
-            inner: self.digester.finalize_fixed(),
-        }
+    pub fn into_hash(self) -> Hash {
+        D::hash(self.digester.finalize_fixed())
+    }
+    pub fn into_hash_output(self) -> HashOutput<D> {
+        self.digester.finalize_fixed()
+    }
+    pub fn into_hash_and_size(self) -> (Hash, u64) {
+        (D::hash(self.digester.finalize_fixed()), self.counter)
     }
 }
-impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> HashingRead
-    for HashingReader<D, R>
-{
-    fn hash_and_size(&mut self) -> (Box<[u8]>, u64) {
-        (
-            self.digester
-                .finalize_fixed_reset()
-                .to_vec()
-                .into_boxed_slice(),
-            self.counter,
-        )
+impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncHashingRead for HashingReader<D, R> {
+    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64) {
+        let this = Pin::into_inner(self);
+        (D::hash(this.digester.finalize_fixed()), this.counter)
     }
 }
-
 impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncRead for HashingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
@@ -655,10 +612,8 @@ impl<D: HashAlgo + Default, W: std::io::Write> SyncHashingWriter<D, W> {
             inner: writer,
         }
     }
-    pub fn into_hash(self) -> Hash<D> {
-        Hash {
-            inner: self.digester.finalize_fixed(),
-        }
+    pub fn into_hash(self) -> Hash {
+        D::hash(self.digester.finalize_fixed())
     }
 }
 
@@ -693,10 +648,8 @@ impl<D: HashAlgo + Default + Send, W: AsyncWrite + Unpin + Send> HashingWriter<D
         }
     }
 
-    pub fn into_hash(self) -> Hash<D> {
-        Hash {
-            inner: self.digester.finalize_fixed(),
-        }
+    pub fn into_hash(self) -> Hash {
+        D::hash(self.digester.finalize_fixed())
     }
 }
 
@@ -737,11 +690,11 @@ pub struct VerifyingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
     inner: R,
 }
 
-impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> VerifyingReader<D, R> {
-    pub fn new(reader: R, size: u64, digest: Hash<D>) -> Self {
+impl<D: HashAlgo, R: AsyncRead + Unpin + Send> VerifyingReader<D, R> {
+    pub fn new(reader: R, size: u64, digest: HashOutput<D>) -> Self {
         Self {
             digester: D::default(),
-            digest: digest.into(),
+            digest,
             size,
             read: 0,
             inner: reader,
@@ -784,7 +737,8 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
                     Ok(0)
                 } else {
                     Err(std::io::Error::other(format!(
-                        "unexpected stream digest `{}` (expected `{}`)",
+                        "unexpected stream {} `{}` (expected `{}`)",
+                        D::NAME,
                         hex::encode(&digest),
                         hex::encode(&this.digest),
                     )))
@@ -795,6 +749,13 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
             }),
             st => st,
         }
+    }
+}
+
+impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncHashingRead for VerifyingReader<D, R> {
+    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64) {
+        let this = Pin::into_inner(self);
+        (D::hash(this.digest.clone()), this.size)
     }
 }
 

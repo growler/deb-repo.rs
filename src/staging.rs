@@ -1,30 +1,35 @@
-use rustix::{
-    fd::AsFd,
-    fs::{
-        chown, chownat, fallocate, fchown, futimens, symlinkat, utimensat, AtFlags, FallocateFlags,
-        Gid, Timespec, Timestamps, Uid, CWD, UTIME_OMIT,
+use {
+    rustix::{
+        fd::AsFd,
+        fs::{
+            chown, chownat, fallocate, fchown, futimens, symlinkat, utimensat, AtFlags,
+            FallocateFlags, Gid, Timespec, Timestamps, Uid, CWD, UTIME_OMIT,
+        },
+    },
+    smol::{
+        fs::{self, unix::OpenOptionsExt},
+        prelude::*,
+    },
+    std::{
+        io,
+        os::unix::fs::{DirBuilderExt, PermissionsExt},
+        path::{Path, PathBuf},
+        sync::Arc,
+        time::{SystemTime, UNIX_EPOCH},
     },
 };
-use smol::{
-    fs::{self, unix::OpenOptionsExt},
-    io,
-    prelude::*,
-};
-use std::{
-    os::unix::fs::{DirBuilderExt, PermissionsExt},
-    path::{Path, PathBuf},
-    sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
-};
 
-use crate::{control::MutableControlStanza, RepositoryFile, Source, TransportProvider};
+use crate::{
+    artifact::{Artifact, ArtifactSource}, control::MutableControlStanza, deb::DebReader,
+    RepositoryFile, Source, TransportProvider,
+};
 
 #[async_trait::async_trait(?Send)]
-pub trait DeploymentFile {
+pub trait StagingFile {
     async fn persist(self) -> io::Result<()>;
 }
 #[async_trait::async_trait(?Send)]
-pub trait DeploymentTempFile {
+pub trait StagingTempFile {
     async fn persist<P>(self, path: P) -> io::Result<()>
     where
         P: AsRef<Path>;
@@ -33,9 +38,9 @@ pub trait DeploymentTempFile {
 /// Defines a file system interface to deploy packages.
 #[allow(clippy::too_many_arguments)]
 #[async_trait::async_trait(?Send)]
-pub trait DeploymentFileSystem {
-    type File: DeploymentFile;
-    type TempFile: DeploymentTempFile;
+pub trait StagingFileSystem {
+    type File: StagingFile;
+    type TempFile: StagingTempFile;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
     async fn create_dir<P>(&self, path: P, uid: u32, gid: u32, mode: u32) -> io::Result<()>
     where
@@ -94,7 +99,7 @@ pub trait DeploymentFileSystem {
         size: Option<usize>,
     ) -> io::Result<Self::File>
     where
-        R: io::AsyncRead + Unpin + Send,
+        R: AsyncRead + Unpin + Send,
         P: AsRef<Path> + Send;
     async fn create_temp_file<R>(
         &self,
@@ -106,21 +111,29 @@ pub trait DeploymentFileSystem {
         size: Option<usize>,
     ) -> io::Result<Self::TempFile>
     where
-        R: io::AsyncRead + Unpin + Send;
+        R: AsyncRead + Unpin + Send;
     async fn remove_file<P: AsRef<Path> + Send>(&self, path: P) -> io::Result<()>;
     async fn import_deb<T>(
         &self,
         source: &Source,
-        transport: &T,
         file: &RepositoryFile,
+        transport: &T,
     ) -> io::Result<MutableControlStanza>
     where
         T: TransportProvider + ?Sized,
     {
-        let deb = source
-            .deb_reader(&file.path, file.size, &file.hash, transport)
+        let url = source.package_url(file.path());
+        let r = transport
+            .open_verified(&url, file.size(), file.hash())
             .await?;
+        let deb = DebReader::new(r).await?;
         deb.extract_to(self).await
+    }
+    async fn import_artifact<'a, T>(&self, source: ArtifactSource<'a>, artifact: &'a Artifact, transport: &T) -> io::Result<()>
+    where
+        T: TransportProvider + ?Sized,
+    {
+        artifact.stage_to(source, self, transport).await
     }
 }
 
@@ -168,7 +181,7 @@ impl HostFileSystem {
 pub struct HostFile {}
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentFile for HostFile {
+impl StagingFile for HostFile {
     async fn persist(self) -> io::Result<()> {
         Ok(())
     }
@@ -180,7 +193,7 @@ pub struct HostTempFile {
 }
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentTempFile for HostTempFile {
+impl StagingTempFile for HostTempFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         let to = self.base.as_ref().join(clean_path(path.as_ref())?);
         use std::os::unix::fs::MetadataExt;
@@ -289,7 +302,7 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
 }
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentFileSystem for HostFileSystem {
+impl StagingFileSystem for HostFileSystem {
     type File = HostFile;
     type TempFile = HostTempFile;
     async fn create_dir<P: AsRef<Path> + Send>(
@@ -382,7 +395,7 @@ impl DeploymentFileSystem for HostFileSystem {
         let to = self.target_path(to.as_ref())?;
         fs::hard_link(from, to).await
     }
-    async fn create_temp_file<R: io::AsyncRead + Unpin + Send>(
+    async fn create_temp_file<R: AsyncRead + Unpin + Send>(
         &self,
         r: R,
         uid: u32,
@@ -412,7 +425,7 @@ impl DeploymentFileSystem for HostFileSystem {
             Ok(file)
         }?
         .into();
-        io::copy(r, &mut file).await?;
+        smol::io::copy(r, &mut file).await?;
         file.flush().await?;
         let chown_allowed = self.chown_allowed;
         blocking::unblock(move || {
@@ -431,7 +444,7 @@ impl DeploymentFileSystem for HostFileSystem {
             path,
         })
     }
-    async fn create_file<R: io::AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
+    async fn create_file<R: AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
         &self,
         r: R,
         path: P,
@@ -463,7 +476,7 @@ impl DeploymentFileSystem for HostFileSystem {
                 .await?;
             }
         }
-        io::copy(r, &mut file).await?;
+        smol::io::copy(r, &mut file).await?;
         let chown_allowed = self.chown_allowed;
         blocking::unblock(move || {
             if chown_allowed {
@@ -485,17 +498,21 @@ impl DeploymentFileSystem for HostFileSystem {
     async fn import_deb<T>(
         &self,
         source: &Source,
-        transport: &T,
         file: &RepositoryFile,
+        transport: &T,
     ) -> io::Result<MutableControlStanza>
     where
         T: TransportProvider + ?Sized,
     {
-        let deb = source
-            .deb_reader(&file.path, file.size, &file.hash, transport)
-            .await?;
         let fs = self.clone();
-        blocking::unblock(move || smol::block_on(deb.extract_to(&fs))).await
+        let url = source.package_url(file.path());
+        let rdr = transport
+            .open_verified(&url, file.size(), file.hash())
+            .await?;
+        blocking::unblock(move || {
+            smol::block_on(async { DebReader::new(rdr).await?.extract_to(&fs).await })
+        })
+        .await
     }
 }
 
@@ -538,7 +555,7 @@ pub struct FileListTempFile {
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
 #[async_trait::async_trait(?Send)]
-impl DeploymentTempFile for FileListTempFile {
+impl StagingTempFile for FileListTempFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {} {}",
@@ -554,14 +571,14 @@ impl DeploymentTempFile for FileListTempFile {
 
 pub struct FileListFile {}
 #[async_trait::async_trait(?Send)]
-impl DeploymentFile for FileListFile {
+impl StagingFile for FileListFile {
     async fn persist(self) -> io::Result<()> {
         Ok(())
     }
 }
 
 #[async_trait::async_trait(?Send)]
-impl DeploymentFileSystem for FileList {
+impl StagingFileSystem for FileList {
     type File = FileListFile;
     type TempFile = FileListTempFile;
     async fn create_dir<P: AsRef<Path> + Send>(
@@ -625,7 +642,7 @@ impl DeploymentFileSystem for FileList {
         ));
         Ok(())
     }
-    async fn create_temp_file<R: io::AsyncRead + Unpin + Send>(
+    async fn create_temp_file<R: AsyncRead + Unpin + Send>(
         &self,
         r: R,
         uid: u32,
@@ -634,7 +651,7 @@ impl DeploymentFileSystem for FileList {
         _mtime: Option<SystemTime>,
         _size: Option<usize>,
     ) -> io::Result<Self::TempFile> {
-        let size = io::copy(r, &mut io::sink()).await?;
+        let size = smol::io::copy(r, &mut smol::io::sink()).await?;
         Ok(FileListTempFile {
             mode,
             uid,
@@ -643,7 +660,7 @@ impl DeploymentFileSystem for FileList {
             out: Arc::clone(&self.out),
         })
     }
-    async fn create_file<R: io::AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
+    async fn create_file<R: AsyncRead + Unpin + Send, P: AsRef<Path> + Send>(
         &self,
         r: R,
         path: P,
@@ -653,7 +670,7 @@ impl DeploymentFileSystem for FileList {
         _mtime: Option<SystemTime>,
         _size: Option<usize>,
     ) -> io::Result<Self::File> {
-        let size = io::copy(r, &mut io::sink()).await?;
+        let size = smol::io::copy(r, &mut smol::io::sink()).await?;
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),

@@ -2,11 +2,11 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
+        builder::Executor,
         cli::Source,
         sandbox::{maybe_run_sandbox, HostSandboxExecutor},
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
-        DEFAULT_SPEC_NAME,
     },
     futures::AsyncWriteExt,
     itertools::Itertools,
@@ -103,6 +103,12 @@ enum Commands {
     /// Remove a package or packages from the spec requirements or constraints
     #[command(name = "drop")]
     Drop,
+    /// Stage an artifact located under the Manifest file path
+    #[command(name = "stage")]
+    Stage,
+    /// Remove an artifact from the spec
+    #[command(name = "unstage")]
+    Unstage,
     /// Lists packages
     #[command(name = "list")]
     List,
@@ -149,8 +155,9 @@ impl Command for Init {
                 } else {
                     (vec![self.source.clone()], self.requirements.clone(), None)
                 };
-            let mut mf = Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment);
-            mf.add_requirements(&DEFAULT_SPEC_NAME, packages.iter(), None::<&str>)?;
+            let mut mf =
+                Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment.as_deref());
+            mf.add_requirements(None, packages.iter(), None::<&str>)?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -188,13 +195,76 @@ impl Command for Drop {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             if !self.constraints_only {
-                mf.drop_requirements(&self.spec, self.cons.iter())?;
+                mf.remove_requirements(self.spec.as_deref(), self.cons.iter())?;
             }
             if !self.requirements_only {
-                mf.drop_constraints(&self.spec, self.cons.iter())?;
+                mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
             }
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Parser)]
+struct Stage {
+    /// Spec name to stage the artifact
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
+    /// A comment for the staged artifact
+    #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+    comment: Option<String>,
+    /// Target file mode (only if artifact is a single file)
+    #[arg(long = "mode", value_name = "MODE")]
+    mode: Option<NonZero<u32>>,
+    /// Do not unpack (only if artifact is a single file compressed by gzip, xz or bzip2)
+    #[arg(long = "no-unpack", action)]
+    do_not_unpack: Option<bool>,
+    /// Artifact URL or path
+    #[arg(value_name = "URL")]
+    url: String,
+    /// A target path on the staging filesystem
+    #[arg(value_name = "TARGET_PATH")]
+    target: Option<String>,
+}
+
+impl Command for Stage {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.add_artifact(
+                self.spec.as_deref(),
+                &self.url,
+                self.target.as_deref(),
+                self.mode,
+                self.do_not_unpack.map(|v| !v),
+                self.comment.as_deref(),
+                conf.transport().await?.as_ref(),
+            )
+            .await?;
+            mf.store(&conf.manifest).await?;
+            Ok(())
+        })
+    }
+}
+
+#[derive(Parser)]
+struct Unstage {
+    /// Spec name to unstage the artifact from
+    #[arg(short = 's', long = "spec", value_name = "SPEC")]
+    spec: Option<String>,
+    /// Artifact URL or path
+    #[arg(value_name = "URL")]
+    url: String,
+}
+
+impl Command for Unstage {
+    fn exec(&self, conf: &App) -> Result<()> {
+        smol::block_on(async move {
+            let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.remove_artifact(self.spec.as_deref(), &self.url)?;
             mf.store(&conf.manifest).await?;
             Ok(())
         })
@@ -215,7 +285,11 @@ impl Command for Include {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-            mf.add_requirements(&self.spec, self.reqs.iter(), self.comment.as_deref())?;
+            mf.add_requirements(
+                self.spec.as_deref(),
+                self.reqs.iter(),
+                self.comment.as_deref(),
+            )?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -238,7 +312,11 @@ impl Command for Exclude {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-            mf.add_constraints(&self.spec, self.reqs.iter(), self.comment.as_deref())?;
+            mf.add_constraints(
+                self.spec.as_deref(),
+                self.reqs.iter(),
+                self.comment.as_deref(),
+            )?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -355,7 +433,7 @@ impl Command for List {
                 .await
                 .map_err(|e| anyhow!("failed to update specs: {e}"))?;
             let mut pkgs = mf
-                .spec_packages(&self.spec)?
+                .spec_packages(self.spec.as_deref())?
                 .filter(|p| !self.only_essential || p.essential())
                 .collect::<Vec<_>>();
             pkgs.sort_by_key(|&pkg| pkg.name());
@@ -379,21 +457,22 @@ struct Build {
 
 impl Command for Build {
     fn exec(&self, conf: &App) -> Result<()> {
-        let builder = HostSandboxExecutor::new(&self.path)?;
+        let mut builder = HostSandboxExecutor::new(&self.path)?;
         smol::block_on(async move {
             let manifest = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             fs::create_dir_all(&self.path).await?;
-            let fs = debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
-                .await?;
-            manifest
-                .build(
-                    &self.spec,
+            let mut fs =
+                debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                    .await?;
+            let (essentials, scripts) = manifest
+                .stage(
+                    self.spec.as_deref(),
+                    &mut fs,
                     conf.concurrency,
                     conf.transport().await?.as_ref(),
-                    &fs,
-                    builder,
                 )
                 .await?;
+            builder.build(&mut fs, essentials, scripts).await?;
             Ok(())
         })
     }
@@ -512,30 +591,6 @@ fn pretty_print_packages<'a, W: std::io::Write>(
     Ok(packages.len())
 }
 
-// async fn copy_repo_package<'a>(
-//     universe: &'a Universe,
-//     id: debrepo::PackageId,
-//     target: &Path,
-// ) -> Result<(debrepo::PackageId, impl std::fmt::Display + 'a, u64)> {
-//     let pkg = universe
-//         .package(id)
-//         .ok_or_else(|| anyhow!("package id {:?} not found", id))?;
-//     let path: PathBuf = pkg.ensure_field("Filename")?.into();
-//     let mut out = PathBuf::from(target);
-//     out.push(path.file_name().unwrap());
-//     let out = fs::File::create(out).await?;
-//     let size = universe.copy_deb_file(out, id).await?;
-//     Ok((id, pkg, size))
-// }
-
-// async fn extract_repo_package<'a, F: DeploymentFileSystem>(
-//     deb: DebReader<'a>,
-//     target: F,
-// ) -> Result<MutableControlStanza> {
-//     let desc = deb.extract_to(&target).await?;
-//     Ok(desc)
-// }
-
 impl App {
     async fn transport(&self) -> Result<Box<dyn TransportProvider>> {
         if let Some(cache) = &self.cache_dir {
@@ -545,7 +600,7 @@ impl App {
                     .map_err(|e| anyhow!("failed to create transport provider: {e}"))?,
             ))
         } else {
-            Ok(Box::new(HttpTransportProvider::new(self.insecure).await))
+            Ok(Box::new(HttpTransportProvider::new(self.insecure)))
         }
     }
 }

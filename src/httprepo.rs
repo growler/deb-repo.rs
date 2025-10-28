@@ -1,32 +1,39 @@
-//! Debian repository client
-
 use {
-    crate::{hash::FileHash, repo::TransportProvider},
+    crate::{
+        hash::{AsyncHashingRead, Hash},
+        repo::{TransportProvider, Url},
+    },
     async_trait::async_trait,
-    futures_lite::io::{copy, AsyncWriteExt},
     isahc::{config::RedirectPolicy, http::StatusCode, prelude::*, HttpClient},
     once_cell::sync::Lazy,
-    smol::{fs, io, prelude::*},
-    std::path::PathBuf,
-    std::{pin::Pin, sync::Arc},
+    smol::{
+        fs,
+        io::{self, copy},
+        prelude::*,
+    },
+    std::{
+        path::{Path, PathBuf},
+        pin::{pin, Pin},
+        sync::Arc,
+    },
 };
 
 #[derive(Clone)]
 pub struct HttpCachingTransportProvider {
     insecure: bool,
-    cache: Arc<PathBuf>,
+    cache: Arc<Box<Path>>,
 }
 
 impl HttpCachingTransportProvider {
-    pub async fn new(insecure: bool, cache: PathBuf) -> io::Result<Self> {
-        fs::create_dir_all(cache.join(".temp"))
+    pub async fn new<P: AsRef<Path>>(insecure: bool, cache: P) -> io::Result<Self> {
+        fs::create_dir_all(cache.as_ref().join(".temp"))
             .await
             .map_err(|err| {
                 io::Error::other(format!("Failed to create cache directory: {}", err))
             })?;
         Ok(Self {
             insecure,
-            cache: Arc::new(cache),
+            cache: Arc::new(cache.as_ref().to_path_buf().into_boxed_path()),
         })
     }
     async fn tmp_file(&self) -> io::Result<(tempfile::TempPath, fs::File)> {
@@ -68,103 +75,149 @@ impl HttpCachingTransportProvider {
         })?;
         Ok(())
     }
-    async fn caching_reader(
+    async fn hash_and_cache<'a, R>(
         &self,
-        uri: &str,
-        cache_path: PathBuf,
-        size: u64,
-        hash: &FileHash,
-    ) -> io::Result<Pin<Box<dyn AsyncRead + Send + Unpin>>> {
-        tracing::debug!("HTTP Caching Transport Fetching (cache miss) {}", uri);
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => (),
-            StatusCode::NOT_FOUND => return Err(io::Error::new(io::ErrorKind::NotFound, uri)),
-            code => {
-                return Err(io::Error::other(format!(
-                    "unexpected HTTP response {}",
-                    code
-                )))
-            }
+        mut r: Pin<Box<R>>,
+    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send + 'a>>>
+    where
+        R: AsyncHashingRead + Send + Unpin + ?Sized + 'a,
+    {
+        let (cache_path, hash, size) = {
+            let (tmp_path, mut tmp_file) = self.tmp_file().await?;
+            copy(&mut r, &mut tmp_file).await.map_err(|err| {
+                io::Error::other(format!("Failed to copy response body: {}", err))
+            })?;
+            let (hash, size) = r.into_hash_and_size();
+            let cache_path = hash.store_name(Some(self.cache.as_ref()), 1);
+            self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
+                .await?;
+            (cache_path, hash, size)
         };
-        if let Some(s) = rsp.body().len() {
-            if s != size {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("{} size mismatch: expected {}, got {}", uri, size, s),
-                ));
-            }
-        }
-        let (tmp_path, mut tmp_file) = self.tmp_file().await?;
-        copy(hash.verifying_reader(size, rsp.into_body()), &mut tmp_file)
-            .await
-            .map_err(|err| io::Error::other(format!("Failed to copy response body: {}", err)))?;
-        self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
-            .await?;
-        Ok(Box::pin(
+        Ok(hash.verifying_reader(
+            size,
             fs::OpenOptions::new()
                 .read(true)
                 .open(cache_path)
                 .await
                 .map_err(|err| io::Error::other(format!("Failed to open cached file: {}", err)))?,
-        ) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+        ))
+    }
+    async fn verify_and_cache<'a, R: AsyncRead + Send + 'a>(
+        &self,
+        r: R,
+        size: u64,
+        hash: &Hash,
+    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send + Unpin>>> {
+        let (tmp_path, mut tmp_file) = self.tmp_file().await?;
+        let r = pin!(r);
+        copy(hash.verifying_reader(size, r), &mut tmp_file)
+            .await
+            .map_err(|err| io::Error::other(format!("Failed to copy response body: {}", err)))?;
+        let cache_path = hash.store_name(Some(self.cache.as_ref()), 1);
+        self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
+            .await?;
+        Ok(hash.verifying_reader(
+            size,
+            fs::OpenOptions::new()
+                .read(true)
+                .open(cache_path)
+                .await
+                .map_err(|err| io::Error::other(format!("Failed to open cached file: {}", err)))?,
+        ))
     }
 }
 
 #[async_trait]
 impl TransportProvider for HttpCachingTransportProvider {
-    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-        tracing::debug!("HTTP Caching Transport Fetching {}", uri);
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => {
-                Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+    async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        let url = to_url(url)?;
+        match url.scheme() {
+            "http" | "https" => {
+                let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                match rsp.status() {
+                    StatusCode::OK => {
+                        Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+                    }
+                    StatusCode::NOT_FOUND => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, url.to_string()))
+                    }
+                    code => Err(io::Error::other(format!(
+                        "unexpected HTTP response {}",
+                        code
+                    ))),
+                }
             }
-            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
-            code => Err(io::Error::other(format!(
-                "unexpected HTTP response {}",
-                code
-            ))),
+            "file" => Ok(Box::pin(smol::fs::File::open(url.path()).await?)),
+            s => Err(io::Error::other(format!("unsupported transport {}", s))),
         }
     }
-    async fn verifying_reader(
+    async fn open_verified(
         &self,
-        path: &str,
+        url: &str,
         size: u64,
-        hash: &FileHash,
-    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-        let cache_path = self.cache.join(PathBuf::from(hash));
-        match fs::File::open(&cache_path).await {
-            Ok(file) => Ok(Box::pin(hash.verifying_reader(size, file))
-                as Pin<Box<dyn AsyncRead + Send + Unpin>>),
-            Err(_) => Ok(self.caching_reader(path, cache_path, size, hash).await?),
+        hash: &Hash,
+    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
+        let url = to_url(url)?;
+        match url.scheme() {
+            "http" | "https" => {
+                let cache_path = hash.store_name(Some(self.cache.as_ref()), 1);
+                match fs::File::open(&cache_path).await {
+                    Ok(file) => Ok(hash.verifying_reader(size, file)),
+                    Err(_) => {
+                        let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                        match rsp.status() {
+                            StatusCode::OK => {
+                                if let Some(s) = rsp.body().len() {
+                                    if s != size {
+                                        return Err(io::Error::other(format!(
+                                            "{} size mismatch: expected {}, got {}",
+                                            url, size, s
+                                        )));
+                                    }
+                                }
+                                Ok(self.verify_and_cache(rsp.into_body(), size, hash).await?)
+                            }
+                            StatusCode::NOT_FOUND => {
+                                Err(io::Error::new(io::ErrorKind::NotFound, url.to_string()))
+                            }
+                            code => Err(io::Error::other(format!(
+                                "unexpected HTTP response {}",
+                                code
+                            ))),
+                        }
+                    }
+                }
+            }
+            "file" => Ok(hash.verifying_reader(size, smol::fs::File::open(url.path()).await?)),
+            s => Err(io::Error::other(format!("unsupported transport {}", s))),
         }
     }
-    async fn fetch_hash(
+    async fn open_hashed(
         &self,
-        path: &str,
-        hash_type: &str,
-        limit: u64,
-    ) -> io::Result<(Vec<u8>, u64, FileHash)> {
-        let mut buffer = vec![0u8; 0];
-        let mut r = self.reader(path).await?.take(limit);
-        r.read_to_end(&mut buffer).await?;
-        let hash = FileHash::hash(hash_type, &buffer).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::InvalidInput,
-                format!("unexpected hash type {}", hash_type),
-            )
-        })?;
-        let (tmp_path, mut tmp_file) = self.tmp_file().await?;
-        tmp_file
-            .write_all(&buffer)
-            .await
-            .map_err(|err| io::Error::other(format!("Failed to copy response body: {}", err)))?;
-        let cache_path = self.cache.join(PathBuf::from(&hash));
-        self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
-            .await?;
-        let l = buffer.len() as u64;
-        Ok((buffer, l, hash))
+        hash: &str,
+        url: &str,
+    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
+        let url = to_url(url)?;
+        match url.scheme() {
+            "http" | "https" => {
+                let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                match rsp.status() {
+                    StatusCode::OK => {
+                        self.hash_and_cache(Hash::hashing_reader_for(hash, rsp.into_body())?)
+                            .await
+                    }
+                    StatusCode::NOT_FOUND => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, url.to_string()))
+                    }
+                    code => Err(io::Error::other(format!(
+                        "unexpected HTTP response {}",
+                        code
+                    ))),
+                }
+            }
+            "file" => Hash::hashing_reader_for(hash, smol::fs::File::open(url.path()).await?),
+            s => Err(io::Error::other(format!("unsupported transport {}", s))),
+        }
     }
 }
 
@@ -202,24 +255,42 @@ pub struct HttpTransportProvider {
 }
 
 impl HttpTransportProvider {
-    pub async fn new(insecure: bool) -> Self {
+    pub fn new(insecure: bool) -> Self {
         Self { insecure }
     }
 }
 
 #[async_trait]
 impl TransportProvider for HttpTransportProvider {
-    async fn reader(&self, uri: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-        let rsp = client(self.insecure).get_async(uri).await?;
-        match rsp.status() {
-            StatusCode::OK => {
-                Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+    async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        let url = to_url(url)?;
+        match url.scheme() {
+            "http" | "https" => {
+                let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                match rsp.status() {
+                    StatusCode::OK => {
+                        Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send + Unpin>>)
+                    }
+                    StatusCode::NOT_FOUND => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, url.to_string()))
+                    }
+                    code => Err(io::Error::other(format!(
+                        "unexpected HTTP response {}",
+                        code
+                    ))),
+                }
             }
-            StatusCode::NOT_FOUND => Err(io::Error::new(io::ErrorKind::NotFound, uri)),
-            code => Err(io::Error::other(format!(
-                "unexpected HTTP response {}",
-                code
-            ))),
+            "file" => Ok(Box::pin(smol::fs::File::open(url.path()).await?)),
+            s => Err(io::Error::other(format!("unsupported transport {}", s))),
         }
     }
+}
+
+fn to_url(url: &str) -> io::Result<Url> {
+    Url::parse(url).map_err(|err| match err {
+        url::ParseError::RelativeUrlWithoutBase => {
+            io::Error::other(format!("expects absolute path: {}", url))
+        }
+        other => io::Error::other(format!("invalid URL {}: {}", url, other)),
+    })
 }

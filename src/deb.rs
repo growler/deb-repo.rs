@@ -1,7 +1,7 @@
 use {
     crate::{
         control::MutableControlStanza,
-        deployfs::{DeploymentFile, DeploymentTempFile},
+        staging::{StagingFile, StagingTempFile},
         hash::HashingReader,
         parse_size,
         tar::{TarEntry, TarLink, TarReader},
@@ -55,7 +55,7 @@ enum EntryKind {
     Data,
 }
 
-struct DebReaderInner {
+struct DebReaderInner<'a> {
     // Current state
     state: State,
     // Content padding
@@ -69,13 +69,13 @@ struct DebReaderInner {
     // Deb entry header
     hdr: [u8; AR_HEADER_SIZE as usize],
     // Source of the data
-    source: Pin<Box<dyn AsyncRead + Send + 'static>>,
+    source: Pin<Box<dyn AsyncRead + Send + 'a>>,
 }
 
-impl Unpin for DebReaderInner {}
+impl<'a> Unpin for DebReaderInner<'a> {}
 
-impl DebReaderInner {
-    async fn new(mut r: Pin<Box<dyn AsyncRead + Send + 'static>>) -> std::io::Result<Self> {
+impl<'a> DebReaderInner<'a> {
+    async fn new(mut r: Pin<Box<dyn AsyncRead + Send + 'a>>) -> std::io::Result<Self> {
         let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
         r.read_exact(&mut hdr).await?;
         if &hdr != AR_MAGIC {
@@ -129,7 +129,7 @@ impl DebReaderInner {
     }
 }
 
-impl AsyncRead for DebReaderInner {
+impl<'a> AsyncRead for DebReaderInner<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -163,7 +163,7 @@ impl AsyncRead for DebReaderInner {
     }
 }
 
-impl Stream for DebReaderInner {
+impl<'a> Stream for DebReaderInner<'a> {
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
@@ -265,15 +265,15 @@ impl Stream for DebReaderInner {
 ///     }
 /// }
 /// ```
-pub struct DebReader {
-    inner: Arc<Mutex<DebReaderInner>>,
+pub struct DebReader<'a> {
+    inner: Arc<Mutex<DebReaderInner<'a>>>,
 }
 
-struct DebEntryReaderInner {
-    inner: Arc<Mutex<DebReaderInner>>,
+struct DebEntryReaderInner<'a> {
+    inner: Arc<Mutex<DebReaderInner<'a>>>,
 }
 
-impl AsyncRead for DebEntryReaderInner {
+impl<'a> AsyncRead for DebEntryReaderInner<'a> {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
@@ -287,7 +287,29 @@ impl AsyncRead for DebEntryReaderInner {
     }
 }
 
-impl DebReader {
+enum Compression {
+    None,
+    Gzip,
+    Xz,
+    Bz2,
+    Lzma,
+    Zstd,
+}
+
+impl Compression {
+    fn from_extension(ext: &[u8]) -> Self {
+        match ext {
+            b".gz" => Compression::Gzip,
+            b".xz" => Compression::Xz,
+            b".bz2" => Compression::Bz2,
+            b".lzma" => Compression::Lzma,
+            b".zst" | b".zstd" => Compression::Zstd,
+            _ => Compression::None,
+        }
+    }
+}
+
+impl<'a> DebReader<'a> {
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -312,25 +334,12 @@ impl DebReader {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn new(r: Pin<Box<dyn AsyncRead + Send + 'static>>) -> Result<Self> {
+    pub async fn new(r: Pin<Box<dyn AsyncRead + Send + 'a>>) -> Result<Self> {
         Ok(DebReader {
             inner: Arc::new(Mutex::new(DebReaderInner::new(r).await?)),
         })
     }
-    fn entry_reader_for_ext(&self, ext: &str) -> TarReader<Pin<Box<dyn AsyncRead + Send>>> {
-        let r = DebEntryReaderInner {
-            inner: Arc::clone(&self.inner),
-        };
-        match ext {
-            ".xz" => TarReader::new(Box::pin(XzDecoder::new(BufReader::new(r)))),
-            ".gz" => TarReader::new(Box::pin(GzipDecoder::new(BufReader::new(r)))),
-            ".bz2" => TarReader::new(Box::pin(BzDecoder::new(BufReader::new(r)))),
-            ".lzma" => TarReader::new(Box::pin(LzmaDecoder::new(BufReader::new(r)))),
-            ".zstd" | ".zst" => TarReader::new(Box::pin(ZstdDecoder::new(BufReader::new(r)))),
-            _ => TarReader::new(Box::pin(r)),
-        }
-    }
-    pub async fn extract_to<FS: crate::DeploymentFileSystem + ?Sized>(
+    pub async fn extract_to<FS: crate::StagingFileSystem + ?Sized>(
         mut self,
         fs: &FS,
     ) -> Result<MutableControlStanza> {
@@ -463,12 +472,12 @@ impl DebReader {
                         "unexpected entry",
                     )),
                 })?;
+            let mut links: Vec<TarLink> = Vec::new();
             while let Some(entry) = data_tarball.next().await {
                 let entry = entry?;
                 tracing::debug!("{} {}", pkg, entry.path());
                 // tracing::debug!("{} {:?} {:#?}", pkg, path.as_os_str(), entry.header());
                 installed_files.push(entry.path().to_owned());
-                let mut links: Vec<TarLink> = Vec::new();
                 match entry {
                     TarEntry::Directory(dir) => {
                         tracing::debug!("creating directory {}", dir.path());
@@ -542,9 +551,9 @@ impl DebReader {
                         links.push(link);
                     }
                 }
-                for link in links.drain(..) {
-                    fs.hardlink(link.link(), link.path()).await?;
-                }
+            }
+            for link in links.drain(..) {
+                fs.hardlink(link.link(), link.path()).await?;
             }
         }
         {
@@ -595,42 +604,67 @@ impl DebReader {
     }
 }
 
-impl Stream for DebReader {
-    type Item = Result<DebEntry>;
+impl<'a> Stream for DebReader<'a> {
+    type Item = Result<DebEntry<'a>>;
     fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let mut reader = self
-            .inner
-            .lock()
-            .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
-        match task::ready!(Pin::new(&mut *reader).poll_next(ctx)) {
-            None => Poll::Ready(None),
-            Some(Err(err)) => Poll::Ready(Some(Err(err))),
-            Some(Ok((entry_kind, ext_range))) => Poll::Ready(Some(match entry_kind {
-                EntryKind::Control => Ok(DebEntry::Control(self.entry_reader_for_ext(unsafe {
-                    std::str::from_utf8_unchecked(&reader.hdr[ext_range])
-                }))),
-                EntryKind::Data => Ok(DebEntry::Data(self.entry_reader_for_ext(unsafe {
-                    std::str::from_utf8_unchecked(&reader.hdr[ext_range])
-                }))),
-            })),
-        }
+        let polled = {
+            let mut reader = self
+                .inner
+                .lock()
+                .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
+            match task::ready!(Pin::new(&mut *reader).poll_next(ctx)) {
+                None => None,
+                Some(Err(err)) => Some(Err(err)),
+                Some(Ok((entry_kind, ext_range))) => Some(Ok((
+                    entry_kind,
+                    Compression::from_extension(&reader.hdr[ext_range]),
+                ))),
+            }
+        };
+        let (entry_kind, comp) = match polled {
+            None => return Poll::Ready(None),
+            Some(Err(e)) => return Poll::Ready(Some(Err(e))),
+            Some(Ok(v)) => v,
+        };
+        let this = self.as_ref();
+        Poll::Ready(Some(Ok(match entry_kind {
+            EntryKind::Control => DebEntry::Control(entry_reader(Arc::clone(&this.inner), comp)),
+            EntryKind::Data => DebEntry::Data(entry_reader(Arc::clone(&this.inner), comp)),
+        })))
     }
 }
 
-pub enum DebEntry {
-    Control(TarReader<Pin<Box<dyn AsyncRead + Send>>>),
-    Data(TarReader<Pin<Box<dyn AsyncRead + Send>>>),
+pub enum DebEntry<'a> {
+    Control(TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>),
+    Data(TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>),
 }
 
-impl DebEntry {
-    pub fn into_inner(self) -> TarReader<Pin<Box<dyn AsyncRead + Send>>> {
+impl<'a> DebEntry<'a> {
+    pub fn into_inner(self) -> TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
         }
     }
-    pub async fn next(&mut self) -> Option<Result<TarEntry<Pin<Box<dyn AsyncRead + Send>>>>> {
+    pub async fn next(
+        &mut self,
+    ) -> Option<Result<TarEntry<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>>> {
         match self {
             DebEntry::Control(tar) | DebEntry::Data(tar) => tar.next().await,
         }
+    }
+}
+
+fn entry_reader(
+    inner: Arc<Mutex<DebReaderInner<'_>>>,
+    comp: Compression,
+) -> TarReader<'_, Pin<Box<dyn AsyncRead + Send + '_>>> {
+    let r = DebEntryReaderInner { inner };
+    match comp {
+        Compression::Xz => TarReader::new(Box::pin(XzDecoder::new(BufReader::new(r)))),
+        Compression::Gzip => TarReader::new(Box::pin(GzipDecoder::new(BufReader::new(r)))),
+        Compression::Bz2 => TarReader::new(Box::pin(BzDecoder::new(BufReader::new(r)))),
+        Compression::Lzma => TarReader::new(Box::pin(LzmaDecoder::new(BufReader::new(r)))),
+        Compression::Zstd => TarReader::new(Box::pin(ZstdDecoder::new(BufReader::new(r)))),
+        Compression::None => TarReader::new(Box::pin(r)),
     }
 }

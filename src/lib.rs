@@ -1,21 +1,23 @@
 //! A Debian repository client library
 
 mod arch;
+pub mod artifact;
 pub mod builder;
 pub mod cli;
 pub mod control;
 pub mod deb;
-mod deployfs;
-mod fsrepo;
+mod staging;
 pub mod hash;
 mod httprepo;
 mod idmap;
 mod manifest;
+mod manifest_doc;
 mod packages;
 mod release;
 mod repo;
 pub mod sandbox;
 mod source;
+mod spec;
 pub mod tar;
 pub mod universe;
 pub mod version;
@@ -23,16 +25,15 @@ pub mod version;
 
 pub use {
     arch::DEFAULT_ARCH,
-    deployfs::{
-        DeploymentFile, DeploymentFileSystem, DeploymentTempFile, FileList, HostFileSystem,
+    staging::{
+        StagingFile, StagingFileSystem, StagingTempFile, FileList, HostFileSystem,
     },
-    fsrepo::FSTransportProvider,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::{Manifest, DEFAULT_SPEC_NAME},
     packages::{InstallPriority, Package, Packages},
     release::Release,
     repo::TransportProvider,
-    sandbox::maybe_run_sandbox,
+    sandbox::{maybe_run_sandbox, unshare_root, unshare_user_ns},
     source::{RepositoryFile, SignedBy, Snapshot, Source},
 };
 
@@ -59,7 +60,7 @@ pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
     Ok(result)
 }
 
-pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
+pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: smol::io::AsyncRead + Send>(
     path: P,
     data: D,
 ) -> std::io::Result<()> {
@@ -86,13 +87,36 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: AsRef<[u8]>>(
         .open(tmp.to_path_buf())
         .await
         .map_err(|err| io::Error::other(format!("Failed to open temporary file: {}", err)))?;
-    futures_lite::io::copy(data.as_ref(), &mut tmp_file)
+    smol::io::copy(data, &mut tmp_file)
         .await
         .map_err(|err| io::Error::other(format!("Failed to copy to temporary file: {}", err)))?;
     fs::rename(tmp.to_path_buf(), &path)
         .await
         .map_err(|err| io::Error::other(format!("Failed to rename temporary file: {}", err)))?;
     Ok(())
+}
+
+#[inline]
+pub(crate) fn is_url(s: &str) -> bool {
+    let mut bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return false;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    bytes = &bytes[1..];
+    while let [c, rest @ ..] = bytes {
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    if bytes.len() < 3 {
+        return false;
+    }
+    bytes[0] == b':' && bytes[1] == b'/' && bytes[2] == b'/'
 }
 
 macro_rules! matches_path {

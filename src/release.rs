@@ -15,7 +15,7 @@
 use {
     crate::{
         control::{ControlStanza, ParseError},
-        hash::FileHash,
+        hash::Hash,
         matches_path, parse_size,
     },
     chrono::{DateTime, Utc},
@@ -42,10 +42,10 @@ impl Release {
     pub(crate) fn files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],
-        hash_name: &str,
+        hash_name: &'a str,
         arch: &'a str,
         ext: Option<&'a str>,
-    ) -> Result<impl Iterator<Item = Result<(&'a str, FileHash, u64), ParseError>> + 'a, ParseError>
+    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>> + 'a, ParseError>
     {
         let ext = ext.unwrap_or(".xz");
         let release_components = self.field("Components").unwrap_or("");
@@ -101,7 +101,7 @@ impl Release {
                         let size = parse_size(size.as_bytes()).map_err(|err| {
                             ParseError::from(format!("invalid size: {:?} {}", size, err))
                         })?;
-                        let hash = FileHash::try_from(digest).map_err(|err| {
+                        let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
                             ParseError::from(format!("invalid hash: {} {}", digest, err))
                         })?;
                         Ok::<_, ParseError>((path, hash, size))

@@ -1,8 +1,5 @@
 use {
-    crate::{
-        control::MutableControlStanza, deb::DebReader, hash::FileHash, release::Release,
-        TransportProvider,
-    },
+    crate::{control::MutableControlStanza, hash::Hash, release::Release, repo::TransportProvider},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::{future::try_join_all, AsyncReadExt},
@@ -476,11 +473,11 @@ impl clap::builder::TypedValueParser for SourceHashKindValueParser {
 #[derive(Clone, Serialize, Deserialize, Debug)]
 pub struct RepositoryFile {
     pub(crate) path: String,
-    pub(crate) hash: FileHash,
+    pub(crate) hash: Hash,
     pub(crate) size: u64,
 }
 impl RepositoryFile {
-    pub fn new(path: String, hash: FileHash, size: u64) -> Self {
+    pub fn new(path: String, hash: Hash, size: u64) -> Self {
         Self { path, hash, size }
     }
     pub fn path(&self) -> &str {
@@ -489,7 +486,7 @@ impl RepositoryFile {
     pub fn size(&self) -> u64 {
         self.size
     }
-    pub fn hash(&self) -> &FileHash {
+    pub fn hash(&self) -> &Hash {
         &self.hash
     }
 }
@@ -571,13 +568,13 @@ impl Source {
     pub async fn fetch_unsigned_release_by_hash<T: TransportProvider>(
         &self,
         transport: &T,
-        path: &str,
+        url: &str,
         size: u64,
-        hash: &FileHash,
+        hash: &Hash,
     ) -> std::io::Result<Release> {
         transport
-            .fetch_verify(
-                &format!("{}/{}", self.url.trim_end_matches('/'), path,),
+            .get_bytes_verified(
+                &format!("{}/{}", self.url.trim_end_matches('/'), url),
                 size,
                 hash,
             )
@@ -591,10 +588,10 @@ impl Source {
         &self,
         suite: &str,
         transport: &T,
-    ) -> std::io::Result<(Release, String, FileHash, u64)> {
+    ) -> std::io::Result<(Release, String, Hash, u64)> {
         let path = format!("dists/{}/Release", suite);
         transport
-            .fetch_hash(
+            .get_bytes_hashed(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
                 self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
@@ -641,10 +638,10 @@ impl Source {
         &self,
         suite: &str,
         transport: &T,
-    ) -> std::io::Result<(Release, String, FileHash, u64)> {
+    ) -> std::io::Result<(Release, String, Hash, u64)> {
         let path = format!("dists/{}/InRelease", suite);
         let (data, size, hash) = transport
-            .fetch_hash(
+            .get_bytes_hashed(
                 &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
                 self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
@@ -657,10 +654,10 @@ impl Source {
         transport: &T,
         path: &str,
         size: u64,
-        hash: &FileHash,
+        hash: &Hash,
     ) -> io::Result<Release> {
         let data = transport
-            .fetch_verify(
+            .get_bytes_verified(
                 &format!("{}/{}", self.url.trim_end_matches('/'), path,),
                 size,
                 hash,
@@ -677,7 +674,7 @@ impl Source {
         T: TransportProvider + ?Sized,
     {
         transport
-            .fetch_verify_unpack(
+            .get_unpacked_bytes_verified(
                 &format!("{}/{}", &self.url, &file.path),
                 file.size,
                 &file.hash,
@@ -716,20 +713,8 @@ impl Source {
         }))
         .await
     }
-    pub async fn deb_reader<T: TransportProvider + ?Sized>(
-        &self,
-        path: &str,
-        size: u64,
-        hash: &FileHash,
-        transport: &T,
-    ) -> io::Result<DebReader> {
-        transport
-            .verifying_deb_reader(
-                &format!("{}/{}", self.url.trim_end_matches('/'), path),
-                size,
-                hash,
-            )
-            .await
+    pub fn package_url(&self, path: &str) -> String {
+        format!("{}/{}", self.url.trim_end_matches('/'), path)
     }
     pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {
         match self.url.to_ascii_lowercase().as_str() {

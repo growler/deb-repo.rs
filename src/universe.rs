@@ -1,7 +1,7 @@
 use {
     crate::{
         control::ParseError,
-        hash::FileHash,
+        hash::Hash,
         idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{Package, Packages},
         version::{self, Constraint, Dependency, Satisfies, Version},
@@ -16,8 +16,7 @@ use {
     std::{
         borrow::Borrow,
         collections::{BinaryHeap, HashMap, HashSet},
-        hash::{Hash, Hasher},
-        io,
+        hash, io,
     },
 };
 
@@ -67,8 +66,8 @@ struct Name<'a> {
     packages: SmallVec<[SolvableId; 1]>,
     required: Vec<SolvableId>,
 }
-impl<'a> Hash for Name<'a> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
+impl<'a> hash::Hash for Name<'a> {
+    fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state)
     }
 }
@@ -500,7 +499,7 @@ impl Universe {
         &self,
         id: PackageId,
         hash_field_name: &'static str,
-    ) -> io::Result<(&'_ str, u64, FileHash)> {
+    ) -> io::Result<(&'_ str, u64, Hash)> {
         self.inner.provider().with(|u| {
             let s = &u.index.solvables[id.to_index()];
             let (path, size, hash) = s.package.repo_file(hash_field_name)?;
