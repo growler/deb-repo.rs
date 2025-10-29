@@ -144,13 +144,6 @@ impl ManifestFile {
                 .collect(),
         }
     }
-    pub fn spec_index<'a>(&self, name: Option<&'a str>) -> io::Result<(&'a str, Option<usize>)> {
-        let spec_name = name
-            .map_or_else(|| Ok(""), |name| valid_spec_name(name))
-            .map_err(io::Error::other)?;
-        let spec_index = self.specs.iter().position(|(n, _)| n == spec_name);
-        Ok((spec_name, spec_index))
-    }
     pub fn spec_index_ensure<'a>(&self, name: Option<&'a str>) -> io::Result<(&'a str, usize)> {
         let spec_name = name
             .map_or_else(|| Ok(""), |name| valid_spec_name(name))
@@ -437,6 +430,7 @@ impl ManifestFile {
             cur: Some(id),
         }
     }
+    #[allow(clippy::type_complexity)]
     pub fn requirements_for(
         &self,
         id: usize,
@@ -592,7 +586,7 @@ impl LockFile {
                     lock_file_path.as_os_str(),
                     e
                 );
-                return Err(e);
+                Err(e)
             }
             Ok(r) => {
                 let mut buf = Vec::<u8>::new();
@@ -670,12 +664,6 @@ impl LockFile {
     pub fn remove_source(&mut self, index: usize) {
         self.sources.remove(index);
     }
-    pub fn set_sources(&mut self, sources: Vec<Option<LockedSource>>) {
-        self.sources = sources;
-    }
-    pub fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ LockedSpec)> {
-        self.specs.iter()
-    }
     pub fn specs_len(&self) -> usize {
         self.specs.len()
     }
@@ -690,12 +678,6 @@ impl LockFile {
     }
     pub fn push_spec(&mut self, name: &str, spec: LockedSpec) {
         self.specs.push(name, spec);
-    }
-    pub fn remove_spec(&mut self, idx: usize) -> (String, LockedSpec) {
-        self.specs.remove_at(idx)
-    }
-    pub fn spec_count(&self) -> usize {
-        self.specs.len()
     }
     pub fn is_uptodate(&self) -> bool {
         self.sources.iter().all(|s| s.is_some())
@@ -834,7 +816,7 @@ where
     deserializer.deserialize_map(SpecsVisitor)
 }
 
-fn serialize_artifact_list<S>(list: &Vec<Artifact>, serializer: S) -> Result<S::Ok, S::Error>
+fn serialize_artifact_list<S>(list: &[Artifact], serializer: S) -> Result<S::Ok, S::Error>
 where
     S: serde::Serializer,
 {
@@ -1041,9 +1023,9 @@ pub(crate) trait ManifestDoc {
                 .expect("failed to serialize table")
                 .into_table();
             let comment = toml_edit::RawString::from(if sources_arr.is_empty() {
-                comment.take().unwrap_or_else(|| "".to_string())
+                comment.take().unwrap_or_default()
             } else {
-                format!("\n{}", comment.take().unwrap_or_else(|| "".to_string()))
+                format!("\n{}", comment.take().unwrap_or_default())
             });
             source_table.decor_mut().set_prefix(comment);
             sources_arr.push(source_table);

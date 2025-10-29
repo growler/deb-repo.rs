@@ -1,16 +1,16 @@
 use {
     crate::{
-        artifact::{Artifact, ArtifactSource},
+        artifact::{Artifact, ArtifactArg, ArtifactSource},
         control::{ControlFile, ControlStanza, MutableControlStanza},
-        staging::{StagingFile, StagingFileSystem},
-        hash::Hash,
+        hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::{Package, Packages},
         repo::TransportProvider,
         source::{RepositoryFile, Source},
-        spec::{LockedSource, LockedSpec, Spec},
+        spec::{LockedPackage, LockedSource, LockedSpec},
+        staging::{StagingFile, StagingFileSystem},
         universe::Universe,
-        version::{Constraint, Dependency, IntoConstraint, IntoDependency},
+        version::{IntoConstraint, IntoDependency},
     },
     futures::stream::{self, Stream, StreamExt, TryStreamExt},
     iterator_ext::IteratorExt,
@@ -133,58 +133,6 @@ impl Manifest {
             s => s,
         })
     }
-    fn specs_iter(&self) -> impl Iterator<Item = (&str, &Spec, &LockedSpec)> {
-        debug_assert_eq!(self.file.spec_count(), self.lock.spec_count());
-        std::iter::zip(self.file.specs(), self.lock.specs()).map(|((ns, s), (nl, l))| {
-            debug_assert_eq!(ns, nl);
-            (ns, s, l)
-        })
-    }
-    fn specs_iter_mut(&mut self) -> impl Iterator<Item = (&str, &Spec, &mut LockedSpec)> {
-        debug_assert_eq!(self.file.spec_count(), self.lock.spec_count());
-        std::iter::zip(self.file.specs(), self.lock.specs_mut()).map(|((ns, s), (nl, l))| {
-            debug_assert_eq!(ns, nl);
-            (ns, s, l)
-        })
-    }
-    fn spec_mut(&mut self, name: &str) -> io::Result<&mut Spec> {
-        self.file
-            .specs_mut()
-            .find_map(|(n, r)| (n == name).then_some(r))
-            .ok_or_else(|| {
-                io::Error::other(format!("spec \"{}\" not found", spec_display_name(name)))
-            })
-    }
-    fn spec_and_lock_mut(&mut self, name: &str) -> io::Result<(&mut Spec, &mut LockedSpec)> {
-        let (id, spec) = self
-            .file
-            .specs_mut()
-            .enumerate()
-            .find_map(|(i, (n, r))| (n == name).then_some((i, r)))
-            .ok_or_else(|| {
-                io::Error::other(format!("spec \"{}\" not found", spec_display_name(name)))
-            })?;
-        Ok((spec, self.lock.get_spec_mut(id)))
-    }
-    fn spec_and_valid_lock(&self, name: &str) -> io::Result<(&Spec, &LockedSpec)> {
-        let (id, spec) = self
-            .file
-            .specs()
-            .enumerate()
-            .find_map(|(i, (n, r))| (n == name).then_some((i, r)))
-            .ok_or_else(|| {
-                io::Error::other(format!("spec \"{}\" not found", spec_display_name(name)))
-            })?;
-        let locked = self.lock.get_spec(id);
-        if locked.is_locked() {
-            Ok((spec, locked))
-        } else {
-            Err(io::Error::other(format!(
-                "no solution for spec \"{}\", update manifest lock",
-                spec_display_name(name),
-            )))
-        }
-    }
     fn valid_lock(&self, name: &str, idx: usize) -> io::Result<&LockedSpec> {
         self.lock.get_spec(idx).as_locked().ok_or_else(|| {
             io::Error::other(format!(
@@ -295,46 +243,26 @@ impl Manifest {
                 Ok((ArtifactSource::new(artifact.uri(), base), artifact))
             })
     }
-    fn requirements_for(
-        &self,
-        id: usize,
-    ) -> io::Result<(Vec<Dependency<String>>, Vec<Constraint<String>>)> {
-        let mut reqs = Vec::new();
-        let mut cons = Vec::new();
-        for spec in self.file.ancestors(id) {
-            let spec = spec?;
-            reqs.extend(spec.include.iter().cloned());
-            cons.extend(spec.exclude.iter().cloned().map(|c| !c));
-        }
-        Ok((reqs, cons))
-    }
     fn invalidate_locked_specs(&mut self, spec: usize) {
         for spec_index in self.file.descendants(spec).into_iter() {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
         }
     }
-    pub async fn add_artifact<U, T>(
+    pub async fn add_artifact<T>(
         &mut self,
         spec_name: Option<&str>,
-        artifact: U,
-        target: Option<&str>,
-        mode: Option<NonZero<u32>>,
-        unpack: Option<bool>,
+        artifact: &ArtifactArg,
         comment: Option<&str>,
         transport: &T,
     ) -> io::Result<()>
     where
-        U: AsRef<str>,
         T: TransportProvider + ?Sized,
     {
         let staged = Artifact::new(
             self.path
                 .as_deref()
                 .ok_or_else(|| io::Error::other("no manifest path"))?,
-            artifact.as_ref(),
-            target,
-            mode,
-            unpack,
+            artifact,
             transport,
         )
         .await?;
@@ -529,23 +457,74 @@ impl Manifest {
             .as_mut()
             .map(|(idx, universe)| (idx, universe.as_mut()))
             .unwrap();
+        let sources = self.file.sources();
+        let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
                 debug_assert_eq!(ns, nl);
                 (!l.is_locked()).then_some((id, ns, s, l))
             })
             .try_for_each(|(spec_index, spec_name, spec, lock)| {
+                use digest::FixedOutput;
+                let mut hasher = blake3::Hasher::default();
                 let (reqs, cons) = self.file.requirements_for(spec_index)?;
-                lock.solve(
-                    spec_name,
-                    spec,
-                    self.file.sources(),
-                    self.file.artifacts(),
-                    reqs,
-                    cons,
-                    pkgs_idx,
-                    universe,
-                )?;
+                let mut solvables = universe.solve(reqs, cons).map_err(|conflict| {
+                    io::Error::other(format!(
+                        "failed to solve spec {}:\n{}",
+                        spec_display_name(spec_name),
+                        universe.display_conflict(conflict)
+                    ))
+                })?;
+                if let Some(script) = spec.run.as_deref() {
+                    let mut h = blake3::Hasher::default();
+                    h.update(script.as_bytes());
+                    hasher.update(&h.finalize_fixed());
+                }
+                for aritfact_id in &spec.stage {
+                    let aritfact = artifacts
+                        .iter()
+                        .find(|a| a.uri() == aritfact_id)
+                        .ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidInput,
+                                format!("missing artifact '{}' in stage", aritfact_id),
+                            )
+                        })?;
+                    hasher.update(aritfact.hash().as_ref());
+                }
+                solvables.sort_unstable();
+                let installables = solvables
+                    .into_iter()
+                    .map(|solvable| {
+                        let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
+                        let src = pkgs_idx[pkgs as usize];
+                        let essential = pkg.essential();
+                        let name = pkg.name().to_string();
+                        let hash_kind = sources.get(src).unwrap().hash.name();
+                        let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("failed to parse package {}: {}", pkg.name(), err),
+                            )
+                        })?;
+                        hasher.update(hash.as_ref());
+                        Ok(LockedPackage {
+                            file: RepositoryFile {
+                                path: path.to_string(),
+                                size,
+                                hash,
+                            },
+                            idx: solvable.into(),
+                            src: src as u32,
+                            name,
+                            essential,
+                        })
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                *lock = LockedSpec {
+                    installables: Some(installables),
+                    hash: Some(hasher.into_hash()),
+                };
                 if !updated {
                     updated = true;
                 }

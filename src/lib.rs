@@ -21,7 +21,6 @@ mod spec;
 pub mod tar;
 pub mod universe;
 pub mod version;
-// mod caching;
 
 pub use {
     arch::DEFAULT_ARCH,

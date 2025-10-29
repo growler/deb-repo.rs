@@ -782,7 +782,7 @@ mod tests {
         assert_eq!(expected_digest, expected_digest1);
 
         let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
 
         let mut buf = vec![0; size.try_into().unwrap()];
         let n = reader.read(&mut buf).await.unwrap() as u64;
@@ -805,7 +805,7 @@ mod tests {
         let incorrect_digest = Sha256::digest(b"incorrect");
 
         let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest.into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest);
 
         let mut buf = vec![0; size.try_into().unwrap()];
         let n = reader.read(&mut buf).await.unwrap() as u64;
@@ -827,7 +827,7 @@ mod tests {
         let expected_digest = hasher.finalize();
 
         let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest.into());
+        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
 
         let mut buf = vec![0; data.len()];
         let n = reader.read(&mut buf).await.unwrap();

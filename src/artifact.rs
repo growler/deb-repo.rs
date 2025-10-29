@@ -1,14 +1,15 @@
 use {
     crate::{
-        staging::FileList,
         hash::{Hash, HashAlgo, HashingReader},
         repo::TransportProvider,
+        staging::FileList,
         tar::{TarEntry, TarLink, TarReader},
         StagingFile, StagingFileSystem,
     },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, Lz4Decoder, XzDecoder, ZstdDecoder,
     },
+    clap::Args,
     futures_lite::StreamExt,
     rustix::{
         fd::AsRawFd,
@@ -25,6 +26,22 @@ use {
         time::{Duration, UNIX_EPOCH},
     },
 };
+
+#[derive(Args)]
+pub struct ArtifactArg {
+    /// Target file mode (only if artifact is a single file)
+    #[arg(long = "mode", value_name = "MODE")]
+    pub mode: Option<NonZero<u32>>,
+    /// Do not unpack (disables auto-unpacking of tar archives and compressed files)
+    #[arg(long = "no-unpack", action)]
+    pub do_not_unpack: Option<bool>,
+    /// Artifact URL or path
+    #[arg(value_name = "URL")]
+    pub url: String,
+    /// A target path on the staging filesystem
+    #[arg(value_name = "TARGET_PATH")]
+    pub target: Option<String>,
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -88,21 +105,19 @@ pub struct File {
 }
 
 impl Artifact {
-    pub(crate) async fn new<B, P, T>(
+    pub(crate) async fn new<B, T>(
         base: B,
-        uri: &str,
-        target: Option<P>,
-        mode: Option<NonZero<u32>>,
-        unpack: Option<bool>,
+        artifact: &ArtifactArg,
         transport: &T,
     ) -> io::Result<Self>
     where
         B: AsRef<Path>,
-        P: AsRef<str>,
         T: TransportProvider + ?Sized,
     {
-        let target = target.map(|s| s.as_ref().to_string());
+        let uri = &artifact.url;
+        let target = artifact.target.clone();
         let source = ArtifactSource::new(uri, base);
+        let unpack = artifact.do_not_unpack.map(|b| !b);
         match source {
             ArtifactSource::Local(ref path) => {
                 let path = path.as_ref();
@@ -113,7 +128,7 @@ impl Artifact {
                     Ok(Artifact::Tar(Tar::new_local(uri, path, target).await?))
                 } else {
                     Ok(Artifact::File(
-                        File::new_local(uri, path, target, mode, unpack).await?,
+                        File::new_local(uri, path, target, artifact.mode, unpack).await?,
                     ))
                 }
             }
@@ -124,7 +139,7 @@ impl Artifact {
                     ))
                 } else {
                     Ok(Artifact::File(
-                        File::new_remote(uri, target, mode, unpack, transport).await?,
+                        File::new_remote(uri, target, artifact.mode, unpack, transport).await?,
                     ))
                 }
             }

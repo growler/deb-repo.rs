@@ -2,11 +2,7 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        builder::Executor,
-        cli::Source,
-        sandbox::{maybe_run_sandbox, HostSandboxExecutor},
-        version::{Constraint, Dependency, Version},
-        HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
+        artifact::ArtifactArg, builder::Executor, cli::Source, sandbox::{maybe_run_sandbox, HostSandboxExecutor}, version::{Constraint, Dependency, Version}, HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider
     },
     futures::AsyncWriteExt,
     itertools::Itertools,
@@ -216,18 +212,8 @@ struct Stage {
     /// A comment for the staged artifact
     #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
     comment: Option<String>,
-    /// Target file mode (only if artifact is a single file)
-    #[arg(long = "mode", value_name = "MODE")]
-    mode: Option<NonZero<u32>>,
-    /// Do not unpack (only if artifact is a single file compressed by gzip, xz or bzip2)
-    #[arg(long = "no-unpack", action)]
-    do_not_unpack: Option<bool>,
-    /// Artifact URL or path
-    #[arg(value_name = "URL")]
-    url: String,
-    /// A target path on the staging filesystem
-    #[arg(value_name = "TARGET_PATH")]
-    target: Option<String>,
+    #[command(flatten)]
+    artifact: ArtifactArg,
 }
 
 impl Command for Stage {
@@ -236,10 +222,7 @@ impl Command for Stage {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
             mf.add_artifact(
                 self.spec.as_deref(),
-                &self.url,
-                self.target.as_deref(),
-                self.mode,
-                self.do_not_unpack.map(|v| !v),
+                &self.artifact,
                 self.comment.as_deref(),
                 conf.transport().await?.as_ref(),
             )

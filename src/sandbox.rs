@@ -142,7 +142,7 @@ impl SandboxExecutor for HostSandboxExecutor {
     where
         E: FnOnce(&Self, BuildJob<Self>) -> io::Result<OwnedFd>,
     {
-        spawner(&self, job)
+        spawner(self, job)
     }
     fn setup_rootfs(&mut self) -> io::Result<OwnedFd> {
         let dfd = openat(

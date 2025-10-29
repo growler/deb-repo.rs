@@ -1,9 +1,7 @@
 use {
     crate::{
-        artifact::Artifact,
-        hash::{Hash, HashAlgo},
+        hash::Hash,
         repo::TransportProvider,
-        universe::Universe,
         version::{Constraint, Dependency},
         RepositoryFile, Source,
     },
@@ -116,75 +114,5 @@ impl LockedSpec {
     }
     pub fn installables(&self) -> impl Iterator<Item = &LockedPackage> {
         self.installables.iter().flat_map(|v| v.iter())
-    }
-    pub fn solve(
-        &mut self,
-        name: &str,
-        spec: &Spec,
-        srcs: &[Source],
-        artifacts: &[Artifact],
-        reqs: Vec<Dependency<String>>,
-        cons: Vec<Constraint<String>>,
-        pkgs_idx: &[usize],
-        universe: &mut Universe,
-    ) -> io::Result<()> {
-        use digest::FixedOutput;
-        let mut solvables = universe.solve(reqs, cons).map_err(|conflict| {
-            io::Error::other(format!(
-                "failed to solve spec {}:\n{}",
-                if name.is_empty() { "<default>" } else { name },
-                universe.display_conflict(conflict)
-            ))
-        })?;
-        solvables.sort_unstable();
-        let mut hasher = blake3::Hasher::default();
-        if let Some(script) = spec.run.as_deref() {
-            let mut h = blake3::Hasher::default();
-            h.update(script.as_bytes());
-            hasher.update(&h.finalize_fixed());
-        }
-        for aritfact_id in &spec.stage {
-            let aritfact = artifacts
-                .iter()
-                .find(|ref a| a.uri() == aritfact_id)
-                .ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!("missing artifact '{}' in stage", aritfact_id),
-                    )
-                })?;
-            hasher.update(aritfact.hash().as_ref());
-        }
-        let installables = solvables
-            .into_iter()
-            .map(|solvable| {
-                let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
-                let src = pkgs_idx[pkgs as usize];
-                let essential = pkg.essential();
-                let name = pkg.name().to_string();
-                let hash_kind = srcs.get(src).unwrap().hash.name();
-                let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("failed to parse package {}: {}", pkg.name(), err),
-                    )
-                })?;
-                hasher.update(hash.as_ref());
-                Ok(LockedPackage {
-                    file: RepositoryFile {
-                        path: path.to_string(),
-                        size,
-                        hash,
-                    },
-                    idx: solvable.into(),
-                    src: src as u32,
-                    name,
-                    essential,
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        self.installables = Some(installables);
-        self.hash = Some(hasher.into_hash());
-        Ok(())
     }
 }

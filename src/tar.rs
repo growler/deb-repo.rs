@@ -13,7 +13,7 @@ use {
 const BLOCK_SIZE: usize = 512;
 const SKIP_BUFFER_SIZE: usize = 64 * 1024;
 const PATH_MAX: usize = 4096;
-const PAX_HEADER_MAX_SIZE: usize = 1 * 1024 * 1024;
+const PAX_HEADER_MAX_SIZE: usize = 1024 * 1024;
 
 macro_rules! ready {
     ($e:expr $(,)?) => {
@@ -388,9 +388,9 @@ impl std::ops::Deref for ExtensionHeader {
     type Target = str;
     fn deref(&self) -> &Self::Target {
         match self {
-            ExtensionHeader::LongName(name) => &name,
-            ExtensionHeader::LongLink(name) => &name,
-            ExtensionHeader::PosixExtension(pax) => &pax,
+            ExtensionHeader::LongName(name) => name,
+            ExtensionHeader::LongLink(name) => name,
+            ExtensionHeader::PosixExtension(pax) => pax,
         }
     }
 }
@@ -753,17 +753,17 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                     if *this.pos == *this.nxt {
                         match kind {
                             Kind::GNULongName => this.exts.push(ExtensionHeader::LongName(
-                                ext_as_path(&this.header, *size as usize, ext)?,
+                                ext_as_path(this.header, *size as usize, ext)?,
                             )),
                             Kind::GNULongLink => this.exts.push(ExtensionHeader::LongLink(
-                                ext_as_path(&this.header, *size as usize, ext)?,
+                                ext_as_path(this.header, *size as usize, ext)?,
                             )),
                             Kind::PAXLocal => this.exts.push(ExtensionHeader::PosixExtension(
-                                ext_as_str(&this.header, *size as usize, ext)?.into(),
+                                ext_as_str(this.header, *size as usize, ext)?.into(),
                             )),
                             Kind::PAXGlobal => this
                                 .globs
-                                .push(ext_as_str(&this.header, *size as usize, ext)?.into()),
+                                .push(ext_as_str(this.header, *size as usize, ext)?.into()),
                             _ => unreachable!(),
                         };
                         *this.nxt += BLOCK_SIZE as u64;
