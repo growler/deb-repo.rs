@@ -20,7 +20,9 @@ use {
 };
 
 use crate::{
-    artifact::{Artifact, ArtifactSource}, control::MutableControlStanza, deb::DebReader,
+    artifact::{Artifact, ArtifactSource},
+    control::MutableControlStanza,
+    deb::DebReader,
     RepositoryFile, Source, TransportProvider,
 };
 
@@ -129,7 +131,12 @@ pub trait StagingFileSystem {
         let deb = DebReader::new(r).await?;
         deb.extract_to(self).await
     }
-    async fn import_artifact<'a, T>(&self, source: ArtifactSource<'a>, artifact: &'a Artifact, transport: &T) -> io::Result<()>
+    async fn import_artifact<'a, T>(
+        &self,
+        source: ArtifactSource<'a>,
+        artifact: &'a Artifact,
+        transport: &T,
+    ) -> io::Result<()>
     where
         T: TransportProvider + ?Sized,
     {

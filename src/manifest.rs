@@ -12,7 +12,7 @@ use {
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
     },
-    futures::stream::{self, Stream, StreamExt, TryStreamExt},
+    futures::stream::{self, StreamExt, TryStreamExt},
     iterator_ext::IteratorExt,
     itertools::Itertools,
     smol::{io, lock::Semaphore},
@@ -53,7 +53,6 @@ pub const DEFAULT_SPEC_NAME: Option<&str> = None;
 /// ```
 ///
 impl Manifest {
-    pub const MAX_LOCK_FILE_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
     pub const DEFAULT_FILE: &str = "Manifest.toml";
     pub fn new<A: ToString>(arch: A, comment: Option<&str>) -> Self {
         Manifest {
@@ -180,21 +179,11 @@ impl Manifest {
             )),
         }
     }
-    pub fn essentials<'a>(
-        &'a self,
-        name: Option<&'a str>,
-    ) -> io::Result<impl Iterator<Item = io::Result<&'a str>> + 'a> {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        Ok(self
-            .valid_lock(spec_name, spec_index)?
-            .installables()
-            .filter(|p| p.essential)
-            .map(move |p| Ok::<_, io::Error>(p.name.as_ref())))
-    }
     pub fn installables<'a>(
         &'a self,
         name: Option<&'a str>,
-    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + 'a> {
+    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, usize, &'a RepositoryFile)>> + 'a>
+    {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
         Ok(self
             .valid_lock(spec_name, spec_index)?
@@ -210,7 +199,7 @@ impl Manifest {
                         ),
                     )
                 })?;
-                Ok::<_, io::Error>((src, &p.file))
+                Ok::<_, io::Error>((src, p.order as usize, &p.file))
             }))
     }
     fn scripts_for(&self, id: usize) -> io::Result<Vec<&str>> {
@@ -226,10 +215,11 @@ impl Manifest {
         &'a self,
         id: usize,
     ) -> impl Iterator<Item = io::Result<(ArtifactSource<'a>, &'a Artifact)>> + 'a {
+        let arch = self.arch.as_str();
         self.file
             .ancestors(id)
             .try_flat_map(|spec| Ok(spec.stage.iter().map(String::as_str)))
-            .and_then(|artifact| {
+            .try_filter_map(move |artifact| {
                 let base = self
                     .path
                     .as_deref()
@@ -240,7 +230,16 @@ impl Manifest {
                         format!("missing artifact '{}' in spec stage list", artifact),
                     )
                 })?;
-                Ok((ArtifactSource::new(artifact.uri(), base), artifact))
+                Ok(
+                    if artifact
+                        .arch()
+                        .is_none_or(|target_arch| target_arch == arch)
+                    {
+                        Some((ArtifactSource::new(artifact.uri(), base), artifact))
+                    } else {
+                        None
+                    },
+                )
             })
     }
     fn invalidate_locked_specs(&mut self, spec: usize) {
@@ -468,7 +467,7 @@ impl Manifest {
                 use digest::FixedOutput;
                 let mut hasher = blake3::Hasher::default();
                 let (reqs, cons) = self.file.requirements_for(spec_index)?;
-                let mut solvables = universe.solve(reqs, cons).map_err(|conflict| {
+                let solvables = universe.solve(reqs, cons).map_err(|conflict| {
                     io::Error::other(format!(
                         "failed to solve spec {}:\n{}",
                         spec_display_name(spec_name),
@@ -492,13 +491,16 @@ impl Manifest {
                         })?;
                     hasher.update(aritfact.hash().as_ref());
                 }
-                solvables.sort_unstable();
-                let installables = solvables
+                let sorted = universe.installation_order(&solvables);
+                let installables = sorted
                     .into_iter()
-                    .map(|solvable| {
+                    .enumerate()
+                    .flat_map(|(order, solvables)| {
+                        solvables.into_iter().map(move |solvable| (order, solvable))
+                    })
+                    .map(|(order, solvable)| {
                         let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
                         let src = pkgs_idx[pkgs as usize];
-                        let essential = pkg.essential();
                         let name = pkg.name().to_string();
                         let hash_kind = sources.get(src).unwrap().hash.name();
                         let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
@@ -515,9 +517,9 @@ impl Manifest {
                                 hash,
                             },
                             idx: solvable.into(),
+                            order: order as u32,
                             src: src as u32,
                             name,
-                            essential,
                         })
                     })
                     .collect::<io::Result<Vec<_>>>()?;
@@ -579,7 +581,7 @@ impl Manifest {
         fs: &mut FS,
         concurrency: NonZero<usize>,
         transport: &T,
-    ) -> io::Result<(Vec<String>, Vec<String>)>
+    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
     where
         FS: StagingFileSystem,
         T: TransportProvider + ?Sized,
@@ -592,27 +594,52 @@ impl Manifest {
                 spec_display_name(spec_name),
             )));
         }
-        let installables = stream::iter(lock.installables().map(move |p| {
-            let src = self.file.get_source(p.src as usize).ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!(
-                        "invalid source index {} in spec {}",
-                        p.src,
-                        spec_display_name(spec_name)
-                    ),
-                )
-            })?;
-            Ok::<_, io::Error>((src, &p.file))
-        }));
-        let essentials = stage_debs(None, installables, fs, concurrency, transport).await?;
+        let installables = lock
+            .installables()
+            .map(move |p| {
+                let src = self.file.get_source(p.src as usize).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid source index {} in spec {}",
+                            p.src,
+                            spec_display_name(spec_name)
+                        ),
+                    )
+                })?;
+                Ok::<_, io::Error>((src, &p.file, p.order, &p.name))
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        stage_debs(
+            None,
+            installables.iter().map(|(src, file, _, _)| (*src, *file)),
+            fs,
+            concurrency,
+            transport,
+        )
+        .await?;
         stage_artifacts(self.artifacts_for(spec_index), fs, concurrency, transport).await?;
         let scripts = self
             .scripts_for(spec_index)?
             .into_iter()
             .map(String::from)
             .collect();
-        Ok((essentials, scripts))
+        let (essentials, other) = installables.into_iter().fold(
+            (Vec::new(), Vec::new()),
+            |(mut essentials, mut other), (_, _, order, name)| {
+                if order == 0 {
+                    essentials.push(name.clone());
+                } else {
+                    let order = order as usize - 1;
+                    if order >= other.len() {
+                        other.resize(order + 1, Vec::new());
+                    }
+                    other[order].push(name.clone());
+                }
+                (essentials, other)
+            },
+        );
+        Ok((essentials, other, scripts))
     }
 }
 async fn stage_artifacts<'a, FS, I, T>(
@@ -641,41 +668,21 @@ async fn stage_debs<'a, FS, S, T>(
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
-) -> io::Result<Vec<String>>
+) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
-    S: Stream<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + 'a,
+    S: Iterator<Item = (&'a Source, &'a RepositoryFile)> + 'a,
     T: TransportProvider + ?Sized,
 {
-    let (new_installed, essentials) = packages
-        .map(|pkg| async {
-            let (source, file) = pkg?;
+    let new_installed = stream::iter(packages)
+        .map(|(source, file)| async {
             let mut ctrl = fs.import_deb(source, file, transport).await?;
-            let mut essential = ctrl
-                .field("Essential")
-                .map(|v| v.eq_ignore_ascii_case("yes"))
-                .unwrap_or(false);
-            let mut control_files = ctrl.field("Controlfiles").unwrap_or("").split_whitespace();
-            if control_files.all(|s| s == "./md5sums" || s == "./conffiles") {
-                ctrl.set("Status", "install ok installed");
-                essential = false;
-            } else {
-                ctrl.set("Status", "install ok unpacked");
-            }
+            ctrl.set("Status", "install ok unpacked");
             ctrl.sort_fields_deb_order();
-            Ok::<_, io::Error>((ctrl, essential))
+            Ok::<_, io::Error>(ctrl)
         })
         .buffer_unordered(concurrency.into())
-        .try_fold(
-            (Vec::<MutableControlStanza>::new(), Vec::<String>::new()),
-            |(mut pkgs, mut essentials), (ctrl, essential)| async move {
-                if essential {
-                    essentials.push(ctrl.field("Package").unwrap().to_string());
-                }
-                pkgs.push(ctrl);
-                Ok((pkgs, essentials))
-            },
-        )
+        .try_collect::<Vec<_>>()
         .await?;
     enum Installed<'a> {
         Old(&'a ControlStanza<'a>),
@@ -731,5 +738,5 @@ where
         .persist()
         .await?;
     }
-    Ok(essentials)
+    Ok(())
 }

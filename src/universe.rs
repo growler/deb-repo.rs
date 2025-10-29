@@ -13,11 +13,7 @@ use {
         SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     },
     smallvec::{smallvec, SmallVec},
-    std::{
-        borrow::Borrow,
-        collections::{BinaryHeap, HashMap, HashSet},
-        hash, io,
-    },
+    std::{borrow::Borrow, collections::HashMap, hash, io},
 };
 
 pub type PackageId = SolvableId;
@@ -449,11 +445,11 @@ impl Universe {
     pub fn dependency_graph(
         &self,
         solution: &mut [PackageId],
-    ) -> petgraph::graphmap::DiGraphMap<PackageId, ()> {
+    ) -> petgraph::graph::Graph<PackageId, ()> {
         self.inner.provider().dependency_graph(solution)
     }
-    pub fn sorted_solution(&self, solution: &[PackageId]) -> (Vec<PackageId>, Vec<PackageId>) {
-        self.inner.provider().sorted_solution(solution)
+    pub fn installation_order(&self, solution: &[PackageId]) -> Vec<Vec<PackageId>> {
+        self.inner.provider().installation_order(solution)
     }
     pub fn package<Id>(&self, solvable: Id) -> Option<&Package<'_>>
     where
@@ -506,88 +502,7 @@ impl Universe {
             Ok::<_, io::Error>((path, size, hash))
         })
     }
-    // pub async fn deb_file_reader(
-    //     &self,
-    //     id: PackageId,
-    // ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-    //     let (repo, path, size, hash) = self.inner.provider().with(|u| {
-    //         let s = &u.index.solvables[id.to_index()];
-    //         let (path, size, hash) = s.package.repo_file()?;
-    //         Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
-    //     })?;
-    //     repo.verifying_reader(path, size, hash).await
-    // }
-    // pub async fn copy_deb_file<W: AsyncWrite + Send>(
-    //     &self,
-    //     w: W,
-    //     id: PackageId,
-    // ) -> io::Result<u64> {
-    //     let (repo, path, size, hash) = self.inner.provider().with(|u| {
-    //         let s = &u.index.solvables[id.to_index()];
-    //         let (path, size, hash) = s.package.repo_file()?;
-    //         Ok::<_, io::Error>((&u.packages[s.pkgs as usize].repo, path, size, hash))
-    //     })?;
-    //     copy(repo.verifying_reader(path, size, hash).await?, &mut pin!(w)).await
-    // }
 }
-
-// pub struct DebFetcher<'a> {
-//     u: &'a Universe,
-//     i: PackageId,
-// }
-//
-// impl<'a> DebFetcher<'a> {
-//     pub fn hash(&self) -> io::Result<HashOf<DebRepo>> {
-//         self.u
-//             .package(self.i)
-//             .ok_or_else(|| {
-//                 io::Error::new(
-//                     io::ErrorKind::NotFound,
-//                     format!("package id {} not found", self.i.to_index()),
-//                 )
-//             })
-//             .and_then(|pkg| {
-//                 pkg.field(hash_field_name::<DebRepo>()).ok_or_else(|| {
-//                     io::Error::new(
-//                         io::ErrorKind::InvalidData,
-//                         format!(
-//                             "package id {} has no SHA256 field\n{}",
-//                             self.i.to_index(),
-//                             &pkg
-//                         ),
-//                     )
-//                 })
-//             })
-//             .and_then(|hash| hash.try_into())
-//     }
-//     pub async fn deb(&self) -> io::Result<DebReader> {
-//         self.u.deb_reader(self.i).await
-//     }
-// }
-//
-// pub struct FetcherIterator<'a, I: Iterator<Item = PackageId>> {
-//     u: &'a Universe,
-//     i: I,
-// }
-//
-// impl<'a, I: Iterator<Item = PackageId>> Iterator for FetcherIterator<'a, I> {
-//     type Item = DebFetcher<'a>;
-//     fn next(&mut self) -> Option<DebFetcher<'a>> {
-//         self.i.next().map(|id| DebFetcher { u: self.u, i: id })
-//     }
-// }
-
-// impl Universe {
-//     pub fn fetch<I: IntoIterator<Item = PackageId>>(
-//         &self,
-//         it: I,
-//     ) -> FetcherIterator<'_, <I as IntoIterator>::IntoIter> {
-//         FetcherIterator {
-//             u: self,
-//             i: it.into_iter(),
-//         }
-//     }
-// }
 
 impl std::fmt::Debug for Universe {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -677,14 +592,12 @@ impl InnerUniverse {
             eprintln!("  ... and {} more", incoming.len() - 20);
         }
     }
-    fn dependency_graph(
-        &self,
-        solution: &[SolvableId],
-    ) -> petgraph::graphmap::DiGraphMap<SolvableId, ()> {
-        let mut g = petgraph::graphmap::DiGraphMap::<SolvableId, ()>::new();
-        for &pkg in solution {
-            g.add_node(pkg);
-        }
+    fn dependency_graph(&self, solution: &[SolvableId]) -> petgraph::graph::Graph<SolvableId, ()> {
+        let mut g = petgraph::graph::Graph::<SolvableId, ()>::new();
+        let nodes = solution
+            .iter()
+            .map(|&pkg| (pkg, g.add_node(pkg)))
+            .collect::<HashMap<_, _>>();
         for &pkg in solution {
             let deps = match self.get_dependencies(pkg) {
                 Dependencies::Known(d) => d,
@@ -712,125 +625,29 @@ impl InnerUniverse {
                     )
                 });
                 if !candidates.is_empty() {
-                    g.add_edge(candidates[0], pkg, ());
+                    g.add_edge(nodes[&candidates[0]], nodes[&pkg], ());
                 }
             }
         }
         g
     }
-    fn sorted_solution(&self, solution: &[PackageId]) -> (Vec<PackageId>, Vec<PackageId>) {
-        let mut g = self.dependency_graph(solution);
-
-        let comps = petgraph::algo::kosaraju_scc(&g);
-        for c in comps
-            .into_iter()
-            .filter(|c| c.len() > 1 || c.iter().any(|&n| g.contains_edge(n, n)))
-        {
-            let mut members = c.clone();
-            members.sort_by_key(|n| self.package(*n).name().to_string());
-            println!(
-                "SCC: {}",
-                members
-                    .iter()
-                    .map(|n| self.package(*n).name())
-                    .collect::<Vec<_>>()
-                    .join(", ")
-            );
-        }
-
-        let mut by_name: Vec<SolvableId> = solution.to_vec();
-        by_name.sort_by_key(|&s| self.package(s).name().to_string());
-        let name_ord: HashMap<SolvableId, usize> = by_name
-            .into_iter()
-            .enumerate()
-            .map(|(rank, s)| (s, rank))
-            .collect();
-
-        let mut indeg: HashMap<SolvableId, usize> = g
-            .nodes()
-            .map(|n| (n, g.neighbors_directed(n, petgraph::Incoming).count()))
-            .collect();
-
-        let mut ready: BinaryHeap<std::cmp::Reverse<(u8, usize, SolvableId)>> = BinaryHeap::new();
-        for (&n, &d) in &indeg {
-            if d == 0 {
-                ready.push(std::cmp::Reverse((
-                    self.package(n).install_priority().rank(),
-                    name_ord[&n],
-                    n,
-                )));
-            }
-        }
-
-        let mut remaining: HashSet<SolvableId> = indeg.keys().copied().collect();
-        let mut order = Vec::<SolvableId>::with_capacity(indeg.len());
-        let mut breaks = Vec::<SolvableId>::new();
-
-        while order.len() < indeg.len() {
-            if let Some(std::cmp::Reverse((_p, _ord, u))) = ready.pop() {
-                remaining.remove(&u);
-                order.push(u);
-                for v in g
-                    .neighbors_directed(u, petgraph::Outgoing)
-                    .collect::<Vec<_>>()
-                {
-                    let d = indeg.get_mut(&v).unwrap();
-                    *d -= 1;
-                    if *d == 0 {
-                        ready.push(std::cmp::Reverse((
-                            self.package(v).install_priority().rank(),
-                            name_ord[&v],
-                            v,
-                        )));
-                    }
-                }
-            } else {
-                let breaker = remaining
-                    .iter()
-                    .copied()
-                    .min_by_key(|&n| {
-                        (
-                            std::cmp::Reverse(self.package(n).install_priority().rank()),
-                            name_ord[&n],
-                        )
-                    })
-                    .unwrap();
-
-                breaks.push(breaker);
-
-                let incoming: Vec<_> = g.neighbors_directed(breaker, petgraph::Incoming).collect();
-                for p in &incoming {
-                    g.remove_edge(*p, breaker);
-                }
-                // after breaking the cycle, breaker has no incoming edges
-                *indeg.entry(breaker).or_insert(0) = 0;
-
-                ready.push(std::cmp::Reverse((
-                    self.package(breaker).install_priority().rank(),
-                    name_ord[&breaker],
-                    breaker,
-                )));
-            }
-        }
-        let pos: HashMap<_, _> = order.iter().enumerate().map(|(i, &n)| (n, i)).collect();
-        for (u, v, _) in g.all_edges() {
-            println!(
-                "topo: {} -> {} placed at {} -> {}",
-                self.package(u).name(),
-                self.package(v).name(),
-                pos[&u],
-                pos[&v]
-            );
-            assert!(
-                pos[&u] < pos[&v],
-                "topo violation: {} -> {} placed at {} -> {}",
-                self.package(u).name(),
-                self.package(v).name(),
-                pos[&u],
-                pos[&v]
-            );
-        }
-        (order, breaks)
+    fn installation_order(&self, solution: &[PackageId]) -> Vec<Vec<PackageId>> {
+        let (essentials, non_essentials): (Vec<_>, Vec<_>) = solution
+            .iter()
+            .copied()
+            .partition(|s| self.package(*s).essential());
+        let g = self.dependency_graph(&non_essentials);
+        let condensed = petgraph::algo::condensation(g, true);
+        let order = petgraph::algo::toposort(&condensed, None).unwrap();
+        let mut result = Vec::with_capacity(condensed.node_count() + 1);
+        result.push(essentials);
+        result.extend(
+            order
+                .iter()
+                .filter_map(|&gid| condensed.node_weight(gid))
+                .cloned(),
+        );
+        result
     }
 }
 
@@ -1092,9 +909,10 @@ mod tests {
                         panic!("{}", uni.display_conflict(err))
                     }
                 };
-                let (solution, _breaks) = uni.sorted_solution(&solution);
+                let solution = uni.installation_order(&solution);
                 let solution: Vec<_> = solution
                     .into_iter()
+                    .flatten()
                     .map(|i| format!("{}", uni.display_solvable(i)))
                     .collect();
                 assert_eq!(solution, $solution);

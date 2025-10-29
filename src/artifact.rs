@@ -35,6 +35,9 @@ pub struct ArtifactArg {
     /// Do not unpack (disables auto-unpacking of tar archives and compressed files)
     #[arg(long = "no-unpack", action)]
     pub do_not_unpack: Option<bool>,
+    /// A target architecture for the artifact
+    #[arg(long = "only-arch", value_name = "ARCH")]
+    pub target_arch: Option<String>,
     /// Artifact URL or path
     #[arg(value_name = "URL")]
     pub url: String,
@@ -74,6 +77,8 @@ impl<'a> ArtifactSource<'a> {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Tar {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
     #[serde(skip, default)]
     uri: String,
     hash: Hash,
@@ -84,6 +89,8 @@ pub struct Tar {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Tree {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
     #[serde(skip, default)]
     path: String,
     hash: Hash,
@@ -93,6 +100,8 @@ pub struct Tree {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct File {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
     #[serde(skip, default)]
     uri: String,
     hash: Hash,
@@ -118,28 +127,29 @@ impl Artifact {
         let target = artifact.target.clone();
         let source = ArtifactSource::new(uri, base);
         let unpack = artifact.do_not_unpack.map(|b| !b);
+        let arch = artifact.target_arch.as_deref();
         match source {
             ArtifactSource::Local(ref path) => {
                 let path = path.as_ref();
                 if smol::fs::symlink_metadata(path).await?.is_dir() {
-                    Ok(Artifact::Dir(Tree::new_local(uri, path, target).await?))
+                    Ok(Artifact::Dir(Tree::new_local(uri, arch, path, target).await?))
                 } else if unpack.unwrap_or(true) && is_tar_ext(path.as_os_str().as_encoded_bytes())
                 {
-                    Ok(Artifact::Tar(Tar::new_local(uri, path, target).await?))
+                    Ok(Artifact::Tar(Tar::new_local(uri, arch, path, target).await?))
                 } else {
                     Ok(Artifact::File(
-                        File::new_local(uri, path, target, artifact.mode, unpack).await?,
+                        File::new_local(uri, arch, path, target, artifact.mode, unpack).await?,
                     ))
                 }
             }
             ArtifactSource::Remote(ref uri) => {
                 if unpack.unwrap_or(true) && is_tar_ext(uri.as_bytes()) {
                     Ok(Artifact::Tar(
-                        Tar::new_remote(uri, target, transport).await?,
+                        Tar::new_remote(uri, arch, target, transport).await?,
                     ))
                 } else {
                     Ok(Artifact::File(
-                        File::new_remote(uri, target, artifact.mode, unpack, transport).await?,
+                        File::new_remote(uri, arch, target, artifact.mode, unpack, transport).await?,
                     ))
                 }
             }
@@ -179,6 +189,13 @@ impl Artifact {
             Artifact::Tar(inner) => &inner.uri,
             Artifact::Dir(inner) => &inner.path,
             Artifact::File(inner) => &inner.uri,
+        }
+    }
+    pub fn arch(&self) -> Option<&str> {
+        match &self {
+            Artifact::Tar(inner) => inner.arch.as_deref(),
+            Artifact::Dir(inner) => inner.arch.as_deref(),
+            Artifact::File(inner) => inner.arch.as_deref(),
         }
     }
     pub(crate) fn with_uri(self, uri: String) -> Self {
@@ -296,6 +313,7 @@ fn tar_reader<'a, R: AsyncRead + Send + 'a>(
 impl Tar {
     async fn new_remote<T: TransportProvider + ?Sized>(
         uri: &str,
+        arch: Option<&str>,
         target: Option<String>,
         transport: &T,
     ) -> io::Result<Self> {
@@ -309,12 +327,18 @@ impl Tar {
         let (hash, size) = reader.into_hash_and_size();
         Ok(Tar {
             uri: uri.to_string(),
+            arch: arch.map(|s| s.to_string()),
             target,
             hash,
             size,
         })
     }
-    async fn new_local(uri: &str, path: &Path, target: Option<String>) -> io::Result<Self> {
+    async fn new_local(
+        uri: &str,
+        arch: Option<&str>,
+        path: &Path,
+        target: Option<String>,
+    ) -> io::Result<Self> {
         let mut reader = HashingReader::<blake3::Hasher, _>::new(smol::fs::File::open(path).await?);
         Self::extract_to(
             &FileList::new(),
@@ -325,6 +349,7 @@ impl Tar {
         let (hash, size) = reader.into_hash_and_size();
         Ok(Tar {
             uri: uri.to_string(),
+            arch: arch.map(|s| s.to_string()),
             target,
             hash,
             size,
@@ -438,6 +463,7 @@ impl Tar {
 impl Tree {
     async fn new_local<P: AsRef<Path>>(
         uri: &str,
+        arch: Option<&str>,
         path: P,
         target: Option<String>,
     ) -> io::Result<Self> {
@@ -450,6 +476,7 @@ impl Tree {
         let merkle = tree::hash_dir(fd).await?;
         Ok(Self {
             path: uri.to_string(),
+            arch: arch.map(|s| s.to_string()),
             target,
             hash: merkle,
         })
@@ -477,6 +504,7 @@ impl Tree {
 impl File {
     async fn new_local(
         uri: &str,
+        arch: Option<&str>,
         path: &Path,
         target: Option<String>,
         mode: Option<NonZero<u32>>,
@@ -523,6 +551,7 @@ impl File {
         };
         Ok(Self {
             uri: uri.to_string(),
+            arch: arch.map(|s| s.to_string()),
             target,
             hash,
             size,
@@ -532,6 +561,7 @@ impl File {
     }
     async fn new_remote<T: TransportProvider + ?Sized>(
         uri: &str,
+        arch: Option<&str>,
         target: Option<String>,
         mode: Option<NonZero<u32>>,
         unpack: Option<bool>,
@@ -553,6 +583,7 @@ impl File {
         let (hash, size) = rdr.into_hash_and_size();
         Ok(Self {
             uri: uri.to_string(),
+            arch: arch.map(|s| s.to_string()),
             target,
             hash,
             size,

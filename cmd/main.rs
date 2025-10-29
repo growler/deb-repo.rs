@@ -2,7 +2,12 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        artifact::ArtifactArg, builder::Executor, cli::Source, sandbox::{maybe_run_sandbox, HostSandboxExecutor}, version::{Constraint, Dependency, Version}, HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider
+        artifact::ArtifactArg,
+        builder::Executor,
+        cli::Source,
+        sandbox::{maybe_run_sandbox, HostSandboxExecutor},
+        version::{Constraint, Dependency, Version},
+        HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
     },
     futures::AsyncWriteExt,
     itertools::Itertools,
@@ -447,7 +452,7 @@ impl Command for Build {
             let mut fs =
                 debrepo::HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await?;
-            let (essentials, scripts) = manifest
+            let (essentials, other, scripts) = manifest
                 .stage(
                     self.spec.as_deref(),
                     &mut fs,
@@ -455,7 +460,7 @@ impl Command for Build {
                     conf.transport().await?.as_ref(),
                 )
                 .await?;
-            builder.build(&mut fs, essentials, scripts).await?;
+            builder.build(&mut fs, essentials, other, scripts).await?;
             Ok(())
         })
     }

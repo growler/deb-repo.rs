@@ -25,6 +25,18 @@ pub enum Priority {
     Required,
 }
 
+impl std::fmt::Display for Priority {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        match self {
+            Priority::Required => write!(f, "required"),
+            Priority::Important => write!(f, "important"),
+            Priority::Standard => write!(f, "standard"),
+            Priority::Optional => write!(f, "optional"),
+            Priority::Unknown => write!(f, "unknown"),
+        }
+    }
+}
+
 impl From<&str> for Priority {
     fn from(value: &str) -> Self {
         if value.eq_ignore_ascii_case("required") {

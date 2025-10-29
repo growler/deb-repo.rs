@@ -299,12 +299,14 @@ impl Hash {
     }
     pub fn store_name<P: AsRef<Path>>(&self, prefix: Option<P>, mut levels: usize) -> PathBuf {
         let pref = prefix.as_ref().map(|p| p.as_ref().as_os_str());
-        let total_len = pref.as_ref().map_or(0, |p| p.len() + 1) + self.size() * 2 + levels;
+        let total_len = pref.as_ref().map_or(0, |p| p.len() + 1) + self.name().len() + 1 + self.size() * 2 + levels;
         let mut buffer = OsString::with_capacity(total_len);
         if let Some(p) = prefix {
             buffer.push(p.as_ref());
             buffer.push("/");
         }
+        buffer.push(self.name());
+        buffer.push("/");
         const fn hexadecimal(c: u8) -> [u8; 2] {
             const HEX: &[u8; 16] = b"0123456789abcdef";
             [HEX[(c >> 4) as usize], HEX[(c & 0x0f) as usize]]

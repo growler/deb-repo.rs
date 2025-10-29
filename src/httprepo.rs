@@ -194,8 +194,8 @@ impl TransportProvider for HttpCachingTransportProvider {
     }
     async fn open_hashed(
         &self,
-        hash: &str,
         url: &str,
+        hash: &str,
     ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
         let url = to_url(url)?;
         match url.scheme() {

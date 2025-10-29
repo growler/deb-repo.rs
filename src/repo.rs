@@ -64,7 +64,7 @@ pub trait TransportProvider: Sync + Send {
         limit: u64,
     ) -> io::Result<(Vec<u8>, u64, Hash)> {
         let mut buffer = vec![0u8; 0];
-        let mut rdr = self.open_hashed(hash_name, url).await?;
+        let mut rdr = self.open_hashed(url, hash_name).await?;
         pin!(&mut rdr).take(limit).read_to_end(&mut buffer).await?;
         let (hash, size) = rdr.into_hash_and_size();
         Ok((buffer, size, hash))
@@ -86,7 +86,7 @@ pub trait TransportProvider: Sync + Send {
         limit: u64,
     ) -> io::Result<(Vec<u8>, u64, Hash)> {
         let mut buffer = vec![0u8; 0];
-        let mut rdr = self.open_hashed(hash_name, url).await?;
+        let mut rdr = self.open_hashed(url, hash_name).await?;
         unpacker(url, &mut rdr)
             .take(limit)
             .read_to_end(&mut buffer)

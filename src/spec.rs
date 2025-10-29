@@ -87,8 +87,7 @@ pub struct LockedPackage {
     pub src: u32,
     pub idx: u32,
     pub name: String,
-    #[serde(skip_serializing_if = "std::ops::Not::not", default)]
-    pub essential: bool,
+    pub order: u32,
     #[serde(flatten)]
     pub file: RepositoryFile,
 }

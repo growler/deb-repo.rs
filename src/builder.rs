@@ -8,14 +8,20 @@ use {
 #[derive(Serialize, Deserialize)]
 pub struct BuildJob<E: Executor> {
     essentials: Vec<String>,
+    packages: Vec<Vec<String>>,
     scripts: Vec<String>,
     _marker: std::marker::PhantomData<E>,
 }
 
 impl<E: Executor> BuildJob<E> {
-    pub(crate) fn new(essentials: Vec<String>, scripts: Vec<String>) -> Self {
+    pub(crate) fn new(
+        essentials: Vec<String>,
+        packages: Vec<Vec<String>>,
+        scripts: Vec<String>,
+    ) -> Self {
         Self {
             essentials,
+            packages,
             scripts,
             _marker: std::marker::PhantomData,
         }
@@ -23,6 +29,7 @@ impl<E: Executor> BuildJob<E> {
     pub(crate) fn with_executor<O: Executor>(self) -> BuildJob<O> {
         BuildJob::<O> {
             essentials: self.essentials,
+            packages: self.packages,
             scripts: self.scripts,
             _marker: std::marker::PhantomData,
         }
@@ -70,7 +77,12 @@ impl<E: Executor> BuildJob<E> {
                     .chain(essential_pkgs.iter().copied()),
             )?;
         }
-        executor.exec_cmd("/usr/bin/dpkg", ["--configure", "-a"])?;
+        for group in self.packages.iter() {
+            executor.exec_cmd(
+                "/usr/bin/dpkg",
+                std::iter::once("--configure").chain(group.iter().map(String::as_str)),
+            )?;
+        }
         for script in self.scripts.iter() {
             executor.exec_script(script.clone())?;
         }
@@ -122,13 +134,14 @@ pub trait Executor {
         &mut self,
         fs: &mut Self::Filesystem,
         essentials: Vec<String>,
+        packages: Vec<Vec<String>>,
         scripts: Vec<String>,
     ) -> io::Result<()>
     where
         Self: Sized,
     {
         self.prepare_tree(fs).await?;
-        self.execute(BuildJob::<Self>::new(essentials, scripts))
+        self.execute(BuildJob::<Self>::new(essentials, packages, scripts))
             .await?;
         self.process_changes(fs).await
     }
