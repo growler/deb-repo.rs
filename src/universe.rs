@@ -6,7 +6,7 @@ use {
         packages::{Package, Packages},
         version::{self, Constraint, Dependency, Satisfies, Version},
     },
-    iterator_ext::IteratorExt,
+    itertools::Itertools,
     resolvo::{
         Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
         DependencyProvider, Interner, KnownDependencies, NameId, Requirement, SolvableId,
@@ -264,44 +264,49 @@ impl<'a> UniverseIndex<'a> {
             .package
             .pre_depends()
             .chain(pkg.package.depends())
-            .and_then(|dep| match dep {
-                Dependency::Single(dep) => Ok(Requirement::Single(
-                    self.add_single_package_dependency(solvable, dep),
-                )),
-                Dependency::Union(deps) => Ok(Requirement::Union(
+            .map_ok(|dep| match dep {
+                Dependency::Single(dep) => {
+                    Requirement::Single(self.add_single_package_dependency(solvable, dep))
+                }
+                Dependency::Union(deps) => Requirement::Union(
                     self.version_set_unions.get_or_insert(
                         deps.into_iter()
                             .map(|dep| self.add_single_package_dependency(solvable, dep))
                             .collect(),
                     ),
-                )),
+                ),
             })
-            .and_then(|req| {
-                Ok(ConditionalRequirement {
+            .map_ok(|req| {
+                ConditionalRequirement {
                     condition: None, // TODO: handle conditions
                     requirement: req,
+                }
+            })
+            .map(|reqs| {
+                reqs.map_err(|err| {
+                    Dependencies::Unknown(
+                        strings
+                            .intern(format!(
+                                "error parsing dependencies for {}: {}",
+                                pkg.package.raw_full_name(),
+                                err
+                            ))
+                            .as_id(),
+                    )
                 })
             })
-            .collect::<Result<Vec<_>, ParseError>>()
+            .collect::<Result<Vec<_>, _>>()
         {
             Ok(reqs) => reqs,
             Err(err) => {
-                return Dependencies::Unknown(
-                    strings
-                        .intern(format!(
-                            "error parsing dependencies for {}: {}",
-                            pkg.package.raw_full_name(),
-                            err
-                        ))
-                        .as_id(),
-                )
+                return err;
             }
         };
         let constrains = match pkg
             .package
             .conflicts()
             .chain(pkg.package.breaks())
-            .and_then(|dep| Ok(self.add_single_package_dependency(solvable, dep)))
+            .map_ok(|dep| self.add_single_package_dependency(solvable, dep))
             .collect::<Result<Vec<_>, ParseError>>()
         {
             Ok(reqs) => reqs,

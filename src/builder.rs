@@ -10,6 +10,7 @@ pub struct BuildJob<E: Executor> {
     essentials: Vec<String>,
     packages: Vec<Vec<String>>,
     scripts: Vec<String>,
+    #[serde(skip)]
     _marker: std::marker::PhantomData<E>,
 }
 

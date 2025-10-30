@@ -136,7 +136,7 @@ impl<D: HashAlgo> InnerHash<D> {
             ));
         }
         let mut inner = HashOutput::<D>::default();
-        hex::decode_to_slice(value, inner.as_mut_slice()).map_err(|err| {
+        hex::decode_to_slice(value, &mut inner).map_err(|err| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("error decoding hex digest: {}", err),

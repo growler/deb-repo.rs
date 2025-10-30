@@ -19,7 +19,6 @@ use {
         matches_path, parse_size,
     },
     chrono::{DateTime, Utc},
-    iterator_ext::IteratorExt,
     itertools::Itertools,
     ouroboros::self_referencing,
     smallvec::SmallVec,
@@ -96,8 +95,8 @@ impl Release {
                             }
                         })
                     })
-                    .try_flatten()
-                    .and_then(|(digest, size, path)| {
+                    .flatten_ok()
+                    .map(|file| file.and_then(|(digest, size, path)| {
                         let size = parse_size(size.as_bytes()).map_err(|err| {
                             ParseError::from(format!("invalid size: {:?} {}", size, err))
                         })?;
@@ -105,7 +104,7 @@ impl Release {
                             ParseError::from(format!("invalid hash: {} {}", digest, err))
                         })?;
                         Ok::<_, ParseError>((path, hash, size))
-                    })
+                    }))
             })
     }
     fn field(&self, name: &str) -> Option<&str> {

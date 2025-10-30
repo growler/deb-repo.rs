@@ -3,8 +3,6 @@ use {
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::{future::try_join_all, AsyncReadExt},
-    iterator_ext::IteratorExt,
-    itertools::Itertools,
     serde::{Deserialize, Serialize},
     smol::{fs, io, lock::Semaphore},
     std::{
@@ -704,9 +702,11 @@ impl Source {
                     arch,
                     self.ext.as_deref(),
                 )?
-                .map_err(Into::into)
-                .map_ok(|(path, hash, size)| {
-                    RepositoryFile::new(format!("dists/{}/{}", s, path), hash, size)
+                .map(|file| {
+                    file.map(|(path, hash, size)| {
+                        RepositoryFile::new(format!("dists/{}/{}", s, path), hash, size)
+                    })
+                    .map_err(Into::into)
                 })
                 .collect::<io::Result<Vec<_>>>()?;
             Ok::<_, io::Error>((RepositoryFile::new(path, hash, size), pkgs_ind))

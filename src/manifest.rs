@@ -13,7 +13,6 @@ use {
         version::{IntoConstraint, IntoDependency},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
-    iterator_ext::IteratorExt,
     itertools::Itertools,
     smol::{io, lock::Semaphore},
     std::{
@@ -206,7 +205,7 @@ impl Manifest {
         let mut scripts = self
             .file
             .ancestors(id)
-            .try_filter_map(|spec| Ok(spec.run.as_deref()))
+            .filter_map_ok(|spec| spec.run.as_deref())
             .collect::<io::Result<Vec<_>>>()?;
         scripts.reverse();
         Ok(scripts)
@@ -218,28 +217,31 @@ impl Manifest {
         let arch = self.arch.as_str();
         self.file
             .ancestors(id)
-            .try_flat_map(|spec| Ok(spec.stage.iter().map(String::as_str)))
-            .try_filter_map(move |artifact| {
-                let base = self
-                    .path
-                    .as_deref()
-                    .ok_or_else(|| io::Error::other("no manifest path"))?;
-                let artifact = self.file.artifact(artifact).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("missing artifact '{}' in spec stage list", artifact),
+            .map_ok(|spec| spec.stage.iter().map(String::as_str))
+            .flatten_ok()
+            .filter_map(move |artifact| {
+                artifact.and_then(|artifact| {
+                    let base = self
+                        .path
+                        .as_deref()
+                        .ok_or_else(|| io::Error::other("no manifest path"))?;
+                    let artifact = self.file.artifact(artifact).ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("missing artifact '{}' in spec stage list", artifact),
+                        )
+                    })?;
+                    Ok(
+                        if artifact
+                            .arch()
+                            .is_none_or(|target_arch| target_arch == arch)
+                        {
+                            Some((ArtifactSource::new(artifact.uri(), base), artifact))
+                        } else {
+                            None
+                        },
                     )
-                })?;
-                Ok(
-                    if artifact
-                        .arch()
-                        .is_none_or(|target_arch| target_arch == arch)
-                    {
-                        Some((ArtifactSource::new(artifact.uri(), base), artifact))
-                    } else {
-                        None
-                    },
-                )
+                }).transpose()
             })
     }
     fn invalidate_locked_specs(&mut self, spec: usize) {

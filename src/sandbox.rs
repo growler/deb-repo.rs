@@ -3,7 +3,6 @@ use {
         builder::{BuildJob, Executor},
         HostFileSystem,
     },
-    clone3::Clone3,
     rustix::{
         fd::{AsFd, AsRawFd, FromRawFd, IntoRawFd, OwnedFd},
         fs::{mkdirat, openat, readlinkat, symlinkat, Mode, OFlags, Uid, CWD},
@@ -26,7 +25,7 @@ use {
         borrow::Cow,
         convert::Infallible,
         ffi::{CStr, OsStr, OsString},
-        io::{self, Write},
+        io::{self, Read, Write},
         iter::once,
         os::unix::{ffi::OsStrExt, fs::OpenOptionsExt, process::CommandExt},
         path::{Path, PathBuf},
@@ -210,15 +209,19 @@ where
     J: Serialize,
 {
     fn write_to(&self, mut w: std::fs::File) -> io::Result<()> {
-        bincode::serde::encode_into_std_write(self, &mut w, bincode::config::standard()).map_err(
-            |err| {
-                io::Error::other(format!(
-                    "failed to send parameters to helper process: {}",
-                    err
-                ))
-            },
-        )?;
-        w.flush()
+        let doc = toml_edit::ser::to_vec(&self).map_err(|err| {
+            io::Error::other(format!(
+                "failed to encode parameters to helper process: {}",
+                err
+            ))
+        })?;
+        w.write_all(&doc).map_err(|err| {
+            io::Error::other(format!(
+                "failed to send parameters to helper process: {}",
+                err
+            ))
+        })?;
+        Ok(())
     }
 }
 
@@ -233,9 +236,16 @@ where
     J: for<'de> Deserialize<'de>,
 {
     fn read_from(mut r: std::fs::File) -> io::Result<Self> {
-        bincode::serde::decode_from_std_read(&mut r, bincode::config::standard()).map_err(|err| {
+        let mut doc = Vec::new();
+        r.read_to_end(&mut doc).map_err(|err| {
             io::Error::other(format!(
-                "failed to get parameters from calling process: {}",
+                "failed to read parameters from calling process: {}",
+                err
+            ))
+        })?;
+        toml_edit::de::from_slice(&doc).map_err(|err| {
+            io::Error::other(format!(
+                "failed to decode parameters from calling process: {}",
                 err
             ))
         })
@@ -651,20 +661,32 @@ where
     let fd_raw = fd.as_raw_fd();
     let mut pidfd = -1;
 
-    let mut clone = Clone3::default();
-    clone
-        .flag_pidfd(&mut pidfd)
-        .exit_signal(rustix::process::Signal::CHILD.as_raw() as u64);
-    if unshare {
-        clone
-            .flag_newnet()
-            .flag_newipc()
-            .flag_newpid()
-            .flag_newuts()
-            .flag_newns();
-    }
+    let clone_args = libc::clone_args {
+        flags: (if unshare {
+            libc::CLONE_NEWNET
+                | libc::CLONE_NEWIPC
+                | libc::CLONE_NEWPID
+                | libc::CLONE_NEWUTS
+                | libc::CLONE_NEWNS
+        } else {
+            0
+        } | libc::CLONE_PIDFD) as u64,
+        pidfd: std::ptr::addr_of_mut!(pidfd) as u64,
+        child_tid: 0,
+        parent_tid: 0,
+        exit_signal: rustix::process::Signal::CHILD.as_raw() as u64,
+        stack: 0,
+        stack_size: 0,
+        tls: 0,
+        set_tid: 0,
+        set_tid_size: 0,
+        cgroup: 0,
+    };
 
-    match unsafe { clone.call()? } {
+    match unsafe { libc::syscall(libc::SYS_clone3, &clone_args, std::mem::size_of::<libc::clone_args>()) } {
+        -1 => {
+            Err(io::Error::last_os_error())
+        }
         0 => unsafe {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 libc::_exit(127);
