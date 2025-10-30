@@ -126,7 +126,7 @@ pub struct Package<'a> {
     multi_arch: MultiArch,
 }
 
-impl<'a> std::fmt::Display for Package<'a> {
+impl std::fmt::Display for Package<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{}:{}={}", self.name, self.arch, self.version)
     }

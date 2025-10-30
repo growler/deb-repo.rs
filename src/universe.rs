@@ -62,18 +62,18 @@ struct Name<'a> {
     packages: SmallVec<[SolvableId; 1]>,
     required: Vec<SolvableId>,
 }
-impl<'a> hash::Hash for Name<'a> {
+impl hash::Hash for Name<'_> {
     fn hash<H: hash::Hasher>(&self, state: &mut H) {
         self.name.hash(state)
     }
 }
-impl<'a> Borrow<str> for HashRef<Name<'a>> {
+impl Borrow<str> for HashRef<Name<'_>> {
     fn borrow(&self) -> &str {
         self.name
     }
 }
-impl<'a> Eq for Name<'a> {}
-impl<'a> PartialEq for Name<'a> {
+impl Eq for Name<'_> {}
+impl PartialEq for Name<'_> {
     fn eq(&self, other: &Self) -> bool {
         self.name.eq(other.name)
     }
@@ -87,7 +87,7 @@ struct VersionSet<'a> {
     range: version::VersionSet<Version<&'a str>>,
 }
 
-impl<'a> VersionSet<'a> {}
+impl VersionSet<'_> {}
 
 struct Solvable<'a> {
     arch: ArchId,
@@ -98,7 +98,7 @@ struct Solvable<'a> {
     package: &'a Package<'a>,
 }
 
-impl<'a> std::fmt::Debug for Solvable<'a> {
+impl std::fmt::Debug for Solvable<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
@@ -632,10 +632,11 @@ impl InnerUniverse {
         g
     }
     fn installation_order(&self, solution: &[PackageId]) -> Vec<Vec<PackageId>> {
-        let (essentials, non_essentials): (Vec<_>, Vec<_>) = solution
+        let (mut essentials, non_essentials): (Vec<_>, Vec<_>) = solution
             .iter()
             .copied()
             .partition(|s| self.package(*s).essential());
+        essentials.sort_by_key(|&p| self.package(p).name());
         let g = self.dependency_graph(&non_essentials);
         let condensed = petgraph::algo::condensation(g, true);
         let order = petgraph::algo::toposort(&condensed, None).unwrap();
@@ -645,7 +646,11 @@ impl InnerUniverse {
             order
                 .iter()
                 .filter_map(|&gid| condensed.node_weight(gid))
-                .cloned(),
+                .map(|pkgs| {
+                    let mut pkgs = pkgs.clone();
+                    pkgs.sort_by_key(|&p| self.package(p).name());
+                    pkgs
+                }),
         );
         result
     }

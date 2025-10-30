@@ -97,7 +97,7 @@ impl<T: Hash + Eq + ?Sized> Borrow<T> for HashRef<T> {
 }
 impl<T: Hash + Eq + ?Sized> Borrow<T> for HashRef<Box<T>> {
     fn borrow(&self) -> &T {
-        unsafe { (&*self.ptr).as_ref() }
+        unsafe { (*self.ptr).as_ref() }
     }
 }
 impl<T: Hash + Eq + ?Sized> std::ops::Deref for HashRef<T> {
@@ -108,12 +108,12 @@ impl<T: Hash + Eq + ?Sized> std::ops::Deref for HashRef<T> {
 }
 impl<T: Hash + Eq + ?Sized> Hash for HashRef<T> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        unsafe { (&*self.ptr).hash(state) }
+        unsafe { (*self.ptr).hash(state) }
     }
 }
 impl<T: Hash + Eq + ?Sized> PartialEq<T> for HashRef<Box<T>> {
     fn eq(&self, other: &T) -> bool {
-        PartialEq::eq(unsafe { (&*self.ptr).as_ref() }, other)
+        PartialEq::eq(unsafe { (*self.ptr).as_ref() }, other)
     }
 }
 impl<T: Hash + Eq + ?Sized> PartialEq for HashRef<T> {
@@ -184,7 +184,7 @@ where
     where
         HashRef<Value>: Borrow<K>,
     {
-        unsafe { (&*self.index.get()).get(item).copied() }
+        unsafe { (*self.index.get()).get(item).copied() }
     }
     fn insert(&self, item: Value) -> IdType {
         unsafe {

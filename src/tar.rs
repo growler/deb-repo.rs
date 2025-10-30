@@ -733,8 +733,7 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                         let remaining = *this.nxt - *this.pos;
                         let filled = BLOCK_SIZE - remaining as usize;
                         let (hdr, reader) = (&mut this.header, &mut this.reader);
-                        let n = ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled..)));
-                        n
+                        ready_opt!(pin!(reader).poll_read(ctx, hdr.buf_mut(filled..)))
                     } else {
                         let buf = ext.as_mut().unwrap();
                         let n =

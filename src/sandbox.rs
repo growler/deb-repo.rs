@@ -204,7 +204,7 @@ where
     executor: &'a E,
     job: &'a J,
 }
-impl<'a, E, J> OutJob<'a, E, J>
+impl<E, J> OutJob<'_, E, J>
 where
     E: Serialize,
     J: Serialize,
@@ -243,7 +243,7 @@ where
 }
 
 #[async_trait::async_trait(?Send)]
-impl<'a, E: SandboxExecutor> Executor for Sandbox<'a, E> {
+impl<E: SandboxExecutor> Executor for Sandbox<'_, E> {
     type Filesystem = E::Filesystem;
     async fn prepare_tree(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
         unimplemented!()
@@ -670,17 +670,16 @@ where
                 libc::_exit(127);
             }
             loop {
-                let n = libc::poll(&mut pfd as *mut libc::pollfd, 1, 0);
-                if n == 0 {
-                    break;
-                } else if n > 0 {
-                    libc::_exit(127);
-                } else {
-                    let e = *libc::__errno_location();
-                    if e == libc::EINTR {
-                        continue;
-                    } else {
-                        libc::_exit(127);
+                match libc::poll(&mut pfd as *mut libc::pollfd, 1, 0) {
+                    0 => break,
+                    n if n > 0 => libc::_exit(127),
+                    _ => {
+                        let e = *libc::__errno_location();
+                        if e == libc::EINTR {
+                            continue;
+                        } else {
+                            libc::_exit(127);
+                        }
                     }
                 }
             }
@@ -732,7 +731,7 @@ struct EnvironIter<'a> {
     env: *mut *mut libc::c_char,
     phantom: std::marker::PhantomData<&'a str>,
 }
-impl<'a> EnvironIter<'a> {
+impl EnvironIter<'_> {
     fn new() -> Self {
         extern "C" {
             static mut environ: *mut *mut libc::c_char;

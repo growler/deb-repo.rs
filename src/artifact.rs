@@ -132,10 +132,14 @@ impl Artifact {
             ArtifactSource::Local(ref path) => {
                 let path = path.as_ref();
                 if smol::fs::symlink_metadata(path).await?.is_dir() {
-                    Ok(Artifact::Dir(Tree::new_local(uri, arch, path, target).await?))
+                    Ok(Artifact::Dir(
+                        Tree::new_local(uri, arch, path, target).await?,
+                    ))
                 } else if unpack.unwrap_or(true) && is_tar_ext(path.as_os_str().as_encoded_bytes())
                 {
-                    Ok(Artifact::Tar(Tar::new_local(uri, arch, path, target).await?))
+                    Ok(Artifact::Tar(
+                        Tar::new_local(uri, arch, path, target).await?,
+                    ))
                 } else {
                     Ok(Artifact::File(
                         File::new_local(uri, arch, path, target, artifact.mode, unpack).await?,
@@ -149,7 +153,8 @@ impl Artifact {
                     ))
                 } else {
                     Ok(Artifact::File(
-                        File::new_remote(uri, arch, target, artifact.mode, unpack, transport).await?,
+                        File::new_remote(uri, arch, target, artifact.mode, unpack, transport)
+                            .await?,
                     ))
                 }
             }
@@ -664,6 +669,7 @@ mod tree {
             StagingFile, StagingFileSystem,
         },
         async_channel as chan,
+        digest::{FixedOutput, Output},
         futures::stream::{self, StreamExt, TryStreamExt},
         itertools::Itertools,
         rustix::{
@@ -734,7 +740,7 @@ mod tree {
     }
 
     type NodeHasher = blake3::Hasher;
-    type NodeHash = blake3::Hash;
+    type NodeHash = Output<NodeHasher>;
 
     pub(super) async fn copy_hash_dir<FS: StagingFileSystem + ?Sized>(
         fd: OwnedFd,
@@ -781,8 +787,7 @@ mod tree {
                         )
                         .await?;
                     file.persist().await?;
-                    let hash: [u8; _] = rd.into_hash_output().into();
-                    Ok(Some(hash.into()))
+                    Ok(Some(rd.into_hash_output()))
                 }
             }
         })
@@ -797,22 +802,22 @@ mod tree {
                 Object::Directory { .. } => Ok(None),
                 Object::RegularFile { fd, stat, path } => {
                     let mut hasher = NodeHasher::new();
-                    let hasher = if stat.st_size < 16 * 1024 {
+                    let hash = if stat.st_size < 16 * 1024 {
                         hasher.update_reader(std::fs::File::from(fd))?;
-                        Ok(hasher)
+                        Ok(hasher.finalize_fixed())
                     } else {
                         pool.spawn(move || {
                             let map = unsafe { memmap2::Mmap::map(fd.as_raw_fd()) }?;
                             map.advise(memmap2::Advice::Sequential)?;
                             hasher.update(&map[..]);
-                            Ok::<_, io::Error>(hasher)
+                            Ok::<_, io::Error>(hasher.finalize_fixed())
                         })
                         .await
                     }
                     .map_err(|err| {
                         io::Error::other(format!("failed to hash file {}: {}", path.display(), err))
                     })?;
-                    Ok(Some(hasher.finalize()))
+                    Ok(Some(hash))
                 }
             }
         })
@@ -824,15 +829,14 @@ mod tree {
         F: Fn(Object) -> Fut,
         Fut: std::future::Future<Output = io::Result<Option<NodeHash>>>,
     {
-        let hash: [u8; _] = process_fs_object(
+        let hash = process_fs_object(
             PathBuf::from_str("").unwrap().as_ref(),
             fd,
             OsStr::from_bytes(b".").to_owned(),
             f,
         )
-        .await?
-        .into();
-        Ok(Hash::new_from_hash::<NodeHasher>(hash.into()))
+        .await?;
+        Ok(Hash::new_from_hash::<NodeHasher>(hash))
     }
 
     async fn process_fs_object<F, Fut>(
@@ -872,20 +876,20 @@ mod tree {
                 let file_hash = f(Object::RegularFile { path, stat, fd })
                     .await?
                     .expect("file hash");
-                hasher.update(file_hash.as_bytes());
-                Ok(hasher.finalize())
+                hasher.update(&file_hash);
+                Ok(hasher.finalize_fixed())
             }
             FileType::Symlink => {
                 let target = readlinkat(&fd, c"", [])?;
                 hasher.update(target.as_bytes());
                 f(Object::Symlink { path, target }).await?;
-                Ok(hasher.finalize())
+                Ok(hasher.finalize_fixed())
             }
             FileType::Directory => {
                 let dir_hash = process_dir(path.clone(), fd, f).await?;
-                hasher.update(dir_hash.as_bytes());
+                hasher.update(&dir_hash);
                 f(Object::Directory { path, stat }).await?;
-                Ok(hasher.finalize())
+                Ok(hasher.finalize_fixed())
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -912,10 +916,10 @@ mod tree {
         )
         .buffered(16)
         .try_fold(NodeHasher::new(), |mut hasher, hash| async move {
-            hasher.update(hash.as_bytes());
+            hasher.update(&hash);
             Ok(hasher)
         })
         .await?;
-        Ok(hasher.finalize())
+        Ok(hasher.finalize_fixed())
     }
 }

@@ -2,7 +2,7 @@
 name = "debrepo"
 version = "0.0.0"
 publish = false
-rust-version = "1.86"
+rust-version = "1.85"
 edition = "2021"
 
 [package.metadata.cargo-machete]

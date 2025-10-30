@@ -124,7 +124,7 @@ pub trait StagingFileSystem {
     where
         T: TransportProvider + ?Sized,
     {
-        let url = source.package_url(file.path());
+        let url = source.file_url(file.path());
         let r = transport
             .open_verified(&url, file.size(), file.hash())
             .await?;
@@ -141,6 +141,34 @@ pub trait StagingFileSystem {
         T: TransportProvider + ?Sized,
     {
         artifact.stage_to(source, self, transport).await
+    }
+    async fn import_repo_file<P, T>(
+        &self,
+        source: &Source,
+        path: P,
+        file: &RepositoryFile,
+        transport: &T,
+    ) -> io::Result<()>
+    where
+        P: AsRef<Path> + Send,
+        T: TransportProvider + ?Sized,
+    {
+        let url = source.file_url(file.path());
+        let r = transport
+            .open_verified(&url, file.size(), file.hash())
+            .await?;
+        self.create_file(
+            r,
+            path,
+            0,
+            0,
+            0o644,
+            None,
+            Some(file.size() as usize),
+        )
+        .await?
+        .persist()
+        .await
     }
 }
 
@@ -512,7 +540,7 @@ impl StagingFileSystem for HostFileSystem {
         T: TransportProvider + ?Sized,
     {
         let fs = self.clone();
-        let url = source.package_url(file.path());
+        let url = source.file_url(file.path());
         let rdr = transport
             .open_verified(&url, file.size(), file.hash())
             .await?;

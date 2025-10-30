@@ -104,7 +104,7 @@ impl<'de> serde::de::Deserialize<'de> for SignedBy {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct SignedByVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for SignedByVisitor {
+        impl serde::de::Visitor<'_> for SignedByVisitor {
             type Value = SignedBy;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -312,7 +312,7 @@ impl<'de> serde::de::Deserialize<'de> for Snapshot {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct SnapshotVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for SnapshotVisitor {
+        impl serde::de::Visitor<'_> for SnapshotVisitor {
             type Value = Snapshot;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -713,7 +713,7 @@ impl Source {
         }))
         .await
     }
-    pub fn package_url(&self, path: &str) -> String {
+    pub fn file_url(&self, path: &str) -> String {
         format!("{}/{}", self.url.trim_end_matches('/'), path)
     }
     pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {

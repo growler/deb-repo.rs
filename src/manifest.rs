@@ -211,10 +211,10 @@ impl Manifest {
         scripts.reverse();
         Ok(scripts)
     }
-    fn artifacts_for<'a>(
-        &'a self,
+    fn artifacts_for(
+        &self,
         id: usize,
-    ) -> impl Iterator<Item = io::Result<(ArtifactSource<'a>, &'a Artifact)>> + 'a {
+    ) -> impl Iterator<Item = io::Result<(ArtifactSource<'_>, &'_ Artifact)>> + '_ {
         let arch = self.arch.as_str();
         self.file
             .ancestors(id)
@@ -484,10 +484,11 @@ impl Manifest {
                         .iter()
                         .find(|a| a.uri() == aritfact_id)
                         .ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidInput,
-                                format!("missing artifact '{}' in stage", aritfact_id),
-                            )
+                            io::Error::other(format!(
+                                "missing artifact '{}' to stage in spec {}",
+                                aritfact_id,
+                                spec_display_name(spec_name)
+                            ))
                         })?;
                     hasher.update(aritfact.hash().as_ref());
                 }
@@ -504,10 +505,12 @@ impl Manifest {
                         let name = pkg.name().to_string();
                         let hash_kind = sources.get(src).unwrap().hash.name();
                         let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("failed to parse package {}: {}", pkg.name(), err),
-                            )
+                            io::Error::other(format!(
+                                "failed to parse package {} record while processing spec {}: {}",
+                                pkg.name(),
+                                spec_display_name(spec_name),
+                                err
+                            ))
                         })?;
                         hasher.update(hash.as_ref());
                         Ok(LockedPackage {
@@ -537,7 +540,7 @@ impl Manifest {
         }
         Ok(())
     }
-    pub fn packages<'a>(&'a self) -> impl Iterator<Item = &'a Package<'a>> {
+    pub fn packages(&self) -> impl Iterator<Item = &'_ Package<'_>> {
         self.universe
             .as_ref()
             .map(|(_, u)| u.as_ref())
@@ -619,6 +622,27 @@ impl Manifest {
         )
         .await?;
         stage_artifacts(self.artifacts_for(spec_index), fs, concurrency, transport).await?;
+        stage_sources(
+            self.file
+                .sources()
+                .iter()
+                .zip(self.lock.sources().iter())
+                .map(|(s, l)| {
+                    l.as_ref().map_or_else(
+                        || {
+                            Err(io::Error::other(format!(
+                                "source {} is not locked, run lock",
+                                s.url
+                            )))
+                        },
+                        |l| Ok((s, l)),
+                    )
+                }),
+            fs,
+            concurrency,
+            transport,
+        )
+        .await?;
         let scripts = self
             .scripts_for(spec_index)?
             .into_iter()
@@ -642,6 +666,54 @@ impl Manifest {
         Ok((essentials, other, scripts))
     }
 }
+
+async fn stage_sources<'a, I, FS, T>(
+    sources: I,
+    fs: &FS,
+    concurrency: NonZero<usize>,
+    transport: &T,
+) -> io::Result<()>
+where
+    FS: StagingFileSystem + ?Sized,
+    T: TransportProvider + ?Sized,
+    I: Iterator<Item = io::Result<(&'a Source, &'a LockedSource)>> + 'a,
+{
+    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
+        .await?;
+    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
+        .await?;
+    stream::iter(sources.enumerate().map(|(id, src)| src.map(|s| (id, s))))
+        .and_then(|(no, (source, locked))| async move {
+            let source_stanza: MutableControlStanza = source.into();
+            fs.create_file(
+                format!("{}", source_stanza).as_bytes(),
+                format!("./etc/apt/sources.list.d/source-{}.sources", no),
+                0,
+                0,
+                0o644,
+                None,
+                None,
+            )
+            .await?
+            .persist()
+            .await?;
+            Ok::<_, io::Error>(stream::iter(
+                locked
+                    .files()
+                    .map(move |file| Ok::<_, io::Error>((source, file))),
+            ))
+        })
+        .try_flatten()
+        .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| async {
+            let file_name = format!(
+                "./var/lib/apt/lists/{}",
+                crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
+            );
+            fs.import_repo_file(source, file_name, file, transport)
+                .await
+        })
+        .await
+}
 async fn stage_artifacts<'a, FS, I, T>(
     artifacts: I,
     fs: &FS,
@@ -654,12 +726,9 @@ where
     T: TransportProvider + ?Sized,
 {
     stream::iter(artifacts.into_iter())
-        .map(|artifact| async {
-            let (source, artifact) = artifact?;
+        .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| async {
             fs.import_artifact(source, artifact, transport).await
         })
-        .buffer_unordered(concurrency.into())
-        .try_for_each(|_| async { Ok(()) })
         .await
 }
 async fn stage_debs<'a, FS, S, T>(
@@ -688,7 +757,7 @@ where
         Old(&'a ControlStanza<'a>),
         New(&'a MutableControlStanza),
     }
-    impl<'a> Installed<'a> {
+    impl Installed<'_> {
         fn package(&self) -> &str {
             match self {
                 Installed::Old(s) => s.field("Package").unwrap(),

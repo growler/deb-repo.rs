@@ -50,7 +50,7 @@ pub struct ControlField<'a> {
     value: &'a str,
 }
 
-impl<'a> std::fmt::Display for ControlField<'a> {
+impl std::fmt::Display for ControlField<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.value.as_bytes().iter().next() == Some(&b'\n') {
             writeln!(f, "{}:{}", self.name, self.value)
@@ -67,7 +67,7 @@ pub struct MutableControlField<'a> {
     value: Cow<'a, str>,
 }
 
-impl<'a> std::fmt::Display for MutableControlField<'a> {
+impl std::fmt::Display for MutableControlField<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.value.as_bytes().iter().next() == Some(&b'\n') {
             writeln!(f, "{}:{}", self.name, self.value)
@@ -109,7 +109,7 @@ pub struct ControlStanza<'a> {
     fields: Vec<ControlField<'a>>,
 }
 
-impl<'a> std::fmt::Display for ControlStanza<'a> {
+impl std::fmt::Display for ControlStanza<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         for field in &self.fields {
             write!(f, "{}", field)?;
@@ -527,7 +527,7 @@ impl std::iter::FromIterator<MutableControlStanza> for MutableControlFile {
     }
 }
 
-impl<'a> std::fmt::Display for ControlFile<'a> {
+impl std::fmt::Display for ControlFile<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         for stanza in &self.stanzas {
             write!(f, "{}", stanza)?;

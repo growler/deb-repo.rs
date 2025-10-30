@@ -1,0 +1,29 @@
+# default manifest file for debian
+[[source]]
+url = "https://ftp.debian.org/debian/"
+snapshots = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"
+suites = ["trixie", "trixie-updates", "trixie-backports"]
+components = ["main", "contrib", "non-free"]
+
+[[source]]
+url = "https://security.debian.org/debian-security/"
+snapshots = "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
+suites = ["trixie-security"]
+components = ["main", "contrib", "non-free"]
+
+[spec]
+include = [
+    "ca-certificates",
+    "build-essential",
+    "pkg-config",
+    "rustup",
+    "libbz2-dev",
+    "libcurl4-openssl-dev",
+    "libgpg-error-dev",
+    "libgpgme-dev",
+    "liblz4-dev",
+    "liblzma-dev",
+    "libssl-dev",
+    "libunistring-dev",
+    "libzstd-dev",
+]

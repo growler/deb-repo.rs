@@ -35,6 +35,7 @@ pub use {
     sandbox::{maybe_run_sandbox, unshare_root, unshare_user_ns},
     source::{RepositoryFile, SignedBy, Snapshot, Source},
 };
+use {std::str::from_utf8_unchecked};
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
     let mut result: u64 = 0;
@@ -116,6 +117,31 @@ pub(crate) fn is_url(s: &str) -> bool {
         return false;
     }
     bytes[0] == b':' && bytes[1] == b'/' && bytes[2] == b'/'
+}
+pub(crate) fn strip_url_scheme(s: &str) -> &str{
+    let mut bytes = s.as_bytes();
+    if bytes.len() < 4 {
+        return s;
+    }
+    if !bytes[0].is_ascii_alphabetic() {
+        return s;
+    }
+    bytes = &bytes[1..];
+    while let [c, rest @ ..] = bytes {
+        if c.is_ascii_alphanumeric() || matches!(c, b'+' | b'-' | b'.') {
+            bytes = rest;
+        } else {
+            break;
+        }
+    }
+    if bytes.len() < 3 {
+        return s;
+    }
+    if bytes[0] == b':' && bytes[1] == b'/' && bytes[2] == b'/' {
+        unsafe { from_utf8_unchecked(&bytes[3..]) }
+    } else {
+        s
+    }
 }
 
 macro_rules! matches_path {

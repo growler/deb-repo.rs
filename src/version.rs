@@ -39,7 +39,7 @@ struct ArchNameDisplay<'a, A: Display, N: Display> {
     name: N,
 }
 
-impl<'a, A: Display, N: Display> Display for ArchNameDisplay<'a, A, N> {
+impl<A: Display, N: Display> Display for ArchNameDisplay<'_, A, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.arch {
             None => self.name.fmt(f),
@@ -155,7 +155,7 @@ impl<'de> serde::de::Deserialize<'de> for Constraint<String> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct ConstraintVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for ConstraintVisitor {
+        impl serde::de::Visitor<'_> for ConstraintVisitor {
             type Value = Constraint<String>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -373,7 +373,7 @@ impl<'de> serde::de::Deserialize<'de> for Dependency<String> {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
         struct DependencyVisitor;
 
-        impl<'de> serde::de::Visitor<'de> for DependencyVisitor {
+        impl serde::de::Visitor<'_> for DependencyVisitor {
             type Value = Dependency<String>;
 
             fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
@@ -783,7 +783,7 @@ struct VersionSetDisplay<'a, V: Display, N: Display> {
     range: &'a VersionSet<V>,
 }
 
-impl<'a, V: Display, N: Display> Display for VersionSetDisplay<'a, V, N> {
+impl<V: Display, N: Display> Display for VersionSetDisplay<'_, V, N> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self.range {
             VersionSet::Any => self.name.fmt(f),
@@ -1120,7 +1120,7 @@ struct Parser<'a> {
     inp: &'a [u8],
 }
 
-impl<'a> fmt::Debug for Parser<'a> {
+impl fmt::Debug for Parser<'_> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "{:?}", unsafe {
             std::str::from_utf8_unchecked(self.inp)
@@ -1598,7 +1598,7 @@ mod comparator {
         data: &'a [u8],
     }
 
-    impl<'a> std::fmt::Debug for VersionComparator<'a> {
+    impl std::fmt::Debug for VersionComparator<'_> {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
             f.write_str("<")?;
             f.write_str(unsafe { std::str::from_utf8_unchecked(self.data) })?;
@@ -1606,7 +1606,7 @@ mod comparator {
         }
     }
 
-    impl<'a> VersionComparator<'a> {
+    impl VersionComparator<'_> {
         #[inline]
         fn advance(&mut self) {
             self.data = &self.data[1..];

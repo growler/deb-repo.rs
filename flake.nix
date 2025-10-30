@@ -76,7 +76,7 @@
 
             pkg-config 
         ];
-        rust-debian-stable = [ (pkgs.rust-bin.stable."1.86.0".default.override {
+        rust-debian-stable = [ (pkgs.rust-bin.stable."1.85.0".default.override {
           extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];
         })];
         rust-stable = [ (pkgs.rust-bin.stable.latest.default.override {
@@ -99,6 +99,6 @@
         devShells.debian-stable = pkgs.mkShell (shell rust-debian-stable { name = "deb-repo-stable"; });
         devShells.stable = pkgs.mkShell (shell rust-stable { name = "deb-repo-stable"; });
         devShells.nightly = pkgs.mkShell (shell rust-nightly { name = "deb-repo-nightly"; });
-        devShell = devShells.stable;
+        devShell = devShells.debian-stable;
     });
 }

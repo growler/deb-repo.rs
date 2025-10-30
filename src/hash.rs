@@ -261,6 +261,7 @@ macro_rules! delegate_block {
 impl Hash {
     delegate! { pub fn size(&self) -> usize }
     delegate! { pub fn name(&self) -> &'static str }
+    delegate! { pub fn sri_name(&self) -> &'static str }
     delegate! { pub fn as_bytes(&self) -> &[u8] }
     delegate! { pub fn to_hex(&self) -> String }
     delegate! { pub fn to_base64(&self) -> String }
@@ -299,13 +300,17 @@ impl Hash {
     }
     pub fn store_name<P: AsRef<Path>>(&self, prefix: Option<P>, mut levels: usize) -> PathBuf {
         let pref = prefix.as_ref().map(|p| p.as_ref().as_os_str());
-        let total_len = pref.as_ref().map_or(0, |p| p.len() + 1) + self.name().len() + 1 + self.size() * 2 + levels;
+        let total_len = pref.as_ref().map_or(0, |p| p.len() + 1)
+            + self.sri_name().len()
+            + 1
+            + self.size() * 2
+            + levels;
         let mut buffer = OsString::with_capacity(total_len);
         if let Some(p) = prefix {
             buffer.push(p.as_ref());
             buffer.push("/");
         }
-        buffer.push(self.name());
+        buffer.push(self.sri_name());
         buffer.push("/");
         const fn hexadecimal(c: u8) -> [u8; 2] {
             const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -439,7 +444,7 @@ pub mod serde {
         {
             struct SriVisitor;
 
-            impl<'de> Visitor<'de> for SriVisitor {
+            impl Visitor<'_> for SriVisitor {
                 type Value = Hash;
 
                 fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
