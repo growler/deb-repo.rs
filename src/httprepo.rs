@@ -80,14 +80,15 @@ impl HttpCachingTransportProvider {
         mut r: Pin<Box<R>>,
     ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send + 'a>>>
     where
-        R: AsyncHashingRead + Send + Unpin + ?Sized + 'a,
+        R: AsyncHashingRead + Send + ?Sized + 'a,
     {
         let (cache_path, hash, size) = {
             let (tmp_path, mut tmp_file) = self.tmp_file().await?;
             copy(&mut r, &mut tmp_file).await.map_err(|err| {
                 io::Error::other(format!("Failed to copy response body: {}", err))
             })?;
-            let (hash, size) = r.into_hash_and_size();
+            let hash = r.as_mut().hash();
+            let size = r.as_mut().size();
             let cache_path = hash.store_name(Some(self.cache.as_ref()), 1);
             self.persist_tmp_file(tmp_path, tmp_file, &cache_path)
                 .await?;
@@ -107,7 +108,7 @@ impl HttpCachingTransportProvider {
         r: R,
         size: u64,
         hash: &Hash,
-    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send + Unpin>>> {
+    ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
         let (tmp_path, mut tmp_file) = self.tmp_file().await?;
         let r = pin!(r);
         copy(hash.verifying_reader(size, r), &mut tmp_file)

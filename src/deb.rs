@@ -9,14 +9,17 @@ use {
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
+    async_lock::Mutex,
     core::task::{self, Context, Poll},
     futures_lite::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
+    pin_project_lite::pin_project,
     std::{
+        future::Future,
         io::{self, Result},
         ops::Range,
         path::PathBuf,
         pin::{pin, Pin},
-        sync::{Arc, Mutex},
+        sync::Arc,
         time::{Duration, UNIX_EPOCH},
     },
 };
@@ -43,90 +46,74 @@ macro_rules! ready {
 const AR_MAGIC: &[u8; 8] = b"!<arch>\n";
 const AR_MAGIC_SIZE: u64 = AR_MAGIC.len() as u64;
 const AR_HEADER_SIZE: u64 = 60;
+const DEBIAN_BINARY_VERSION: &str = "2.0\n";
 
+#[derive(Clone, Copy, PartialEq)]
 enum State {
+    Magic,
     Header,
+    Version,
     Content,
 }
 
-#[derive(PartialEq)]
+#[derive(Clone, Copy, PartialEq)]
 enum EntryKind {
     Control,
     Data,
 }
 
-struct DebReaderInner<'a, R>
-where
-    R: AsyncRead + Unpin + Send + 'a,
-{
-    // Current state
-    state: State,
-    // Content padding
-    padding: u8,
-    // Size of the current entry
-    size: u64,
-    // Total bytes read for the current entry
-    read: u64,
-    // Total bytes read for the whole file
-    total: u64,
-    // Deb entry header
-    hdr: [u8; AR_HEADER_SIZE as usize],
-    // Source of the data
-    source: R,
-    _marker: std::marker::PhantomData<&'a ()>,
+pin_project! {
+    struct DebReaderInner<'a, R> {
+        // Current state
+        state: State,
+        // Content padding
+        padding: u8,
+        // Size of the current entry
+        size: u64,
+        // Total bytes read for the current entry
+        read: u64,
+        // Total bytes read for the whole file
+        total: u64,
+        // Deb entry header
+        hdr: [u8; AR_HEADER_SIZE as usize],
+        // Source of the data
+        #[pin]
+        source: R,
+        _marker: std::marker::PhantomData<&'a ()>,
+    }
 }
-
-impl<'a, R> Unpin for DebReaderInner<'a, R> where R: AsyncRead + Unpin + Send + 'a {}
 
 impl<'a, R> DebReaderInner<'a, R>
 where
-    R: AsyncRead + Unpin + Send + 'a,
+    R: AsyncRead + Send + 'a,
 {
-    async fn new(mut r: R) -> std::io::Result<Self> {
-        let mut hdr = [0u8; AR_MAGIC_SIZE as usize];
-        r.read_exact(&mut hdr).await?;
-        if &hdr != AR_MAGIC {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "invalid deb header",
-            ));
-        }
-        Ok(Self {
-            state: State::Header,
-            size: AR_HEADER_SIZE,
+    fn new(r: R) -> Self {
+        Self {
+            state: State::Magic,
+            size: AR_MAGIC_SIZE,
             padding: 0,
             read: 0,
-            total: AR_MAGIC_SIZE,
+            total: 0,
             hdr: [0u8; AR_HEADER_SIZE as usize],
             source: r,
             _marker: std::marker::PhantomData,
-        })
-    }
-    fn reset_for_next_chunk(&mut self, state: State, size: u64) {
-        self.state = state;
-        self.size = size;
-        self.padding = (size & 1) as u8;
-        self.read = 0;
-    }
-    fn size_with_padding(&self) -> u64 {
-        self.size + (self.padding as u64)
+        }
     }
     fn poll_read_header(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Result<usize>> {
-        let this = self.get_mut();
-        let remain = (this.size + this.padding as u64) - this.read;
+        let this = self.project();
+        // padding might be useful to read debian version entry
+        let size = *this.size + *this.padding as u64;
+        let remain = size - *this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         }
-        let size = this.size as usize;
-        let read_so_far = this.read as usize;
-        let padding = this.padding;
-        // Borrow disjoint fields to satisfy the borrow checker
-        let (hdr, source) = (&mut this.hdr, &mut this.source);
-        match ready!(pin!(source).poll_read(ctx, &mut hdr[read_so_far..size])) {
+        let read_so_far = *this.read as usize;
+        let padding = *this.padding;
+        match ready!(pin!(this.source).poll_read(ctx, &mut this.hdr[read_so_far..size as usize])) {
             0 => Poll::Ready(Ok(0)),
             n => {
-                this.read += n as u64;
-                this.total += n as u64;
+                *this.read += n as u64;
+                *this.total += n as u64;
                 Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
@@ -139,100 +126,118 @@ where
 
 impl<'a, R> AsyncRead for DebReaderInner<'a, R>
 where
-    R: AsyncRead + Unpin + Send + 'a,
+    R: AsyncRead + Send + 'a,
 {
     fn poll_read(
         self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let this = self.get_mut();
-        let remain = (this.size + this.padding as u64) - this.read;
+        let this = self.project();
+        let remain = (*this.size + *this.padding as u64) - *this.read;
         if remain == 0 {
             return Poll::Ready(Ok(0));
         };
         let size = std::cmp::min(remain, buf.len() as u64);
-        match ready!(pin!(&mut this.source).poll_read(ctx, &mut buf[0..size as usize])) {
+        match ready!(pin!(this.source).poll_read(ctx, &mut buf[0..size as usize])) {
             0 => Poll::Ready(Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "unexpected EOF while reading package entry",
             ))),
             n => {
-                this.read += n as u64;
-                this.total += n as u64;
+                *this.read += n as u64;
+                *this.total += n as u64;
                 Poll::Ready(Ok(if (n as u64) < remain {
                     n
                 } else {
-                    n - this.padding as usize
+                    n - *this.padding as usize
                 }))
             }
         }
     }
 }
 
-impl<'a, R> Stream for DebReaderInner<'a, R> where R: AsyncRead + Unpin + Send + 'a {
+impl<'a, R> Stream for DebReaderInner<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
     type Item = Result<(EntryKind, Range<usize>)>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         loop {
-            match self.state {
-                // skip the rest of the unread body if necessary
-                State::Content => {
-                    if self.read < self.size_with_padding() {
-                        let mut buf = [0u8; 8192];
-                        while self.read < self.size_with_padding() {
-                            if ready_opt!(self.as_mut().poll_read(ctx, &mut buf[..])) == 0 {
-                                return Poll::Ready(Some(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "unexpected EOF while reading entry content",
-                                ))));
-                            }
-                        }
-                    }
-                    self.reset_for_next_chunk(State::Header, AR_HEADER_SIZE);
-                }
-                // read the header
-                State::Header => {
-                    while self.read < AR_HEADER_SIZE {
-                        match ready_opt!(self.as_mut().poll_read_header(ctx)) {
-                            0 if self.read == 0 => return Poll::Ready(None),
-                            0 => {
-                                return Poll::Ready(Some(Err(io::Error::new(
-                                    io::ErrorKind::UnexpectedEof,
-                                    "unexpected EOF while reading entry header",
-                                ))))
-                            }
-                            _ => continue,
-                        }
-                    }
-                    let size = parse_size(&self.hdr[48..58])?;
-                    self.reset_for_next_chunk(State::Content, size);
-                    let name = std::str::from_utf8(&self.hdr[0..16]).map_err(|_| {
-                        io::Error::new(
+            let state = *self.as_mut().project().state;
+            match state {
+                State::Magic => {
+                    // reading magic
+                    while ready_opt!(self.as_mut().poll_read_header(ctx)) != 0 {}
+                    let this = self.as_mut().project();
+                    if this.hdr[..AR_MAGIC_SIZE as usize] != AR_MAGIC[..] {
+                        return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("invalid header: {:?}", &self.hdr),
-                        )
-                    })?;
-                    let name = name.find(' ').map(|n| &name[..n]).ok_or(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!("error parsing deb entry name {}", name),
-                    ))?;
+                            "invalid debian package magic",
+                        ))));
+                    }
+                    *this.state = State::Header;
+                    *this.size = AR_HEADER_SIZE;
+                    *this.padding = 0;
+                    *this.read = 0;
+                }
+                State::Content => {
+                    // skipping content
+                    let mut buf = [0u8; 8192];
+                    while ready_opt!(self.as_mut().poll_read(ctx, &mut buf[..])) != 0 {}
+                    let this = self.as_mut().project();
+                    *this.state = State::Header;
+                    *this.size = AR_HEADER_SIZE;
+                    *this.padding = 0;
+                    *this.read = 0;
+                }
+                State::Version => {
+                    while ready_opt!(self.as_mut().poll_read_header(ctx)) != 0 {}
+                    let this = self.as_mut().project();
+                    if this.hdr[..DEBIAN_BINARY_VERSION.len()]
+                        != DEBIAN_BINARY_VERSION.as_bytes()[..]
+                    {
+                        return Poll::Ready(Some(Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "unsupported debian binary package version",
+                        ))));
+                    }
+                    *this.state = State::Header;
+                    *this.size = AR_HEADER_SIZE;
+                    *this.padding = 0;
+                    *this.read = 0;
+                }
+                State::Header => {
+                    // reding header
+                    while ready_opt!(self.as_mut().poll_read_header(ctx)) != 0 {}
+                    let (size_with_padding, name) = {
+                        let this = self.as_mut().project();
+                        let size = parse_size(&this.hdr[48..58])?;
+                        let size_with_padding = size + (size & 1);
+                        let name = std::str::from_utf8(&this.hdr[0..16]).map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("invalid header: {:?}", &this.hdr),
+                            )
+                        })?;
+                        let name = name.find(' ').map_or(name, |n| &name[..n]);
+                        *this.state = State::Content;
+                        *this.size = size;
+                        *this.padding = (size & 1) as u8;
+                        *this.read = 0;
+                        (size_with_padding, name)
+                    };
                     if name == "debian-binary" {
-                        // a minor optimization to avoid allocating buffer when skipping version
-                        if size <= AR_HEADER_SIZE {
-                            match ready_opt!(self.as_mut().poll_read_header(ctx)) {
-                                0 => {
-                                    return Poll::Ready(Some(Err(io::Error::new(
-                                        io::ErrorKind::UnexpectedEof,
-                                        "unexpected EOF while reading entry content",
-                                    ))))
-                                }
-                                n if (n as u64) == size => {
-                                    self.reset_for_next_chunk(State::Header, AR_HEADER_SIZE);
-                                }
-                                _ => {} // skip as content
-                            }
+                        if size_with_padding > AR_HEADER_SIZE {
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid debian binary entry size",
+                            ))));
+                        } else {
+                            let this = self.as_mut().project();
+                            *this.state = State::Version;
+                            continue;
                         }
-                        continue;
                     } else if name.starts_with("control.tar") {
                         let ext_range = "control.tar".len()..name.len();
                         return Poll::Ready(Some(Ok((EntryKind::Control, ext_range))));
@@ -242,7 +247,7 @@ impl<'a, R> Stream for DebReaderInner<'a, R> where R: AsyncRead + Unpin + Send +
                     } else {
                         return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
-                            format!("unexpected debian package entry {}", name),
+                            format!("unexpected debian package entry \"{}\"", name),
                         ))));
                     }
                 }
@@ -272,25 +277,33 @@ impl<'a, R> Stream for DebReaderInner<'a, R> where R: AsyncRead + Unpin + Send +
 ///     }
 /// }
 /// ```
-pub struct DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
-    inner: Arc<Mutex<DebReaderInner<'a, R>>>,
+pub struct DebReader<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
+    inner: Arc<Mutex<Pin<Box<DebReaderInner<'a, R>>>>>,
 }
 
-struct DebEntryReaderInner<'a, R> where R: AsyncRead + Unpin + Send + 'a {
-    inner: Arc<Mutex<DebReaderInner<'a, R>>>,
+struct DebEntryReaderInner<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
+    inner: Arc<Mutex<Pin<Box<DebReaderInner<'a, R>>>>>,
 }
 
-impl<'a, R> AsyncRead for DebEntryReaderInner<'a, R> where R: AsyncRead + Unpin + Send + 'a {
+impl<'a, R> AsyncRead for DebEntryReaderInner<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut reader = self
-            .inner
-            .lock()
-            .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
-        Pin::new(&mut *reader).poll_read(ctx, buf)
+        let this = self.as_mut();
+        let mut fut = this.inner.lock();
+        let mut guard = task::ready!(pin!(fut).poll(ctx));
+        guard.as_mut().poll_read(ctx, buf)
     }
 }
 
@@ -316,7 +329,10 @@ impl Compression {
     }
 }
 
-impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
+impl<'a, R> DebReader<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
     /// Creates a new asynchronous Debian archive reader from the given reader `R`.
     ///
     /// # Arguments
@@ -341,15 +357,15 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
     ///     Ok(())
     /// }
     /// ```
-    pub async fn new(r: R) -> Result<Self>
-    {
-        Ok(DebReader {
-            inner: Arc::new(Mutex::new(DebReaderInner::new(r).await?)),
-        })
+    pub fn new(r: R) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
+        }
     }
     pub async fn extract_to<FS: crate::StagingFileSystem + ?Sized>(
         mut self,
         fs: &FS,
+        keep_mtime: bool,
     ) -> Result<MutableControlStanza> {
         let mut installed_files: Vec<String> = vec![];
         let mut ctrl: MutableControlStanza;
@@ -359,7 +375,8 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
         let multiarch: Option<&str>;
         let pkg: &str;
         let ctrl_base = PathBuf::from("./var/lib/dpkg/info");
-        fs.create_dir_all(&ctrl_base, 0, 0, 0o755).await?;
+        fs.create_dir_all(&ctrl_base, 0, 0, 0o755, (!keep_mtime).then_some(UNIX_EPOCH))
+            .await?;
         {
             let mut control_tarball = self
                 .next()
@@ -382,7 +399,11 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
                 let entry = entry?;
                 match entry {
                     TarEntry::File(mut file) => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(file.mtime().into());
+                        let mtime = if keep_mtime {
+                            UNIX_EPOCH + Duration::from_secs(file.mtime().into())
+                        } else {
+                            UNIX_EPOCH
+                        };
                         let uid = file.uid();
                         let gid = file.gid();
                         let mode = file.mode();
@@ -489,11 +510,25 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
                 match entry {
                     TarEntry::Directory(dir) => {
                         tracing::debug!("creating directory {}", dir.path());
-                        fs.create_dir_all(dir.path(), dir.uid(), dir.gid(), dir.mode())
-                            .await?;
+                        fs.create_dir_all(
+                            dir.path(),
+                            dir.uid(),
+                            dir.gid(),
+                            dir.mode(),
+                            Some(if keep_mtime {
+                                UNIX_EPOCH + Duration::from_secs(dir.mtime().into())
+                            } else {
+                                UNIX_EPOCH
+                            }),
+                        )
+                        .await?;
                     }
                     TarEntry::File(mut file) => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(file.mtime() as u64);
+                        let mtime = if keep_mtime {
+                            UNIX_EPOCH + Duration::from_secs(file.mtime() as u64)
+                        } else {
+                            UNIX_EPOCH
+                        };
                         let size = file.size() as usize;
                         let path = PathBuf::from(file.path());
                         let uid = file.uid();
@@ -549,7 +584,11 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
                         .await?;
                     }
                     TarEntry::Symlink(link) => {
-                        let mtime = UNIX_EPOCH + Duration::from_secs(link.mtime() as u64);
+                        let mtime = if keep_mtime {
+                            UNIX_EPOCH + Duration::from_secs(link.mtime() as u64)
+                        } else {
+                            UNIX_EPOCH
+                        };
                         let uid = link.uid();
                         let gid = link.gid();
                         fs.symlink(link.link(), link.path(), uid, gid, Some(mtime))
@@ -584,7 +623,7 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
                 0,
                 0,
                 0o644,
-                None,
+                (!keep_mtime).then_some(UNIX_EPOCH),
                 Some(buf.len()),
             )
             .await?
@@ -612,20 +651,22 @@ impl<'a, R> DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
     }
 }
 
-impl<'a, R> Stream for DebReader<'a, R> where R: AsyncRead + Unpin + Send + 'a {
+impl<'a, R> Stream for DebReader<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+{
     type Item = Result<DebEntry<'a>>;
-    fn poll_next(self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+    fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let polled = {
-            let mut reader = self
-                .inner
-                .lock()
-                .map_err(|err| io::Error::other(format!("unexpected mutex error {}", err)))?;
-            match task::ready!(Pin::new(&mut *reader).poll_next(ctx)) {
+            let this = self.as_mut();
+            let mut fut = this.inner.lock();
+            let mut inner = task::ready!(pin!(fut).poll(ctx));
+            match task::ready!(inner.as_mut().poll_next(ctx)) {
                 None => None,
                 Some(Err(err)) => Some(Err(err)),
                 Some(Ok((entry_kind, ext_range))) => Some(Ok((
                     entry_kind,
-                    Compression::from_extension(&reader.hdr[ext_range]),
+                    Compression::from_extension(&inner.hdr[ext_range]),
                 ))),
             }
         };
@@ -647,25 +688,13 @@ pub enum DebEntry<'a> {
     Data(TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>),
 }
 
-impl<'a> DebEntry<'a> {
-    pub fn into_inner(self) -> TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>> {
-        match self {
-            DebEntry::Control(tar) | DebEntry::Data(tar) => tar,
-        }
-    }
-    pub async fn next(
-        &mut self,
-    ) -> Option<Result<TarEntry<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>>> {
-        match self {
-            DebEntry::Control(tar) | DebEntry::Data(tar) => tar.next().await,
-        }
-    }
-}
-
 fn entry_reader<'a, R>(
-    inner: Arc<Mutex<DebReaderInner<'a, R>>>,
+    inner: Arc<Mutex<Pin<Box<DebReaderInner<'a, R>>>>>,
     comp: Compression,
-) -> TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>> where R: AsyncRead + Unpin + Send + 'a {
+) -> TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>
+where
+    R: AsyncRead + Send + 'a,
+{
     let r = DebEntryReaderInner { inner };
     match comp {
         Compression::Xz => TarReader::new(Box::pin(XzDecoder::new(BufReader::new(r)))),

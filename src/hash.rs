@@ -12,7 +12,7 @@ use {
     ::serde::{Deserialize, Deserializer, Serialize, Serializer},
     digest::{FixedOutput, FixedOutputReset},
     futures_lite::ready,
-    pin_project::pin_project,
+    pin_project_lite::pin_project,
     smol::io::{AsyncRead, AsyncWrite},
     std::task::{Context, Poll},
     std::{fmt, pin::Pin},
@@ -99,7 +99,7 @@ impl<D: HashAlgo> InnerHash<D> {
     fn hash(&self) -> Hash {
         D::hash(self.inner.clone())
     }
-    fn verifying_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
+    fn verifying_reader<'b, R: AsyncRead + Send + 'b>(
         &self,
         size: u64,
         reader: R,
@@ -113,7 +113,7 @@ impl<D: HashAlgo> InnerHash<D> {
             self.inner.clone(),
         ))
     }
-    fn hashing_reader<'b, R: AsyncRead + Unpin + Send + 'b>(
+    fn hashing_reader<'b, R: AsyncRead + Send + 'b>(
         reader: R,
     ) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
     where
@@ -272,9 +272,9 @@ impl Hash {
             reader: R,
         ) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
         where
-            R: AsyncRead + Unpin + Send + 'b
+            R: AsyncRead + Send + 'b
     }
-    pub fn hashing_reader_for<'b, R: AsyncRead + Send + Unpin + 'b>(
+    pub fn hashing_reader_for<'b, R: AsyncRead + Send + 'b>(
         hash: &str,
         reader: R,
     ) -> std::io::Result<Pin<Box<dyn AsyncHashingRead + Send + 'b>>> {
@@ -294,7 +294,7 @@ impl Hash {
     pub fn hashing_reader<'b, D, R>(reader: R) -> Pin<Box<dyn AsyncHashingRead + Send + 'b>>
     where
         D: HashAlgo + 'static,
-        R: AsyncRead + Send + Unpin + 'b,
+        R: AsyncRead + Send + 'b,
     {
         InnerHash::<D>::hashing_reader(reader)
     }
@@ -552,19 +552,21 @@ pub mod serde {
     }
 }
 
-#[pin_project]
-pub struct HashingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
-    digester: D,
-    counter: u64,
-    #[pin]
-    inner: R,
+pin_project! {
+    pub struct HashingReader<D, R> {
+        digester: D,
+        counter: u64,
+        #[pin]
+        inner: R,
+    }
 }
 
-pub trait AsyncHashingRead: AsyncRead + Unpin {
-    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64);
+pub trait AsyncHashingRead: AsyncRead {
+    fn hash(self: Pin<&mut Self>) -> Hash;
+    fn size(self: Pin<&mut Self>) -> u64;
 }
 
-impl<D: HashAlgo, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
+impl<D: HashAlgo, R: AsyncRead + Send> HashingReader<D, R> {
     pub fn new(reader: R) -> Self {
         Self {
             counter: 0,
@@ -582,13 +584,15 @@ impl<D: HashAlgo, R: AsyncRead + Unpin + Send> HashingReader<D, R> {
         (D::hash(self.digester.finalize_fixed()), self.counter)
     }
 }
-impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncHashingRead for HashingReader<D, R> {
-    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64) {
-        let this = Pin::into_inner(self);
-        (D::hash(this.digester.finalize_fixed()), this.counter)
+impl<D: HashAlgo, R: AsyncRead + Send> AsyncHashingRead for HashingReader<D, R> {
+    fn hash(self: Pin<&mut Self>) -> Hash {
+        D::hash(self.project().digester.finalize_fixed_reset())
+    }
+    fn size(self: Pin<&mut Self>) -> u64 {
+        *self.project().counter
     }
 }
-impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncRead for HashingReader<D, R> {
+impl<D: HashAlgo, R: AsyncRead + Send> AsyncRead for HashingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -640,14 +644,15 @@ impl<D: HashAlgo, W: std::io::Write> std::io::Write for SyncHashingWriter<D, W> 
     }
 }
 
-#[pin_project]
-pub struct HashingWriter<D: HashAlgo, W: AsyncWrite + Unpin + Send> {
-    digester: D,
-    #[pin]
-    inner: W,
+pin_project! {
+    pub struct HashingWriter<D, W> {
+        digester: D,
+        #[pin]
+        inner: W,
+    }
 }
 
-impl<D: HashAlgo + Default + Send, W: AsyncWrite + Unpin + Send> HashingWriter<D, W> {
+impl<D: HashAlgo + Default + Send, W: AsyncWrite + Send> HashingWriter<D, W> {
     pub fn new(writer: W) -> Self {
         Self {
             digester: D::default(),
@@ -660,7 +665,7 @@ impl<D: HashAlgo + Default + Send, W: AsyncWrite + Unpin + Send> HashingWriter<D
     }
 }
 
-impl<D: HashAlgo, W: AsyncWrite + Unpin + Send> AsyncWrite for HashingWriter<D, W> {
+impl<D: HashAlgo, W: AsyncWrite + Send> AsyncWrite for HashingWriter<D, W> {
     fn poll_write(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -687,17 +692,18 @@ impl<D: HashAlgo, W: AsyncWrite + Unpin + Send> AsyncWrite for HashingWriter<D, 
     }
 }
 
-#[pin_project]
-pub struct VerifyingReader<D: HashAlgo, R: AsyncRead + Unpin + Send> {
-    digester: D,
-    digest: HashOutput<D>,
-    size: u64,
-    read: u64,
-    #[pin]
-    inner: R,
+pin_project! {
+    pub struct VerifyingReader<D: OutputSizeUser, R> {
+        digester: D,
+        digest: HashOutput<D>,
+        size: u64,
+        read: u64,
+        #[pin]
+        inner: R,
+    }
 }
 
-impl<D: HashAlgo, R: AsyncRead + Unpin + Send> VerifyingReader<D, R> {
+impl<D: HashAlgo, R: AsyncRead + Send> VerifyingReader<D, R> {
     pub fn new(reader: R, size: u64, digest: HashOutput<D>) -> Self {
         Self {
             digester: D::default(),
@@ -709,7 +715,7 @@ impl<D: HashAlgo, R: AsyncRead + Unpin + Send> VerifyingReader<D, R> {
     }
 }
 
-impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Send> AsyncRead
     for VerifyingReader<D, R>
 {
     fn poll_read(
@@ -759,10 +765,12 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Unpin + Send> AsyncRead
     }
 }
 
-impl<D: HashAlgo, R: AsyncRead + Unpin + Send> AsyncHashingRead for VerifyingReader<D, R> {
-    fn into_hash_and_size(self: Pin<Box<Self>>) -> (Hash, u64) {
-        let this = Pin::into_inner(self);
-        (D::hash(this.digest.clone()), this.size)
+impl<D: HashAlgo, R: AsyncRead + Send> AsyncHashingRead for VerifyingReader<D, R> {
+    fn hash(self: Pin<&mut Self>) -> Hash {
+        D::hash(self.project().digest.clone())
+    }
+    fn size(self: Pin<&mut Self>) -> u64 {
+        *self.project().size
     }
 }
 

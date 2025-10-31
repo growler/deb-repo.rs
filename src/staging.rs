@@ -1,3 +1,5 @@
+use rustix::fs::Mode;
+
 use {
     rustix::{
         fd::AsFd,
@@ -12,7 +14,7 @@ use {
     },
     std::{
         io,
-        os::unix::fs::{DirBuilderExt, PermissionsExt},
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::Arc,
         time::{SystemTime, UNIX_EPOCH},
@@ -44,12 +46,26 @@ pub trait StagingFileSystem {
     type File: StagingFile;
     type TempFile: StagingTempFile;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
-    async fn create_dir<P>(&self, path: P, uid: u32, gid: u32, mode: u32) -> io::Result<()>
+    async fn create_dir<P>(
+        &self,
+        path: P,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: Option<SystemTime>,
+    ) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
     /// Create a directory at `path`, including all the parent directories if necessary,
     /// optionall owned by (`uid`, `gid`) using mode bits `mode`
-    async fn create_dir_all<P>(&self, path: P, uid: u32, gid: u32, mode: u32) -> io::Result<()>
+    async fn create_dir_all<P>(
+        &self,
+        path: P,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: Option<SystemTime>,
+    ) -> io::Result<()>
     where
         P: AsRef<Path> + Send;
     async fn symlink<P, Q>(
@@ -128,8 +144,7 @@ pub trait StagingFileSystem {
         let r = transport
             .open_verified(&url, file.size(), file.hash())
             .await?;
-        let deb = DebReader::new(r).await?;
-        deb.extract_to(self).await
+        DebReader::new(r).extract_to(self, false).await
     }
     async fn import_artifact<'a, T>(
         &self,
@@ -157,18 +172,10 @@ pub trait StagingFileSystem {
         let r = transport
             .open_verified(&url, file.size(), file.hash())
             .await?;
-        self.create_file(
-            r,
-            path,
-            0,
-            0,
-            0o644,
-            None,
-            Some(file.size() as usize),
-        )
-        .await?
-        .persist()
-        .await
+        self.create_file(r, path, 0, 0, 0o644, Some(UNIX_EPOCH), Some(file.size() as usize))
+            .await?
+            .persist()
+            .await
     }
 }
 
@@ -303,29 +310,39 @@ fn mtime_to_ts(ts: &SystemTime) -> Timestamps {
     }
 }
 
-fn mkdir(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(mode);
-    builder.create(path)?;
+fn mkdir(
+    path: &std::path::Path,
+    owner: Option<(u32, u32)>,
+    mode: u32,
+    mtime: Option<SystemTime>,
+) -> io::Result<()> {
+    rustix::fs::mkdirat(CWD, path, Mode::from_raw_mode(mode))?;
     if let Some((uid, gid)) = owner {
-        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).map_err(Into::into)
-    } else {
-        Ok(())
+        chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
     }
+    if let Some(mtime) = mtime {
+        utimensat(CWD, path, &mtime_to_ts(&mtime), AtFlags::empty())?;
+    }
+    Ok(())
 }
 
-fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
+fn mkdir_rec(
+    path: &std::path::Path,
+    owner: Option<(u32, u32)>,
+    mode: u32,
+    mtime: Option<SystemTime>,
+) -> io::Result<()> {
     if path.is_dir() {
         return Ok(());
     }
-    match mkdir(path, owner, mode) {
+    match mkdir(path, owner, mode, mtime) {
         Ok(()) => Ok(()),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
             let parent = path
                 .parent()
                 .ok_or_else(|| io::Error::other("failed to create tree: no parent"))?;
-            mkdir_rec(parent, owner, mode)?;
-            match mkdir(path, owner, mode) {
+            mkdir_rec(parent, owner, mode, mtime)?;
+            match mkdir(path, owner, mode, mtime) {
                 Ok(()) => Ok(()),
                 Err(_) if path.is_dir() => Ok(()),
                 Err(e) => Err(e),
@@ -346,6 +363,7 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
+        mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         let target = self.target_path(path.as_ref())?;
         let owner = if self.chown_allowed {
@@ -354,12 +372,16 @@ impl StagingFileSystem for HostFileSystem {
             None
         };
         blocking::unblock(move || {
-            mkdir(target.as_ref(), owner, mode).map_err(|e| {
+            mkdir(target.as_ref(), owner, mode, mtime).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("failed to create directory {:?}: {}", target.as_os_str(), e),
                 )
-            })
+            })?;
+            if let Some(mtime) = mtime {
+                utimensat(CWD, target, &mtime_to_ts(&mtime), AtFlags::empty())?;
+            }
+            Ok(())
         })
         .await
     }
@@ -369,6 +391,7 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
+        mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         let target = self.target_path(path.as_ref())?;
         let owner = if self.chown_allowed {
@@ -377,7 +400,7 @@ impl StagingFileSystem for HostFileSystem {
             None
         };
         blocking::unblock(move || {
-            mkdir_rec(target.as_ref(), owner, mode).map_err(|e| {
+            mkdir_rec(target.as_ref(), owner, mode, mtime).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -545,7 +568,7 @@ impl StagingFileSystem for HostFileSystem {
             .open_verified(&url, file.size(), file.hash())
             .await?;
         blocking::unblock(move || {
-            smol::block_on(async { DebReader::new(rdr).await?.extract_to(&fs).await })
+            smol::block_on(async { DebReader::new(rdr).extract_to(&fs, false).await })
         })
         .await
     }
@@ -622,6 +645,7 @@ impl StagingFileSystem for FileList {
         uid: u32,
         gid: u32,
         mode: u32,
+        _mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
@@ -638,6 +662,7 @@ impl StagingFileSystem for FileList {
         uid: u32,
         gid: u32,
         mode: u32,
+        _mtime: Option<SystemTime>,
     ) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",

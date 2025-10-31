@@ -329,7 +329,8 @@ impl Tar {
             target.as_deref(),
         )
         .await?;
-        let (hash, size) = reader.into_hash_and_size();
+        let hash = reader.as_mut().hash();
+        let size = reader.as_mut().size();
         Ok(Tar {
             uri: uri.to_string(),
             arch: arch.map(|s| s.to_string()),
@@ -399,7 +400,7 @@ impl Tar {
                         |p| Cow::Owned(Path::new(p).join(dir.path())),
                     );
                     tracing::debug!("creating directory {}", path.display());
-                    fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode())
+                    fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode(), Some(UNIX_EPOCH))
                         .await?;
                 }
                 TarEntry::File(mut file) => {
@@ -585,7 +586,8 @@ impl File {
         } else {
             smol::io::copy(&mut rdr, &mut smol::io::sink()).await?;
         }
-        let (hash, size) = rdr.into_hash_and_size();
+        let hash = rdr.as_mut().hash();
+        let size = rdr.as_mut().size();
         Ok(Self {
             uri: uri.to_string(),
             arch: arch.map(|s| s.to_string()),
@@ -682,7 +684,7 @@ mod tree {
             io,
             os::{fd::AsRawFd, unix::ffi::OsStrExt},
             path::{Path, PathBuf},
-            str::FromStr,
+            str::FromStr, time::UNIX_EPOCH,
         },
     };
 
@@ -765,7 +767,7 @@ mod tree {
                     } else {
                         path
                     };
-                    fs.create_dir_all(path, 0, 0, stat.st_mode).await?;
+                    fs.create_dir_all(path, 0, 0, stat.st_mode, Some(UNIX_EPOCH)).await?;
                     Ok(None)
                 }
                 Object::RegularFile { fd, stat, path } => {

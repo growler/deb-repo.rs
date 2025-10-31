@@ -1,12 +1,14 @@
 use {
+    async_lock::Mutex,
     futures_lite::{io::AsyncRead, Stream},
-    pin_project::pin_project,
+    pin_project_lite::pin_project,
     std::{
+        future::Future,
         io::{Error, ErrorKind, Result},
         pin::{pin, Pin},
         str::from_utf8,
-        sync::{Arc, Mutex},
-        task::{Context, Poll},
+        sync::Arc,
+        task::{self, Context, Poll},
     },
 };
 
@@ -433,25 +435,26 @@ impl ExtensionBuffer {
     }
 }
 
-#[pin_project]
-struct TarReaderInner<'a, R: AsyncRead + Send + 'a> {
-    // current position in the stream
-    pos: u64,
-    // end of the current record being processed
-    nxt: u64,
-    // current state
-    state: State,
-    // the buffer for the current extended header or for skipping a entry
-    ext: Option<ExtensionBuffer>,
-    // list of the current extended headers
-    exts: Vec<ExtensionHeader>,
-    // list of the global extended headers
-    globs: Vec<PosixExtension>,
-    // the current record buffer
-    header: Header,
-    #[pin]
-    reader: R,
-    marker: std::marker::PhantomData<&'a ()>,
+pin_project! {
+    struct TarReaderInner<'a, R> {
+        // current position in the stream
+        pos: u64,
+        // end of the current record being processed
+        nxt: u64,
+        // current state
+        state: State,
+        // the buffer for the current extended header or for skipping a entry
+        ext: Option<ExtensionBuffer>,
+        // list of the current extended headers
+        exts: Vec<ExtensionHeader>,
+        // list of the global extended headers
+        globs: Vec<PosixExtension>,
+        // the current record buffer
+        header: Header,
+        #[pin]
+        reader: R,
+        marker: std::marker::PhantomData<&'a ()>,
+    }
 }
 
 pub struct TarReader<'a, R: AsyncRead + Send + 'a> {
@@ -863,7 +866,8 @@ impl<'a, R: AsyncRead + Send + 'a> Stream for TarReader<'a, R> {
     type Item = Result<TarEntry<'a, R>>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut();
-        let mut g = this.inner.lock().unwrap();
+        let mut fut = this.inner.lock();
+        let mut g = task::ready!(pin!(fut).poll(ctx));
         let inner: Pin<&mut TarReaderInner<R>> = g.as_mut();
         let entry = {
             match inner.poll_next(ctx) {
@@ -987,12 +991,14 @@ impl TarDirectory {
 
 impl<'a, R: AsyncRead + Send + 'a> AsyncRead for TarRegularFile<'a, R> {
     fn poll_read(
-        self: Pin<&mut Self>,
+        mut self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let eof = self.eof;
-        let mut g = self.get_mut().inner.lock().unwrap();
+        let this = self.as_mut();
+        let mut fut = this.inner.lock();
+        let mut g = task::ready!(pin!(fut).poll(ctx));
         let inner_pin: Pin<&mut TarReaderInner<R>> = g.as_mut();
         let inner = inner_pin.project();
         if *inner.pos >= eof {

@@ -102,7 +102,7 @@ impl ManifestFile {
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(r);
         let mut buf = Vec::<u8>::new();
         r.read_to_end(&mut buf).await?;
-        let (hash, _) = r.into_hash_and_size();
+        let hash = r.as_mut().hash();
         let text = std::str::from_utf8(&buf).map_err(|err| {
             io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -132,7 +132,7 @@ impl ManifestFile {
         let out = self.doc.to_string();
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(out.as_bytes());
         crate::safe_store(path.as_ref(), &mut r).await?;
-        let (hash, _) = r.into_hash_and_size();
+        let hash = r.as_mut().hash();
         Ok(hash)
     }
     pub fn unlocked_lock_file(&self) -> LockFile {

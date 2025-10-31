@@ -66,7 +66,8 @@ pub trait TransportProvider: Sync + Send {
         let mut buffer = vec![0u8; 0];
         let mut rdr = self.open_hashed(url, hash_name).await?;
         pin!(&mut rdr).take(limit).read_to_end(&mut buffer).await?;
-        let (hash, size) = rdr.into_hash_and_size();
+        let hash = rdr.as_mut().hash();
+        let size = rdr.as_mut().size();
         Ok((buffer, size, hash))
     }
 
@@ -91,7 +92,8 @@ pub trait TransportProvider: Sync + Send {
             .take(limit)
             .read_to_end(&mut buffer)
             .await?;
-        let (hash, size) = rdr.into_hash_and_size();
+        let hash = rdr.as_mut().hash();
+        let size = rdr.as_mut().size();
         Ok((buffer, size, hash))
     }
 

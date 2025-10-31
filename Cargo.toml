@@ -13,7 +13,7 @@ name = "debrepo"
 path = "src/lib.rs"
 
 [[bin]]
-name = "deb-repo"
+name = "rdebootstrap"
 path = "cmd/main.rs"
 
 [[bin]]
@@ -50,7 +50,7 @@ num_cpus = "1.16.0"
 once_cell = "1.21"
 ouroboros = "0.18"
 petgraph = { version = "0.8", default-features = false, features = [ "graphmap" ] }
-pin-project = "1"
+pin-project-lite = "0.2.13"
 regex = "1.11"
 resolvo = "0.10.0"
 rustix = { version = "1", features = [ "fs", "pipe", "thread", "mount" ] }

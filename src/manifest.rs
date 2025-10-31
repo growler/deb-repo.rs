@@ -19,6 +19,7 @@ use {
         num::NonZero,
         path::{Path, PathBuf},
         sync::Arc,
+        time::UNIX_EPOCH,
     },
 };
 
@@ -220,28 +221,30 @@ impl Manifest {
             .map_ok(|spec| spec.stage.iter().map(String::as_str))
             .flatten_ok()
             .filter_map(move |artifact| {
-                artifact.and_then(|artifact| {
-                    let base = self
-                        .path
-                        .as_deref()
-                        .ok_or_else(|| io::Error::other("no manifest path"))?;
-                    let artifact = self.file.artifact(artifact).ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("missing artifact '{}' in spec stage list", artifact),
+                artifact
+                    .and_then(|artifact| {
+                        let base = self
+                            .path
+                            .as_deref()
+                            .ok_or_else(|| io::Error::other("no manifest path"))?;
+                        let artifact = self.file.artifact(artifact).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("missing artifact '{}' in spec stage list", artifact),
+                            )
+                        })?;
+                        Ok(
+                            if artifact
+                                .arch()
+                                .is_none_or(|target_arch| target_arch == arch)
+                            {
+                                Some((ArtifactSource::new(artifact.uri(), base), artifact))
+                            } else {
+                                None
+                            },
                         )
-                    })?;
-                    Ok(
-                        if artifact
-                            .arch()
-                            .is_none_or(|target_arch| target_arch == arch)
-                        {
-                            Some((ArtifactSource::new(artifact.uri(), base), artifact))
-                        } else {
-                            None
-                        },
-                    )
-                }).transpose()
+                    })
+                    .transpose()
             })
     }
     fn invalidate_locked_specs(&mut self, spec: usize) {
@@ -680,21 +683,21 @@ where
     T: TransportProvider + ?Sized,
     I: Iterator<Item = io::Result<(&'a Source, &'a LockedSource)>> + 'a,
 {
-    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
+    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755, Some(UNIX_EPOCH))
         .await?;
-    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
+    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755, Some(UNIX_EPOCH))
         .await?;
     stream::iter(sources.enumerate().map(|(id, src)| src.map(|s| (id, s))))
         .and_then(|(no, (source, locked))| async move {
-            let source_stanza: MutableControlStanza = source.into();
+            let source_stanza = Into::<MutableControlStanza>::into(source).to_string();
             fs.create_file(
-                format!("{}", source_stanza).as_bytes(),
+                source_stanza.as_bytes(),
                 format!("./etc/apt/sources.list.d/source-{}.sources", no),
                 0,
                 0,
                 0o644,
-                None,
-                None,
+                Some(UNIX_EPOCH),
+                Some(source_stanza.len()),
             )
             .await?
             .persist()
@@ -787,7 +790,8 @@ where
         .chain(new_installed.iter().map(Installed::New))
         .collect::<Vec<_>>();
     all_installed.sort_by(|a, b| a.package().cmp(b.package()));
-    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32).await?;
+    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32, Some(UNIX_EPOCH))
+        .await?;
     {
         use smol::io::AsyncWriteExt;
         let size = all_installed.iter().map(|i| i.len() + 1).sum();
@@ -802,7 +806,7 @@ where
             0,
             0,
             0o644,
-            None,
+            Some(UNIX_EPOCH),
             Some(size),
         )
         .await?

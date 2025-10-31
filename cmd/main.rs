@@ -9,7 +9,7 @@ use {
         version::{Constraint, Dependency, Version},
         HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
     },
-    futures::AsyncWriteExt,
+    futures_lite::AsyncWriteExt,
     itertools::Itertools,
     smol::fs,
     std::{num::NonZero, path::PathBuf, process::ExitCode},

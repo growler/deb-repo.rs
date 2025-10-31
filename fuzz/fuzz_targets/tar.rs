@@ -1,7 +1,7 @@
 #![no_main]
 extern crate debrepo;
 use libfuzzer_sys::fuzz_target;
-use smol::{io::{AsyncReadExt, BufReader, AsyncBufReadExt}, stream::StreamExt};
+use smol::{io::BufReader, stream::StreamExt};
 
 fuzz_target!(|data: &[u8]| {
         smol::block_on(async {
