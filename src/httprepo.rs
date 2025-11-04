@@ -131,6 +131,7 @@ impl HttpCachingTransportProvider {
 #[async_trait]
 impl TransportProvider for HttpCachingTransportProvider {
     async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        tracing::debug!("HTTP open {}", url);
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {
@@ -158,6 +159,7 @@ impl TransportProvider for HttpCachingTransportProvider {
         size: u64,
         hash: &Hash,
     ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
+        tracing::debug!("HTTP open verifying {}", url);
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {
@@ -198,6 +200,7 @@ impl TransportProvider for HttpCachingTransportProvider {
         url: &str,
         hash: &str,
     ) -> io::Result<Pin<Box<dyn AsyncHashingRead + Send>>> {
+        tracing::debug!("HTTP open hashing {}", url);
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {

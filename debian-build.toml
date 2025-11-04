@@ -2,12 +2,14 @@
 [[source]]
 url = "https://ftp.debian.org/debian/"
 snapshots = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"
+snapshot = "20251104T163055Z"
 suites = ["trixie", "trixie-updates", "trixie-backports"]
 components = ["main", "contrib", "non-free"]
 
 [[source]]
 url = "https://security.debian.org/debian-security/"
 snapshots = "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
+snapshot = "20251104T163055Z"
 suites = ["trixie-security"]
 components = ["main", "contrib", "non-free"]
 
@@ -16,7 +18,13 @@ include = [
     "ca-certificates",
     "build-essential",
     "pkg-config",
-    "rustup",
+    "devscripts",
+    "libdistro-info-perl",
+    "debhelper",
+    "git-buildpackage",
+    "cargo",
+    "debcargo",
+    "dh-cargo",
     "libbz2-dev",
     "libcurl4-openssl-dev",
     "libgpg-error-dev",
@@ -26,4 +34,5 @@ include = [
     "libssl-dev",
     "libunistring-dev",
     "libzstd-dev",
+    "btop",
 ]

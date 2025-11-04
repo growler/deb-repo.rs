@@ -1,4 +1,6 @@
-pub use crate::source::Source;
+pub use crate::source::{
+    Source, SnapshotId, SnapshotIdArgParser,
+};
 use {
     crate::version::{Constraint, Dependency},
     std::str::FromStr,

@@ -1,12 +1,12 @@
 use {
     crate::{
         artifact::{Artifact, ArtifactArg, ArtifactSource},
-        control::{ControlFile, ControlStanza, MutableControlStanza},
+        control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::{Package, Packages},
         repo::TransportProvider,
-        source::{RepositoryFile, Source},
+        source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
         staging::{StagingFile, StagingFileSystem},
         universe::Universe,
@@ -14,11 +14,10 @@ use {
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     itertools::Itertools,
-    smol::{io, lock::Semaphore},
+    smol::io,
     std::{
         num::NonZero,
         path::{Path, PathBuf},
-        sync::Arc,
         time::UNIX_EPOCH,
     },
 };
@@ -376,40 +375,44 @@ impl Manifest {
         concurrency: NonZero<usize>,
         transport: &T,
     ) -> io::Result<()> {
-        let mut packages = stream::iter(
-            self.lock
+        tracing::debug!("building package universe");
+        let packages: Vec<(usize, Packages)> = stream::iter(
+            self.file
                 .sources()
                 .iter()
                 .enumerate()
-                .flat_map(|(i, locked_source)| {
+                .zip(self.lock.sources().iter())
+                .map(|((i, source), locked_source)| {
                     locked_source
                         .as_ref()
-                        .expect("a locked source")
-                        .suites
-                        .iter()
-                        .flat_map(|s| s.packages.iter())
-                        .map(move |f| (i, f))
-                })
-                .map(|(i, file)| {
-                    self.file
-                        .get_source(i)
-                        .ok_or_else(|| io::Error::other(format!("invalid source index {}", i)))
-                        .map(|s| (i, s, file))
+                        .ok_or_else(|| {
+                            io::Error::other("a source is not locked, call udpate first")
+                        })
+                        .map(|l| (i, source, l))
                 }),
         )
-        .map_ok(|(i, source, file)| async move {
+        .map_ok(|(idx, source, locked_source)| {
+            stream::iter(
+                locked_source
+                    .suites
+                    .iter()
+                    .flat_map(|s| s.packages.iter())
+                    .map(move |f| Ok::<_, io::Error>((idx, source, f))),
+            )
+        })
+        .try_flatten()
+        .map_ok(|(idx, source, file)| async move {
             source
                 .file_by_hash(transport, file)
                 .await
                 .and_then(|data| {
                     Packages::new_from_bytes(data, source.priority).map_err(Into::into)
                 })
-                .map(|pkgs| (i, pkgs))
+                .map(|pkgs| (idx, pkgs))
         })
-        .try_buffer_unordered(concurrency.into())
-        .try_collect::<Vec<_>>()
+        .try_buffered(concurrency.into())
+        .try_collect()
         .await?;
-        packages.sort_by_key(|(i, _)| *i);
         self.universe = Some((
             packages.iter().map(|(i, _)| *i).collect(),
             Box::new(Universe::new(
@@ -419,31 +422,63 @@ impl Manifest {
         ));
         Ok(())
     }
-    async fn make_locked_sources<T: TransportProvider + ?Sized>(
+    pub fn set_snapshot(&mut self, stamp: SnapshotId) {
+        tracing::debug!("setting snapshot to {}", stamp);
+        let updated = self
+            .file
+            .update_source_snapshots(stamp)
+            .fold(false, |_, i| {
+                self.lock.invalidate_source(i);
+                true
+            });
+        if updated {
+            self.mark_file_updated();
+            self.lock
+                .specs_mut()
+                .for_each(|(_, r)| r.invalidate_solution());
+            self.mark_lock_updated();
+        }
+    }
+    async fn update_locked_sources<T: TransportProvider + ?Sized>(
         &mut self,
+        concurrency: NonZero<usize>,
+        force: bool,
+        transport: &T,
+    ) -> io::Result<bool> {
+        let arch = self.arch.as_str();
+        stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
+            move |(source, locked)| {
+                LockedSource::fetch_or_refresh(locked, source, arch, force, transport)
+            },
+        ))
+        .flatten_unordered(concurrency.get())
+        .try_fold(false, |a, r| async move {
+            Ok(a || r)
+        })
+        .await
+    }
+    pub async fn update<T: TransportProvider + ?Sized>(
+        &mut self,
+        force: bool,
         concurrency: NonZero<usize>,
         transport: &T,
     ) -> io::Result<()> {
-        let sem = Arc::new(Semaphore::new(concurrency.get()));
-        let arch = &self.arch;
-        stream::iter(
-            self.file
-                .sources()
-                .iter()
-                .zip(self.lock.sources_mut())
-                .filter(|(_, locked)| locked.is_none()),
-        )
-        .map(Ok::<_, io::Error>)
-        .try_for_each_concurrent(None, |(source, locked)| {
-            let sem = Arc::clone(&sem);
-            async move {
-                *locked = LockedSource::from_source(source, arch, &sem, transport)
-                    .await
-                    .map(Some)?;
-                Ok(())
-            }
-        })
-        .await
+        tracing::debug!("updating locked sources");
+        let updated = self
+            .update_locked_sources(concurrency, force, transport)
+            .await?;
+        if updated {
+            tracing::debug!("sources updated, invalidating locked specs");
+            self.lock
+                .specs_mut()
+                .for_each(|(_, r)| r.invalidate_solution());
+            self.universe.take();
+            self.mark_lock_updated();
+        } else if self.lock.specs().all(|(_, l)| l.is_locked()) {
+            tracing::debug!("sources up-to-date, all specs locked, skipping resolve");
+            return Ok(());
+        }
+        self.resolve(concurrency, transport).await
     }
     pub async fn resolve<T: TransportProvider + ?Sized>(
         &mut self,
@@ -452,9 +487,7 @@ impl Manifest {
     ) -> io::Result<()> {
         let mut updated = false;
         if self.universe.is_none() {
-            self.make_locked_sources(concurrency, transport).await?;
             self.make_universe(concurrency, transport).await?;
-            updated = true;
         }
         let (pkgs_idx, universe) = self
             .universe
@@ -469,6 +502,7 @@ impl Manifest {
                 (!l.is_locked()).then_some((id, ns, s, l))
             })
             .try_for_each(|(spec_index, spec_name, spec, lock)| {
+                tracing::debug!("resolving spec {}", spec_display_name(spec_name));
                 use digest::FixedOutput;
                 let mut hasher = blake3::Hasher::default();
                 let (reqs, cons) = self.file.requirements_for(spec_index)?;
@@ -687,37 +721,43 @@ where
         .await?;
     fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755, Some(UNIX_EPOCH))
         .await?;
-    stream::iter(sources.enumerate().map(|(id, src)| src.map(|s| (id, s))))
-        .and_then(|(no, (source, locked))| async move {
-            let source_stanza = Into::<MutableControlStanza>::into(source).to_string();
-            fs.create_file(
-                source_stanza.as_bytes(),
-                format!("./etc/apt/sources.list.d/source-{}.sources", no),
-                0,
-                0,
-                0o644,
-                Some(UNIX_EPOCH),
-                Some(source_stanza.len()),
-            )
-            .await?
-            .persist()
-            .await?;
-            Ok::<_, io::Error>(stream::iter(
-                locked
-                    .files()
-                    .map(move |file| Ok::<_, io::Error>((source, file))),
-            ))
+    let mut sources_file = MutableControlFile::new();
+    stream::iter(sources.map(|src| {
+        src.map(|(source, locked)| {
+            sources_file.add(Into::<MutableControlStanza>::into(source));
+            (source, locked)
         })
-        .try_flatten()
-        .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| async {
-            let file_name = format!(
-                "./var/lib/apt/lists/{}",
-                crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
-            );
-            fs.import_repo_file(source, file_name, file, transport)
-                .await
-        })
-        .await
+    }))
+    .and_then(|(source, locked)| async move {
+        Ok::<_, io::Error>(stream::iter(
+            locked
+                .files()
+                .map(move |file| Ok::<_, io::Error>((source, file))),
+        ))
+    })
+    .try_flatten()
+    .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| async {
+        let file_name = format!(
+            "./var/lib/apt/lists/{}",
+            crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
+        );
+        fs.import_repo_file(source, file_name, file, transport)
+            .await
+    })
+    .await?;
+    let sources_file = sources_file.to_string();
+    fs.create_file(
+        sources_file.as_bytes(),
+        "./etc/apt/sources.list.d/manifest.sources",
+        0,
+        0,
+        0o644,
+        Some(UNIX_EPOCH),
+        Some(sources_file.len()),
+    )
+    .await?
+    .persist()
+    .await
 }
 async fn stage_artifacts<'a, FS, I, T>(
     artifacts: I,

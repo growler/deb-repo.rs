@@ -33,7 +33,7 @@ pub use {
     release::Release,
     repo::TransportProvider,
     sandbox::{maybe_run_sandbox, unshare_root, unshare_user_ns},
-    source::{RepositoryFile, SignedBy, Snapshot, Source},
+    source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
 };
 use {std::str::from_utf8_unchecked};
 

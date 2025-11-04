@@ -56,7 +56,7 @@ impl HashAlgo for blake3::Hasher {
     }
 }
 
-#[derive(Clone)]
+#[derive(Clone, Default)]
 pub struct InnerHash<D: HashAlgo> {
     inner: HashOutput<D>,
 }
@@ -218,6 +218,12 @@ pub enum Hash {
     SHA256(InnerHash<sha2::Sha256>),
     SHA512(InnerHash<sha2::Sha512>),
     Blake3(InnerHash<blake3::Hasher>),
+}
+
+impl Default for Hash {
+    fn default() -> Self {
+        Hash::SHA256(InnerHash::<sha2::Sha256>::default())
+    }
 }
 
 macro_rules! delegate {
@@ -715,9 +721,7 @@ impl<D: HashAlgo, R: AsyncRead + Send> VerifyingReader<D, R> {
     }
 }
 
-impl<D: HashAlgo + Default + Send, R: AsyncRead + Send> AsyncRead
-    for VerifyingReader<D, R>
-{
+impl<D: HashAlgo + Default + Send, R: AsyncRead + Send> AsyncRead for VerifyingReader<D, R> {
     fn poll_read(
         self: Pin<&mut Self>,
         cx: &mut Context<'_>,
@@ -777,81 +781,83 @@ impl<D: HashAlgo, R: AsyncRead + Send> AsyncHashingRead for VerifyingReader<D, R
 #[cfg(test)]
 mod tests {
     use super::*;
-    use macro_rules_attribute::apply;
     use sha2::{Digest, Sha256};
     use smol::io::{AsyncReadExt, Cursor};
     use smol_macros::test;
 
-    #[apply(test!)]
-    async fn test_verifying_reader() {
-        let data = b"hello world";
-        let size = data.len() as u64;
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let expected_digest = hasher.finalize();
+    test! {
+        async fn test_verifying_reader() {
+            let data = b"hello world";
+            let size = data.len() as u64;
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let expected_digest = hasher.finalize();
 
-        let mut hasher1 = Sha256::default();
-        hasher1.update(data);
-        let expected_digest1 = hasher1.finalize_fixed_reset();
+            let mut hasher1 = Sha256::default();
+            hasher1.update(data);
+            let expected_digest1 = hasher1.finalize_fixed_reset();
 
-        assert_eq!(expected_digest, expected_digest1);
+            assert_eq!(expected_digest, expected_digest1);
 
-        let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
+            let cursor = Cursor::new(data);
+            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
 
-        let mut buf = vec![0; size.try_into().unwrap()];
-        let n = reader.read(&mut buf).await.unwrap() as u64;
-        assert_eq!(n, size);
-        assert_eq!(&buf, data);
+            let mut buf = vec![0; size.try_into().unwrap()];
+            let n = reader.read(&mut buf).await.unwrap() as u64;
+            assert_eq!(n, size);
+            assert_eq!(&buf, data);
 
-        // Check that reading to the end verifies the digest
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
+            // Check that reading to the end verifies the digest
+            let n = reader.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0);
 
-        // Check that reading past the end returns 0 but no error
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n, 0);
+            // Check that reading past the end returns 0 but no error
+            let n = reader.read(&mut buf).await.unwrap();
+            assert_eq!(n, 0);
+        }
     }
 
-    #[apply(test!)]
-    async fn test_verifying_reader_incorrect_digest() {
-        let data = b"hello world";
-        let size = data.len() as u64;
-        let incorrect_digest = Sha256::digest(b"incorrect");
+    test! {
+        async fn test_verifying_reader_incorrect_digest() {
+            let data = b"hello world";
+            let size = data.len() as u64;
+            let incorrect_digest = Sha256::digest(b"incorrect");
 
-        let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest);
+            let cursor = Cursor::new(data);
+            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest);
 
-        let mut buf = vec![0; size.try_into().unwrap()];
-        let n = reader.read(&mut buf).await.unwrap() as u64;
-        assert_eq!(n, size);
-        assert_eq!(&buf, data);
+            let mut buf = vec![0; size.try_into().unwrap()];
+            let n = reader.read(&mut buf).await.unwrap() as u64;
+            assert_eq!(n, size);
+            assert_eq!(&buf, data);
 
-        // Reading to the end should result in a digest verification error
-        let err = reader.read(&mut buf).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("unexpected stream digest"));
+            // Reading to the end should result in a digest verification error
+            let err = reader.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Other);
+            assert!(err.to_string().contains("unexpected stream digest"));
+        }
     }
 
-    #[apply(test!)]
-    async fn test_verifying_reader_incorrect_size() {
-        let data = b"hello world";
-        let size = data.len() as u64 + 1; // incorrect size
-        let mut hasher = Sha256::new();
-        hasher.update(data);
-        let expected_digest = hasher.finalize();
+    test! {
+        async fn test_verifying_reader_incorrect_size() {
+            let data = b"hello world";
+            let size = data.len() as u64 + 1; // incorrect size
+            let mut hasher = Sha256::new();
+            hasher.update(data);
+            let expected_digest = hasher.finalize();
 
-        let cursor = Cursor::new(data);
-        let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
+            let cursor = Cursor::new(data);
+            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
 
-        let mut buf = vec![0; data.len()];
-        let n = reader.read(&mut buf).await.unwrap();
-        assert_eq!(n, data.len());
-        assert_eq!(&buf, data);
+            let mut buf = vec![0; data.len()];
+            let n = reader.read(&mut buf).await.unwrap();
+            assert_eq!(n, data.len());
+            assert_eq!(&buf, data);
 
-        // Reading to the end should result in a size mismatch error
-        let err = reader.read(&mut buf).await.unwrap_err();
-        assert_eq!(err.kind(), std::io::ErrorKind::Other);
-        assert!(err.to_string().contains("unexpected stream size"));
+            // Reading to the end should result in a size mismatch error
+            let err = reader.read(&mut buf).await.unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::Other);
+            assert!(err.to_string().contains("unexpected stream size"));
+        }
     }
 }

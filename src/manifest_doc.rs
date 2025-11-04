@@ -1,8 +1,10 @@
+use crate::source::SnapshotId;
+
 use {
     crate::{
         artifact::Artifact,
         hash::Hash,
-        source::Source,
+        source::{Snapshot, Source},
         spec::*,
         version::{Constraint, Dependency},
     },
@@ -377,6 +379,29 @@ impl ManifestFile {
     pub fn get_source(&self, index: usize) -> Option<&'_ Source> {
         self.sources.get(index)
     }
+    pub fn update_source_snapshots(
+        &mut self,
+        stamp: SnapshotId,
+    ) -> impl Iterator<Item = usize> + '_ {
+        let doc = &mut self.doc;
+        self.sources
+            .iter_mut()
+            .enumerate()
+            .filter_map(move |(i, source)| {
+                if let Some(snapshot) = source.snapshot.as_mut() {
+                    match snapshot {
+                        Snapshot::Disable => None,
+                        Snapshot::Enable | Snapshot::Use(_) => {
+                            doc.update_source_snapshot(i, stamp);
+                            *snapshot = Snapshot::Use(stamp);
+                            Some(i)
+                        }
+                    }
+                } else {
+                    None
+                }
+            })
+    }
     pub fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
         self.specs.iter()
     }
@@ -661,11 +686,17 @@ impl LockFile {
     pub fn push_source(&mut self, source: Option<LockedSource>) {
         self.sources.push(source);
     }
+    pub fn invalidate_source(&mut self, index: usize) {
+        self.sources[index] = None;
+    }
     pub fn remove_source(&mut self, index: usize) {
         self.sources.remove(index);
     }
     pub fn specs_len(&self) -> usize {
         self.specs.len()
+    }
+    pub fn specs(&mut self) -> impl Iterator<Item = (&'_ str, &'_ LockedSpec)> {
+        self.specs.iter()
     }
     pub fn specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut LockedSpec)> {
         self.specs.iter_mut()
@@ -1034,6 +1065,18 @@ pub(crate) trait ManifestDoc {
     fn drop_source(&mut self, index: usize) {
         let sources = self.get_sources();
         sources.remove(index);
+    }
+    fn update_source_snapshot(&mut self, index: usize, stamp: SnapshotId) {
+        let sources = self.get_sources();
+        let source_table = sources.get_mut(index).expect("a valid source");
+        match source_table.entry("snapshot") {
+            toml_edit::Entry::Occupied(ref mut e) => {
+                *(e.get_mut()) = toml_edit::value(stamp.to_string());
+            }
+            toml_edit::Entry::Vacant(e) => {
+                e.insert(toml_edit::value(stamp.to_string()));
+            }
+        }
     }
     fn remove_spec_list_item(&mut self, spec_name: &str, kind: &str, index: usize) {
         self.get_spec_table_mut(spec_name)

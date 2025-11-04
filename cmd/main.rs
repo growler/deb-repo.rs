@@ -2,6 +2,7 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
+        SnapshotId,
         artifact::ArtifactArg,
         builder::Executor,
         cli::Source,
@@ -119,9 +120,6 @@ enum Commands {
     /// Show package description
     #[command(name = "show")]
     Show,
-    /// Updates lock file
-    #[command(name = "lock")]
-    Lock,
 }
 
 #[derive(Parser)]
@@ -314,22 +312,21 @@ impl Command for Exclude {
 }
 
 #[derive(Parser)]
-struct Update {}
-
-impl Command for Update {
-    fn exec(&self, _conf: &App) -> Result<()> {
-        Ok(())
-    }
+struct Update {
+    #[arg(short = 'f', long = "force", action)]
+    force: bool,
+    #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = debrepo::cli::SnapshotIdArgParser)]
+    snapshot: Option<SnapshotId>,
 }
 
-#[derive(Parser)]
-struct Lock {}
-
-impl Command for Lock {
+impl Command for Update {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
-            mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
+            if let Some(snapshot) = &self.snapshot {
+                mf.set_snapshot(*snapshot);
+            }
+            mf.update(self.force, conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
             Ok(())

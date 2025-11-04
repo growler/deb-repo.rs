@@ -2,13 +2,10 @@ use {
     crate::{control::MutableControlStanza, hash::Hash, release::Release, repo::TransportProvider},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
-    futures::{future::try_join_all, AsyncReadExt},
+    futures::AsyncReadExt,
     serde::{Deserialize, Serialize},
-    smol::{fs, io, lock::Semaphore},
-    std::{
-        path::{Path, PathBuf},
-        sync::Arc,
-    },
+    smol::{fs, io},
+    std::path::{Path, PathBuf},
 };
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
@@ -200,18 +197,132 @@ impl clap::builder::TypedValueParser for ClapSignedByParser {
     }
 }
 
+#[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+pub struct SnapshotId(pub DateTime<Utc>);
+
+impl SnapshotId {
+    pub fn format(&self, fmt: &str) -> String {
+        self.0.format(fmt).to_string()
+    }
+}
+
+impl From<&DateTime<Utc>> for SnapshotId {
+    fn from(dt: &DateTime<Utc>) -> Self {
+        SnapshotId(*dt)
+    }
+}
+
+impl From<&DateTime<Utc>> for Snapshot {
+    fn from(dt: &DateTime<Utc>) -> Self {
+        Snapshot::Use(dt.into())
+    }
+}
+
+impl std::fmt::Display for SnapshotId {
+    fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+        write!(f, "{}", self.format("%Y%m%dT%H%M%SZ"))
+    }
+}
+
+impl From<SnapshotId> for Snapshot {
+    fn from(dt: SnapshotId) -> Self {
+        Snapshot::Use(dt)
+    }
+}
+
+macro_rules! parse_snapshot {
+    ($var:expr, [ $($fmt:literal),+ $(,)? ]) => {
+        $(if let Some(parsed) = SnapshotFormatSpec::new($fmt).parse($var) {
+            Ok(SnapshotId(parsed))
+        } else
+        )+
+        {
+            Err(format!("invalid snapshot ID '{}' - expected a timestamp", $var))
+        }
+    }
+}
+
+impl TryFrom<&str> for SnapshotId {
+    type Error = String;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        parse_snapshot!(
+            s.trim(),
+            [
+                "%Y%m%dT%H%M%SZ",
+                "%Y%m%dT%H%M%S%z",
+                "%Y-%m-%d",
+                "%Y-%m-%dT%H:%M:%S%z",
+                "%Y-%m-%dT%H:%M:%S",
+                "%Y%m%d",
+                "%Y%m%dT%H%M%S",
+            ]
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct SnapshotIdArgParser;
+
+impl clap::builder::TypedValueParser for SnapshotIdArgParser {
+    type Value = SnapshotId;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &std::ffi::OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let value = value.to_str().ok_or_else(|| {
+            let mut err = clap::Error::new(clap::error::ErrorKind::InvalidUtf8).with_cmd(cmd);
+            if let Some(arg) = arg {
+                err.insert(
+                    clap::error::ContextKind::InvalidArg,
+                    clap::error::ContextValue::String(arg.to_string()),
+                );
+            }
+            err
+        })?;
+        if value.eq_ignore_ascii_case("now") {
+            Ok(SnapshotId(Utc::now()))
+        } else {
+            value.try_into().map_err(|e: String| {
+                let mut err =
+                    clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+                if let Some(arg) = arg {
+                    err.insert(
+                        clap::error::ContextKind::InvalidArg,
+                        clap::error::ContextValue::String(arg.to_string()),
+                    );
+                }
+                err.insert(
+                    clap::error::ContextKind::InvalidValue,
+                    clap::error::ContextValue::String(value.to_string()),
+                );
+                err.insert(
+                    clap::error::ContextKind::Custom,
+                    clap::error::ContextValue::String(e),
+                );
+                err
+            })
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub enum Snapshot {
     #[default]
     Disable,
-    Use(DateTime<Utc>),
+    Enable,
+    Use(SnapshotId),
 }
 
 impl std::fmt::Display for Snapshot {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         match self {
-            Snapshot::Disable => write!(f, "no"),
+            Snapshot::Disable => write!(f, "disable"),
+            Snapshot::Enable => write!(f, "enable"),
             Snapshot::Use(s) => write!(f, "{}", s.format("%Y%m%dT%H%M%SZ")),
         }
     }
@@ -219,16 +330,7 @@ impl std::fmt::Display for Snapshot {
 
 impl From<&Snapshot> for String {
     fn from(s: &Snapshot) -> Self {
-        match s {
-            Snapshot::Disable => "no".to_string(),
-            Snapshot::Use(s) => s.format("%Y%m%dT%H%M%SZ").to_string(),
-        }
-    }
-}
-
-impl From<&DateTime<Utc>> for Snapshot {
-    fn from(dt: &DateTime<Utc>) -> Self {
-        Snapshot::Use(*dt)
+        format!("{}", s)
     }
 }
 
@@ -273,35 +375,17 @@ impl SnapshotFormatSpec {
     }
 }
 
-macro_rules! snapshot_formats {
-    ($($fmt:literal),+ $(,)?) => {
-        &[
-            $( SnapshotFormatSpec::new($fmt) ),+
-        ] as &[SnapshotFormatSpec]
-    }
-}
-
 impl TryFrom<&str> for Snapshot {
     type Error = String;
 
     fn try_from(s: &str) -> Result<Self, Self::Error> {
         let s = s.trim();
-        if s.eq_ignore_ascii_case("no") {
+        if s.eq_ignore_ascii_case("disable") {
             Ok(Snapshot::Disable)
+        } else if s.eq_ignore_ascii_case("enable") {
+            Ok(Snapshot::Enable)
         } else {
-            snapshot_formats![
-                "%Y%m%dT%H%M%S%z",
-                "%Y-%m-%d",
-                "%Y-%m-%dT%H:%M:%S%z",
-                "%Y-%m-%dT%H:%M:%S",
-                "%Y%m%d",
-                "%Y%m%dT%H%M%S",
-            ]
-            .iter()
-            .filter_map(|f| f.parse(s))
-            .map(Snapshot::Use)
-            .next()
-            .ok_or_else(|| format!("invalid snapshot ID '{}' - expected a timestamp", s))
+            TryFrom::<&str>::try_from(s).map(Snapshot::Use)
         }
     }
 }
@@ -321,21 +405,11 @@ impl<'de> serde::de::Deserialize<'de> for Snapshot {
             }
 
             fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<Self::Value, E> {
-                let v = v.trim();
-                if v.eq_ignore_ascii_case("no") {
-                    Ok(Snapshot::Disable)
-                } else {
-                    v.try_into().map_err(|e: String| E::custom(e))
-                }
+                v.trim().try_into().map_err(|e: String| E::custom(e))
             }
 
             fn visit_string<E: serde::de::Error>(self, v: String) -> Result<Self::Value, E> {
-                let v = v.trim();
-                if v.eq_ignore_ascii_case("no") {
-                    Ok(Snapshot::Disable)
-                } else {
-                    v.try_into().map_err(|e: String| E::custom(e))
-                }
+                v.trim().try_into().map_err(|e: String| E::custom(e))
             }
         }
 
@@ -468,7 +542,7 @@ impl clap::builder::TypedValueParser for SourceHashKindValueParser {
     }
 }
 
-#[derive(Clone, Serialize, Deserialize, Debug)]
+#[derive(Clone, Default, Serialize, Deserialize, Debug)]
 pub struct RepositoryFile {
     pub(crate) path: String,
     pub(crate) hash: Hash,
@@ -563,24 +637,44 @@ impl Source {
         self.snapshots = Some(snapshots.as_ref().to_string());
         self
     }
-    pub async fn fetch_unsigned_release_by_hash<T: TransportProvider>(
+    pub async fn fetch_release_by_hash<T: TransportProvider + ?Sized>(
         &self,
-        transport: &T,
-        url: &str,
-        size: u64,
+        suite: &str,
         hash: &Hash,
+        size: u64,
+        transport: &T,
     ) -> std::io::Result<Release> {
+        if self.allow_insecure() {
+            self.fetch_unsigned_release_by_hash(suite, hash, size, transport)
+                .await
+        } else {
+            self.fetch_signed_release_by_hash(suite, hash, size, transport)
+                .await
+        }
+    }
+    pub async fn fetch_release<T: TransportProvider + ?Sized>(
+        &self,
+        suite: &str,
+        transport: &T,
+    ) -> std::io::Result<(Release, String, Hash, u64)> {
+        if self.allow_insecure() {
+            self.fetch_unsigned_release(suite, transport).await
+        } else {
+            self.fetch_signed_release(suite, transport).await
+        }
+    }
+    pub async fn fetch_unsigned_release_by_hash<T: TransportProvider + ?Sized>(
+        &self,
+        suite: &str,
+        hash: &Hash,
+        size: u64,
+        transport: &T,
+    ) -> std::io::Result<Release> {
+        let path = format!("dists/{}/Release", suite);
         transport
-            .get_bytes_verified(
-                &format!("{}/{}", self.url.trim_end_matches('/'), url),
-                size,
-                hash,
-            )
+            .get_bytes_verified(&self.file_url(&path), size, hash)
             .await
-            .and_then(|buf| {
-                Release::try_from(buf)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
-            })
+            .and_then(|buf| Release::try_from(buf).map_err(std::io::Error::other))
     }
     pub async fn fetch_unsigned_release<T: TransportProvider + ?Sized>(
         &self,
@@ -590,15 +684,14 @@ impl Source {
         let path = format!("dists/{}/Release", suite);
         transport
             .get_bytes_hashed(
-                &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
+                &self.file_url(&path),
                 self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
             )
             .await
             .and_then(|(buf, size, hash)| {
                 Ok((
-                    Release::try_from(buf)
-                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?,
+                    Release::try_from(buf).map_err(std::io::Error::other)?,
                     path,
                     hash,
                     size,
@@ -629,8 +722,20 @@ impl Source {
                 "no signature found in InRelease",
             ));
         }
-        Release::try_from(plaintext)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        Release::try_from(plaintext).map_err(std::io::Error::other)
+    }
+    pub async fn fetch_signed_release_by_hash<T: TransportProvider + ?Sized>(
+        &self,
+        suite: &str,
+        hash: &Hash,
+        size: u64,
+        transport: &T,
+    ) -> std::io::Result<Release> {
+        let path = format!("dists/{}/InRelease", suite);
+        let data = transport
+            .get_bytes_verified(&self.file_url(&path), size, hash)
+            .await?;
+        self.verify_signed_release(data).await
     }
     pub async fn fetch_signed_release<T: TransportProvider + ?Sized>(
         &self,
@@ -640,28 +745,12 @@ impl Source {
         let path = format!("dists/{}/InRelease", suite);
         let (data, size, hash) = transport
             .get_bytes_hashed(
-                &format!("{}/{}", self.url.trim_end_matches('/'), &path,),
+                &self.file_url(&path),
                 self.hash.name(),
                 Self::MAX_RELEASE_SIZE,
             )
             .await?;
         Ok((self.verify_signed_release(data).await?, path, hash, size))
-    }
-    pub async fn fetch_signed_release_by_hash<T: TransportProvider>(
-        &self,
-        transport: &T,
-        path: &str,
-        size: u64,
-        hash: &Hash,
-    ) -> io::Result<Release> {
-        let data = transport
-            .get_bytes_verified(
-                &format!("{}/{}", self.url.trim_end_matches('/'), path,),
-                size,
-                hash,
-            )
-            .await?;
-        self.verify_signed_release(data).await
     }
     pub(crate) async fn file_by_hash<T>(
         &self,
@@ -673,7 +762,7 @@ impl Source {
     {
         transport
             .get_unpacked_bytes_verified(
-                &format!("{}/{}", &self.url, &file.path),
+                &self.file_url(&file.path),
                 file.size,
                 &file.hash,
                 Self::MAX_PACKAGE_SIZE,
@@ -681,39 +770,45 @@ impl Source {
             .await
             .map(|s| s.into_boxed_slice())
     }
-    pub(crate) async fn files<T: TransportProvider + ?Sized>(
+    pub async fn fetch_suite<T: TransportProvider + ?Sized>(
         &self,
+        suite: &str,
         arch: &str,
-        sem: &Arc<Semaphore>,
         transport: &T,
-    ) -> Result<Vec<(RepositoryFile, Vec<RepositoryFile>)>, io::Error> {
-        try_join_all(self.suites.iter().map(|s| async move {
-            let sem = Arc::clone(sem);
-            let _permit = sem.acquire().await;
-            let (rel, path, hash, size) = if self.allow_insecure() {
-                self.fetch_unsigned_release(s, transport).await?
-            } else {
-                self.fetch_signed_release(s, transport).await?
-            };
-            let pkgs_ind = rel
-                .files(
-                    &self.components,
-                    self.hash.name(),
-                    arch,
-                    self.ext.as_deref(),
-                )?
-                .map(|file| {
-                    file.map(|(path, hash, size)| {
-                        RepositoryFile::new(format!("dists/{}/{}", s, path), hash, size)
-                    })
-                    .map_err(Into::into)
+    ) -> io::Result<(RepositoryFile, Vec<RepositoryFile>)> {
+        let (rel, path, hash, size) = if self.allow_insecure() {
+            self.fetch_unsigned_release(suite, transport).await?
+        } else {
+            self.fetch_signed_release(suite, transport).await?
+        };
+        let pkgs_ind = rel
+            .files(
+                &self.components,
+                self.hash.name(),
+                arch,
+                self.ext.as_deref(),
+            )?
+            .map(|file| {
+                file.map(|(path, hash, size)| {
+                    RepositoryFile::new(format!("dists/{}/{}", suite, path), hash, size)
                 })
-                .collect::<io::Result<Vec<_>>>()?;
-            Ok::<_, io::Error>((RepositoryFile::new(path, hash, size), pkgs_ind))
-        }))
-        .await
+                .map_err(Into::into)
+            })
+            .collect::<io::Result<Vec<_>>>()?;
+        Ok((RepositoryFile::new(path, hash, size), pkgs_ind))
     }
     pub fn file_url(&self, path: &str) -> String {
+        if let Some(snapshots_template) = &self.snapshots {
+            if let Some(Snapshot::Use(snap)) = &self.snapshot {
+                return format!(
+                    "{}/{}",
+                    snapshots_template
+                        .trim_end_matches('/')
+                        .replace("@SNAPSHOTID@", &snap.format("%Y%m%dT%H%M%SZ").to_string()),
+                    path
+                );
+            }
+        }
         format!("{}/{}", self.url.trim_end_matches('/'), path)
     }
     pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {

@@ -70,6 +70,7 @@
             cargo-bloat
             cargo-depgraph
             cargo-benchcmp
+            cargo-audit
 
             sequoia-sq
             sequoia-sqv
