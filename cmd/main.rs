@@ -2,13 +2,13 @@ use {
     anyhow::{anyhow, Result},
     clap::{Parser, Subcommand},
     debrepo::{
-        SnapshotId,
         artifact::ArtifactArg,
         builder::Executor,
         cli::Source,
         sandbox::{maybe_run_sandbox, HostSandboxExecutor},
         version::{Constraint, Dependency, Version},
-        HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
+        HttpCachingTransportProvider, HttpTransportProvider, Manifest, SnapshotId,
+        TransportProvider,
     },
     futures_lite::AsyncWriteExt,
     itertools::Itertools,
@@ -24,6 +24,19 @@ pub trait Command {
 }
 
 #[derive(Parser)]
+#[command(
+    version,
+    about = "Bootstrap Debian-based system tree from a manifest file",
+    long_about = "Bootstrap a Debian root filesystem from a manifest file.
+This tool resolves packages from configured repositories, locks and updates
+a snapshot, stages artifacts, and builds a rootfs-like directory tree.
+Typical workflow:  
+    1) init             - create a manifest with sources and initial packages
+    2) include/exclude  - add packages requirements and constraints 
+    3) update           - refresh lock/snapshot and metadata
+    4) build            - extract and configure packages into a target directory
+"
+)]
 pub struct App {
     /// Turns off all output except errors
     #[arg(short, long)]
@@ -42,7 +55,7 @@ pub struct App {
     )]
     concurrency: NonZero<usize>,
 
-    /// Target architecture
+    /// Target architecture (e.g. amd64, arm64)
     #[arg(long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
     arch: String,
 
@@ -73,7 +86,7 @@ pub struct App {
     #[arg(short = 'k', long = "insecure", action, display_order = 0, action)]
     pub insecure: bool,
 
-    /// Manifest file
+    /// Path to the manifest file
     #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE, display_order = 0)]
     manifest: PathBuf,
 
@@ -87,52 +100,57 @@ enum Commands {
     /// Initialize a new manifest file
     #[command(name = "init", next_display_order = 200)]
     Init,
-    /// Fetch artefact
-    #[command(name = "fetch", hide = true)]
-    Fetch,
-    /// Update lock file
+    /// Update the lock file
     #[command(name = "update")]
     Update,
-    /// Extract system to a target directory
+    /// Build a root filesystem into a target directory from the manifest
     #[command(name = "build")]
     Build,
-    /// Include a package or packages into the spec
+    /// Include package requirements into a spec
     #[command(name = "include")]
     Include,
-    /// Exlicitly exclude a package or packages from the spec
+    /// Explicitly exclude packages or versions from a spec
     #[command(name = "exclude")]
     Exclude,
-    /// Remove a package or packages from the spec requirements or constraints
+    /// Remove requirements or constraints from a spec
     #[command(name = "drop")]
     Drop,
-    /// Stage an artifact located under the Manifest file path
+    /// Add a reference to an external artifact into a spec to stage to the system tree
     #[command(name = "stage")]
     Stage,
-    /// Remove an artifact from the spec
+    /// Remove a staged artifact from a spec
     #[command(name = "unstage")]
     Unstage,
-    /// Lists packages
+    /// List resolved packages for a specific spec
     #[command(name = "list")]
     List,
-    /// Lists packages
+    /// Search packages
     #[command(name = "search")]
     Search,
-    /// Show package description
+    /// Show raw package metadata
     #[command(name = "show")]
     Show,
 }
 
 #[derive(Parser)]
+#[command(
+    about = "Create a new manifest file",
+    long_about = "Create a new manifest file from a source definition.
+If a vendor name is provided as source URL, default sources and packages are derived from it.
+Examples:  
+    debrepo init --package mc --package libcom-err2 --url debian"
+)]
 pub struct Init {
     /// Overwrite existing manifest if present
     #[arg(long)]
     pub force: bool,
 
-    /// Package to add
+    /// Package to add (can be used multiple times)
     #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
     requirements: Vec<String>,
 
-    /// Source definition
+    /// Source definition (i.e. --url <URL> ...).
+    /// URL might be a vendor name (debian, ubuntu, devuan).
     #[command(flatten)]
     source: Source,
 }
@@ -156,7 +174,9 @@ impl Command for Init {
                 };
             let mut mf =
                 Manifest::from_sources(&conf.arch, sources.iter().cloned(), comment.as_deref());
-            mf.add_requirements(None, packages.iter(), None::<&str>)?;
+            mf.add_requirements(None, packages.iter(), None)?;
+            mf.update(true, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -166,24 +186,32 @@ impl Command for Init {
 }
 
 #[derive(Parser)]
+#[command(
+    about = "Remove requirements or constraints from a spec",
+    long_about = "Remove requirements and/or constraints from a spec
+Use --requirements-only or --constraints-only to limit the operation scope."
+)]
 struct Drop {
-    /// Specify to drop only requirements
+    /// Drop only requirements (do not touch constraints)
     #[arg(
         short = 'R',
         long = "requirements-only",
         conflicts_with = "constraints_only"
     )]
     requirements_only: bool,
-    /// Specify to drop only constraints
+
+    /// Drop only constraints (do not touch requirements)
     #[arg(
         short = 'C',
         long = "constraints-only",
         conflicts_with = "requirements_only"
     )]
     constraints_only: bool,
-    /// The spec name to modify.
+
+    /// The spec name to modify
     #[arg(short = 's', long = "spec", value_name = "SPEC")]
     spec: Option<String>,
+
     /// Package name or package version set
     #[arg(value_name = "CONSTRAINT")]
     cons: Vec<String>,
@@ -199,6 +227,8 @@ impl Command for Drop {
             if !self.requirements_only {
                 mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
             }
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -276,6 +306,8 @@ impl Command for Include {
                 self.reqs.iter(),
                 self.comment.as_deref(),
             )?;
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -303,6 +335,8 @@ impl Command for Exclude {
                 self.reqs.iter(),
                 self.comment.as_deref(),
             )?;
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             mf.store(&conf.manifest).await?;
@@ -326,8 +360,12 @@ impl Command for Update {
             if let Some(snapshot) = &self.snapshot {
                 mf.set_snapshot(*snapshot);
             }
-            mf.update(self.force, conf.concurrency, conf.transport().await?.as_ref())
-                .await?;
+            mf.update(
+                self.force,
+                conf.concurrency,
+                conf.transport().await?.as_ref(),
+            )
+            .await?;
             mf.store(&conf.manifest).await?;
             Ok(())
         })
@@ -346,6 +384,8 @@ impl Command for Search {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             let res = self
@@ -387,6 +427,8 @@ impl Command for Show {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await?;
             let pkg = mf.packages().find(|p| self.package == p.name());
@@ -414,6 +456,8 @@ impl Command for List {
     fn exec(&self, conf: &App) -> Result<()> {
         smol::block_on(async move {
             let mut mf = Manifest::from_file(&conf.manifest, &conf.arch).await?;
+            mf.update(false, conf.concurrency, conf.transport().await?.as_ref())
+                .await?;
             mf.resolve(conf.concurrency, conf.transport().await?.as_ref())
                 .await
                 .map_err(|e| anyhow!("failed to update specs: {e}"))?;
@@ -460,60 +504,6 @@ impl Command for Build {
             builder.build(&mut fs, essentials, other, scripts).await?;
             Ok(())
         })
-    }
-}
-
-#[derive(Parser)]
-struct Fetch {
-    /// Architecture
-    #[arg(short, long, value_name = "ARCH", default_value = debrepo::DEFAULT_ARCH)]
-    arch: String,
-    /// Origin repository URL
-    #[arg(
-        short = 'u',
-        long = "url",
-        value_name = "URL",
-        default_value = "https://ftp.debian.org/debian/"
-    )]
-    origin: String,
-    /// Verify
-    #[arg(short = 'v', long = "verify")]
-    verify: bool,
-    /// Target file name
-    #[arg(short = 'o', long = "output", value_name = "FILE")]
-    out: Option<PathBuf>,
-    /// Distribution name
-    #[arg(value_name = "DISTR", default_value = "sid")]
-    distr: String,
-    /// Component
-    #[arg(value_name = "COMPONENT", default_value = "main")]
-    comp: String,
-}
-
-impl Command for Fetch {
-    fn exec(&self, _conf: &App) -> Result<()> {
-        // let start = std::time::Instant::now();
-        // let repo: DebRepo = HttpDebRepo::new(&self.origin, conf.insecure).await?.into();
-        // let release = if self.verify {
-        //     repo.fetch_verify_release(&self.distr, iter::empty()).await
-        // } else {
-        //     repo.fetch_release(&self.distr).await
-        // }?;
-        // let (path, size, hash) = release
-        //     .packages_file(&self.comp, &self.arch)
-        //     .ok_or_else(|| anyhow!("Packages file for {} {} not found", &self.arch, &self.comp))?;
-        // match self.out {
-        //     None => {
-        //         repo.copy_verify_unpack(async_std::io::stdout(), &path, size, hash)
-        //             .await
-        //     }
-        //     Some(ref out) => {
-        //         let out = async_std::fs::File::create(out).await?;
-        //         repo.copy_verify_unpack(out, &path, size, hash).await
-        //     }
-        // }?;
-        // println!("fetched in {:?}", start.elapsed());
-        Ok(())
     }
 }
 
