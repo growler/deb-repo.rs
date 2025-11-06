@@ -2,8 +2,8 @@ use {
     crate::{
         control::ParseError,
         hash::Hash,
-        idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
-        packages::{Package, Packages},
+        idmap::{HashRef, IdMap, IntoId, ToIndex, UpdateResult, id_type},
+        packages::{MemoryMappedUniverseFile, Package, Packages},
         version::{self, Constraint, Dependency, Satisfies, Version},
     },
     itertools::Itertools,
@@ -12,7 +12,7 @@ use {
         DependencyProvider, Interner, KnownDependencies, NameId, Requirement, SolvableId,
         SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     },
-    smallvec::{smallvec, SmallVec},
+    smallvec::{SmallVec, smallvec},
     std::{borrow::Borrow, collections::HashMap, hash, io},
 };
 
@@ -398,6 +398,17 @@ impl Universe {
             )
             .with_runtime(SmolAsyncRuntime),
         })
+    }
+    pub fn open<P: AsRef<std::path::Path>>(p: P) -> io::Result<Self> {
+        let (arch, packages) = MemoryMappedUniverseFile::open(p)?;
+        Self::new(arch, packages).map_err(Into::into)
+    }
+    pub async fn store<P: AsRef<std::path::Path>>(&self, p: P) -> io::Result<()> {
+        let packages: &[Packages] = self.inner.provider().with_packages(|p| p);
+        MemoryMappedUniverseFile::store(p, self.architecture(), packages).await
+    }
+    pub fn architecture(&self) -> &str {
+        self.inner.provider().with_index(|i| i.archlist[i.arch])
     }
     pub fn solve<R, Id, Ic>(
         &mut self,
@@ -904,7 +915,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src, None).expect("failed to parse test source")]
+                    vec![Packages::new($src.to_string().into_boxed_str(), None).expect("failed to parse test source")]
                         .into_iter(),
                 )
                 .unwrap();

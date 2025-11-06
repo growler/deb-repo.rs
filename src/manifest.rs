@@ -29,7 +29,8 @@ pub struct Manifest {
     hash: Option<Hash>,
     lock: LockFile,
     lock_updated: bool,
-    universe: Option<(Vec<usize>, Box<Universe>)>,
+    cache: Option<PathBuf>,
+    universe: Option<(Hash, Box<Universe>)>,
 }
 
 pub const DEFAULT_SPEC_NAME: Option<&str> = None;
@@ -53,7 +54,11 @@ pub const DEFAULT_SPEC_NAME: Option<&str> = None;
 ///
 impl Manifest {
     pub const DEFAULT_FILE: &str = "Manifest.toml";
-    pub fn new<A: ToString>(arch: A, comment: Option<&str>) -> Self {
+    pub fn new<A: ToString, P: AsRef<Path>>(
+        arch: A,
+        comment: Option<&str>,
+        cache: Option<P>,
+    ) -> Self {
         Manifest {
             arch: arch.to_string(),
             hash: None,
@@ -61,28 +66,39 @@ impl Manifest {
             file: ManifestFile::new(comment),
             lock: LockFile::new(),
             lock_updated: false,
+            cache: cache.map(|p| p.as_ref().to_path_buf()),
             universe: None,
         }
     }
-    pub fn from_sources<A, I, S>(arch: A, sources: I, comment: Option<&str>) -> Self
+    pub fn from_sources<A, I, S, P>(
+        arch: A,
+        sources: I,
+        comment: Option<&str>,
+        cache: Option<P>,
+    ) -> Self
     where
         A: ToString,
         I: IntoIterator<Item = S>,
         S: Into<Source>,
+        P: AsRef<Path>,
     {
         let sources: Vec<Source> = sources.into_iter().map(|s| s.into()).collect();
-        let locked: Vec<Option<LockedSource>> = sources.iter().map(|_| None).collect();
         Manifest {
             arch: arch.to_string(),
             hash: None,
             path: None,
+            lock: LockFile::new_with_sources(sources.len()),
             file: ManifestFile::new_with_sources(sources, comment),
-            lock: LockFile::new_with_sources(locked),
             lock_updated: false,
+            cache: cache.map(|p| p.as_ref().to_path_buf()),
             universe: None,
         }
     }
-    pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<Self> {
+    pub async fn from_file<A: ToString, P: AsRef<Path>, C: AsRef<Path>>(
+        path: P,
+        arch: A,
+        cache: Option<C>,
+    ) -> io::Result<Self> {
         let path = smol::fs::canonicalize(path.as_ref()).await?;
         let (manifest, hash) = ManifestFile::from_file(&path).await?;
         let arch = arch.to_string();
@@ -105,6 +121,7 @@ impl Manifest {
             file: manifest,
             lock,
             lock_updated: false,
+            cache: cache.map(|p| p.as_ref().to_path_buf()),
             universe: None,
         })
     }
@@ -122,6 +139,11 @@ impl Manifest {
         };
         if self.lock_updated {
             self.lock.store(path.as_ref(), &self.arch, &hash).await?;
+        }
+        if let Some((hash, universe)) = self.universe.as_ref() {
+            if let Some(cache) = self.cache.as_deref() {
+                universe.store(hash.store_name(Some(cache), 1)).await?;
+            }
         }
         Ok(())
     }
@@ -376,53 +398,64 @@ impl Manifest {
         transport: &T,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        let packages: Vec<(usize, Packages)> = stream::iter(
+        if let Some(cache) = self.cache.as_deref() {
+            if let Some(hash) = self.lock.universe_hash() {
+                let path = hash.store_name(Some(cache), 1);
+                match Universe::open(&path) {
+                    Ok(u) => {
+                        tracing::debug!("loaded universe from cache {}", path.display());
+                        self.universe = Some((hash.clone(), Box::new(u)));
+                        return Ok(());
+                    }
+                    Err(err) => {
+                        tracing::debug!(
+                            "failed to load universe from cache {} ({}), rebuilding",
+                            err,
+                            path.display()
+                        );
+                    }
+                }
+            }
+        }
+        let packages: Vec<Packages> = stream::iter(
             self.file
                 .sources()
                 .iter()
-                .enumerate()
                 .zip(self.lock.sources().iter())
-                .map(|((i, source), locked_source)| {
+                .map(|(source, locked_source)| {
                     locked_source
                         .as_ref()
                         .ok_or_else(|| {
                             io::Error::other("a source is not locked, call udpate first")
                         })
-                        .map(|l| (i, source, l))
+                        .map(|l| (source, l))
                 }),
         )
-        .map_ok(|(idx, source, locked_source)| {
+        .map_ok(|(source, locked_source)| {
             stream::iter(
                 locked_source
                     .suites
                     .iter()
                     .flat_map(|s| s.packages.iter())
-                    .map(move |f| Ok::<_, io::Error>((idx, source, f))),
+                    .map(move |f| Ok::<_, io::Error>((source, f))),
             )
         })
         .try_flatten()
-        .map_ok(|(idx, source, file)| async move {
-            source
-                .file_by_hash(transport, file)
-                .await
-                .and_then(|data| {
-                    Packages::new_from_bytes(data, source.priority).map_err(Into::into)
-                })
-                .map(|pkgs| (idx, pkgs))
+        .map_ok(|(source, file)| async move {
+            source.file_by_hash(transport, file).await.and_then(|data| {
+                Packages::new_from_bytes(data, source.priority).map_err(Into::into)
+            })
         })
         .try_buffered(concurrency.into())
         .try_collect()
         .await?;
         self.universe = Some((
-            packages.iter().map(|(i, _)| *i).collect(),
-            Box::new(Universe::new(
-                &self.arch,
-                packages.into_iter().map(|(_, p)| p),
-            )?),
+            self.lock.universe_hash().unwrap().clone(),
+            Box::new(Universe::new(&self.arch, packages)?),
         ));
         Ok(())
     }
-    pub fn set_snapshot(&mut self, stamp: SnapshotId) {
+    pub async fn set_snapshot(&mut self, stamp: SnapshotId) {
         tracing::debug!("setting snapshot to {}", stamp);
         let updated = self
             .file
@@ -433,9 +466,8 @@ impl Manifest {
             });
         if updated {
             self.mark_file_updated();
-            self.lock
-                .specs_mut()
-                .for_each(|(_, r)| r.invalidate_solution());
+            self.lock.invalidate_specs();
+            self.drop_universe().await;
             self.mark_lock_updated();
         }
     }
@@ -446,16 +478,18 @@ impl Manifest {
         transport: &T,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
-        stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
+        let updated = stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
             move |(source, locked)| {
                 LockedSource::fetch_or_refresh(locked, source, arch, force, transport)
             },
         ))
         .flatten_unordered(concurrency.get())
-        .try_fold(false, |a, r| async move {
-            Ok(a || r)
-        })
-        .await
+        .try_fold(false, |a, r| async move { Ok(a || r) })
+        .await?;
+        if updated {
+            self.lock.update_universe_hash();
+        }
+        Ok(updated)
     }
     pub async fn update<T: TransportProvider + ?Sized>(
         &mut self,
@@ -469,10 +503,8 @@ impl Manifest {
             .await?;
         if updated {
             tracing::debug!("sources updated, invalidating locked specs");
-            self.lock
-                .specs_mut()
-                .for_each(|(_, r)| r.invalidate_solution());
-            self.universe.take();
+            self.lock.invalidate_specs();
+            self.drop_universe().await;
             self.mark_lock_updated();
         } else if self.lock.specs().all(|(_, l)| l.is_locked()) {
             tracing::debug!("sources up-to-date, all specs locked, skipping resolve");
@@ -480,21 +512,26 @@ impl Manifest {
         }
         self.resolve(concurrency, transport).await
     }
+    pub async fn load_universe<T: TransportProvider + ?Sized>(
+        &mut self,
+        concurrency: NonZero<usize>,
+        transport: &T,
+    ) -> io::Result<()> {
+        if self.universe.is_none() {
+            self.make_universe(concurrency, transport).await?;
+        }
+        Ok(())
+    }
     pub async fn resolve<T: TransportProvider + ?Sized>(
         &mut self,
         concurrency: NonZero<usize>,
         transport: &T,
     ) -> io::Result<()> {
         let mut updated = false;
-        if self.universe.is_none() {
-            self.make_universe(concurrency, transport).await?;
-        }
-        let (pkgs_idx, universe) = self
-            .universe
-            .as_mut()
-            .map(|(idx, universe)| (idx, universe.as_mut()))
-            .unwrap();
+        self.load_universe(concurrency, transport).await?;
+        let universe = self.universe.as_mut().map(|(_, u)| u.as_mut()).unwrap();
         let sources = self.file.sources();
+        let pkgs_idx = self.file.sources_pkgs();
         let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
@@ -579,12 +616,18 @@ impl Manifest {
         }
         Ok(())
     }
-    pub fn packages(&self) -> impl Iterator<Item = &'_ Package<'_>> {
+    async fn drop_universe(&mut self) {
+        if let Some((hash, _)) = self.universe.take() {
+            if let Some(cache) = self.cache.as_deref() {
+                let _ = smol::fs::remove_file(hash.store_name(Some(cache), 1)).await;
+            }
+        }
+    }
+    pub fn packages(&self) -> io::Result<impl Iterator<Item = &'_ Package<'_>>> {
         self.universe
             .as_ref()
-            .map(|(_, u)| u.as_ref())
-            .expect("call resolve first")
-            .packages()
+            .map(|(_, u)| u.packages())
+            .ok_or_else(|| io::Error::other("call resolve first"))
     }
     pub fn spec_packages<'a>(
         &'a self,

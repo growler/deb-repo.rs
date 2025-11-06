@@ -1,4 +1,4 @@
-use crate::source::SnapshotId;
+use crate::{hash::HashAlgo, source::SnapshotId};
 
 use {
     crate::{
@@ -49,6 +49,10 @@ pub struct ManifestFile {
     #[serde(default, rename = "source", skip_serializing_if = "Vec::is_empty")]
     sources: Vec<Source>,
 
+    // an index mapping packages files to their sources in `sources`
+    #[serde(default, skip)]
+    sources_pkgs: Vec<usize>,
+
     #[serde(
         default,
         rename = "artifact",
@@ -75,6 +79,15 @@ enum DFSNodeState {
     Done,
 }
 
+fn sources_pkgs(sources: &[Source]) -> Vec<usize> {
+    sources
+        .iter()
+        .enumerate()
+        .flat_map(|(i, s)| s.suites.iter().map(move |_| (i, s)))
+        .flat_map(|(i, s)| s.components.iter().map(move |_| i))
+        .collect()
+}
+
 impl ManifestFile {
     pub const MAX_SIZE: u64 = 1024 * 1024; // 1 MiB
 
@@ -83,6 +96,7 @@ impl ManifestFile {
         ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
             sources: Vec::new(),
+            sources_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
@@ -94,11 +108,13 @@ impl ManifestFile {
         doc.push_sources(sources.iter(), None);
         ManifestFile {
             doc,
+            sources_pkgs: sources_pkgs(&sources),
             sources,
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
     }
+
     pub async fn from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, Hash)> {
         let r = smol::fs::File::open(&path).await?.take(Self::MAX_SIZE);
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(r);
@@ -128,8 +144,10 @@ impl ManifestFile {
             })?
             .init_manifest(None);
         manifest.doc = doc;
+        manifest.sources_pkgs = sources_pkgs(&manifest.sources);
         Ok((manifest, hash))
     }
+
     pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<Hash> {
         let out = self.doc.to_string();
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(out.as_bytes());
@@ -137,6 +155,7 @@ impl ManifestFile {
         let hash = r.as_mut().hash();
         Ok(hash)
     }
+
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
             sources: self.sources().iter().map(|_| None).collect(),
@@ -144,6 +163,7 @@ impl ManifestFile {
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
                 .collect(),
+            universe_hash: None,
         }
     }
     pub fn spec_index_ensure<'a>(&self, name: Option<&'a str>) -> io::Result<(&'a str, usize)> {
@@ -368,13 +388,19 @@ impl ManifestFile {
     pub fn sources(&self) -> &'_ [Source] {
         &self.sources
     }
+    pub fn sources_pkgs(&self) -> &'_ [usize] {
+        &self.sources_pkgs
+    }
     pub fn add_source(&mut self, source: Source, comment: Option<&str>) {
         self.doc.push_sources(std::iter::once(&source), comment);
         self.sources.push(source);
+        self.sources_pkgs = sources_pkgs(&self.sources);
     }
     pub fn remove_source(&mut self, index: usize) -> Source {
         self.doc.drop_source(index);
-        self.sources.remove(index)
+        let source = self.sources.remove(index);
+        self.sources_pkgs = sources_pkgs(&self.sources);
+        source
     }
     pub fn get_source(&self, index: usize) -> Option<&'_ Source> {
         self.sources.get(index)
@@ -404,29 +430,6 @@ impl ManifestFile {
     }
     pub fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
         self.specs.iter()
-    }
-    pub fn specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut Spec)> {
-        self.specs.iter_mut()
-    }
-    pub fn spec_count(&self) -> usize {
-        self.specs.len()
-    }
-    pub fn get_spec(&self, id: usize) -> &'_ Spec {
-        &self.specs[id]
-    }
-    pub fn get_spec_mut(&mut self, id: usize) -> &'_ mut Spec {
-        &mut self.specs[id]
-    }
-    pub fn push_spec(&mut self, name: &str, spec: Spec) {
-        self.specs.push(name, spec);
-    }
-    pub fn remove_spec(&mut self, idx: usize) -> (String, Spec) {
-        self.specs.remove_at(idx)
-    }
-    pub fn add_spec(&mut self, name: &str) -> usize {
-        let spec_index = self.specs.len();
-        self.specs.push(name, Spec::new());
-        spec_index
     }
     pub fn names(&self) -> impl Iterator<Item = &'_ str> {
         self.specs.iter_keys()
@@ -571,24 +574,39 @@ impl<'a> Iterator for SpecIterator<'a> {
     }
 }
 
+fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> Hash {
+    sources
+        .flat_map(|s| s.suites.iter())
+        .flat_map(|s| s.packages.iter())
+        .fold(blake3::Hasher::new(), |mut hasher, file| {
+            hasher.update(file.hash.as_bytes());
+            hasher
+        })
+        .into_hash()
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     sources: Vec<Option<LockedSource>>,
     specs: KVList<LockedSpec>,
+    #[serde(skip, default)]
+    universe_hash: Option<Hash>,
 }
 
 impl LockFile {
     pub const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
     pub fn new() -> Self {
         LockFile {
+            universe_hash: None,
             sources: Vec::new(),
             specs: KVList::new(),
         }
     }
-    pub fn new_with_sources(sources: Vec<Option<LockedSource>>) -> Self {
+    pub fn new_with_sources(sources: usize) -> Self {
         LockFile {
-            sources,
+            universe_hash: None,
+            sources: vec![None; sources],
             specs: KVList::new(),
         }
     }
@@ -622,7 +640,7 @@ impl LockFile {
                     _timestamp: DateTime<Utc>,
                     arch: String,
                     hash: Hash,
-                    sources: Vec<Option<LockedSource>>,
+                    sources: Vec<LockedSource>,
                     specs: KVList<LockedSpec>,
                 }
                 r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
@@ -636,7 +654,8 @@ impl LockFile {
                     .map(|lock| {
                         if &lock.hash == manifest_hash && lock.arch.as_str() == arch.as_ref() {
                             Some(LockFile {
-                                sources: lock.sources,
+                                universe_hash: Some(universe_hash(lock.sources.iter())),
+                                sources: lock.sources.into_iter().map(Some).collect(),
                                 specs: lock.specs,
                             })
                         } else {
@@ -685,12 +704,21 @@ impl LockFile {
     }
     pub fn push_source(&mut self, source: Option<LockedSource>) {
         self.sources.push(source);
+        self.universe_hash.take();
     }
     pub fn invalidate_source(&mut self, index: usize) {
         self.sources[index] = None;
+        self.universe_hash.take();
     }
     pub fn remove_source(&mut self, index: usize) {
         self.sources.remove(index);
+        self.universe_hash.take();
+    }
+    pub(crate) fn update_universe_hash(&mut self) {
+        self.universe_hash = Some(universe_hash(self.sources.iter().map(|s| s.as_ref().unwrap())));
+    }
+    pub(crate) fn universe_hash(&self) -> Option<&Hash> {
+        self.universe_hash.as_ref()
     }
     pub fn specs_len(&self) -> usize {
         self.specs.len()
@@ -700,6 +728,9 @@ impl LockFile {
     }
     pub fn specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut LockedSpec)> {
         self.specs.iter_mut()
+    }
+    pub fn invalidate_specs(&mut self) {
+        self.specs.iter_mut().for_each(|(_, s)| s.invalidate_solution());
     }
     pub fn get_spec(&self, id: usize) -> &'_ LockedSpec {
         &self.specs[id]
@@ -1012,7 +1043,7 @@ pub(crate) trait ManifestDoc {
             .as_table_mut()
             .expect("a table of artifacts");
         let mut table = artifact.toml_table();
-        if let Some(prefix) = comment.map(|s| {
+        if let Some(prefix) = comment.as_ref().map(|s| {
             let comment = s
                 .as_ref()
                 .split('\n')
@@ -1176,6 +1207,7 @@ mod kvlist {
 
     pub(super) struct KVList<R>(Vec<(String, R)>);
 
+    #[allow(dead_code)]
     pub trait KVListSet<K, R> {
         fn set(&mut self, k: K, v: R);
         fn push(&mut self, k: K, v: R);

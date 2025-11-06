@@ -727,7 +727,6 @@ dependencies = [
  "clap_mangen",
  "criterion",
  "digest",
- "enum_dispatch",
  "filetime",
  "futures",
  "futures-lite 2.3.0",
@@ -797,18 +796,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9abf33c656a7256451ebb7d0082c5a471820c31269e49d807c538c252352186e"
 dependencies = [
  "stable_deref_trait",
-]
-
-[[package]]
-name = "enum_dispatch"
-version = "0.3.13"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa18ce2bc66555b3218614519ac839ddb759a7d6720732f979ef8d13be147ecd"
-dependencies = [
- "once_cell",
- "proc-macro2",
- "quote",
- "syn",
 ]
 
 [[package]]
