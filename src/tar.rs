@@ -866,7 +866,7 @@ impl<'a, R: AsyncRead + Send + 'a> Stream for TarReader<'a, R> {
     type Item = Result<TarEntry<'a, R>>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut();
-        let mut fut = this.inner.lock();
+        let fut = this.inner.lock();
         let mut g = task::ready!(pin!(fut).poll(ctx));
         let inner: Pin<&mut TarReaderInner<R>> = g.as_mut();
         let entry = {
@@ -997,7 +997,7 @@ impl<'a, R: AsyncRead + Send + 'a> AsyncRead for TarRegularFile<'a, R> {
     ) -> Poll<std::io::Result<usize>> {
         let eof = self.eof;
         let this = self.as_mut();
-        let mut fut = this.inner.lock();
+        let fut = this.inner.lock();
         let mut g = task::ready!(pin!(fut).poll(ctx));
         let inner_pin: Pin<&mut TarReaderInner<R>> = g.as_mut();
         let inner = inner_pin.project();

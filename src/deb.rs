@@ -301,7 +301,7 @@ where
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
         let this = self.as_mut();
-        let mut fut = this.inner.lock();
+        let fut = this.inner.lock();
         let mut guard = task::ready!(pin!(fut).poll(ctx));
         guard.as_mut().poll_read(ctx, buf)
     }
@@ -659,7 +659,7 @@ where
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let polled = {
             let this = self.as_mut();
-            let mut fut = this.inner.lock();
+            let fut = this.inner.lock();
             let mut inner = task::ready!(pin!(fut).poll(ctx));
             match task::ready!(inner.as_mut().poll_next(ctx)) {
                 None => None,

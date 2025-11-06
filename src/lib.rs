@@ -196,15 +196,11 @@ pub(crate) use matches_path;
 #[macro_export]
 macro_rules! commands {
     ($v:vis enum $E:ident <$C:ident> { $($rest:tt)* }) => {
-        #[derive(::clap::Subcommand)]
-        $v enum $E {
-            $($rest)*
-        }
         $crate::__commands_collect! {
             @vis ($v)
             @enum $E
             @conf $C
-            @pairs ()
+            @items ()
             @rest $($rest)*
         }
     };
@@ -213,39 +209,43 @@ macro_rules! commands {
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __commands_collect {
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $($pairs:tt)* ) @rest $(#[$($attr:tt)*])* $V:ident ( $T:path ) , $($rest:tt)* ) => {
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $($items:tt)* ) @rest $(#[$attrs:meta])* $V:ident ( $T:path ) , $($rest:tt)* ) => {
         $crate::__commands_collect! {
             @vis ($v)
             @enum $E
             @conf $C
-            @pairs ( $($pairs)* ( $V $T ) )
+            @items ( $($items)* ( [$(#[$attrs])*] $V $T ) )
             @rest $($rest)*
         }
     };
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $($pairs:tt)* ) @rest $(#[$($attr:tt)*])* $V:ident ( $T:path ) ) => {
-        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @pairs ( $($pairs)* ( $V $T ) ) }
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $($items:tt)* ) @rest $(#[$attrs:meta])* $V:ident ( $T:path ) ) => {
+        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @items ( $($items)* ( [$(#[$attrs])*] $V $T ) ) }
     };
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $($pairs:tt)* ) @rest $(#[$($attr:tt)*])* $V:ident , $($rest:tt)* ) => {
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $($items:tt)* ) @rest $(#[$attrs:meta])* $V:ident , $($rest:tt)* ) => {
         $crate::__commands_collect! {
             @vis ($v)
             @enum $E
             @conf $C
-            @pairs ( $($pairs)* ( $V $V ) )
+            @items ( $($items)* ( [$(#[$attrs])*] $V $V ) )
             @rest $($rest)*
         }
     };
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $($pairs:tt)* ) @rest $(#[$($attr:tt)*])* $V:ident ) => {
-        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @pairs ( $($pairs)* ( $V $V ) ) }
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $($items:tt)* ) @rest $(#[$attrs:meta])* $V:ident ) => {
+        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @items ( $($items)* ( [$(#[$attrs])*] $V $V ) ) }
     };
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $($pairs:tt)* ) @rest) => {
-        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @pairs ( $($pairs)* ) }
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $($items:tt)* ) @rest) => {
+        $crate::__commands_expand! { @vis ($v) @enum $E @conf $C @items ( $($items)* ) }
     };
 }
 
 #[doc(hidden)]
 #[macro_export]
 macro_rules! __commands_expand {
-    (@vis ($v:vis) @enum $E:ident @conf $C:ident @pairs ( $( ( $V:ident $T:path ) )* ) ) => {
+    (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $( ( [$($attrs:tt)*] $V:ident $T:path ) )* ) ) => {
+        #[derive(::clap::Subcommand)]
+        $v enum $E {
+            $( $($attrs)* $V($T), )*
+        }
         impl $crate::cli::Command<$C> for $E {
             fn exec(&self, conf: &$C) -> ::anyhow::Result<()> {
                 match self {
