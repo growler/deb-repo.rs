@@ -3,8 +3,8 @@ use {
     clap::Parser,
     debrepo::{
         cli::{self, Command},
-        sandbox::{maybe_run_sandbox, HostSandboxExecutor},
-        HttpCachingTransportProvider, HttpTransportProvider, Manifest, TransportProvider,
+        maybe_run_sandbox, HostSandboxExecutor, HttpCachingTransportProvider,
+        HttpTransportProvider, Manifest, TransportProvider,
     },
     std::{
         num::NonZero,
@@ -87,6 +87,13 @@ pub struct App {
 }
 
 impl cli::Config for App {
+    fn log_level(&self) -> i32 {
+        if self.quiet {
+            -1
+        } else {
+            self.debug as i32
+        }
+    }
     fn arch(&self) -> &str {
         &self.arch
     }
@@ -121,7 +128,7 @@ impl cli::Config for App {
     }
 }
 
-debrepo::commands! {
+debrepo::cli_commands! {
     enum Commands<App> {
         Init(cli::cmd::Init),
         Update(cli::cmd::Update),

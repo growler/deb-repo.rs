@@ -3,8 +3,9 @@ use {
         control::MutableControlStanza,
         hash::HashingReader,
         parse_size,
-        staging::{StagingFile, StagingTempFile},
+        staging::{Stage, StagingFile, StagingTempFile},
         tar::{TarEntry, TarLink, TarReader},
+        StagingFileSystem,
     },
     async_compression::futures::bufread::{
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
@@ -362,11 +363,15 @@ where
             inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
         }
     }
-    pub async fn extract_to<FS: crate::StagingFileSystem + ?Sized>(
+    pub async fn extract_to<'f, FS>(
         mut self,
-        fs: &FS,
+        fs: &'f FS,
         keep_mtime: bool,
-    ) -> Result<MutableControlStanza> {
+    ) -> Result<MutableControlStanza>
+    where
+        'a: 'f,
+        FS: StagingFileSystem + ?Sized,
+    {
         let mut installed_files: Vec<String> = vec![];
         let mut ctrl: MutableControlStanza;
         let mut ctrl_files: Vec<(String, FS::TempFile)> = vec![];
@@ -375,8 +380,14 @@ where
         let multiarch: Option<&str>;
         let pkg: &str;
         let ctrl_base = PathBuf::from("./var/lib/dpkg/info");
-        fs.create_dir_all(&ctrl_base, 0, 0, 0o755, (!keep_mtime).then_some(UNIX_EPOCH))
-            .await?;
+        fs.create_dir_all(
+            ctrl_base.clone(),
+            0,
+            0,
+            0o755,
+            (!keep_mtime).then_some(UNIX_EPOCH),
+        )
+        .await?;
         {
             let mut control_tarball = self
                 .next()
@@ -651,6 +662,18 @@ where
     }
 }
 
+impl<'a, 'f, R, FS> Stage<'f, FS> for DebReader<'a, R>
+where
+    R: AsyncRead + Send + 'a,
+    FS: StagingFileSystem + ?Sized,
+    'a: 'f,
+{
+    type Output = MutableControlStanza;
+    fn stage(self, fs: &'f FS) -> impl Future<Output = io::Result<MutableControlStanza>> + 'f {
+        self.extract_to(fs, false)
+    }
+}
+
 impl<'a, R> Stream for DebReader<'a, R>
 where
     R: AsyncRead + Send + 'a,
@@ -704,4 +727,11 @@ where
         Compression::Zstd => TarReader::new(Box::pin(ZstdDecoder::new(BufReader::new(r)))),
         Compression::None => TarReader::new(Box::pin(r)),
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_impl_all;
+    assert_impl_all!(DebReader<'_, smol::fs::File>: Send, Sync);
 }

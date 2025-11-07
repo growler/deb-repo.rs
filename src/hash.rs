@@ -99,6 +99,20 @@ impl<D: HashAlgo> InnerHash<D> {
     fn hash(&self) -> Hash {
         D::hash(self.inner.clone())
     }
+    fn reader<'b, R: AsyncRead + Send + 'b>(
+        &self,
+        size: u64,
+        reader: R,
+    ) -> Pin<Box<dyn AsyncRead + Send + 'b>>
+    where
+        D: 'b,
+    {
+        Box::pin(VerifyingReader::<D, _>::new(
+            reader,
+            size,
+            self.inner.clone(),
+        ))
+    }
     fn verifying_reader<'b, R: AsyncRead + Send + 'b>(
         &self,
         size: u64,
@@ -272,6 +286,14 @@ impl Hash {
     delegate! { pub fn to_hex(&self) -> String }
     delegate! { pub fn to_base64(&self) -> String }
     delegate! { pub fn to_sri(&self) -> String }
+    delegate! { pub fn reader<'b, R>(
+            &self,
+            size: u64,
+            reader: R,
+        ) -> Pin<Box<dyn AsyncRead + Send + 'b>>
+        where
+            R: AsyncRead + Send + 'b
+    }
     delegate! { pub fn verifying_reader<'b, R>(
             &self,
             size: u64,

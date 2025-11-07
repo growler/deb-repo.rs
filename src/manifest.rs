@@ -1,7 +1,8 @@
 use {
     crate::{
-        artifact::{Artifact, ArtifactArg, ArtifactSource},
+        artifact::{self, Artifact, ArtifactArg, ArtifactSource},
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
+        deb::DebReader,
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::{Package, Packages},
@@ -13,6 +14,7 @@ use {
         version::{IntoConstraint, IntoDependency},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
+    indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
     std::{
@@ -32,8 +34,6 @@ pub struct Manifest {
     cache: Option<PathBuf>,
     universe: Option<(Hash, Box<Universe>)>,
 }
-
-pub const DEFAULT_SPEC_NAME: Option<&str> = None;
 
 ///
 /// Example (simplified):
@@ -231,6 +231,13 @@ impl Manifest {
             .collect::<io::Result<Vec<_>>>()?;
         scripts.reverse();
         Ok(scripts)
+    }
+    pub fn artifacts<'a>(
+        &'a self,
+        name: Option<&str>,
+    ) -> io::Result<impl Iterator<Item = io::Result<(ArtifactSource<'a>, &'a Artifact)>> + 'a> {
+        let (_, spec_index) = self.file.spec_index_ensure(name)?;
+        Ok(self.artifacts_for(spec_index))
     }
     fn artifacts_for(
         &self,
@@ -660,16 +667,18 @@ impl Manifest {
             })
             .cloned()
     }
-    pub async fn stage<FS, T>(
+    pub async fn stage<FS, T, P>(
         &self,
         name: Option<&str>,
         fs: &mut FS,
         concurrency: NonZero<usize>,
         transport: &T,
+        pb: Option<P>,
     ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
     where
         FS: StagingFileSystem,
         T: TransportProvider + ?Sized,
+        P: FnOnce(u64) -> ProgressBar,
     {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
         let lock = self.lock.get_spec(spec_index);
@@ -695,15 +704,27 @@ impl Manifest {
                 Ok::<_, io::Error>((src, &p.file, p.order, &p.name))
             })
             .collect::<io::Result<Vec<_>>>()?;
+        let artifacts = self
+            .artifacts_for(spec_index)
+            .collect::<io::Result<Vec<_>>>()?;
+        let pb = pb.map(|f| {
+            let installables_size: u64 = installables.iter().map(|(_, file, _, _)| file.size).sum();
+            let artifacts_size: u64 = artifacts.iter().map(|(_, a)| a.size()).sum();
+            f(installables_size + artifacts_size)
+        });
         stage_debs(
             None,
             installables.iter().map(|(src, file, _, _)| (*src, *file)),
             fs,
             concurrency,
             transport,
+            pb.clone(),
         )
         .await?;
-        stage_artifacts(self.artifacts_for(spec_index), fs, concurrency, transport).await?;
+        stage_artifacts(artifacts.into_iter(), fs, concurrency, transport, pb.clone()).await?;
+        if let Some(pb) = pb {
+            pb.finish_using_style();
+        }
         stage_sources(
             self.file
                 .sources()
@@ -780,12 +801,16 @@ where
     })
     .try_flatten()
     .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| async {
-        let file_name = format!(
+        let target = format!(
             "./var/lib/apt/lists/{}",
             crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
         );
-        fs.import_repo_file(source, file_name, file, transport)
-            .await
+        let reader = transport
+            .open_verified(&source.file_url(file.path()), file.size(), file.hash())
+            .await?;
+        let reader =
+            artifact::FileReader::new(reader, target, None, (file.size() as usize).try_into().ok());
+        fs.stage(reader).await
     })
     .await?;
     let sources_file = sources_file.to_string();
@@ -807,15 +832,21 @@ async fn stage_artifacts<'a, FS, I, T>(
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
+    pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
-    I: IntoIterator<Item = io::Result<(ArtifactSource<'a>, &'a Artifact)>> + 'a,
+    I: IntoIterator<Item = (ArtifactSource<'a>, &'a Artifact)> + 'a,
     T: TransportProvider + ?Sized,
 {
-    stream::iter(artifacts.into_iter())
+    stream::iter(artifacts.into_iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| async {
-            fs.import_artifact(source, artifact, transport).await
+            let reader = artifact.reader(source, transport).await?;
+            fs.stage_artifact(artifact.hash().clone(), reader).await?;
+            if let Some(pb) = &pb {
+                pb.inc(artifact.size());
+            }
+            Ok(())
         })
         .await
 }
@@ -825,6 +856,7 @@ async fn stage_debs<'a, FS, S, T>(
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
+    pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
@@ -833,7 +865,16 @@ where
 {
     let new_installed = stream::iter(packages)
         .map(|(source, file)| async {
-            let mut ctrl = fs.import_deb(source, file, transport).await?;
+            let url = source.file_url(file.path());
+            let deb = DebReader::new(
+                transport
+                    .open_verified(&url, file.size(), file.hash())
+                    .await?,
+            );
+            let mut ctrl = fs.stage_deb(file.hash.clone(), deb).await?;
+            if let Some(pb) = &pb {
+                pb.inc(file.size);
+            }
             ctrl.set("Status", "install ok unpacked");
             ctrl.sort_fields_deb_order();
             Ok::<_, io::Error>(ctrl)

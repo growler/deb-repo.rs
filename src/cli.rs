@@ -10,6 +10,9 @@ use {
 };
 
 pub trait Config {
+    fn log_level(&self) -> i32 {
+        0
+    }
     fn arch(&self) -> &str;
     fn manifest(&self) -> &Path;
     fn concurrency(&self) -> NonZero<usize>;
@@ -30,6 +33,7 @@ pub mod cmd {
         },
         anyhow::{anyhow, Result},
         clap::Parser,
+        indicatif::ProgressBar,
         itertools::Itertools,
         smol::io::AsyncWriteExt,
         std::path::PathBuf,
@@ -457,6 +461,19 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 let manifest =
                     Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
                 smol::fs::create_dir_all(&self.path).await?;
+                let pb = if conf.log_level() == 0 {
+                    Some(|size| {
+                        ProgressBar::new(size).with_style(
+                                indicatif::ProgressStyle::with_template(
+                                    "staging files: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+                                )
+                                .unwrap()
+                                .progress_chars("#>-"),
+                            ).with_finish(indicatif::ProgressFinish::AndClear)
+                    })
+                } else {
+                    None
+                };
                 let mut fs =
                     HostFileSystem::new(&self.path, rustix::process::geteuid().is_root()).await?;
                 let (essentials, other, scripts) = manifest
@@ -465,6 +482,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                         &mut fs,
                         conf.concurrency(),
                         conf.transport().await?,
+                        pb,
                     )
                     .await?;
                 builder.build(&mut fs, essentials, other, scripts).await?;

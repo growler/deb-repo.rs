@@ -597,3 +597,10 @@ struct PackagesInner {
     #[covariant]
     packages: Vec<Package<'this>>,
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use static_assertions::assert_impl_all;
+    assert_impl_all!(MutableControlStanza: Send, Sync);
+}

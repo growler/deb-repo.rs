@@ -2,7 +2,7 @@
 
 mod arch;
 pub mod artifact;
-pub mod builder;
+mod builder;
 pub mod cli;
 pub mod control;
 pub mod deb;
@@ -14,7 +14,7 @@ mod manifest_doc;
 mod packages;
 mod release;
 mod repo;
-pub mod sandbox;
+mod sandbox;
 mod source;
 mod spec;
 mod staging;
@@ -22,17 +22,18 @@ pub mod tar;
 pub mod universe;
 pub mod version;
 
-use std::{path::PathBuf, str::from_utf8_unchecked};
 pub use {
     arch::DEFAULT_ARCH,
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
-    manifest::{Manifest, DEFAULT_SPEC_NAME},
-    packages::{InstallPriority, Package, Packages},
+    manifest::Manifest,
+    packages::{Package, Packages},
+    version::{Version, Dependency, Constraint},
     release::Release,
     repo::TransportProvider,
-    sandbox::{maybe_run_sandbox, unshare_root, unshare_user_ns},
+    builder::{BuildJob, Executor},
+    sandbox::{Sandbox, SandboxExecutor, HostSandboxExecutor, maybe_run_sandbox, unshare_root, unshare_user_ns},
     source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
-    staging::{FileList, HostFileSystem, StagingFile, StagingFileSystem, StagingTempFile},
+    staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem, StagingTempFile},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
@@ -59,7 +60,7 @@ pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
 }
 
 pub(crate) struct SafeStoreFile {
-    name: PathBuf,
+    name: std::path::PathBuf,
     file: smol::fs::File,
     path: tempfile::TempPath,
 }
@@ -174,7 +175,8 @@ pub(crate) fn strip_url_scheme(s: &str) -> &str {
         return s;
     }
     if bytes[0] == b':' && bytes[1] == b'/' && bytes[2] == b'/' {
-        unsafe { from_utf8_unchecked(&bytes[3..]) }
+        // SAFETY: we are just slicing the original string
+        unsafe { std::str::from_utf8_unchecked(&bytes[3..]) }
     } else {
         s
     }
@@ -193,8 +195,47 @@ macro_rules! matches_path {
 }
 pub(crate) use matches_path;
 
+/// A small enum dispatch macro for defining CLI commands.
+///
+/// Examples
+/// ```ignore
+/// #[derive(Parser)]
+/// #[command(name = "app")]
+/// struct App {
+///   // ...
+/// }
+///
+/// impl debrepo::cli::Config for App {
+///   // ...
+///   #[command(subcommand)]
+///   cmd: Commands,
+/// }
+///
+/// debrepo::cli_commands! {
+///   enum Commands<App> {
+///     Init(debrepo::cli::cmd::Init),
+///     // ...
+///     #[command(name = "app-specific")]
+///     Local,
+///   }
+/// }
+///
+/// #[derive(Parser)]
+/// struct Local {
+/// }
+/// impl debrepo::cli::Command<App> for Local {
+///   fn exec(&self, conf: &App) -> anyhow::Result<()> {
+///     // ...
+///   }
+/// }
+///
+/// fn main() -> anyhow::Result<()> {
+///   let mut app = App::parse();  
+///   app.cmd.exec(&app)
+/// }
+// ```
 #[macro_export]
-macro_rules! commands {
+macro_rules! cli_commands {
     ($v:vis enum $E:ident <$C:ident> { $($rest:tt)* }) => {
         $crate::__commands_collect! {
             @vis ($v)
@@ -255,4 +296,3 @@ macro_rules! __commands_expand {
         }
     };
 }
-
