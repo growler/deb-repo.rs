@@ -683,10 +683,14 @@ where
         cgroup: 0,
     };
 
-    match unsafe { libc::syscall(libc::SYS_clone3, &clone_args, std::mem::size_of::<libc::clone_args>()) } {
-        -1 => {
-            Err(io::Error::last_os_error())
-        }
+    match unsafe {
+        libc::syscall(
+            libc::SYS_clone3,
+            &clone_args,
+            std::mem::size_of::<libc::clone_args>(),
+        )
+    } {
+        -1 => Err(io::Error::last_os_error()),
         0 => unsafe {
             if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGKILL, 0, 0, 0) != 0 {
                 libc::_exit(127);

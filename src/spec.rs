@@ -92,7 +92,7 @@ impl LockedSource {
         force: bool,
         transport: &'a T,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
-       tracing::debug!(
+        tracing::debug!(
             "Refreshing locked source for {} {}",
             source.url,
             source.suites.iter().join(" "),

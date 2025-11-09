@@ -26,10 +26,9 @@ pub struct HttpCachingTransportProvider {
 
 impl HttpCachingTransportProvider {
     pub fn new<P: AsRef<Path>>(insecure: bool, cache: P) -> io::Result<Self> {
-        std::fs::create_dir_all(cache.as_ref().join(".temp"))
-            .map_err(|err| {
-                io::Error::other(format!("Failed to create cache directory: {}", err))
-            })?;
+        std::fs::create_dir_all(cache.as_ref().join(".temp")).map_err(|err| {
+            io::Error::other(format!("Failed to create cache directory: {}", err))
+        })?;
         Ok(Self {
             insecure,
             cache: Arc::new(cache.as_ref().to_path_buf().into_boxed_path()),

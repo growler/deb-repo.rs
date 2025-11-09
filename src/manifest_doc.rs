@@ -715,7 +715,9 @@ impl LockFile {
         self.universe_hash.take();
     }
     pub(crate) fn update_universe_hash(&mut self) {
-        self.universe_hash = Some(universe_hash(self.sources.iter().map(|s| s.as_ref().unwrap())));
+        self.universe_hash = Some(universe_hash(
+            self.sources.iter().map(|s| s.as_ref().unwrap()),
+        ));
     }
     pub(crate) fn universe_hash(&self) -> Option<&Hash> {
         self.universe_hash.as_ref()
@@ -730,7 +732,9 @@ impl LockFile {
         self.specs.iter_mut()
     }
     pub fn invalidate_specs(&mut self) {
-        self.specs.iter_mut().for_each(|(_, s)| s.invalidate_solution());
+        self.specs
+            .iter_mut()
+            .for_each(|(_, s)| s.invalidate_solution());
     }
     pub fn get_spec(&self, id: usize) -> &'_ LockedSpec {
         &self.specs[id]

@@ -23,7 +23,6 @@ use {
         path::Path,
         pin::Pin,
         task::{Context, Poll},
-        time::{Duration, UNIX_EPOCH},
     },
 };
 
@@ -482,7 +481,7 @@ where
                         |p| Cow::Owned(Path::new(p).join(dir.path())),
                     );
                     tracing::debug!("creating directory {}", path.display());
-                    fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode(), Some(UNIX_EPOCH))
+                    fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode())
                         .await?;
                 }
                 tar::TarEntry::File(mut file) => {
@@ -490,13 +489,12 @@ where
                         || Path::new(file.path()).to_path_buf(),
                         |p| Path::new(p).join(file.path()),
                     );
-                    let mtime = UNIX_EPOCH;
                     let size = file.size() as usize;
                     let uid = file.uid();
                     let gid = file.gid();
                     let mode = file.mode();
                     tracing::debug!("extracting {}", path.display());
-                    fs.create_file(&mut file, &path, uid, gid, mode, Some(mtime), Some(size))
+                    fs.create_file(&mut file, uid, gid, mode, Some(size))
                         .await
                         .map_err(|err| {
                             io::Error::other(format!(
@@ -505,11 +503,10 @@ where
                                 err
                             ))
                         })?
-                        .persist()
+                        .persist(&path)
                         .await?;
                 }
                 tar::TarEntry::Symlink(link) => {
-                    let mtime = UNIX_EPOCH + Duration::from_secs(link.mtime() as u64);
                     let uid = link.uid();
                     let gid = link.gid();
                     let path = target.map_or_else(
@@ -527,7 +524,7 @@ where
                             }
                         },
                     );
-                    fs.symlink(link, path, uid, gid, Some(mtime)).await?;
+                    fs.symlink(link, path, uid, gid).await?;
                 }
                 tar::TarEntry::Link(link) => {
                     links.push(link);
@@ -759,15 +756,13 @@ where
     async fn stage(self, fs: &'f FS) -> io::Result<()> {
         fs.create_file(
             self.inner,
-            &self.target,
             0,
             0,
             self.mode.map_or(0o644, |m| m.get() & 0o7777),
-            Some(UNIX_EPOCH),
             self.size.map(|s| s.get()),
         )
         .await?
-        .persist()
+        .persist(&self.target)
         .await
     }
 }
@@ -800,7 +795,6 @@ mod tree {
             os::{fd::AsRawFd, unix::ffi::OsStrExt},
             path::{Path, PathBuf},
             str::FromStr,
-            time::UNIX_EPOCH,
         },
     };
 
@@ -874,7 +868,7 @@ mod tree {
                     } else {
                         path
                     };
-                    fs.symlink(link_target, &path, 0, 0, None).await?;
+                    fs.symlink(link_target, &path, 0, 0).await?;
                     Ok(None)
                 }
                 Object::Directory { stat, path } => {
@@ -883,7 +877,7 @@ mod tree {
                     } else {
                         path
                     };
-                    fs.create_dir_all(path, 0, 0, stat.st_mode, Some(UNIX_EPOCH))
+                    fs.create_dir_all(path, 0, 0, stat.st_mode)
                         .await?;
                     Ok(None)
                 }
@@ -897,15 +891,13 @@ mod tree {
                     let file = fs
                         .create_file(
                             &mut rd,
-                            path,
                             0,
                             0,
                             stat.st_mode,
-                            None,
                             Some(stat.st_size as usize),
                         )
                         .await?;
-                    file.persist().await?;
+                    file.persist(path).await?;
                     Ok(Some(rd.into_hash_output()))
                 }
             }
@@ -1035,10 +1027,13 @@ mod tree {
                 .map(|entry| process_fs_object(&path, &fd, entry, f)),
         )
         .buffered(16)
-        .try_fold((NodeHasher::new(), 0u64), |(mut hasher, size), (hash, s)| async move {
-            hasher.update(&hash);
-            Ok((hasher, size + s))
-        })
+        .try_fold(
+            (NodeHasher::new(), 0u64),
+            |(mut hasher, size), (hash, s)| async move {
+                hasher.update(&hash);
+                Ok((hasher, size + s))
+            },
+        )
         .await?;
         Ok((hasher.finalize_fixed(), size))
     }

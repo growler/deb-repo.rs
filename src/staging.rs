@@ -1,25 +1,16 @@
 use {
     crate::{control::MutableControlStanza, hash::Hash},
     futures::future::{BoxFuture, LocalBoxFuture},
-    indicatif::ProgressBar,
-    rustix::{
-        fd::AsFd,
-        fs::{
-            chown, chownat, fallocate, fchown, futimens, link, symlinkat, unlink, utimensat,
-            AtFlags, FallocateFlags, Gid, Mode, Timespec, Timestamps, Uid, CWD, UTIME_OMIT,
-        },
+    rustix::fs::{
+        AtFlags, CWD, FallocateFlags, Gid, Mode, OFlags, Timespec, Timestamps, UTIME_OMIT, Uid, chown, chownat, fallocate, fchown, fstat, futimens, link, linkat, openat, stat, symlinkat, unlink, utimensat
     },
-    smol::{
-        fs::{self, unix::OpenOptionsExt},
-        prelude::*,
-    },
+    smol::prelude::*,
     std::{
         io,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::Arc,
-        time::{SystemTime, UNIX_EPOCH},
-    },
+    }, tempfile::TempPath,
 };
 
 pub trait Stage<'f, FS: StagingFileSystem + ?Sized> {
@@ -28,9 +19,6 @@ pub trait Stage<'f, FS: StagingFileSystem + ?Sized> {
 }
 
 pub trait StagingFile {
-    fn persist(self) -> impl Future<Output = io::Result<()>>;
-}
-pub trait StagingTempFile {
     fn persist<P>(self, path: P) -> impl Future<Output = io::Result<()>>
     where
         P: AsRef<Path>;
@@ -40,7 +28,6 @@ pub trait StagingTempFile {
 #[allow(clippy::too_many_arguments)]
 pub trait StagingFileSystem {
     type File: StagingFile;
-    type TempFile: StagingTempFile;
     type IoFut<'a, T>: Future<Output = io::Result<T>> + 'a
     where
         Self: 'a,
@@ -52,7 +39,6 @@ pub trait StagingFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()>;
     /// Create a directory at `path`, including all the parent directories if necessary,
     /// optionall owned by (`uid`, `gid`) using mode bits `mode`
@@ -62,7 +48,6 @@ pub trait StagingFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()>;
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
@@ -70,7 +55,6 @@ pub trait StagingFileSystem {
         link: Q,
         uid: u32,
         gid: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()>;
     fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, target: P, link: Q) -> Self::IoFut<'_, ()>;
     /// Creates a file using content provided by the reader `r`.
@@ -96,25 +80,23 @@ pub trait StagingFileSystem {
     /// # Errors
     /// This method may return an I/O error if the file creation or any of the specified
     /// parameters are invalid or if there are issues during the operation.
-    fn create_file<'a, R: AsyncRead + Send + 'a, P: AsRef<Path>>(
+    fn create_file<'a, R: AsyncRead + Send + 'a>(
         &'a self,
         r: R,
-        path: P,
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
         size: Option<usize>,
     ) -> Self::IoFut<'a, Self::File>;
-    fn create_temp_file<'a, R: AsyncRead + Send + 'a>(
+    fn create_file_from_bytes<'a>(
         &'a self,
-        r: R,
+        r: &'a [u8],
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
-        size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::TempFile>;
+    ) -> Self::IoFut<'a, Self::File> {
+        self.create_file(r, uid, gid, mode, Some(r.len()))
+    }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()>;
     fn stage<'f, A, T>(&'f self, artifact: A) -> Self::IoFut<'f, T>
     where
@@ -163,11 +145,8 @@ fn clean_path(target: &Path) -> io::Result<&Path> {
 }
 
 impl HostFileSystem {
-    pub async fn new<P: AsRef<Path>>(
-        root: P,
-        allow_chown: bool,
-    ) -> io::Result<Self> {
-        let root = fs::canonicalize(root.as_ref()).await?;
+    pub async fn new<P: AsRef<Path>>(root: P, allow_chown: bool) -> io::Result<Self> {
+        let root = smol::fs::canonicalize(root.as_ref()).await?;
         Ok(Self {
             root: root.into(),
             chown_allowed: allow_chown,
@@ -178,128 +157,102 @@ impl HostFileSystem {
     }
 }
 
-pub struct HostFile {}
-
-// #[async_trait::async_trait(?Send)]
-impl StagingFile for HostFile {
-    async fn persist(self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
-pub struct HostTempFile {
+pub struct HostFile {
     base: Arc<Path>,
-    path: tempfile::TempPath,
+    path: TempPath,
+    file: smol::fs::File,
 }
 
-impl StagingTempFile for HostTempFile {
-    async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
-        let to = self.base.as_ref().join(clean_path(path.as_ref())?);
-        use std::os::unix::fs::MetadataExt;
-        let rename = if let Some(to_dir) = to.parent() {
-            if let Ok(to_md) = fs::metadata(&to_dir).await {
-                let from_md = fs::metadata(&self.path).await.map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to get metadata for {:?}: {}", to_dir.as_os_str(), e),
-                    )
-                })?;
-                from_md.dev() == to_md.dev()
+impl StagingFile for HostFile {
+    async fn persist<P: AsRef<Path>>(self, name: P) -> io::Result<()> {
+        let to = self.base.as_ref().join(clean_path(name.as_ref())?);
+        if to.parent().is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid path {}", name.as_ref().display()),
+            ));
+        }
+        let file = self.file;
+        let _path = self.path;
+        match blocking::unblock(move || {
+            let file_meta = fstat(&file)?;
+            let dir_met = stat(to.parent().unwrap())?;
+            if file_meta.st_dev == dir_met.st_dev {
+                linkat(&file, "", CWD, &to, AtFlags::EMPTY_PATH)?;
+                futimens(&file, &EPOCH)?;
+                Ok::<_, io::Error>(None)
             } else {
-                false
+                let target = openat(
+                    CWD,
+                    &to,
+                    OFlags::CREATE | OFlags::WRONLY,
+                    Mode::from_raw_mode(file_meta.st_mode),
+                )?;
+                fchown(
+                    &target,
+                    Some(Uid::from_raw(file_meta.st_uid)),
+                    Some(Gid::from_raw(file_meta.st_gid)),
+                )?;
+                Ok(Some((file, target)))
             }
-        } else {
-            false
-        };
-        if rename {
-            fs::rename(&self.path, &to).await.map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to rename {:?} to {:?}: {}",
-                        self.path.as_os_str(),
-                        to.as_os_str(),
-                        e
-                    ),
-                )
-            })
-        } else {
-            fs::copy(&self.path, &to).await.map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!(
-                        "failed to copy {:?} to {:?}: {}",
-                        self.path.as_os_str(),
-                        &to,
-                        e
-                    ),
-                )
-            })?;
-            fs::remove_file(&self.path).await.map_err(|e| {
-                io::Error::new(
-                    e.kind(),
-                    format!("failed to remove {:?}: {}", self.path.as_os_str(), e),
-                )
-            })
+        })
+        .await
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to persist file {}: {}",
+                name.as_ref().display(),
+                err
+            ))
+        })? {
+            None => Ok(()),
+            Some((mut src, dst)) => {
+                let mut dst: smol::fs::File = dst.into();
+                src.seek(smol::io::SeekFrom::Start(0)).await?;
+                smol::io::copy(&mut src, &mut dst).await?;
+                dst.sync_data().await?;
+                drop(src);
+                blocking::unblock(move || {
+                    futimens(&dst, &EPOCH)?;
+                    Ok(())
+                })
+                .await
+            }
         }
     }
 }
 
-fn mtime_to_ts(ts: &SystemTime) -> Timestamps {
-    Timestamps {
-        last_modification: match ts.duration_since(UNIX_EPOCH) {
-            Ok(d) => Timespec {
-                tv_sec: d.as_secs() as i64,
-                tv_nsec: d.subsec_nanos() as i64,
-            },
-            Err(d) => {
-                let d = d.duration();
-                Timespec {
-                    tv_sec: -(d.as_secs() as i64),
-                    tv_nsec: -(d.subsec_nanos() as i64),
-                }
-            }
-        },
-        last_access: Timespec {
-            tv_sec: 0,
-            tv_nsec: UTIME_OMIT,
-        },
-    }
-}
+const EPOCH: Timestamps = Timestamps {
+    last_modification: Timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    },
+    last_access: Timespec {
+        tv_sec: 0,
+        tv_nsec: UTIME_OMIT,
+    },
+};
 
-fn mkdir(
-    path: &std::path::Path,
-    owner: Option<(u32, u32)>,
-    mode: u32,
-    mtime: Option<SystemTime>,
-) -> io::Result<()> {
+fn mkdir(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
     rustix::fs::mkdirat(CWD, path, Mode::from_raw_mode(mode))?;
     if let Some((uid, gid)) = owner {
         chown(path, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
     }
-    if let Some(mtime) = mtime {
-        utimensat(CWD, path, &mtime_to_ts(&mtime), AtFlags::empty())?;
-    }
+    utimensat(CWD, path, &EPOCH, AtFlags::empty())?;
     Ok(())
 }
 
-fn mkdir_rec(
-    path: &std::path::Path,
-    owner: Option<(u32, u32)>,
-    mode: u32,
-    mtime: Option<SystemTime>,
-) -> io::Result<()> {
+fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io::Result<()> {
     if path.is_dir() {
         return Ok(());
     }
-    match mkdir(path, owner, mode, mtime) {
+    match mkdir(path, owner, mode) {
         Ok(()) => Ok(()),
         Err(ref e) if e.kind() == io::ErrorKind::NotFound => {
             let parent = path
                 .parent()
                 .ok_or_else(|| io::Error::other("failed to create tree: no parent"))?;
-            mkdir_rec(parent, owner, mode, mtime)?;
-            match mkdir(path, owner, mode, mtime) {
+            mkdir_rec(parent, owner, mode)?;
+            match mkdir(path, owner, mode) {
                 Ok(()) => Ok(()),
                 Err(_) if path.is_dir() => Ok(()),
                 Err(e) => Err(e),
@@ -312,7 +265,6 @@ fn mkdir_rec(
 
 impl StagingFileSystem for HostFileSystem {
     type File = HostFile;
-    type TempFile = HostTempFile;
     type IoFut<'a, T>
         = BoxFuture<'a, io::Result<T>>
     where
@@ -324,7 +276,6 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         let target = self.target_path(path.as_ref());
         let owner = if self.chown_allowed {
@@ -334,15 +285,13 @@ impl StagingFileSystem for HostFileSystem {
         };
         blocking::unblock(move || {
             let target = target?;
-            mkdir(target.as_ref(), owner, mode, mtime).map_err(|e| {
+            mkdir(target.as_ref(), owner, mode).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("failed to create directory {:?}: {}", target.as_os_str(), e),
                 )
             })?;
-            if let Some(mtime) = mtime {
-                utimensat(CWD, target, &mtime_to_ts(&mtime), AtFlags::empty())?;
-            }
+            utimensat(CWD, target, &EPOCH, AtFlags::empty())?;
             Ok(())
         })
         .boxed()
@@ -353,7 +302,6 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         let target = self.target_path(path.as_ref());
         let owner = if self.chown_allowed {
@@ -363,7 +311,7 @@ impl StagingFileSystem for HostFileSystem {
         };
         blocking::unblock(move || {
             let target = target?;
-            mkdir_rec(target.as_ref(), owner, mode, mtime).map_err(|e| {
+            mkdir_rec(target.as_ref(), owner, mode).map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!(
@@ -382,7 +330,6 @@ impl StagingFileSystem for HostFileSystem {
         path: Q,
         uid: u32,
         gid: u32,
-        mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         let link = self.target_path(path.as_ref());
         let target = target.as_ref().to_owned();
@@ -400,12 +347,7 @@ impl StagingFileSystem for HostFileSystem {
                 )
                 .map_err(Into::<io::Error>::into)?;
             }
-            if let Some(mtime) = mtime {
-                utimensat(CWD, link, &mtime_to_ts(&mtime), AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(Into::<io::Error>::into)
-            } else {
-                Ok(())
-            }
+            utimensat(CWD, link, &EPOCH, AtFlags::SYMLINK_NOFOLLOW).map_err(Into::<io::Error>::into)
         })
         .boxed()
     }
@@ -419,108 +361,52 @@ impl StagingFileSystem for HostFileSystem {
         })
         .boxed()
     }
-    fn create_temp_file<'a, R: AsyncRead + Send + 'a>(
+    fn create_file<'a, R: AsyncRead + Send + 'a>(
         &'a self,
         r: R,
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
         size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::TempFile> {
+    ) -> Self::IoFut<'a, Self::File> {
         let root = self.root.clone();
         async move {
-            let (file, path) = blocking::unblock(move || {
-                tempfile::Builder::new()
-                    .permissions(fs::Permissions::from_mode(mode))
-                    .tempfile_in(&root)
-                    .map(|f| f.into_parts())
-            })
-            .await?;
-            let mut file: smol::fs::File = if let Some(size) = size {
-                if size > 0 {
-                    blocking::unblock(move || {
-                        fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64).map(|_| file)
-                    })
-                    .await
-                } else {
-                    Ok(file)
-                }
-            } else {
-                Ok(file)
-            }?
-            .into();
-            smol::io::copy(r, &mut file).await?;
-            file.flush().await?;
             let chown_allowed = self.chown_allowed;
-            blocking::unblock(move || {
+            let (file, path) = blocking::unblock(move || {
+                let (file, path) = tempfile::Builder::new()
+                    .permissions(smol::fs::Permissions::from_mode(mode))
+                    .tempfile_in(&root)
+                    .map(|f| f.into_parts())?;
+                if let Some(size) = size {
+                    if size > 0 {
+                        fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)?;
+                    }
+                }
                 if chown_allowed {
                     fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
                 }
-                if let Some(mtime) = mtime {
-                    futimens(&file, &mtime_to_ts(&mtime))
-                } else {
-                    Ok(())
-                }
+                Ok::<_, io::Error>((file, path))
             })
             .await?;
-            Ok(HostTempFile {
+            let mut file: smol::fs::File = file.into();
+            smol::io::copy(r, &mut file).await?;
+            file.sync_data().await?;
+            Ok(HostFile {
                 base: Arc::clone(&self.root),
+                file,
                 path,
             })
         }
         .boxed()
     }
-    fn create_file<'a, R: AsyncRead + Send + 'a, P: AsRef<Path>>(
+    fn create_file_from_bytes<'a>(
         &'a self,
-        r: R,
-        path: P,
+        r: &'a [u8],
         uid: u32,
         gid: u32,
         mode: u32,
-        mtime: Option<SystemTime>,
-        size: Option<usize>,
     ) -> Self::IoFut<'a, Self::File> {
-        let path = self.target_path(path.as_ref());
-        async move {
-            let path = path?;
-            let mut file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(mode)
-                .open(&path)
-                .await
-                .map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("failed to create file {}: {}", path.display(), e),
-                    )
-                })?;
-            if let Some(size) = size {
-                if size > 0 {
-                    let fd = file.as_fd().try_clone_to_owned()?;
-                    blocking::unblock(move || {
-                        fallocate(&fd, FallocateFlags::KEEP_SIZE, 0, size as u64)
-                    })
-                    .await?;
-                }
-            }
-            smol::io::copy(r, &mut file).await?;
-            let chown_allowed = self.chown_allowed;
-            blocking::unblock(move || {
-                if chown_allowed {
-                    fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))?;
-                }
-                if let Some(mtime) = mtime {
-                    futimens(&file, &mtime_to_ts(&mtime))
-                } else {
-                    Ok(())
-                }
-            })
-            .await?;
-            Ok(HostFile {})
-        }
-        .boxed()
+        self.create_file(r, uid, gid, mode, Some(r.len()))
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()> {
         let target = self.target_path(path.as_ref());
@@ -554,7 +440,7 @@ impl FileList {
         }
     }
     pub async fn keep<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
-        let mut file = fs::OpenOptions::new()
+        let mut file = smol::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
@@ -567,15 +453,15 @@ impl FileList {
     }
 }
 
-pub struct FileListTempFile {
+pub struct FileListFile {
     uid: u32,
     gid: u32,
     mode: u32,
     size: u64,
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
-// #[async_trait::async_trait(?Send)]
-impl StagingTempFile for FileListTempFile {
+
+impl StagingFile for FileListFile {
     async fn persist<P: AsRef<Path>>(self, path: P) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {} {}",
@@ -589,14 +475,6 @@ impl StagingTempFile for FileListTempFile {
     }
 }
 
-pub struct FileListFile {}
-// #[async_trait::async_trait(?Send)]
-impl StagingFile for FileListFile {
-    async fn persist(self) -> io::Result<()> {
-        Ok(())
-    }
-}
-
 fn iofut<'a, T: 'a>(t: T) -> LocalBoxFuture<'a, io::Result<T>> {
     async move { Ok(t) }.boxed_local()
 }
@@ -604,7 +482,6 @@ fn iofut<'a, T: 'a>(t: T) -> LocalBoxFuture<'a, io::Result<T>> {
 // #[async_trait::async_trait(?Send)]
 impl StagingFileSystem for FileList {
     type File = FileListFile;
-    type TempFile = FileListTempFile;
     type IoFut<'a, T>
         = LocalBoxFuture<'a, io::Result<T>>
     where
@@ -616,7 +493,6 @@ impl StagingFileSystem for FileList {
         uid: u32,
         gid: u32,
         mode: u32,
-        _mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
@@ -633,7 +509,6 @@ impl StagingFileSystem for FileList {
         uid: u32,
         gid: u32,
         mode: u32,
-        _mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
@@ -650,7 +525,6 @@ impl StagingFileSystem for FileList {
         path: Q,
         uid: u32,
         gid: u32,
-        _mtime: Option<SystemTime>,
     ) -> Self::IoFut<'_, ()> {
         self.out.lock().unwrap().insert(format!(
             "{} -> {} {} {}",
@@ -669,45 +543,23 @@ impl StagingFileSystem for FileList {
         ));
         iofut(())
     }
-    fn create_temp_file<'a, R: AsyncRead + Send + 'a>(
+    fn create_file<'a, R: AsyncRead + Send + 'a>(
         &'a self,
         r: R,
         uid: u32,
         gid: u32,
         mode: u32,
-        _mtime: Option<SystemTime>,
         _size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::TempFile> {
+    ) -> Self::IoFut<'a, Self::File> {
         async move {
             let size = smol::io::copy(r, &mut smol::io::sink()).await?;
-            Ok(FileListTempFile {
+            Ok(FileListFile {
                 mode,
                 uid,
                 gid,
                 size,
                 out: Arc::clone(&self.out),
             })
-        }
-        .boxed_local()
-    }
-    fn create_file<'a, R: AsyncRead + Send + 'a, P: AsRef<Path>>(
-        &'a self,
-        r: R,
-        path: P,
-        uid: u32,
-        gid: u32,
-        mode: u32,
-        _mtime: Option<SystemTime>,
-        _size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::File> {
-        let path = path.as_ref().as_os_str().to_string_lossy().into_owned();
-        async move {
-            let size = smol::io::copy(r, &mut smol::io::sink()).await?;
-            self.out
-                .lock()
-                .unwrap()
-                .insert(format!("{} {:o} {} {} {}", path, mode, uid, gid, size));
-            Ok(FileListFile {})
         }
         .boxed_local()
     }
@@ -737,17 +589,14 @@ mod tests {
     where
         T: StagingFileSystem + Sync + Send + Clone,
         T::File: Send,
-        T::TempFile: Send,
         for<'a> T::IoFut<'a, ()>: Send,
         for<'a> T::IoFut<'a, T::File>: Send,
-        for<'a> T::IoFut<'a, T::TempFile>: Send,
     {
     }
 
     use static_assertions::{assert_impl_all, assert_not_impl_all};
     assert_impl_all!(HostFileSystem: Send, Sync, ThreadSafeStagingFS);
     assert_impl_all!(HostFile: Send, Sync);
-    assert_impl_all!(HostTempFile: Send, Sync);
     assert_impl_all!(FileList: Send, Sync);
     assert_not_impl_all!(FileList: ThreadSafeStagingFS);
 }

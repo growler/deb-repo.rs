@@ -1,12 +1,15 @@
 use {
     crate::{
-        SafeStoreFile, control::{
+        control::{
             ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
             ParseError,
-        }, hash::Hash, version::{
+        },
+        hash::Hash,
+        version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
-        }
+        },
+        SafeStoreFile,
     },
     futures::AsyncWriteExt,
     futures_lite::io::{AsyncRead, AsyncReadExt},

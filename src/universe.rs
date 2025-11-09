@@ -2,7 +2,7 @@ use {
     crate::{
         control::ParseError,
         hash::Hash,
-        idmap::{HashRef, IdMap, IntoId, ToIndex, UpdateResult, id_type},
+        idmap::{id_type, HashRef, IdMap, IntoId, ToIndex, UpdateResult},
         packages::{MemoryMappedUniverseFile, Package, Packages},
         version::{self, Constraint, Dependency, Satisfies, Version},
     },
@@ -12,7 +12,7 @@ use {
         DependencyProvider, Interner, KnownDependencies, NameId, Requirement, SolvableId,
         SolverCache, StringId, UnsolvableOrCancelled, VersionSetId, VersionSetUnionId,
     },
-    smallvec::{SmallVec, smallvec},
+    smallvec::{smallvec, SmallVec},
     std::{borrow::Borrow, collections::HashMap, hash, io},
 };
 
@@ -915,8 +915,9 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src.to_string().into_boxed_str(), None).expect("failed to parse test source")]
-                        .into_iter(),
+                    vec![Packages::new($src.to_string().into_boxed_str(), None)
+                        .expect("failed to parse test source")]
+                    .into_iter(),
                 )
                 .unwrap();
                 let solution = match uni.solve(

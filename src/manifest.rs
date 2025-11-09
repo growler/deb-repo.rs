@@ -20,7 +20,6 @@ use {
     std::{
         num::NonZero,
         path::{Path, PathBuf},
-        time::UNIX_EPOCH,
     },
 };
 
@@ -721,7 +720,14 @@ impl Manifest {
             pb.clone(),
         )
         .await?;
-        stage_artifacts(artifacts.into_iter(), fs, concurrency, transport, pb.clone()).await?;
+        stage_artifacts(
+            artifacts.into_iter(),
+            fs,
+            concurrency,
+            transport,
+            pb.clone(),
+        )
+        .await?;
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
@@ -781,9 +787,9 @@ where
     T: TransportProvider + ?Sized,
     I: Iterator<Item = io::Result<(&'a Source, &'a LockedSource)>> + 'a,
 {
-    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755, Some(UNIX_EPOCH))
+    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
         .await?;
-    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755, Some(UNIX_EPOCH))
+    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
         .await?;
     let mut sources_file = MutableControlFile::new();
     stream::iter(sources.map(|src| {
@@ -814,18 +820,10 @@ where
     })
     .await?;
     let sources_file = sources_file.to_string();
-    fs.create_file(
-        sources_file.as_bytes(),
-        "./etc/apt/sources.list.d/manifest.sources",
-        0,
-        0,
-        0o644,
-        Some(UNIX_EPOCH),
-        Some(sources_file.len()),
-    )
-    .await?
-    .persist()
-    .await
+    fs.create_file_from_bytes(sources_file.as_bytes(), 0, 0, 0o644)
+        .await?
+        .persist("./etc/apt/sources.list.d/manifest.sources")
+        .await
 }
 async fn stage_artifacts<'a, FS, I, T>(
     artifacts: I,
@@ -914,8 +912,7 @@ where
         .chain(new_installed.iter().map(Installed::New))
         .collect::<Vec<_>>();
     all_installed.sort_by(|a, b| a.package().cmp(b.package()));
-    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32, Some(UNIX_EPOCH))
-        .await?;
+    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32).await?;
     {
         use smol::io::AsyncWriteExt;
         let size = all_installed.iter().map(|i| i.len() + 1).sum();
@@ -924,18 +921,10 @@ where
             status.write_all(format!("{}", &i).as_bytes()).await?;
             status.write_all(b"\n").await?;
         }
-        fs.create_file(
-            status.as_slice(),
-            "./var/lib/dpkg/status",
-            0,
-            0,
-            0o644,
-            Some(UNIX_EPOCH),
-            Some(size),
-        )
-        .await?
-        .persist()
-        .await?;
+        fs.create_file_from_bytes(status.as_slice(), 0, 0, 0o644)
+            .await?
+            .persist("./var/lib/dpkg/status")
+            .await?;
     }
     Ok(())
 }

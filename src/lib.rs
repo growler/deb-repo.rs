@@ -24,16 +24,19 @@ pub mod version;
 
 pub use {
     arch::DEFAULT_ARCH,
+    builder::{BuildJob, Executor},
     httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::Manifest,
     packages::{Package, Packages},
-    version::{Version, Dependency, Constraint},
     release::Release,
     repo::TransportProvider,
-    builder::{BuildJob, Executor},
-    sandbox::{Sandbox, SandboxExecutor, HostSandboxExecutor, maybe_run_sandbox, unshare_root, unshare_user_ns},
+    sandbox::{
+        maybe_run_sandbox, unshare_root, unshare_user_ns, HostSandboxExecutor, Sandbox,
+        SandboxExecutor,
+    },
     source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
-    staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem, StagingTempFile},
+    staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
+    version::{Constraint, Dependency, Version},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {

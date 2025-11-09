@@ -3,7 +3,7 @@ use {
         control::MutableControlStanza,
         hash::HashingReader,
         parse_size,
-        staging::{Stage, StagingFile, StagingTempFile},
+        staging::{Stage, StagingFile},
         tar::{TarEntry, TarLink, TarReader},
         StagingFileSystem,
     },
@@ -21,7 +21,6 @@ use {
         path::PathBuf,
         pin::{pin, Pin},
         sync::Arc,
-        time::{Duration, UNIX_EPOCH},
     },
 };
 
@@ -366,7 +365,6 @@ where
     pub async fn extract_to<'f, FS>(
         mut self,
         fs: &'f FS,
-        keep_mtime: bool,
     ) -> Result<MutableControlStanza>
     where
         'a: 'f,
@@ -374,20 +372,13 @@ where
     {
         let mut installed_files: Vec<String> = vec![];
         let mut ctrl: MutableControlStanza;
-        let mut ctrl_files: Vec<(String, FS::TempFile)> = vec![];
+        let mut ctrl_files: Vec<(String, FS::File)> = vec![];
         let mut ctrl_files_list = String::new();
         let mut conf_files: Vec<(String, Option<String>)> = vec![];
         let multiarch: Option<&str>;
         let pkg: &str;
         let ctrl_base = PathBuf::from("./var/lib/dpkg/info");
-        fs.create_dir_all(
-            ctrl_base.clone(),
-            0,
-            0,
-            0o755,
-            (!keep_mtime).then_some(UNIX_EPOCH),
-        )
-        .await?;
+        fs.create_dir_all(ctrl_base.clone(), 0, 0, 0o755).await?;
         {
             let mut control_tarball = self
                 .next()
@@ -410,11 +401,6 @@ where
                 let entry = entry?;
                 match entry {
                     TarEntry::File(mut file) => {
-                        let mtime = if keep_mtime {
-                            UNIX_EPOCH + Duration::from_secs(file.mtime().into())
-                        } else {
-                            UNIX_EPOCH
-                        };
                         let uid = file.uid();
                         let gid = file.gid();
                         let mode = file.mode();
@@ -437,24 +423,21 @@ where
                             file.read_to_string(&mut buf).await?;
                             conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
                             let file = fs
-                                .create_temp_file(
+                                .create_file_from_bytes(
                                     buf.as_bytes(),
                                     uid,
                                     gid,
                                     mode,
-                                    Some(mtime),
-                                    Some(size as usize),
                                 )
                                 .await?;
                             ctrl_files.push((filename, file));
                         } else {
                             let file = fs
-                                .create_temp_file(
+                                .create_file(
                                     file,
                                     uid,
                                     gid,
                                     mode,
-                                    Some(mtime),
                                     Some(size as usize),
                                 )
                                 .await?;
@@ -521,25 +504,10 @@ where
                 match entry {
                     TarEntry::Directory(dir) => {
                         tracing::debug!("creating directory {}", dir.path());
-                        fs.create_dir_all(
-                            dir.path(),
-                            dir.uid(),
-                            dir.gid(),
-                            dir.mode(),
-                            Some(if keep_mtime {
-                                UNIX_EPOCH + Duration::from_secs(dir.mtime().into())
-                            } else {
-                                UNIX_EPOCH
-                            }),
-                        )
-                        .await?;
+                        fs.create_dir_all(dir.path(), dir.uid(), dir.gid(), dir.mode())
+                            .await?;
                     }
                     TarEntry::File(mut file) => {
-                        let mtime = if keep_mtime {
-                            UNIX_EPOCH + Duration::from_secs(file.mtime() as u64)
-                        } else {
-                            UNIX_EPOCH
-                        };
                         let size = file.size() as usize;
                         let path = PathBuf::from(file.path());
                         let uid = file.uid();
@@ -548,15 +516,7 @@ where
                         tracing::debug!("extracting {}", file.path());
                         match conf_files.iter_mut().find(|(name, _)| name == file.path()) {
                             None => fs
-                                .create_file(
-                                    &mut file,
-                                    &path,
-                                    uid,
-                                    gid,
-                                    mode,
-                                    Some(mtime),
-                                    Some(size),
-                                )
+                                .create_file(&mut file, uid, gid, mode, Some(size))
                                 .await
                                 .map_err(|err| {
                                     io::Error::other(format!(
@@ -568,15 +528,7 @@ where
                             Some((_, sum)) => {
                                 let mut hasher = HashingReader::<md5::Md5, _>::new(file);
                                 let file = fs
-                                    .create_file(
-                                        &mut hasher,
-                                        &path,
-                                        uid,
-                                        gid,
-                                        mode,
-                                        Some(mtime),
-                                        Some(size),
-                                    )
+                                    .create_file(&mut hasher, uid, gid, mode, Some(size))
                                     .await
                                     .map_err(|err| {
                                         io::Error::other(format!(
@@ -591,19 +543,13 @@ where
                                 file
                             }
                         }
-                        .persist()
+                        .persist(&path)
                         .await?;
                     }
                     TarEntry::Symlink(link) => {
-                        let mtime = if keep_mtime {
-                            UNIX_EPOCH + Duration::from_secs(link.mtime() as u64)
-                        } else {
-                            UNIX_EPOCH
-                        };
                         let uid = link.uid();
                         let gid = link.gid();
-                        fs.symlink(link.link(), link.path(), uid, gid, Some(mtime))
-                            .await?;
+                        fs.symlink(link.link(), link.path(), uid, gid).await?;
                     }
                     TarEntry::Link(link) => {
                         links.push(link);
@@ -628,18 +574,10 @@ where
                 buf.push('\n');
             }
             let target_name = ctrl_base.join(target_name);
-            fs.create_file(
-                buf.as_bytes(),
-                &target_name,
-                0,
-                0,
-                0o644,
-                (!keep_mtime).then_some(UNIX_EPOCH),
-                Some(buf.len()),
-            )
-            .await?
-            .persist()
-            .await?;
+            fs.create_file_from_bytes(buf.as_bytes(), 0, 0, 0o644)
+                .await?
+                .persist(&target_name)
+                .await?;
         }
         if !conf_files.is_empty() {
             let mut buf = String::new();
@@ -670,7 +608,7 @@ where
 {
     type Output = MutableControlStanza;
     fn stage(self, fs: &'f FS) -> impl Future<Output = io::Result<MutableControlStanza>> + 'f {
-        self.extract_to(fs, false)
+        self.extract_to(fs)
     }
 }
 

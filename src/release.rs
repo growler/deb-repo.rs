@@ -96,15 +96,17 @@ impl Release {
                         })
                     })
                     .flatten_ok()
-                    .map(|file| file.and_then(|(digest, size, path)| {
-                        let size = parse_size(size.as_bytes()).map_err(|err| {
-                            ParseError::from(format!("invalid size: {:?} {}", size, err))
-                        })?;
-                        let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
-                            ParseError::from(format!("invalid hash: {} {}", digest, err))
-                        })?;
-                        Ok::<_, ParseError>((path, hash, size))
-                    }))
+                    .map(|file| {
+                        file.and_then(|(digest, size, path)| {
+                            let size = parse_size(size.as_bytes()).map_err(|err| {
+                                ParseError::from(format!("invalid size: {:?} {}", size, err))
+                            })?;
+                            let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
+                                ParseError::from(format!("invalid hash: {} {}", digest, err))
+                            })?;
+                            Ok::<_, ParseError>((path, hash, size))
+                        })
+                    })
             })
     }
     fn field(&self, name: &str) -> Option<&str> {
