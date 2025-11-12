@@ -1,6 +1,6 @@
 use {
     crate::{
-        artifact::{Artifact, ArtifactArg, },
+        artifact::{Artifact, ArtifactArg},
         cache::CacheProvider,
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
@@ -19,16 +19,12 @@ use {
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
-    std::{
-        num::NonZero,
-        path::{Path, PathBuf},
-    },
+    std::{num::NonZero, path::Path},
 };
 
 pub struct Manifest {
     arch: String,
     file: ManifestFile,
-    path: Option<PathBuf>,
     hash: Option<Hash>,
     lock: LockFile,
     lock_updated: bool,
@@ -58,7 +54,6 @@ impl Manifest {
         Manifest {
             arch: arch.to_string(),
             hash: None,
-            path: None,
             file: ManifestFile::new(comment),
             lock: LockFile::new(),
             lock_updated: false,
@@ -75,7 +70,6 @@ impl Manifest {
         Manifest {
             arch: arch.to_string(),
             hash: None,
-            path: None,
             lock: LockFile::new_with_sources(sources.len()),
             file: ManifestFile::new_with_sources(sources, comment),
             lock_updated: false,
@@ -89,19 +83,9 @@ impl Manifest {
         let lock = LockFile::from_file(&path, &arch, &hash)
             .await?
             .unwrap_or_else(|| manifest.unlocked_lock_file());
-        let path = path
-            .parent()
-            .ok_or_else(|| {
-                io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "manifest has no parent directory",
-                )
-            })?
-            .to_path_buf();
         Ok(Manifest {
             arch: arch.to_string(),
             hash: Some(hash),
-            path: Some(path),
             file: manifest,
             lock,
             lock_updated: false,
@@ -259,14 +243,9 @@ impl Manifest {
     ) -> io::Result<()>
     where
         T: TransportProvider + ?Sized,
-        C: CacheProvider + ?Sized,
+        C: CacheProvider,
     {
-        let staged = Artifact::new(
-            artifact,
-            transport,
-            cache,
-        )
-        .await?;
+        let staged = Artifact::new(artifact, transport, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
         Ok(())

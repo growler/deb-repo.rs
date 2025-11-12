@@ -1,6 +1,6 @@
 use {
     crate::{
-        artifact::{Artifact },
+        artifact::Artifact,
         cache::CacheProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         repo::{strip_comp_ext, TransportProvider},

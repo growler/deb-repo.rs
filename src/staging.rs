@@ -17,23 +17,11 @@ use {
 
 pub trait Stage {
     type Output;
-    type Target: StagingFileSystem;
-    fn stage(self, fs: &Self::Target) -> impl Future<Output = io::Result<Self::Output>>;
-}
-
-pub trait Stage_ {
-    type Output;
     type Target: StagingFileSystem + ?Sized;
-    fn stage_<'a>(
+    fn stage<'a>(
         &'a mut self,
         fs: &'a Self::Target,
     ) -> Pin<Box<dyn Future<Output = io::Result<Self::Output>> + 'a>>;
-}
-async fn s<FS: StagingFileSystem, T>(
-    mut s: Box<dyn Stage_<Output = T, Target = FS>>,
-    fs: &FS,
-) -> io::Result<T> {
-    s.stage_(fs).await
 }
 
 pub trait StagingFile {
@@ -118,7 +106,7 @@ pub trait StagingFileSystem {
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>>;
     fn stage<T>(
         &self,
-        artifact: Box<dyn Stage_<Target = Self, Output = T>>,
+        artifact: Box<dyn Stage<Target = Self, Output = T>>,
     ) -> impl Future<Output = io::Result<T>>
     where
         T: Send + 'static;
@@ -415,14 +403,14 @@ impl StagingFileSystem for HostFileSystem {
         let target = self.target_path(path.as_ref());
         blocking::unblock(move || unlink(target?).map_err(Into::into))
     }
-    fn stage<T>(
+    async fn stage<T>(
         &self,
-        mut artifact: Box<dyn Stage_<Target = Self, Output = T> + 'static>,
-    ) -> impl Future<Output = io::Result<T>>
+        mut artifact: Box<dyn Stage<Target = Self, Output = T> + 'static>,
+    ) -> io::Result<T>
     where
         T: Send + 'static,
     {
-        async move { artifact.as_mut().stage_(self).await }
+        artifact.as_mut().stage(self).await
     }
 }
 
@@ -562,14 +550,14 @@ impl StagingFileSystem for FileList {
             .insert(format!("!{}", path.as_ref().as_os_str().to_string_lossy(),));
         Ok(())
     }
-    fn stage<T>(
+    async fn stage<T>(
         &self,
-        mut artifact: Box<dyn Stage_<Target = Self, Output = T>>,
-    ) -> impl Future<Output = io::Result<T>>
+        mut artifact: Box<dyn Stage<Target = Self, Output = T>>,
+    ) -> io::Result<T>
     where
         T: Send + 'static,
     {
-        async move { artifact.as_mut().stage_(self).await }
+        artifact.as_mut().stage(self).await
     }
 }
 

@@ -1,7 +1,7 @@
 use std::{future::Future, path::PathBuf};
 
 pub use crate::indexfile::IndexFile;
-use crate::staging::Stage_;
+use crate::staging::Stage;
 use {
     crate::{
         artifact::Artifact,
@@ -31,7 +31,7 @@ pub trait CacheProvider: Clone + Send {
         transport: &T,
     ) -> impl Future<
         Output = io::Result<
-            Box<dyn Stage_<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+            Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
         >,
     >;
     fn cached_artifact<'a, T: TransportProvider + ?Sized>(
@@ -39,7 +39,7 @@ pub trait CacheProvider: Clone + Send {
         artifact: &'a Artifact,
         transport: &T,
     ) -> impl Future<
-        Output = io::Result<Box<dyn Stage_<Target = Self::Target, Output = ()> + Send + 'static>>,
+        Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
     >;
     fn cache_artifact<T: TransportProvider + ?Sized>(
         &self,
@@ -107,7 +107,7 @@ impl CacheProvider for HostCache {
         url: &str,
         transport: &T,
     ) -> io::Result<
-        Box<dyn Stage_<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+        Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
     > {
         if let Some(cache) = self.cache.as_ref() {
             let cache_path = hash.store_name(Some(cache.as_ref()), 1);
@@ -117,7 +117,7 @@ impl CacheProvider for HostCache {
                     Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
                 ))
                     as Box<
-                        dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                        dyn Stage<Target = Self::Target, Output = MutableControlStanza>
                             + Send
                             + 'static,
                     >);
@@ -137,7 +137,7 @@ impl CacheProvider for HostCache {
                 Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
             ))
                 as Box<
-                    dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                    dyn Stage<Target = Self::Target, Output = MutableControlStanza>
                         + Send
                         + 'static,
                 >)
@@ -147,7 +147,7 @@ impl CacheProvider for HostCache {
                 Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
             ))
                 as Box<
-                    dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                    dyn Stage<Target = Self::Target, Output = MutableControlStanza>
                         + Send
                         + 'static,
                 >)
@@ -185,7 +185,7 @@ impl CacheProvider for HostCache {
         &self,
         artifact: &'a Artifact,
         transport: &T,
-    ) -> io::Result<Box<dyn Stage_<Target = Self::Target, Output = ()> + Send + 'static>> {
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         tracing::debug!("Fetching artifact_ {}", artifact.uri());
         if artifact.is_local() {
             let path = self.base.join(artifact.uri());

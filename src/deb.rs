@@ -3,7 +3,7 @@ use {
         control::MutableControlStanza,
         hash::HashingReader,
         parse_size,
-        staging::{Stage, Stage_, StagingFile},
+        staging::{Stage, StagingFile},
         tar::{TarEntry, TarLink, TarReader},
         StagingFileSystem,
     },
@@ -604,30 +604,18 @@ where
     }
 }
 
-impl<'a, R, FS> Stage_ for DebStage<'a, R, FS>
+impl<'a, R, FS> Stage for DebStage<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
     FS: StagingFileSystem + ?Sized,
 {
     type Target = FS;
     type Output = MutableControlStanza;
-    fn stage_<'b>(
+    fn stage<'b>(
         &'b mut self,
         fs: &'b Self::Target,
     ) -> Pin<Box<dyn Future<Output = io::Result<MutableControlStanza>> + 'b>> {
         Box::pin(self.inner.extract_to(fs))
-    }
-}
-
-impl<'a, R, FS> Stage for DebStage<'a, R, FS>
-where
-    R: AsyncRead + Send + 'a,
-    FS: StagingFileSystem,
-{
-    type Target = FS;
-    type Output = MutableControlStanza;
-    async fn stage(mut self, fs: &Self::Target) -> io::Result<MutableControlStanza> {
-        self.inner.extract_to(fs).await
     }
 }
 

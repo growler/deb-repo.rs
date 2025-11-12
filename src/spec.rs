@@ -148,11 +148,6 @@ impl LockedSource {
             })
             .boxed_local()
     }
-    pub fn files(&self) -> impl Iterator<Item = &RepositoryFile> {
-        self.suites
-            .iter()
-            .flat_map(|suite| std::iter::once(&suite.release).chain(suite.packages.iter()))
-    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
