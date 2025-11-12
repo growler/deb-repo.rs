@@ -277,7 +277,7 @@ where
 ///     }
 /// }
 /// ```
-pub struct DebReader<'a, R>
+pub struct Deb<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -329,7 +329,7 @@ impl Compression {
     }
 }
 
-impl<'a, R> DebReader<'a, R>
+impl<'a, R> Deb<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -362,12 +362,8 @@ where
             inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
         }
     }
-    pub async fn extract_to<'f, FS>(
-        mut self,
-        fs: &'f FS,
-    ) -> Result<MutableControlStanza>
+    pub async fn extract_to<FS>(mut self, fs: &FS) -> Result<MutableControlStanza>
     where
-        'a: 'f,
         FS: StagingFileSystem + ?Sized,
     {
         let mut installed_files: Vec<String> = vec![];
@@ -423,23 +419,12 @@ where
                             file.read_to_string(&mut buf).await?;
                             conf_files.extend(buf.lines().map(|l| (l.to_owned(), None)));
                             let file = fs
-                                .create_file_from_bytes(
-                                    buf.as_bytes(),
-                                    uid,
-                                    gid,
-                                    mode,
-                                )
+                                .create_file_from_bytes(buf.as_bytes(), uid, gid, mode)
                                 .await?;
                             ctrl_files.push((filename, file));
                         } else {
                             let file = fs
-                                .create_file(
-                                    file,
-                                    uid,
-                                    gid,
-                                    mode,
-                                    Some(size as usize),
-                                )
+                                .create_file(file, uid, gid, mode, Some(size as usize))
                                 .await?;
                             ctrl_files.push((filename, file));
                         }
@@ -498,12 +483,11 @@ where
             let mut links: Vec<TarLink> = Vec::new();
             while let Some(entry) = data_tarball.next().await {
                 let entry = entry?;
-                tracing::debug!("{} {}", pkg, entry.path());
-                // tracing::debug!("{} {:?} {:#?}", pkg, path.as_os_str(), entry.header());
+                tracing::trace!("{} {}", pkg, entry.path());
                 installed_files.push(entry.path().to_owned());
                 match entry {
                     TarEntry::Directory(dir) => {
-                        tracing::debug!("creating directory {}", dir.path());
+                        tracing::trace!("creating directory {}", dir.path());
                         fs.create_dir_all(dir.path(), dir.uid(), dir.gid(), dir.mode())
                             .await?;
                     }
@@ -513,7 +497,7 @@ where
                         let uid = file.uid();
                         let gid = file.gid();
                         let mode = file.mode();
-                        tracing::debug!("extracting {}", file.path());
+                        tracing::trace!("extracting {}", file.path());
                         match conf_files.iter_mut().find(|(name, _)| name == file.path()) {
                             None => fs
                                 .create_file(&mut file, uid, gid, mode, Some(size))
@@ -600,19 +584,39 @@ where
     }
 }
 
-impl<'a, 'f, R, FS> Stage<'f, FS> for DebReader<'a, R>
+pub struct DebReader<'a, R: AsyncRead + Send, FS> {
+    inner: Deb<'a, R>,
+    _phantom: std::marker::PhantomData<FS>,
+}
+
+impl<'a, R, FS> DebReader<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
-    FS: StagingFileSystem + ?Sized,
-    'a: 'f,
+    FS: StagingFileSystem,
 {
-    type Output = MutableControlStanza;
-    fn stage(self, fs: &'f FS) -> impl Future<Output = io::Result<MutableControlStanza>> + 'f {
-        self.extract_to(fs)
+    pub fn new(r: R) -> Self {
+        Self {
+            inner: Deb {
+                inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
+            },
+            _phantom: std::marker::PhantomData,
+        }
     }
 }
 
-impl<'a, R> Stream for DebReader<'a, R>
+impl<'a, R, FS> Stage for DebReader<'a, R, FS>
+where
+    R: AsyncRead + Send + 'a,
+    FS: StagingFileSystem,
+{
+    type Target = FS;
+    type Output = MutableControlStanza;
+    fn stage(self, fs: &Self::Target) -> impl Future<Output = io::Result<MutableControlStanza>> {
+        self.inner.extract_to(fs)
+    }
+}
+
+impl<'a, R> Stream for Deb<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -671,5 +675,5 @@ where
 mod tests {
     use super::*;
     use static_assertions::assert_impl_all;
-    assert_impl_all!(DebReader<'_, smol::fs::File>: Send, Sync);
+    assert_impl_all!(Deb<'_, smol::fs::File>: Send, Sync);
 }

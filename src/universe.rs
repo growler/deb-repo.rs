@@ -915,7 +915,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src.to_string().into_boxed_str(), None)
+                    vec![Packages::new($src.to_string().into(), None)
                         .expect("failed to parse test source")]
                     .into_iter(),
                 )

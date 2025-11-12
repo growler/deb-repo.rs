@@ -1,5 +1,3 @@
-use std::pin::pin;
-
 pub use url::Url;
 
 use {
@@ -8,8 +6,7 @@ use {
         BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     async_trait::async_trait,
-    futures_lite::io::{AsyncRead, AsyncReadExt, BufReader},
-    smol::io,
+    smol::io::{self, AsyncRead, BufReader},
     std::pin::Pin,
 };
 
@@ -37,95 +34,37 @@ pub trait TransportProvider: Sync + Send {
     async fn open_unpacked(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         Ok(unpacker(url, self.open(url).await?))
     }
+}
 
-    async fn open_unpacked_verified(
-        &self,
-        url: &str,
-        size: u64,
-        hash: &Hash,
-    ) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
-        Ok(unpacker(url, self.open_verified(url, size, hash).await?))
-    }
-
-    async fn get_bytes(&self, url: &str, limit: u64) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; 0];
-        self.open(url)
-            .await?
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await?;
-        Ok(buffer)
-    }
-
-    async fn get_bytes_hashed(
-        &self,
-        url: &str,
-        hash_name: &str,
-        limit: u64,
-    ) -> io::Result<(Vec<u8>, u64, Hash)> {
-        let mut buffer = vec![0u8; 0];
-        let mut rdr = self.open_hashed(url, hash_name).await?;
-        pin!(&mut rdr).take(limit).read_to_end(&mut buffer).await?;
-        let hash = rdr.as_mut().hash();
-        let size = rdr.as_mut().size();
-        Ok((buffer, size, hash))
-    }
-
-    async fn get_unpacked_bytes(&self, url: &str, limit: u64) -> io::Result<Vec<u8>> {
-        let mut buffer = vec![0u8; 0];
-        unpacker(url, self.open(url).await?)
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await?;
-        Ok(buffer)
-    }
-
-    async fn get_unpacked_bytes_hashed(
-        &self,
-        url: &str,
-        hash_name: &str,
-        limit: u64,
-    ) -> io::Result<(Vec<u8>, u64, Hash)> {
-        let mut buffer = vec![0u8; 0];
-        let mut rdr = self.open_hashed(url, hash_name).await?;
-        unpacker(url, &mut rdr)
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await?;
-        let hash = rdr.as_mut().hash();
-        let size = rdr.as_mut().size();
-        Ok((buffer, size, hash))
-    }
-
-    async fn get_bytes_verified(&self, url: &str, size: u64, hash: &Hash) -> io::Result<Vec<u8>> {
-        let mut buffer = Vec::<u8>::with_capacity(
-            size.try_into()
-                .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?,
-        );
-        self.open_verified(url, size, hash)
-            .await?
-            .read_to_end(&mut buffer)
-            .await?;
-        Ok(buffer)
-    }
-
-    async fn get_unpacked_bytes_verified(
-        &self,
-        url: &str,
-        size: u64,
-        hash: &Hash,
-        limit: u64,
-    ) -> io::Result<Vec<u8>> {
-        let mut buffer = Vec::<u8>::with_capacity(size as usize);
-        unpacker(url, self.open_verified(url, size, hash).await?)
-            .take(limit)
-            .read_to_end(&mut buffer)
-            .await?;
-        Ok(buffer)
+pub(crate) fn strip_comp_ext(str: &str) -> &str {
+    if let Some(pos) = str.rfind('.') {
+        match &str[pos + 1..] {
+            "xz" | "gz" | "bz2" | "lzma" | "zstd" | "zst" => &str[..pos],
+            _ => str,
+        }
+    } else {
+        str
     }
 }
 
-fn unpacker<'a, R: AsyncRead + Send + 'a>(u: &str, r: R) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
+pub(crate) fn unpacker<'a>(
+    u: &str,
+    r: Pin<Box<dyn AsyncRead + Send + 'a>>,
+) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
+    match u.rsplit('.').next().unwrap_or("") {
+        "xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
+        "gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
+        "bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
+        "lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
+        "zstd" | "zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+        _ => r,
+    }
+}
+
+pub(crate) fn unpacker_<'a, R: AsyncRead + Send + 'a>(
+    u: &str,
+    r: R,
+) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
     match u.rsplit('.').next().unwrap_or("") {
         "xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
         "gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),

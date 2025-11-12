@@ -16,6 +16,7 @@ use {
     crate::{
         control::{ControlStanza, ParseError},
         hash::Hash,
+        indexfile::IndexFile,
         matches_path, parse_size,
     },
     chrono::{DateTime, Utc},
@@ -144,19 +145,33 @@ impl Release {
         self.field("Valid-Until")
             .and_then(|date| DateTime::parse_from_rfc2822(date).map(|t| t.to_utc()).ok())
     }
-    pub fn new(data: Box<str>) -> Result<Release, ParseError> {
+    pub fn new(data: IndexFile) -> Result<Release, ParseError> {
         Ok(Release {
             inner: ReleaseInnerTryBuilder {
                 data,
                 #[allow(clippy::borrowed_box)]
-                control_builder: |data: &'_ Box<str>| {
-                    ControlStanza::parse(data.as_ref()).map_err(|err| {
+                control_builder: |data: &'_ IndexFile| {
+                    ControlStanza::parse(data).map_err(|err| {
                         ParseError::from(format!("error parsing release file: {}", err))
                     })
                 },
             }
             .try_build()?,
         })
+    }
+}
+
+impl TryFrom<String> for Release {
+    type Error = ParseError;
+    fn try_from(str: String) -> Result<Self, Self::Error> {
+        Release::new(str.into())
+    }
+}
+
+impl TryFrom<Box<str>> for Release {
+    type Error = ParseError;
+    fn try_from(str: Box<str>) -> Result<Self, Self::Error> {
+        Release::new(str.into())
     }
 }
 
@@ -173,7 +188,7 @@ impl TryFrom<Vec<u8>> for Release {
 
 #[self_referencing]
 struct ReleaseInner {
-    data: Box<str>,
+    data: IndexFile,
     #[borrows(data)]
     #[covariant]
     control: ControlStanza<'this>,

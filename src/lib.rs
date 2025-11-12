@@ -3,12 +3,14 @@
 mod arch;
 pub mod artifact;
 mod builder;
+pub mod cache;
 pub mod cli;
 pub mod control;
 pub mod deb;
 pub mod hash;
 mod httprepo;
 mod idmap;
+mod indexfile;
 mod manifest;
 mod manifest_doc;
 mod packages;
@@ -21,6 +23,8 @@ mod staging;
 pub mod tar;
 pub mod universe;
 pub mod version;
+pub mod comp;
+mod stage;
 
 pub use {
     arch::DEFAULT_ARCH,
@@ -182,6 +186,35 @@ pub(crate) fn strip_url_scheme(s: &str) -> &str {
         unsafe { std::str::from_utf8_unchecked(&bytes[3..]) }
     } else {
         s
+    }
+}
+
+pub fn unpacker<'a, R: smol::io::AsyncRead + Send + 'a>(
+    u: &str,
+    r: R,
+) -> std::pin::Pin<Box<dyn smol::io::AsyncRead + Send + 'a>> {
+    use async_compression::futures::bufread::{
+        BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
+    };
+    use smol::io::BufReader;
+    match u.rsplit('.').next().unwrap_or("") {
+        "xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
+        "gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
+        "bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
+        "lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
+        "zstd" | "zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
+        _ => Box::pin(r),
+    }
+}
+
+pub fn strip_compression_ext(str: &str) -> &str {
+    if let Some(pos) = str.rfind('.') {
+        match &str[pos + 1..] {
+            "xz" | "gz" | "bz2" | "lzma" | "zstd" | "zst" => &str[..pos],
+            _ => str,
+        }
+    } else {
+        str
     }
 }
 

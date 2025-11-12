@@ -1,5 +1,7 @@
 use {
-    crate::{control::MutableControlStanza, hash::Hash, release::Release, repo::TransportProvider},
+    crate::{
+        control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release, Packages,
+    },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::AsyncReadExt,
@@ -625,8 +627,6 @@ pub struct Source {
 }
 
 impl Source {
-    const MAX_RELEASE_SIZE: u64 = 2 * 1024 * 1024; // 10 MiB
-    const MAX_PACKAGE_SIZE: u64 = 100 * 1024 * 1024; // 10 GiB
     pub fn should_include_arch(&self, arch: &str) -> bool {
         self.arch.is_empty() || self.arch.iter().any(|s| s == arch)
     }
@@ -637,68 +637,24 @@ impl Source {
         self.snapshots = Some(snapshots.as_ref().to_string());
         self
     }
-    pub async fn fetch_release_by_hash<T: TransportProvider + ?Sized>(
-        &self,
-        suite: &str,
-        hash: &Hash,
-        size: u64,
-        transport: &T,
-    ) -> std::io::Result<Release> {
+    pub(crate) fn release_path(&self, suite: &str) -> String {
         if self.allow_insecure() {
-            self.fetch_unsigned_release_by_hash(suite, hash, size, transport)
-                .await
+            format!("dists/{}/Release", suite)
         } else {
-            self.fetch_signed_release_by_hash(suite, hash, size, transport)
-                .await
+            format!("dists/{}/InRelease", suite)
         }
     }
-    pub async fn fetch_release<T: TransportProvider + ?Sized>(
-        &self,
-        suite: &str,
-        transport: &T,
-    ) -> std::io::Result<(Release, String, Hash, u64)> {
+    pub(crate) async fn release_from_file(&self, r: IndexFile) -> io::Result<Release> {
         if self.allow_insecure() {
-            self.fetch_unsigned_release(suite, transport).await
+            Release::new(r).map_err(std::io::Error::other)
         } else {
-            self.fetch_signed_release(suite, transport).await
+            self.verify_signed_release(&r).await
         }
     }
-    pub async fn fetch_unsigned_release_by_hash<T: TransportProvider + ?Sized>(
-        &self,
-        suite: &str,
-        hash: &Hash,
-        size: u64,
-        transport: &T,
-    ) -> std::io::Result<Release> {
-        let path = format!("dists/{}/Release", suite);
-        transport
-            .get_bytes_verified(&self.file_url(&path), size, hash)
-            .await
-            .and_then(|buf| Release::try_from(buf).map_err(std::io::Error::other))
+    pub(crate) async fn packages_from_file(&self, r: IndexFile) -> io::Result<Packages> {
+        Packages::new(r, self.priority).map_err(Into::into)
     }
-    pub async fn fetch_unsigned_release<T: TransportProvider + ?Sized>(
-        &self,
-        suite: &str,
-        transport: &T,
-    ) -> std::io::Result<(Release, String, Hash, u64)> {
-        let path = format!("dists/{}/Release", suite);
-        transport
-            .get_bytes_hashed(
-                &self.file_url(&path),
-                self.hash.name(),
-                Self::MAX_RELEASE_SIZE,
-            )
-            .await
-            .and_then(|(buf, size, hash)| {
-                Ok((
-                    Release::try_from(buf).map_err(std::io::Error::other)?,
-                    path,
-                    hash,
-                    size,
-                ))
-            })
-    }
-    async fn verify_signed_release(&self, data: Vec<u8>) -> io::Result<Release> {
+    async fn verify_signed_release<T: AsRef<str>>(&self, data: T) -> io::Result<Release> {
         let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
         let tempdir = tempfile::tempdir()?;
         ctx.set_engine_home_dir(tempdir.path().as_os_str().as_encoded_bytes())?;
@@ -711,7 +667,7 @@ impl Source {
             .await?;
 
         let mut plaintext = Vec::new();
-        let verify_result = ctx.verify_opaque(data, &mut plaintext)?;
+        let verify_result = ctx.verify_opaque(data.as_ref().as_bytes(), &mut plaintext)?;
         if let Some(signature) = verify_result.signatures().next() {
             if let Err(err) = signature.status() {
                 return Err(err.into());
@@ -724,64 +680,13 @@ impl Source {
         }
         Release::try_from(plaintext).map_err(std::io::Error::other)
     }
-    pub async fn fetch_signed_release_by_hash<T: TransportProvider + ?Sized>(
+    pub(crate) fn release_files(
         &self,
-        suite: &str,
-        hash: &Hash,
-        size: u64,
-        transport: &T,
-    ) -> std::io::Result<Release> {
-        let path = format!("dists/{}/InRelease", suite);
-        let data = transport
-            .get_bytes_verified(&self.file_url(&path), size, hash)
-            .await?;
-        self.verify_signed_release(data).await
-    }
-    pub async fn fetch_signed_release<T: TransportProvider + ?Sized>(
-        &self,
-        suite: &str,
-        transport: &T,
-    ) -> std::io::Result<(Release, String, Hash, u64)> {
-        let path = format!("dists/{}/InRelease", suite);
-        let (data, size, hash) = transport
-            .get_bytes_hashed(
-                &self.file_url(&path),
-                self.hash.name(),
-                Self::MAX_RELEASE_SIZE,
-            )
-            .await?;
-        Ok((self.verify_signed_release(data).await?, path, hash, size))
-    }
-    pub(crate) async fn file_by_hash<T>(
-        &self,
-        transport: &T,
-        file: &RepositoryFile,
-    ) -> io::Result<Box<[u8]>>
-    where
-        T: TransportProvider + ?Sized,
-    {
-        transport
-            .get_unpacked_bytes_verified(
-                &self.file_url(&file.path),
-                file.size,
-                &file.hash,
-                Self::MAX_PACKAGE_SIZE,
-            )
-            .await
-            .map(|s| s.into_boxed_slice())
-    }
-    pub async fn fetch_suite<T: TransportProvider + ?Sized>(
-        &self,
+        release: &Release,
         suite: &str,
         arch: &str,
-        transport: &T,
-    ) -> io::Result<(RepositoryFile, Vec<RepositoryFile>)> {
-        let (rel, path, hash, size) = if self.allow_insecure() {
-            self.fetch_unsigned_release(suite, transport).await?
-        } else {
-            self.fetch_signed_release(suite, transport).await?
-        };
-        let pkgs_ind = rel
+    ) -> io::Result<Vec<RepositoryFile>> {
+        release
             .files(
                 &self.components,
                 self.hash.name(),
@@ -794,10 +699,9 @@ impl Source {
                 })
                 .map_err(Into::into)
             })
-            .collect::<io::Result<Vec<_>>>()?;
-        Ok((RepositoryFile::new(path, hash, size), pkgs_ind))
+            .collect::<io::Result<Vec<_>>>()
     }
-    pub fn file_url(&self, path: &str) -> String {
+    pub fn file_url<P: AsRef<str>>(&self, path: P) -> String {
         if let Some(snapshots_template) = &self.snapshots {
             if let Some(Snapshot::Use(snap)) = &self.snapshot {
                 return format!(
@@ -805,11 +709,11 @@ impl Source {
                     snapshots_template
                         .trim_end_matches('/')
                         .replace("@SNAPSHOTID@", &snap.format("%Y%m%dT%H%M%SZ").to_string()),
-                    path
+                    path.as_ref()
                 );
             }
         }
-        format!("{}/{}", self.url.trim_end_matches('/'), path)
+        format!("{}/{}", self.url.trim_end_matches('/'), path.as_ref())
     }
     pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {
         match self.url.to_ascii_lowercase().as_str() {

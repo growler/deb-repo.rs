@@ -1,8 +1,9 @@
 use {
-    crate::{control::MutableControlStanza, hash::Hash},
     futures::future::{BoxFuture, LocalBoxFuture},
     rustix::fs::{
-        AtFlags, CWD, FallocateFlags, Gid, Mode, OFlags, Timespec, Timestamps, UTIME_OMIT, Uid, chown, chownat, fallocate, fchown, fstat, futimens, link, linkat, openat, stat, symlinkat, unlink, utimensat
+        chown, chownat, fallocate, fchown, fstat, futimens, link, linkat, openat, stat, symlinkat,
+        unlink, utimensat, AtFlags, FallocateFlags, Gid, Mode, OFlags, Timespec, Timestamps, Uid,
+        CWD, UTIME_OMIT,
     },
     smol::prelude::*,
     std::{
@@ -10,12 +11,14 @@ use {
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         sync::Arc,
-    }, tempfile::TempPath,
+    },
+    tempfile::TempPath,
 };
 
-pub trait Stage<'f, FS: StagingFileSystem + ?Sized> {
+pub trait Stage {
     type Output;
-    fn stage(self, fs: &'f FS) -> impl Future<Output = io::Result<Self::Output>> + 'f;
+    type Target: StagingFileSystem;
+    fn stage(self, fs: &Self::Target) -> impl Future<Output = io::Result<Self::Output>>;
 }
 
 pub trait StagingFile {
@@ -98,22 +101,10 @@ pub trait StagingFileSystem {
         self.create_file(r, uid, gid, mode, Some(r.len()))
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()>;
-    fn stage<'f, A, T>(&'f self, artifact: A) -> Self::IoFut<'f, T>
+    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
     where
         T: Send + 'static,
-        A: for<'a> Stage<'a, Self, Output = T> + Send + 'static;
-    fn stage_deb<'f, D>(&'f self, _hash: Hash, deb: D) -> Self::IoFut<'f, MutableControlStanza>
-    where
-        D: for<'a> Stage<'a, Self, Output = MutableControlStanza> + Send + 'static,
-    {
-        self.stage(deb)
-    }
-    fn stage_artifact<'f, A>(&'f self, _hash: Hash, artifact: A) -> Self::IoFut<'f, ()>
-    where
-        A: for<'a> Stage<'a, Self, Output = ()> + Send + 'static,
-    {
-        self.stage(artifact)
-    }
+        A: Stage<Target = Self, Output = T> + Send + 'static;
 }
 
 #[derive(Clone)]
@@ -146,6 +137,7 @@ fn clean_path(target: &Path) -> io::Result<&Path> {
 
 impl HostFileSystem {
     pub async fn new<P: AsRef<Path>>(root: P, allow_chown: bool) -> io::Result<Self> {
+        smol::fs::create_dir_all(root.as_ref()).await?;
         let root = smol::fs::canonicalize(root.as_ref()).await?;
         Ok(Self {
             root: root.into(),
@@ -412,14 +404,52 @@ impl StagingFileSystem for HostFileSystem {
         let target = self.target_path(path.as_ref());
         blocking::unblock(move || unlink(target?).map_err(Into::into)).boxed()
     }
-    fn stage<'f, A, T>(&'f self, artifact: A) -> Self::IoFut<'f, T>
+    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
     where
         T: Send + 'static,
-        A: for<'a> Stage<'a, Self, Output = T> + Send + 'static,
+        A: Stage<Target = Self, Output = T> + Send + 'static,
     {
         let fs = self.clone();
         blocking::unblock(move || smol::block_on(artifact.stage(&fs))).boxed()
     }
+    // fn stage_deb<F, Fut, R>(
+    //     &self,
+    //     _hash: Hash,
+    //     _size: u64,
+    //     open: F,
+    // ) -> Self::IoFut<'_, MutableControlStanza>
+    // where
+    //     F: FnOnce() -> Fut + Send + 'static,
+    //     Fut: Future<Output = io::Result<R>> + Send,
+    //     R: AsyncRead + Send + 'static,
+    // {
+    //     let fs = self.clone();
+    //     async move {
+    //         let r = open().await?;
+    //         let deb = DebReader::new(r);
+    //         blocking::unblock(move || smol::block_on(deb.stage(&fs))).await
+    //     }
+    //     .boxed()
+    // }
+    // fn stage_artifact<'f, C, F, Fut, R>(
+    //     &'f self,
+    //     _hash: Hash,
+    //     cache: OptionalCache<C>,
+    //     artifact: F,
+    // ) -> Self::IoFut<'f, ()>
+    // where
+    //     F: FnOnce(OptionalCache<C>) -> Fut + Send + 'f,
+    //     Fut: Future<Output = io::Result<R>> + Send,
+    //     R: for<'a> Stage<'a, Self, Output = ()> + Send + 'static,
+    //     C: CacheProvider + 'f,
+    // {
+    //     let fs = self.clone();
+    //     async move {
+    //         let artifact = artifact(cache).await?;
+    //         blocking::unblock(move || smol::block_on(artifact.stage(&fs))).await
+    //     }
+    //     .boxed()
+    // }
 }
 
 #[derive(Clone, Debug)]
@@ -570,13 +600,50 @@ impl StagingFileSystem for FileList {
             .insert(format!("!{}", path.as_ref().as_os_str().to_string_lossy(),));
         iofut(())
     }
-    fn stage<'f, A, T>(&'f self, artifact: A) -> Self::IoFut<'f, T>
+    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
     where
         T: Send + 'static,
-        A: for<'a> Stage<'a, Self, Output = T> + Send + 'static,
+        A: Stage<Target = Self, Output = T> + Send + 'static,
     {
         artifact.stage(self).boxed_local()
     }
+    // fn stage_deb<'f, C, F, Fut, R>(
+    //     &self,
+    //     _hash: Hash,
+    //     _size: u64,
+    //     _cache: OptionalCache<C>,
+    //     deb: F,
+    // ) -> Self::IoFut<'_, MutableControlStanza>
+    // where
+    //     C: CacheProvider + 'f,
+    //     F: FnOnce() -> Fut + Send + 'f,
+    //     Fut: Future<Output = io::Result<R>> + Send,
+    //     R: AsyncRead + Send + 'f,
+    // {
+    //     async move {
+    //         let deb = DebReader::new(deb().await?);
+    //         deb.stage(self).await
+    //     }
+    //     .boxed_local()
+    // }
+    // fn stage_artifact<'f, C, F, Fut, A>(
+    //     &'f self,
+    //     _hash: Hash,
+    //     cache: OptionalCache<C>,
+    //     artifact: F,
+    // ) -> Self::IoFut<'f, ()>
+    // where
+    //     F: FnOnce(OptionalCache<C>) -> Fut + Send + 'f,
+    //     Fut: Future<Output = io::Result<A>> + Send,
+    //     A: for<'a> Stage<'a, Self, Output = ()> + Send + 'f,
+    //     C: CacheProvider + 'f,
+    // {
+    //     async move {
+    //         let artifact = artifact(cache).await?;
+    //         artifact.stage(self).await
+    //     }
+    //     .boxed_local()
+    // }
 }
 
 #[cfg(test)]

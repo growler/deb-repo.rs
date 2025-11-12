@@ -5,6 +5,7 @@ use {
             ParseError,
         },
         hash::Hash,
+        indexfile::IndexFile,
         version::{
             Constraint, Dependency, ParsedConstraintIterator, ParsedDependencyIterator,
             ParsedProvidedNameIterator, ProvidedName, Version,
@@ -17,49 +18,18 @@ use {
     std::{io, sync::Arc},
 };
 
-pub trait PackagesFile: AsRef<str> {
-    fn as_str(&self) -> &str;
-}
-
-impl PackagesFile for Box<str> {
-    fn as_str(&self) -> &str {
-        self.as_ref()
-    }
-}
-
-pub struct MemoryMappedPackagesFile {
-    mmap: memmap2::Mmap,
-}
-
-impl MemoryMappedPackagesFile {
-    pub fn open<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let file = std::fs::File::open(path)?;
-        let mmap = unsafe { memmap2::MmapOptions::new().map(&file)? };
-        std::str::from_utf8(&mmap).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Packages file is not valid UTF-8: {}", err),
-            )
-        })?;
-        Ok(MemoryMappedPackagesFile { mmap })
-    }
-}
 
 pub struct MemoryMappedUniverseFile {
     mmap: Arc<memmap2::Mmap>,
     begin: usize,
     end: usize,
 }
-impl PackagesFile for MemoryMappedUniverseFile {
-    fn as_str(&self) -> &str {
+
+impl AsRef<str> for MemoryMappedUniverseFile {
+    fn as_ref(&self) -> &str {
         let slice = &self.mmap[self.begin..self.end];
         // Safety: The mmap is guaranteed to be valid UTF-8 as it was created from a file
         unsafe { std::str::from_utf8_unchecked(slice) }
-    }
-}
-impl AsRef<str> for MemoryMappedUniverseFile {
-    fn as_ref(&self) -> &str {
-        self.as_str()
     }
 }
 impl MemoryMappedUniverseFile {
@@ -157,11 +127,7 @@ impl MemoryMappedUniverseFile {
             off = end;
             files.push(
                 Packages::new(
-                    Self {
-                        mmap: Arc::clone(&mmap),
-                        begin,
-                        end,
-                    },
+                    IndexFile::mmap_region(Arc::clone(&mmap), begin, end)?,
                     Some(prio),
                 )
                 .map_err(io::Error::other)?,
@@ -169,18 +135,6 @@ impl MemoryMappedUniverseFile {
             index_off += 12;
         }
         Ok((arch, files))
-    }
-}
-
-impl PackagesFile for MemoryMappedPackagesFile {
-    fn as_str(&self) -> &str {
-        // Safety: The mmap is guaranteed to be valid UTF-8 as it was created from a file
-        unsafe { std::str::from_utf8_unchecked(&self.mmap) }
-    }
-}
-impl AsRef<str> for MemoryMappedPackagesFile {
-    fn as_ref(&self) -> &str {
-        self.as_str()
     }
 }
 
@@ -519,32 +473,22 @@ impl Packages {
     pub fn prio(&self) -> u32 {
         self.prio
     }
-    pub fn new<T: PackagesFile + 'static>(data: T, prio: Option<u32>) -> Result<Self, ParseError> {
-        let d: Arc<dyn PackagesFile> = Arc::new(data);
+    pub fn new(data: IndexFile, prio: Option<u32>) -> Result<Self, ParseError> {
         Ok(Packages {
             prio: prio.unwrap_or(500),
             inner: PackagesInnerTryBuilder {
-                data: d,
-                packages_builder:
-                    |data: &'_ Arc<dyn PackagesFile>| -> Result<Vec<Package<'_>>, ParseError> {
-                        let mut parser = ControlParser::new(data.as_str());
-                        let mut packages: Vec<Package<'_>> = vec![];
-                        while let Some(package) = Package::try_parse_from(&mut parser)? {
-                            packages.push(package)
-                        }
-                        Ok(packages)
-                    },
+                data,
+                packages_builder: |data: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> {
+                    let mut parser = ControlParser::new(data.as_str());
+                    let mut packages: Vec<Package<'_>> = vec![];
+                    while let Some(package) = Package::try_parse_from(&mut parser)? {
+                        packages.push(package)
+                    }
+                    Ok(packages)
+                },
             }
             .try_build()?,
         })
-    }
-    pub(crate) fn new_from_bytes<D>(data: D, prio: Option<u32>) -> Result<Self, ParseError>
-    where
-        Vec<u8>: From<D>,
-    {
-        let s = String::from_utf8(data.into())
-            .map_err(|err| ParseError::from(format!("Invalid UTF-8: {}", err)))?;
-        Self::new(s.into_boxed_str(), prio)
     }
     pub async fn read<R: AsyncRead + Unpin + Send>(r: &mut R) -> io::Result<Self> {
         let mut buf = String::new();
@@ -556,28 +500,19 @@ impl Packages {
             )
         })
     }
-    pub fn memory_mapped<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
-        let mmaped = MemoryMappedPackagesFile::open(path)?;
-        Self::new(mmaped, None).map_err(|err| {
-            io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("Error parsing packages file: {}", err),
-            )
-        })
-    }
 }
 
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(inp.to_owned().into_boxed_str(), None)
+        Self::new(inp.to_owned().into(), None)
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(inp.into_boxed_str(), None)
+        Self::new(inp.into(), None)
     }
 }
 
@@ -587,7 +522,7 @@ impl TryFrom<Vec<u8>> for Packages {
         Self::new(
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
-                .into_boxed_str(),
+                .into(),
             None,
         )
     }
@@ -595,7 +530,7 @@ impl TryFrom<Vec<u8>> for Packages {
 
 #[self_referencing]
 struct PackagesInner {
-    data: Arc<dyn PackagesFile>,
+    data: IndexFile,
     #[borrows(data)]
     #[covariant]
     packages: Vec<Package<'this>>,

@@ -1,5 +1,6 @@
 use {
     crate::{
+        cache::CacheProvider,
         hash::Hash,
         repo::TransportProvider,
         version::{Constraint, Dependency},
@@ -7,7 +8,7 @@ use {
     },
     futures::{
         stream::{self, LocalBoxStream},
-        StreamExt,
+        StreamExt, TryFutureExt,
     },
     itertools::Itertools,
     serde::{Deserialize, Serialize},
@@ -65,15 +66,16 @@ pub struct LockedSource {
 }
 
 impl LockedSource {
-    pub fn fetch_or_refresh<'a, T: TransportProvider + ?Sized>(
+    pub fn fetch_or_refresh<'a, T: TransportProvider + ?Sized, C: CacheProvider>(
         locked: &'a mut Option<Self>,
         source: &'a Source,
         arch: &'a str,
         force: bool,
         transport: &'a T,
+        cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         match locked {
-            Some(locked) => locked.refresh(source, arch, force, transport),
+            Some(locked) => locked.refresh(source, arch, force, transport, cache),
             None => {
                 *locked = Some(LockedSource {
                     suites: vec![LockedSuite::default(); source.suites.len()],
@@ -81,16 +83,17 @@ impl LockedSource {
                 locked
                     .as_mut()
                     .unwrap()
-                    .refresh(source, arch, true, transport)
+                    .refresh(source, arch, true, transport, cache)
             }
         }
     }
-    fn refresh<'a, T: TransportProvider + ?Sized>(
+    fn refresh<'a, T: TransportProvider + ?Sized, C: CacheProvider>(
         &'a mut self,
         source: &'a Source,
         arch: &'a str,
         force: bool,
         transport: &'a T,
+        cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         tracing::debug!(
             "Refreshing locked source for {} {}",
@@ -100,26 +103,38 @@ impl LockedSource {
         stream::iter(source.suites.iter().zip(self.suites.iter_mut()))
             .then(move |(suite, locked)| {
                 tracing::debug!("Refreshing locked source for {} {}", source.url, suite);
+                let cache = cache.clone();
                 async move {
+                    tracing::debug!("Checking locked source for {} {}", source.url, suite,);
+                    let path = source.release_path(suite);
                     if !locked.release.path.is_empty() && !force {
-                        let rel = source
-                            .fetch_release_by_hash(
-                                suite,
-                                &locked.release.hash,
+                        let rel = cache
+                            .cached_file(
+                                locked.release.hash.clone(),
                                 locked.release.size,
+                                &source.file_url(&path),
                                 transport,
                             )
-                            .await;
+                            .await?;
+                        let rel = source.release_from_file(rel).await;
                         if rel.is_ok() {
                             return Ok::<_, io::Error>(false);
                         }
                     }
-                    let (rel, files) = source.fetch_suite(suite, arch, transport).await?;
-                    if rel.hash == locked.release.hash && rel.size == locked.release.size {
+                    tracing::debug!("forced load locked source for {} {}", source.url, suite,);
+                    let (rel, hash, size) = cache
+                        .cache_file::<blake3::Hasher, _>(&source.file_url(&path), transport)
+                        .and_then(|(rel, hash, size)| async move {
+                            let rel = source.release_from_file(rel).await?;
+                            Ok((rel, hash, size))
+                        })
+                        .await?;
+                    if hash == locked.release.hash && size == locked.release.size {
                         return Ok(false);
                     }
+                    let files = source.release_files(&rel, suite, arch)?;
                     *locked = LockedSuite {
-                        release: rel,
+                        release: RepositoryFile { path, hash, size },
                         packages: files,
                     };
                     tracing::debug!(

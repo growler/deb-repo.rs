@@ -1,21 +1,15 @@
 use {
     crate::{
-        hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader},
-        repo::TransportProvider,
-        staging::{FileList, Stage},
-        tar, StagingFile, StagingFileSystem,
-    },
-    async_compression::futures::bufread::{
-        BzDecoder, GzipDecoder, Lz4Decoder, XzDecoder, ZstdDecoder,
+        StagingFile, StagingFileSystem, comp::{comp_reader, is_comp_ext, is_tar_ext, tar_reader}, hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader}, repo::TransportProvider, staging::{FileList, Stage}, tar
     },
     clap::Args,
     futures_lite::StreamExt,
     rustix::{
         fd::{AsRawFd, OwnedFd},
-        fs::{fstat, openat, FileType, Mode, OFlags, CWD},
+        fs::{CWD, FileType, Mode, OFlags, fstat, openat},
     },
     serde::{Deserialize, Serialize},
-    smol::io::{AsyncRead, BufReader},
+    smol::io::{AsyncRead},
     std::{
         borrow::Cow,
         io,
@@ -72,6 +66,15 @@ impl<'a> ArtifactSource<'a> {
             }
         }
     }
+    pub fn is_remote(&self) -> bool {
+        matches!(self, ArtifactSource::Remote(_))
+    }
+    pub fn remote_uri(&self) -> Option<&str> {
+        match self {
+            ArtifactSource::Remote(ref uri) => Some(uri.as_ref()),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -85,9 +88,10 @@ pub struct Tar {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
-pub struct TarReader<'a, R: AsyncRead + Send + 'a> {
+pub struct TarReader<'a, R: AsyncRead + Send + 'a, FS> {
     target: Option<String>,
     inner: tar::TarReader<'a, R>,
+    _marker: std::marker::PhantomData<FS>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -101,10 +105,11 @@ pub struct Tree {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
-pub struct TreeReader {
+pub struct TreeReader<FS> {
     target: Option<String>,
     dir: OwnedFd,
     hash: Hash,
+    _marker: std::marker::PhantomData<FS>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -121,28 +126,29 @@ pub struct File {
     #[serde(skip_serializing_if = "Option::is_none")]
     unpack: Option<bool>,
 }
-pub struct FileReader<'a, R: AsyncRead + Send + 'a> {
+pub struct FileReader<'a, R: AsyncRead + Send + 'a, FS> {
     target: String,
     inner: R,
     mode: Option<NonZero<u32>>,
     size: Option<NonZero<usize>>,
     _marker: std::marker::PhantomData<&'a ()>,
+    _marker_fs: std::marker::PhantomData<FS>,
 }
 
-pub enum ArtifactReader<'a, R: AsyncRead + Send + 'a> {
-    Tar(TarReader<'a, R>),
-    Tree(TreeReader),
-    File(FileReader<'a, R>),
+pub enum ArtifactReader<'a, R: AsyncRead + Send + 'a, FS> {
+    Tar(TarReader<'a, R, FS>),
+    Tree(TreeReader<FS>),
+    File(FileReader<'a, R, FS>),
 }
 
-impl<'a, 'f, R, FS> Stage<'f, FS> for ArtifactReader<'a, R>
+impl<'a, R, FS> Stage for ArtifactReader<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
-    FS: StagingFileSystem + ?Sized,
-    'a: 'f,
+    FS: StagingFileSystem,
 {
+    type Target = FS;
     type Output = ();
-    async fn stage(self, fs: &'f FS) -> io::Result<()> {
+    async fn stage(self, fs: &Self::Target) -> io::Result<()> {
         match self {
             ArtifactReader::Tar(tar) => tar.stage(fs).await,
             ArtifactReader::Tree(tree) => tree.stage(fs).await,
@@ -151,7 +157,7 @@ where
     }
 }
 
-impl<'a, R: AsyncRead + Send + 'a> FileReader<'a, R> {
+impl<'a, R: AsyncRead + Send + 'a, FS> FileReader<'a, R, FS> {
     pub fn new<P: Into<String>>(
         reader: R,
         target: P,
@@ -164,6 +170,7 @@ impl<'a, R: AsyncRead + Send + 'a> FileReader<'a, R> {
             mode,
             size,
             _marker: std::marker::PhantomData,
+            _marker_fs: std::marker::PhantomData,
         }
     }
 }
@@ -215,11 +222,29 @@ impl Artifact {
             }
         }
     }
-    pub async fn reader<T: TransportProvider + ?Sized>(
+    pub fn with_remote_reader<R: AsyncRead + Send + 'static, FS: StagingFileSystem>(
+        &self,
+        r: R,
+    ) -> ArtifactReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS> {
+        match &self {
+            Artifact::Tar(inner) => ArtifactReader::Tar(
+                inner
+                    .with_remote_reader(r)
+                    .expect("failed to create tar reader"),
+            ),
+            Artifact::File(inner) => ArtifactReader::File(
+                inner
+                    .with_remote_reader(r)
+                    .expect("failed to create file reader"),
+            ),
+            Artifact::Dir(_) => panic!("directory artifacts do not support remote readers"),
+        }
+    }
+    pub async fn reader<T: TransportProvider + ?Sized, FS: StagingFileSystem>(
         &self,
         source: ArtifactSource<'_>,
         transport: &T,
-    ) -> io::Result<ArtifactReader<'static, Pin<Box<dyn AsyncRead + Send>>>> {
+    ) -> io::Result<ArtifactReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
         match source {
             ArtifactSource::Local(ref path) => match &self {
                 Artifact::Tar(inner) => inner.local_reader(path).await.map(ArtifactReader::Tar),
@@ -302,86 +327,6 @@ impl Artifact {
     }
 }
 
-fn ends_with_ignore_case(s: &[u8], suffix: &[u8]) -> bool {
-    if suffix.len() > s.len() {
-        return false;
-    }
-    let mut i = s.len();
-    let mut j = suffix.len();
-    while j > 0 {
-        i -= 1;
-        j -= 1;
-        if !s[i].eq_ignore_ascii_case(&suffix[j]) {
-            return false;
-        }
-    }
-    true
-}
-
-macro_rules! match_ext_int {
-    ($lbl:lifetime $var:ident { $lit:literal $( | $cont:literal )* => $block:expr,  $($rest:tt)+ }) => {{
-        if ends_with_ignore_case($var, concat!(".", $lit).as_bytes())
-            $( || ends_with_ignore_case($var, concat!(".", $cont).as_bytes()) )* {
-            break $lbl $block
-        }
-        match_ext_int!($lbl $var { $($rest)* })
-    }};
-    ($lbl:lifetime $var:ident { None => $none_block:expr $(,)? }) => {{
-        { $none_block }
-    }};
-}
-macro_rules! match_ext {
-    ($expr:expr, { $($rest:tt)* }) => {{
-        let s: &[u8] = $expr;
-        'matcher: {
-            match_ext_int!('matcher s { $($rest)* })
-        }
-    }};
-}
-fn buffered<R: AsyncRead + Send>(reader: R) -> BufReader<R> {
-    const BUFSIZE: usize = 64 * 1024;
-    BufReader::with_capacity(BUFSIZE, reader)
-}
-
-fn is_comp_ext<P: AsRef<[u8]>>(uri: P) -> bool {
-    match_ext!(uri.as_ref(), { "gz" | "xz" | "bz2" | "zstd" | "zst" | "lz4" => true, None => false})
-}
-fn comp_reader<'a, R: AsyncRead + Send + 'a>(
-    uri: &str,
-    reader: R,
-) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
-    match_ext!(uri.as_bytes(), {
-        "gz" => Box::pin(GzipDecoder::new(buffered(reader))),
-        "xz" => Box::pin(XzDecoder::new(buffered(reader))),
-        "bz2" => Box::pin(BzDecoder::new(buffered(reader))),
-        "lz4" => Box::pin(Lz4Decoder::new(buffered(reader))),
-        "zstd" | "zst" => Box::pin(ZstdDecoder::new(buffered(reader))),
-        None => Box::pin(buffered(reader)),
-    })
-}
-fn is_tar_ext<P: AsRef<[u8]>>(path: P) -> bool {
-    match_ext!(path.as_ref(), {
-        "tar" | "tar.gz" | "tgz" |
-        "tar.xz" | "txz" |
-        "tar.bz2" | "tbz" | "tbz2" |
-        "tar.zstd" | "tar.zst" | "tzst" => true,
-        None => false,
-    })
-}
-fn tar_reader<'a, R: AsyncRead + Send + 'a>(
-    uri: &str,
-    reader: R,
-) -> io::Result<tar::TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>> {
-    match_ext!(uri.as_bytes(), {
-        "tar" => Ok(tar::TarReader::new(Box::pin(buffered(reader)))),
-        "tar.gz" | "tgz" => Ok(tar::TarReader::new(Box::pin(GzipDecoder::new(buffered(reader))))),
-        "tar.xz" | "txz" => Ok(tar::TarReader::new(Box::pin(XzDecoder::new(buffered(reader))))),
-        "tar.bz2" | "tbz" | "tbz2" => Ok(tar::TarReader::new(Box::pin(BzDecoder::new(buffered(reader))))),
-        "tar.zstd" | "tar.zst" | "tzst" => Ok(tar::TarReader::new(Box::pin(ZstdDecoder::new(buffered(reader))))),
-        None => Err(io::Error::other(format!("unsupported archive format {}", uri))),
-    })
-}
-
 impl Tar {
     async fn new_remote<T: TransportProvider + ?Sized>(
         uri: &str,
@@ -393,6 +338,7 @@ impl Tar {
         TarReader {
             inner: tar_reader(uri, &mut reader)?,
             target: target.clone(),
+            _marker: std::marker::PhantomData,
         }
         .stage(&FileList::new())
         .await?;
@@ -416,6 +362,7 @@ impl Tar {
         TarReader {
             inner: tar_reader(uri, &mut reader)?,
             target: target.clone(),
+            _marker: std::marker::PhantomData,
         }
         .stage(&FileList::new())
         .await?;
@@ -428,10 +375,10 @@ impl Tar {
             size,
         })
     }
-    async fn local_reader(
+    async fn local_reader<FS: StagingFileSystem>(
         &self,
         path: &Path,
-    ) -> io::Result<TarReader<'static, Pin<Box<dyn AsyncRead + Send>>>> {
+    ) -> io::Result<TarReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
         let inner = tar_reader(
             &self.uri,
             self.hash
@@ -440,38 +387,48 @@ impl Tar {
         Ok(TarReader {
             inner,
             target: self.target.clone(),
+            _marker: std::marker::PhantomData,
         })
     }
-    async fn remote_reader<T>(
+    fn with_remote_reader<R: AsyncRead + Send + 'static, FS: StagingFileSystem>(
+        &self,
+        r: R,
+    ) -> io::Result<TarReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
+        tar_reader(&self.uri, r).map(|inner| TarReader {
+            inner,
+            target: self.target.clone(),
+            _marker: std::marker::PhantomData,
+        })
+    }
+    async fn remote_reader<T, FS>(
         &self,
         transport: &T,
-    ) -> io::Result<TarReader<'static, Pin<Box<dyn AsyncRead + Send>>>>
+    ) -> io::Result<TarReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>>
     where
         T: TransportProvider + ?Sized,
+        FS: StagingFileSystem,
     {
-        let inner = tar_reader(
-            &self.uri,
+        self.with_remote_reader(
             transport
                 .open_verified(&self.uri, self.size, &self.hash)
                 .await?,
-        )?;
-        Ok(TarReader {
-            inner,
-            target: self.target.clone(),
-        })
+        )
     }
 }
 
-impl<'a, 'f, R, FS> Stage<'f, FS> for TarReader<'a, R>
+impl<'a, R, FS> Stage for TarReader<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
-    FS: StagingFileSystem + ?Sized,
-    'a: 'f,
+    FS: StagingFileSystem,
 {
+    type Target = FS;
     type Output = ();
-    async fn stage(mut self, fs: &'f FS) -> io::Result<()> {
+    async fn stage(mut self, fs: &Self::Target) -> io::Result<()> {
         let mut links: Vec<tar::TarLink> = Vec::new();
         let target = self.target.as_deref();
+        if let Some(parent) = target.and_then(|t| Path::new(t).parent()) {
+            fs.create_dir_all(parent, 0, 0, 0o755).await?;
+        }
         while let Some(entry) = self.inner.next().await {
             let entry = entry?;
             match entry {
@@ -480,7 +437,7 @@ where
                         || Cow::Borrowed(Path::new(dir.path())),
                         |p| Cow::Owned(Path::new(p).join(dir.path())),
                     );
-                    tracing::debug!("creating directory {}", path.display());
+                    tracing::trace!("creating directory {}", path.display());
                     fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode())
                         .await?;
                 }
@@ -493,7 +450,7 @@ where
                     let uid = file.uid();
                     let gid = file.gid();
                     let mode = file.mode();
-                    tracing::debug!("extracting {}", path.display());
+                    tracing::trace!("extracting {}", path.display());
                     fs.create_file(&mut file, uid, gid, mode, Some(size))
                         .await
                         .map_err(|err| {
@@ -568,7 +525,10 @@ impl Tree {
             size,
         })
     }
-    async fn local_reader<P: AsRef<Path>>(&self, path: P) -> io::Result<TreeReader> {
+    async fn local_reader<P: AsRef<Path>, FS: StagingFileSystem>(
+        &self,
+        path: P,
+    ) -> io::Result<TreeReader<FS>> {
         let fd = openat(
             CWD,
             path.as_ref(),
@@ -579,16 +539,21 @@ impl Tree {
             dir: fd,
             target: self.target.clone(),
             hash: self.hash.clone(),
+            _marker: std::marker::PhantomData,
         })
     }
 }
 
-impl<'f, FS> Stage<'f, FS> for TreeReader
+impl<FS> Stage for TreeReader<FS>
 where
-    FS: StagingFileSystem + ?Sized,
+    FS: StagingFileSystem,
 {
+    type Target = FS;
     type Output = ();
-    async fn stage(self, fs: &'f FS) -> io::Result<()> {
+    async fn stage(self, fs: &Self::Target) -> io::Result<()> {
+        if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
+            fs.create_dir_all(parent, 0, 0, 0o755).await?;
+        }
         let hash = tree::copy_hash_dir(self.dir, fs, self.target.as_deref()).await?;
         if hash != self.hash {
             Err(io::Error::other("hash mismatch after copying local tree"))
@@ -689,10 +654,10 @@ impl File {
             unpack,
         })
     }
-    async fn local_reader(
+    async fn local_reader<FS: StagingFileSystem>(
         &self,
         path: &Path,
-    ) -> io::Result<FileReader<'static, Pin<Box<dyn AsyncRead + Send>>>> {
+    ) -> io::Result<FileReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
         let inner: Pin<Box<dyn AsyncRead + Send>> = self
             .hash
             .reader(self.size, smol::fs::File::open(path).await?);
@@ -702,31 +667,39 @@ impl File {
             mode: self.mode,
             size: Some(NonZero::new(self.size as usize).unwrap()),
             _marker: std::marker::PhantomData,
+            _marker_fs: std::marker::PhantomData,
         })
     }
-    async fn remote_reader<T: TransportProvider + ?Sized>(
+    fn with_remote_reader<R: AsyncRead + Send + 'static, FS: StagingFileSystem>(
         &self,
-        transport: &T,
-    ) -> io::Result<FileReader<'static, Pin<Box<dyn AsyncRead + Send>>>> {
-        let inner: Pin<Box<dyn AsyncRead + Send>> = Box::pin(EraseHashingRead::new(
-            transport
-                .open_verified(&self.uri, self.size, &self.hash)
-                .await?,
-        ));
+        r: R,
+    ) -> io::Result<FileReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
+        let inner: Pin<Box<dyn AsyncRead + Send>> = self.hash.reader(self.size, r);
         Ok(FileReader {
             inner,
             target: self.target.clone(),
             mode: self.mode,
             size: Some(NonZero::new(self.size as usize).unwrap()),
             _marker: std::marker::PhantomData,
+            _marker_fs: std::marker::PhantomData,
         })
+    }
+    async fn remote_reader<T: TransportProvider + ?Sized, FS: StagingFileSystem>(
+        &self,
+        transport: &T,
+    ) -> io::Result<FileReader<'static, Pin<Box<dyn AsyncRead + Send>>, FS>> {
+        self.with_remote_reader(
+            transport
+                .open_verified(&self.uri, self.size, &self.hash)
+                .await?,
+        )
     }
 }
 
 // rust supports dyn trat upcast only since 1.86.
 // TODO:: remove as soon as debian MSRV is 1.86+
 pin_project_lite::pin_project! {
-    struct EraseHashingRead {
+    pub(crate) struct EraseHashingRead {
         #[pin]
         inner: Pin<Box<dyn AsyncHashingRead + Send + 'static>>,
     }
@@ -746,14 +719,17 @@ impl AsyncRead for EraseHashingRead {
     }
 }
 
-impl<'a, 'f, R, FS> Stage<'f, FS> for FileReader<'a, R>
+impl<'a, R, FS> Stage for FileReader<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
-    FS: StagingFileSystem + ?Sized,
-    'a: 'f,
+    FS: StagingFileSystem,
 {
+    type Target = FS;
     type Output = ();
-    async fn stage(self, fs: &'f FS) -> io::Result<()> {
+    async fn stage(self, fs: &Self::Target) -> io::Result<()> {
+        if let Some(parent) = Path::new(&self.target).parent() {
+            fs.create_dir_all(parent, 0, 0, 0o755).await?;
+        }
         fs.create_file(
             self.inner,
             0,
@@ -877,8 +853,7 @@ mod tree {
                     } else {
                         path
                     };
-                    fs.create_dir_all(path, 0, 0, stat.st_mode)
-                        .await?;
+                    fs.create_dir_all(path, 0, 0, stat.st_mode).await?;
                     Ok(None)
                 }
                 Object::RegularFile { fd, stat, path } => {
@@ -889,13 +864,7 @@ mod tree {
                     };
                     let mut rd = HashingReader::<blake3::Hasher, _>::new(smol::fs::File::from(fd));
                     let file = fs
-                        .create_file(
-                            &mut rd,
-                            0,
-                            0,
-                            stat.st_mode,
-                            Some(stat.st_size as usize),
-                        )
+                        .create_file(&mut rd, 0, 0, stat.st_mode, Some(stat.st_size as usize))
                         .await?;
                     file.persist(path).await?;
                     Ok(Some(rd.into_hash_output()))

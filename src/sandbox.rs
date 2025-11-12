@@ -255,10 +255,10 @@ where
 #[async_trait::async_trait(?Send)]
 impl<E: SandboxExecutor> Executor for Sandbox<'_, E> {
     type Filesystem = E::Filesystem;
-    async fn prepare_tree(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
+    async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
         unimplemented!()
     }
-    async fn process_changes(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
+    async fn process_changes(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
         unimplemented!()
     }
     fn env<K, V>(&mut self, _k: K, _v: V) -> io::Result<()>

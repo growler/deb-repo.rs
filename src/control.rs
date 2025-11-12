@@ -476,7 +476,7 @@ pub struct MutableControlFile {
 impl std::fmt::Display for MutableControlFile {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {
         for stanza in &self.stanzas {
-            write!(f, "{}", stanza)?;
+            writeln!(f, "{}", stanza)?;
         }
         writeln!(f)
     }

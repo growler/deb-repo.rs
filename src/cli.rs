@@ -1,23 +1,28 @@
-pub use crate::source::{SnapshotId, SnapshotIdArgParser, Source};
 use {
     crate::{
+        cache::CacheProvider,
         packages::{InstallPriority, Package},
         repo::TransportProvider,
+        source::{SnapshotId, SnapshotIdArgParser, Source},
         version::{Constraint, Dependency, Version},
+        StagingFileSystem,
     },
     anyhow::Result,
     std::{io, num::NonZero, path::Path, str::FromStr},
 };
 
 pub trait Config {
+    type FS: StagingFileSystem;
+    type Cache: CacheProvider<Target = Self::FS>;
+    type Transport: TransportProvider;
     fn log_level(&self) -> i32 {
         0
     }
     fn arch(&self) -> &str;
     fn manifest(&self) -> &Path;
     fn concurrency(&self) -> NonZero<usize>;
-    fn cache(&self) -> Option<&Path>;
-    fn transport(&self) -> impl std::future::Future<Output = io::Result<&dyn TransportProvider>>;
+    fn cache(&self) -> &Self::Cache;
+    fn transport(&self) -> &Self::Transport;
 }
 
 pub trait Command<C> {
@@ -28,7 +33,7 @@ pub mod cmd {
     use {
         super::*,
         crate::{
-            artifact::ArtifactArg, builder::Executor, manifest::Manifest,
+            artifact::ArtifactArg, builder::Executor, cache::HostCache, manifest::Manifest,
             sandbox::HostSandboxExecutor, staging::HostFileSystem,
         },
         anyhow::{anyhow, Result},
@@ -82,12 +87,11 @@ Examples:
                     conf.arch(),
                     sources.iter().cloned(),
                     comment.as_deref(),
-                    conf.cache(),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(true, conf.concurrency(), conf.transport().await?)
+                mf.update(true, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport().await?)
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
                 mf.store(conf.manifest()).await?;
                 Ok(())
@@ -128,18 +132,19 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Drop {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if !self.constraints_only {
                     mf.remove_requirements(self.spec.as_deref(), self.cons.iter())?;
                 }
                 if !self.requirements_only {
                     mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
                 }
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport().await?)
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
+                conf.cache().close().await?;
                 mf.store(conf.manifest()).await?;
                 Ok(())
             })
@@ -167,13 +172,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Stage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_artifact(
                     self.spec.as_deref(),
                     &self.artifact,
                     self.comment.as_deref(),
-                    conf.transport().await?,
+                    conf.transport(),
                 )
                 .await?;
                 mf.store(conf.manifest()).await?;
@@ -199,8 +203,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Unstage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.remove_artifact(self.spec.as_deref(), &self.url)?;
                 mf.store(conf.manifest()).await?;
                 Ok(())
@@ -232,18 +235,19 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Include {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_requirements(
                     self.spec.as_deref(),
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport().await?)
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
                 mf.store(conf.manifest()).await?;
+                conf.cache().close().await?;
                 Ok(())
             })
         }
@@ -272,18 +276,19 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Exclude {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_constraints(
                     self.spec.as_deref(),
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport().await?)
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
                 mf.store(conf.manifest()).await?;
+                conf.cache().close().await?;
                 Ok(())
             })
         }
@@ -306,14 +311,20 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Update {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                mf.update(self.force, conf.concurrency(), conf.transport().await?)
-                    .await?;
+                conf.cache().init().await?;
+                mf.update(
+                    self.force,
+                    conf.concurrency(),
+                    conf.transport(),
+                    conf.cache(),
+                )
+                .await?;
                 mf.store(conf.manifest()).await?;
+                conf.cache().close().await?;
                 Ok(())
             })
         }
@@ -336,12 +347,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Search {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.load_universe(conf.concurrency(), conf.transport().await?)
+                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
+                conf.cache().close().await?;
                 let res = self
                     .pattern
                     .iter()
@@ -385,12 +397,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Show {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.load_universe(conf.concurrency(), conf.transport().await?)
+                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
+                conf.cache().close().await?;
                 let pkg = mf.packages()?.find(|p| self.package == p.name());
                 if let Some(pkg) = pkg {
                     let mut out = async_io::Async::new(std::io::stdout().lock())?;
@@ -419,13 +432,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for List {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
-                mf.update(false, conf.concurrency(), conf.transport().await?)
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                conf.cache().init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport().await?)
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
                     .await
                     .map_err(|e| anyhow!("failed to update specs: {e}"))?;
+                conf.cache().close().await?;
                 let mut pkgs = mf
                     .spec_packages(self.spec.as_deref())?
                     .filter(|p| !self.only_essential || p.essential())
@@ -434,7 +448,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 let mut out = std::io::stdout().lock();
                 let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
                 pretty_print_packages(&mut out, pkgs, false).await?;
-                mf.store(conf.manifest()).await?;
                 Ok(())
             })
         }
@@ -454,13 +467,28 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         path: PathBuf,
     }
 
-    impl<C: Config> Command<C> for Build {
+    impl<C: Config<FS = HostFileSystem, Cache = HostCache>> Command<C> for Build {
         fn exec(&self, conf: &C) -> Result<()> {
             let mut builder = HostSandboxExecutor::new(&self.path)?;
             smol::block_on(async move {
-                let manifest =
-                    Manifest::from_file(conf.manifest(), conf.arch(), conf.cache()).await?;
-                smol::fs::create_dir_all(&self.path).await?;
+                let fs =
+                    HostFileSystem::new(&self.path, rustix::process::geteuid().is_root()).await.map_err(|err| {
+                        anyhow!(
+                            "failed to initialize staging filesystem at {}: {}",
+                            self.path.display(),
+                            err
+                        )
+                    })?;
+                conf.cache().init().await?;
+                let manifest = Manifest::from_file(conf.manifest(), conf.arch())
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to load manifest from {}: {}",
+                            conf.manifest().display(),
+                            err
+                        )
+                    })?;
                 let pb = if conf.log_level() == 0 {
                     Some(|size| {
                         ProgressBar::new(size).with_style(
@@ -474,18 +502,22 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 } else {
                     None
                 };
-                let mut fs =
-                    HostFileSystem::new(&self.path, rustix::process::geteuid().is_root()).await?;
+                tracing::debug!(
+                    "Staging spec '{}' into '{}'",
+                    self.spec.as_deref().unwrap_or("default"),
+                    self.path.display()
+                );
                 let (essentials, other, scripts) = manifest
-                    .stage(
+                    .stage_(
                         self.spec.as_deref(),
-                        &mut fs,
+                        &fs,
                         conf.concurrency(),
-                        conf.transport().await?,
+                        conf.transport(),
+                        conf.cache(),
                         pb,
                     )
                     .await?;
-                builder.build(&mut fs, essentials, other, scripts).await?;
+                builder.build(&fs, essentials, other, scripts).await?;
                 Ok(())
             })
         }

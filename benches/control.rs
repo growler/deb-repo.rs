@@ -29,7 +29,7 @@ Description: GNU core utilities
 ";
 
 pub fn parse_benchmark(c: &mut Criterion) {
-    c.bench_function("parse test", |b| {
+    c.bench_function("parse single package", |b| {
         b.iter(|| {
             std::hint::black_box(ControlFile::parse(TEXT)).unwrap();
         })

@@ -98,10 +98,10 @@ pub trait Executor {
     fn setup(&mut self) -> io::Result<()> {
         Ok(())
     }
-    async fn prepare_tree(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
+    async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
         Ok(())
     }
-    async fn process_changes(&mut self, _fs: &mut Self::Filesystem) -> io::Result<()> {
+    async fn process_changes(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
         Ok(())
     }
     async fn execute(&mut self, job: BuildJob<Self>) -> io::Result<()>
@@ -133,7 +133,7 @@ pub trait Executor {
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()>;
     async fn build(
         &mut self,
-        fs: &mut Self::Filesystem,
+        fs: &Self::Filesystem,
         essentials: Vec<String>,
         packages: Vec<Vec<String>>,
         scripts: Vec<String>,

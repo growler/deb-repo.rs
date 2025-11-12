@@ -1,30 +1,38 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::{
-    control::ControlParser, hash::Hash, universe::Universe, version::Dependency,
-    HttpTransportProvider, Package, Packages, TransportProvider,
+    cache::IndexFile, control::ControlParser, hash::Hash, universe::Universe, version::Dependency,
+    Package, Packages,
 };
-use std::sync::Arc;
+use std::path::PathBuf;
 
-async fn fetch_packages() -> Arc<str> {
-    let transport = HttpTransportProvider::new(false);
-    let uri = "https://snapshot.debian.org/archive/debian/20241201T025825Z/dists/bookworm/main/binary-amd64/Packages.xz";
+async fn fetch_packages() -> IndexFile {
+    let path =  PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("benches/data/snapshot.debian.org_archive_debian_20241201T025825Z_dists_bookworm_main_binary-amd64_Packages.xz");
     let size = 8788624;
     let hash = Hash::from_hex(
         "SHA256",
         "2f674d057c5f274c5a863664a586ef62a0deb571993914ccfe4e2cd784a4840d",
     )
     .unwrap();
-    let data = transport
-        .get_unpacked_bytes_verified(uri, size, &hash, 100_000_000)
-        .await
-        .expect("package downloaded");
-    String::from_utf8(data).expect("correct utf-8").into()
+    println!("Loading package data from {:?}", path);
+    IndexFile::read(debrepo::unpacker(
+        path.to_str().expect("valid path"),
+        hash.verifying_reader(
+            size,
+            smol::fs::File::open(&path)
+                .await
+                .expect("open snapshot file"),
+        ),
+    ))
+    .await
+    .expect("read data file")
 }
 
 pub fn parse_benchmark(c: &mut Criterion) {
     let data = smol::block_on(fetch_packages());
+    let mut g = c.benchmark_group("solve");
 
-    c.bench_function("parse test", |b| {
+    g.bench_function("parse packages", |b| {
         b.iter(|| {
             let mut parser = ControlParser::new(&data);
             let mut count = 0;
@@ -37,16 +45,12 @@ pub fn parse_benchmark(c: &mut Criterion) {
             std::hint::black_box(count);
         })
     });
+    g.measurement_time(std::time::Duration::from_secs(20));
 
-    let mut g = c.benchmark_group("solve");
-    g.measurement_time(std::time::Duration::from_secs(10));
-
-    g.bench_function("solve test", |b| {
+    g.bench_function("find solution", |b| {
         b.iter(|| {
-            let packages = Some(
-                Packages::new(data.clone().to_string().into_boxed_str(), None)
-                    .expect("failed to parse packages"),
-            );
+            let packages =
+                Some(Packages::new(data.clone(), None).expect("failed to parse packages"));
             let mut uni = Universe::new("amd64", packages).expect("universe");
             let _ = match uni.solve(
                 vec!["task-gnome-desktop | task-kde-desktop"

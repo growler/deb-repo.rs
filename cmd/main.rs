@@ -2,8 +2,9 @@ use {
     async_lock::OnceCell,
     clap::Parser,
     debrepo::{
+        cache::{CacheProvider, HostCache},
         cli::{self, Command},
-        maybe_run_sandbox, HostSandboxExecutor, HttpCachingTransportProvider,
+        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpCachingTransportProvider,
         HttpTransportProvider, Manifest, TransportProvider,
     },
     std::{
@@ -87,6 +88,9 @@ pub struct App {
 }
 
 impl cli::Config for App {
+    type FS = HostFileSystem;
+    type Cache = HostCache;
+    type Transport = HttpTransportProvider;
     fn log_level(&self) -> i32 {
         if self.quiet {
             -1
@@ -103,28 +107,14 @@ impl cli::Config for App {
     fn concurrency(&self) -> NonZero<usize> {
         self.concurrency
     }
-    fn cache(&self) -> Option<&Path> {
-        self.cache_dir.as_deref()
+    fn cache(&self) -> &HostCache {
+        static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
+        PROVIDER.get_or_init(|| HostCache::new(self.cache_dir.as_deref()))
     }
-    fn transport(
-        &self,
-    ) -> impl std::future::Future<Output = std::io::Result<&dyn TransportProvider>> {
-        static PROVIDER: OnceCell<Box<dyn TransportProvider>> = OnceCell::new();
-        async {
-            let provider = PROVIDER
-                .get_or_try_init(|| async {
-                    if let Some(cache) = &self.cache_dir {
-                        HttpCachingTransportProvider::new(self.insecure, cache.clone())
-                            .map(|p| Box::new(p) as Box<dyn TransportProvider>)
-                    } else {
-                        Ok(Box::new(HttpTransportProvider::new(self.insecure))
-                            as Box<dyn TransportProvider>)
-                    }
-                })
-                .await
-                .map(|t| t.as_ref());
-            provider
-        }
+    fn transport(&self) -> &Self::Transport {
+        static PROVIDER: once_cell::sync::OnceCell<HttpTransportProvider> =
+            once_cell::sync::OnceCell::new();
+        PROVIDER.get_or_init(|| HttpTransportProvider::new(self.insecure))
     }
 }
 
