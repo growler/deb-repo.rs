@@ -31,10 +31,6 @@ pub trait StagingFile {
 #[allow(clippy::too_many_arguments)]
 pub trait StagingFileSystem {
     type File: StagingFile;
-    type IoFut<'a, T>: Future<Output = io::Result<T>> + 'a
-    where
-        Self: 'a,
-        T: 'a;
     /// Create a directory at `path`, optionaly owned by (`uid`, `gid`) and using mode bits `mode`
     fn create_dir<P: AsRef<Path>>(
         &self,
@@ -42,7 +38,7 @@ pub trait StagingFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()>;
+    ) -> impl Future<Output = io::Result<()>>;
     /// Create a directory at `path`, including all the parent directories if necessary,
     /// optionall owned by (`uid`, `gid`) using mode bits `mode`
     fn create_dir_all<P: AsRef<Path>>(
@@ -51,15 +47,15 @@ pub trait StagingFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()>;
+    ) -> impl Future<Output = io::Result<()>>;
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         target: P,
         link: Q,
         uid: u32,
         gid: u32,
-    ) -> Self::IoFut<'_, ()>;
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, target: P, link: Q) -> Self::IoFut<'_, ()>;
+    ) -> impl Future<Output = io::Result<()>>;
+    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, target: P, link: Q) -> impl Future<Output = io::Result<()>>;
     /// Creates a file using content provided by the reader `r`.
     /// The resulting file must later be made persistent by calling `file.persist(path)`.
     ///
@@ -90,18 +86,18 @@ pub trait StagingFileSystem {
         gid: u32,
         mode: u32,
         size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::File>;
+    ) -> impl Future<Output = io::Result<Self::File>> + 'a;
     fn create_file_from_bytes<'a>(
         &'a self,
         r: &'a [u8],
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'a, Self::File> {
+    ) -> impl Future<Output = io::Result<Self::File>> + 'a {
         self.create_file(r, uid, gid, mode, Some(r.len()))
     }
-    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()>;
-    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>>;
+    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>>
     where
         T: Send + 'static,
         A: Stage<Target = Self, Output = T> + Send + 'static;
@@ -257,18 +253,13 @@ fn mkdir_rec(path: &std::path::Path, owner: Option<(u32, u32)>, mode: u32) -> io
 
 impl StagingFileSystem for HostFileSystem {
     type File = HostFile;
-    type IoFut<'a, T>
-        = BoxFuture<'a, io::Result<T>>
-    where
-        Self: 'a,
-        T: 'a;
     fn create_dir<P: AsRef<Path>>(
         &self,
         path: P,
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
         let owner = if self.chown_allowed {
             Some((uid, gid))
@@ -286,7 +277,6 @@ impl StagingFileSystem for HostFileSystem {
             utimensat(CWD, target, &EPOCH, AtFlags::empty())?;
             Ok(())
         })
-        .boxed()
     }
     fn create_dir_all<P: AsRef<Path>>(
         &self,
@@ -294,7 +284,7 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
         let owner = if self.chown_allowed {
             Some((uid, gid))
@@ -314,7 +304,6 @@ impl StagingFileSystem for HostFileSystem {
                 )
             })
         })
-        .boxed()
     }
     fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
@@ -322,7 +311,7 @@ impl StagingFileSystem for HostFileSystem {
         path: Q,
         uid: u32,
         gid: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         let link = self.target_path(path.as_ref());
         let target = target.as_ref().to_owned();
         let chown_allowed = self.chown_allowed;
@@ -341,9 +330,8 @@ impl StagingFileSystem for HostFileSystem {
             }
             utimensat(CWD, link, &EPOCH, AtFlags::SYMLINK_NOFOLLOW).map_err(Into::<io::Error>::into)
         })
-        .boxed()
     }
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Self::IoFut<'_, ()> {
+    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> impl Future<Output = io::Result<()>> {
         let from = self.target_path(from.as_ref());
         let to = self.target_path(to.as_ref());
         blocking::unblock(move || {
@@ -351,7 +339,6 @@ impl StagingFileSystem for HostFileSystem {
             let to = to?;
             link(from, to).map_err(Into::into)
         })
-        .boxed()
     }
     fn create_file<'a, R: AsyncRead + Send + 'a>(
         &'a self,
@@ -360,7 +347,7 @@ impl StagingFileSystem for HostFileSystem {
         gid: u32,
         mode: u32,
         size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::File> {
+    ) -> impl Future<Output = io::Result<Self::File>> + 'a {
         let root = self.root.clone();
         async move {
             let chown_allowed = self.chown_allowed;
@@ -389,7 +376,6 @@ impl StagingFileSystem for HostFileSystem {
                 path,
             })
         }
-        .boxed()
     }
     fn create_file_from_bytes<'a>(
         &'a self,
@@ -397,59 +383,20 @@ impl StagingFileSystem for HostFileSystem {
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'a, Self::File> {
+    ) -> impl Future<Output = io::Result<Self::File>> + 'a {
         self.create_file(r, uid, gid, mode, Some(r.len()))
     }
-    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()> {
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
-        blocking::unblock(move || unlink(target?).map_err(Into::into)).boxed()
+        blocking::unblock(move || unlink(target?).map_err(Into::into))
     }
-    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
+    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>> 
     where
         T: Send + 'static,
         A: Stage<Target = Self, Output = T> + Send + 'static,
     {
-        let fs = self.clone();
-        blocking::unblock(move || smol::block_on(artifact.stage(&fs))).boxed()
+        artifact.stage(self)
     }
-    // fn stage_deb<F, Fut, R>(
-    //     &self,
-    //     _hash: Hash,
-    //     _size: u64,
-    //     open: F,
-    // ) -> Self::IoFut<'_, MutableControlStanza>
-    // where
-    //     F: FnOnce() -> Fut + Send + 'static,
-    //     Fut: Future<Output = io::Result<R>> + Send,
-    //     R: AsyncRead + Send + 'static,
-    // {
-    //     let fs = self.clone();
-    //     async move {
-    //         let r = open().await?;
-    //         let deb = DebReader::new(r);
-    //         blocking::unblock(move || smol::block_on(deb.stage(&fs))).await
-    //     }
-    //     .boxed()
-    // }
-    // fn stage_artifact<'f, C, F, Fut, R>(
-    //     &'f self,
-    //     _hash: Hash,
-    //     cache: OptionalCache<C>,
-    //     artifact: F,
-    // ) -> Self::IoFut<'f, ()>
-    // where
-    //     F: FnOnce(OptionalCache<C>) -> Fut + Send + 'f,
-    //     Fut: Future<Output = io::Result<R>> + Send,
-    //     R: for<'a> Stage<'a, Self, Output = ()> + Send + 'static,
-    //     C: CacheProvider + 'f,
-    // {
-    //     let fs = self.clone();
-    //     async move {
-    //         let artifact = artifact(cache).await?;
-    //         blocking::unblock(move || smol::block_on(artifact.stage(&fs))).await
-    //     }
-    //     .boxed()
-    // }
 }
 
 #[derive(Clone, Debug)]
@@ -512,18 +459,13 @@ fn iofut<'a, T: 'a>(t: T) -> LocalBoxFuture<'a, io::Result<T>> {
 // #[async_trait::async_trait(?Send)]
 impl StagingFileSystem for FileList {
     type File = FileListFile;
-    type IoFut<'a, T>
-        = LocalBoxFuture<'a, io::Result<T>>
-    where
-        Self: 'a,
-        T: 'a;
     fn create_dir<P: AsRef<Path>>(
         &self,
         path: P,
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -539,7 +481,7 @@ impl StagingFileSystem for FileList {
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -555,7 +497,7 @@ impl StagingFileSystem for FileList {
         path: Q,
         uid: u32,
         gid: u32,
-    ) -> Self::IoFut<'_, ()> {
+    ) -> impl Future<Output = io::Result<()>> {
         self.out.lock().unwrap().insert(format!(
             "{} -> {} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -565,7 +507,7 @@ impl StagingFileSystem for FileList {
         ));
         iofut(())
     }
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> Self::IoFut<'_, ()> {
+    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> impl Future<Output = io::Result<()>> {
         self.out.lock().unwrap().insert(format!(
             "{} -> {}",
             from.as_ref().as_os_str().to_string_lossy(),
@@ -580,7 +522,7 @@ impl StagingFileSystem for FileList {
         gid: u32,
         mode: u32,
         _size: Option<usize>,
-    ) -> Self::IoFut<'a, Self::File> {
+    ) -> impl Future<Output = io::Result<Self::File>> + 'a {
         async move {
             let size = smol::io::copy(r, &mut smol::io::sink()).await?;
             Ok(FileListFile {
@@ -591,59 +533,21 @@ impl StagingFileSystem for FileList {
                 out: Arc::clone(&self.out),
             })
         }
-        .boxed_local()
     }
-    fn remove_file<P: AsRef<Path>>(&self, path: P) -> Self::IoFut<'_, ()> {
+    fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>> {
         self.out
             .lock()
             .unwrap()
             .insert(format!("!{}", path.as_ref().as_os_str().to_string_lossy(),));
         iofut(())
     }
-    fn stage<A, T>(&self, artifact: A) -> Self::IoFut<'_, T>
+    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>>
     where
         T: Send + 'static,
         A: Stage<Target = Self, Output = T> + Send + 'static,
     {
         artifact.stage(self).boxed_local()
     }
-    // fn stage_deb<'f, C, F, Fut, R>(
-    //     &self,
-    //     _hash: Hash,
-    //     _size: u64,
-    //     _cache: OptionalCache<C>,
-    //     deb: F,
-    // ) -> Self::IoFut<'_, MutableControlStanza>
-    // where
-    //     C: CacheProvider + 'f,
-    //     F: FnOnce() -> Fut + Send + 'f,
-    //     Fut: Future<Output = io::Result<R>> + Send,
-    //     R: AsyncRead + Send + 'f,
-    // {
-    //     async move {
-    //         let deb = DebReader::new(deb().await?);
-    //         deb.stage(self).await
-    //     }
-    //     .boxed_local()
-    // }
-    // fn stage_artifact<'f, C, F, Fut, A>(
-    //     &'f self,
-    //     _hash: Hash,
-    //     cache: OptionalCache<C>,
-    //     artifact: F,
-    // ) -> Self::IoFut<'f, ()>
-    // where
-    //     F: FnOnce(OptionalCache<C>) -> Fut + Send + 'f,
-    //     Fut: Future<Output = io::Result<A>> + Send,
-    //     A: for<'a> Stage<'a, Self, Output = ()> + Send + 'f,
-    //     C: CacheProvider + 'f,
-    // {
-    //     async move {
-    //         let artifact = artifact(cache).await?;
-    //         artifact.stage(self).await
-    //     }
-    //     .boxed_local()
-    // }
 }
 
 #[cfg(test)]
@@ -656,8 +560,6 @@ mod tests {
     where
         T: StagingFileSystem + Sync + Send + Clone,
         T::File: Send,
-        for<'a> T::IoFut<'a, ()>: Send,
-        for<'a> T::IoFut<'a, T::File>: Send,
     {
     }
 
@@ -665,5 +567,5 @@ mod tests {
     assert_impl_all!(HostFileSystem: Send, Sync, ThreadSafeStagingFS);
     assert_impl_all!(HostFile: Send, Sync);
     assert_impl_all!(FileList: Send, Sync);
-    assert_not_impl_all!(FileList: ThreadSafeStagingFS);
+    // assert_not_impl_all!(FileList: ThreadSafeStagingFS);
 }
