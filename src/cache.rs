@@ -1,12 +1,15 @@
+use std::{future::Future, path::PathBuf};
+
 pub use crate::indexfile::IndexFile;
+use crate::staging::Stage_;
 use {
     crate::{
-        artifact::{Artifact, ArtifactSource},
+        artifact::Artifact,
         control::MutableControlStanza,
-        deb::DebReader,
+        deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
         repo::unpacker_,
-        HostFileSystem, Stage, StagingFileSystem, TransportProvider,
+        HostFileSystem, StagingFileSystem, TransportProvider,
     },
     futures::AsyncReadExt,
     smol::{
@@ -16,47 +19,59 @@ use {
     std::{path::Path, pin::Pin, sync::Arc},
 };
 
-#[async_trait::async_trait(?Send)]
 pub trait CacheProvider: Clone + Send {
     type Target: StagingFileSystem;
-    async fn init(&self) -> io::Result<()>;
-    async fn close(&self) -> io::Result<()>;
-    async fn cached_deb<T: TransportProvider + ?Sized>(
+    fn init(&self) -> impl Future<Output = io::Result<()>>;
+    fn close(&self) -> impl Future<Output = io::Result<()>>;
+    fn cached_deb<T: TransportProvider + ?Sized>(
         &self,
         hash: Hash,
         size: u64,
         url: &str,
         transport: &T,
-    ) -> io::Result<impl Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>;
-    async fn cached_artifact<'a, T: TransportProvider + ?Sized>(
+    ) -> impl Future<
+        Output = io::Result<
+            Box<dyn Stage_<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+        >,
+    >;
+    fn cached_artifact<'a, T: TransportProvider + ?Sized>(
         &self,
         artifact: &'a Artifact,
-        source: ArtifactSource<'a>,
         transport: &T,
-    ) -> io::Result<impl Stage<Target = Self::Target, Output = ()> + Send + 'static>;
-    async fn cached_file<T: TransportProvider + ?Sized>(
+    ) -> impl Future<
+        Output = io::Result<Box<dyn Stage_<Target = Self::Target, Output = ()> + Send + 'static>>,
+    >;
+    fn cache_artifact<T: TransportProvider + ?Sized>(
+        &self,
+        artifact: &mut Artifact,
+        transport: &T,
+    ) -> impl Future<Output = io::Result<()>>;
+    fn cached_index_file<T: TransportProvider + ?Sized>(
         &self,
         hash: Hash,
         size: u64,
         url: &str,
         transport: &T,
-    ) -> io::Result<IndexFile>;
-    async fn cache_file<H, T>(
+    ) -> impl Future<Output = io::Result<IndexFile>>;
+    fn cache_index_file<H, T>(
         &self,
         url: &str,
         transport: &T,
-    ) -> io::Result<(IndexFile, Hash, u64)>
+    ) -> impl Future<Output = io::Result<(IndexFile, Hash, u64)>>
     where
         T: TransportProvider + ?Sized,
         H: HashAlgo + 'static;
+    fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
 }
 
 pub struct HostCache {
+    base: Arc<Path>,
     cache: Option<Arc<Path>>,
 }
 impl HostCache {
-    pub fn new<P: AsRef<Path>>(path: Option<P>) -> Self {
+    pub fn new<B: AsRef<Path>, P: AsRef<Path>>(base: B, path: Option<P>) -> Self {
         Self {
+            base: base.as_ref().to_owned().into(),
             cache: path.map(|p| p.as_ref().to_owned().into()),
         }
     }
@@ -65,6 +80,7 @@ impl HostCache {
 impl Clone for HostCache {
     fn clone(&self) -> Self {
         Self {
+            base: Arc::clone(&self.base),
             cache: self.cache.as_ref().map(Arc::clone),
         }
     }
@@ -72,7 +88,6 @@ impl Clone for HostCache {
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
 
-#[async_trait::async_trait(?Send)]
 impl CacheProvider for HostCache {
     type Target = HostFileSystem;
     async fn init(&self) -> io::Result<()> {
@@ -91,15 +106,21 @@ impl CacheProvider for HostCache {
         size: u64,
         url: &str,
         transport: &T,
-    ) -> io::Result<impl Stage<Target = Self::Target, Output = MutableControlStanza> + 'static>
-    {
+    ) -> io::Result<
+        Box<dyn Stage_<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+    > {
         if let Some(cache) = self.cache.as_ref() {
             let cache_path = hash.store_name(Some(cache.as_ref()), 1);
             if let Ok(file) = fs::File::open(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
-                return Ok(DebReader::new(
+                return Ok(Box::new(DebStage::new(
                     Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
-                ));
+                ))
+                    as Box<
+                        dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                            + Send
+                            + 'static,
+                    >);
             }
             let mut src = hash.verifying_reader(size, transport.open(url).await?);
             let (dst, path) = tempfile::Builder::new()
@@ -111,50 +132,102 @@ impl CacheProvider for HostCache {
             smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
             path.persist(&cache_path)?;
             tracing::debug!("Cached {} at {}", url, cache_path.display());
-            fs::File::open(cache_path)
-                .await
-                .map(|f| DebReader::new(Box::pin(f) as Pin<Box<dyn AsyncRead + Send>>))
+            let file = fs::File::open(&cache_path).await?;
+            Ok(Box::new(DebStage::new(
+                Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
+            ))
+                as Box<
+                    dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                        + Send
+                        + 'static,
+                >)
         } else {
             let src = hash.verifying_reader(size, transport.open(url).await?);
-            Ok(DebReader::new(
+            Ok(Box::new(DebStage::new(
                 Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
             ))
+                as Box<
+                    dyn Stage_<Target = Self::Target, Output = MutableControlStanza>
+                        + Send
+                        + 'static,
+                >)
         }
+    }
+    async fn cache_artifact<T: TransportProvider + ?Sized>(
+        &self,
+        artifact: &mut Artifact,
+        transport: &T,
+    ) -> io::Result<()> {
+        if artifact.is_local() {
+            let path = self.base.join(artifact.uri());
+            let _ = artifact.hash_local(&path).await;
+        } else {
+            let mut src = transport.open(artifact.uri()).await?;
+            if let Some(cache) = self.cache.as_ref() {
+                let (dst, path) = tempfile::Builder::new()
+                    .tempfile_in(cache.as_ref())?
+                    .into_parts();
+                let mut dst: smol::fs::File = dst.into();
+                io::copy(&mut src, &mut dst).await?;
+                dst.sync_data().await?;
+                let (hash, _) = artifact.hash_local(&path).await?;
+                let cache_path = hash.store_name(Some(cache.as_ref()), 1);
+                smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
+                path.persist(&cache_path)?;
+                tracing::debug!("Cached {} at {}", artifact.uri(), cache_path.display());
+            } else {
+                let _ = artifact.hash_remote(src).await?;
+            }
+        }
+        Ok(())
     }
     async fn cached_artifact<'a, T: TransportProvider + ?Sized>(
         &self,
         artifact: &'a Artifact,
-        source: ArtifactSource<'a>,
         transport: &T,
-    ) -> io::Result<impl Stage<Target = Self::Target, Output = ()> + 'static> {
-        if let Some(cache) = self.cache.as_ref() {
-            if source.is_remote() {
-                let url = source.remote_uri().unwrap();
-                let cache_path = artifact.hash().store_name(Some(cache.as_ref()), 1);
-                let file = if let Ok(file) = fs::File::open(&cache_path).await {
-                    tracing::debug!("Using cached {} at {}", url, cache_path.display());
-                    file
-                } else {
-                    let mut src = artifact
-                        .hash()
-                        .verifying_reader(artifact.size(), transport.open(url).await?);
-                    let (dst, path) = tempfile::Builder::new()
-                        .tempfile_in(cache.as_ref())?
-                        .into_parts();
-                    let mut dst: smol::fs::File = dst.into();
-                    io::copy(&mut src, &mut dst).await?;
-                    dst.sync_data().await?;
-                    smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
-                    path.persist(&cache_path)?;
-                    tracing::debug!("Cached {} at {}", url, cache_path.display());
-                    fs::File::open(cache_path).await?
-                };
-                return Ok(artifact.with_remote_reader(file));
-            }
+    ) -> io::Result<Box<dyn Stage_<Target = Self::Target, Output = ()> + Send + 'static>> {
+        tracing::debug!("Fetching artifact_ {}", artifact.uri());
+        if artifact.is_local() {
+            let path = self.base.join(artifact.uri());
+            return artifact.local(path).await;
+        } else if let Some(cache) = self.cache.as_ref() {
+            let url = artifact.uri();
+            let cache_path = artifact.hash().store_name(Some(cache.as_ref()), 1);
+            let file = if let Ok(file) = fs::File::open(&cache_path).await {
+                tracing::debug!("Using cached {} at {}", url, cache_path.display());
+                file
+            } else {
+                let src = transport.open(url).await.map_err(|e| {
+                    io::Error::new(
+                        e.kind(),
+                        format!("failed to open remote artifact {}: {}", url, e),
+                    )
+                })?;
+                let mut src = artifact.hash().verifying_reader(artifact.size(), src);
+                let (dst, path) = tempfile::Builder::new()
+                    .tempfile_in(cache.as_ref())?
+                    .into_parts();
+                let mut dst: smol::fs::File = dst.into();
+                io::copy(&mut src, &mut dst).await?;
+                dst.sync_data().await?;
+                smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
+                path.persist(&cache_path)?;
+                tracing::debug!("Cached {} at {}", url, cache_path.display());
+                fs::File::open(cache_path).await?
+            };
+            return artifact.remote(file);
+        } else {
+            let url = artifact.uri();
+            let src = transport.open(url).await.map_err(|e| {
+                io::Error::new(
+                    e.kind(),
+                    format!("failed to open remote artifact {}: {}", url, e),
+                )
+            })?;
+            return artifact.remote(src);
         }
-        artifact.reader(source, transport).await
     }
-    async fn cached_file<T: TransportProvider + ?Sized>(
+    async fn cached_index_file<T: TransportProvider + ?Sized>(
         &self,
         hash: Hash,
         size: u64,
@@ -187,7 +260,11 @@ impl CacheProvider for HostCache {
             .await
         }
     }
-    async fn cache_file<H, T>(&self, url: &str, transport: &T) -> io::Result<(IndexFile, Hash, u64)>
+    async fn cache_index_file<H, T>(
+        &self,
+        url: &str,
+        transport: &T,
+    ) -> io::Result<(IndexFile, Hash, u64)>
     where
         T: TransportProvider + ?Sized,
         H: HashAlgo + 'static,
@@ -214,5 +291,8 @@ impl CacheProvider for HostCache {
             let (hash, size) = input.into_hash_and_size();
             Ok((file, hash, size))
         }
+    }
+    async fn resolve_path<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
+        smol::fs::canonicalize(self.base.join(path.as_ref())).await
     }
 }

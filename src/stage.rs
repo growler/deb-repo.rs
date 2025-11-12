@@ -1,30 +1,17 @@
 use {
     crate::{
-        artifact::{Artifact, ArtifactArg, ArtifactSource},
+        artifact::{Artifact },
         cache::CacheProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
-        hash::{Hash, HashAlgo},
-        manifest_doc::{spec_display_name, LockFile, ManifestFile},
-        packages::{Package, Packages},
         repo::{strip_comp_ext, TransportProvider},
-        source::{RepositoryFile, SnapshotId, Source},
-        spec::{LockedPackage, LockedSource, LockedSpec},
+        source::{RepositoryFile, Source},
+        spec::LockedSource,
         staging::{StagingFile, StagingFileSystem},
-        universe::Universe,
-        version::{IntoConstraint, IntoDependency},
-        Manifest,
     },
-    futures::{
-        stream::{self, StreamExt, TryStreamExt},
-        TryFutureExt,
-    },
+    futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
-    itertools::Itertools,
     smol::io,
-    std::{
-        num::NonZero,
-        path::{Path, PathBuf},
-    },
+    std::num::NonZero,
 };
 
 // COMMON
@@ -67,7 +54,7 @@ where
         );
         async move {
             let file = cache
-                .cached_file(
+                .cached_index_file(
                     file.hash().clone(),
                     file.size(),
                     &source.file_url(file.path()),
@@ -92,7 +79,7 @@ where
 
 pub async fn stage_local<'a, FS, T, C>(
     installables: Vec<(&'a Source, &'a RepositoryFile)>,
-    artifacts: Vec<(ArtifactSource<'a>, &'a Artifact)>,
+    artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
@@ -115,7 +102,7 @@ where
     )
     .await?;
     stage_artifacts_local(
-        artifacts.into_iter(),
+        artifacts.as_slice(),
         fs,
         concurrency,
         transport,
@@ -126,8 +113,8 @@ where
     Ok(())
 }
 
-async fn stage_artifacts_local<'a, FS, I, T, C>(
-    artifacts: I,
+async fn stage_artifacts_local<'a, FS, T, C>(
+    artifacts: &'a [&'a Artifact],
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
@@ -136,16 +123,15 @@ async fn stage_artifacts_local<'a, FS, I, T, C>(
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
-    I: IntoIterator<Item = (ArtifactSource<'a>, &'a Artifact)> + 'a,
     T: TransportProvider + ?Sized,
     C: CacheProvider<Target = FS>,
 {
-    stream::iter(artifacts.into_iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| {
+    stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
+        .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
             let pb = pb.clone();
             async move {
                 let size = artifact.size();
-                let cached = cache.cached_artifact(artifact, source, transport).await?;
+                let cached = cache.cached_artifact(artifact, transport).await?;
                 fs.stage(cached).await?;
                 if let Some(pb) = &pb {
                     pb.inc(size);
@@ -244,7 +230,7 @@ where
 //
 pub async fn stage<'a, FS, T, C>(
     installables: Vec<(&'a Source, &'a RepositoryFile)>,
-    artifacts: Vec<(ArtifactSource<'a>, &'a Artifact)>,
+    artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
@@ -277,9 +263,8 @@ where
     .await?;
     Ok(())
 }
-
 async fn stage_artifacts<'a, FS, T, C>(
-    artifacts: &'a [(ArtifactSource<'a>, &'a Artifact)],
+    artifacts: &'a [&'a Artifact],
     fs: &FS,
     concurrency: NonZero<usize>,
     transport: &T,
@@ -292,12 +277,12 @@ where
     C: CacheProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| {
+        .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
             let pb = pb.clone();
             let size = artifact.size();
             let fs = fs.clone();
             async move {
-                let cached = cache.cached_artifact(artifact, source.clone(), transport).await?;
+                let cached = cache.cached_artifact(artifact, transport).await?;
                 blocking::unblock(move || smol::block_on(async move { fs.stage(cached).await }))
                     .await?;
                 if let Some(pb) = &pb {
@@ -331,12 +316,12 @@ where
             let hash = file.hash().clone();
             let fs = fs.clone();
             async move {
-                let deb = cache.cached_deb(hash, size, &url, transport).await.map_err(|e| {
-                    io::Error::new(
-                        e.kind(),
-                        format!("Error getting deb {}: {}", &url, e),
-                    )
-                })?;
+                let deb = cache
+                    .cached_deb(hash, size, &url, transport)
+                    .await
+                    .map_err(|e| {
+                        io::Error::new(e.kind(), format!("Error getting deb {}: {}", &url, e))
+                    })?;
                 let ctrl = blocking::unblock(move || {
                     smol::block_on(async move {
                         let mut ctrl = fs.stage(deb).await?;
@@ -345,11 +330,9 @@ where
                         Ok::<_, io::Error>(ctrl)
                     })
                 })
-                .await.map_err(|err| {
-                    io::Error::new(
-                        err.kind(),
-                        format!("Error staging deb {}: {}", &url, err),
-                    )
+                .await
+                .map_err(|err| {
+                    io::Error::new(err.kind(), format!("Error staging deb {}: {}", &url, err))
                 })?;
                 if let Some(pb) = &pb {
                     pb.inc(size);

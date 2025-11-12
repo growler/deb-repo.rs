@@ -1,15 +1,14 @@
 use {
     crate::{
-        artifact::{Artifact, ArtifactArg, ArtifactSource},
+        artifact::{Artifact, ArtifactArg, },
         cache::CacheProvider,
-        control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::{Package, Packages},
-        repo::{strip_comp_ext, TransportProvider},
+        repo::TransportProvider,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
-        staging::{StagingFile, StagingFileSystem},
+        staging::StagingFileSystem,
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
     },
@@ -216,17 +215,7 @@ impl Manifest {
         scripts.reverse();
         Ok(scripts)
     }
-    pub fn artifacts<'a>(
-        &'a self,
-        name: Option<&str>,
-    ) -> io::Result<impl Iterator<Item = io::Result<(ArtifactSource<'a>, &'a Artifact)>> + 'a> {
-        let (_, spec_index) = self.file.spec_index_ensure(name)?;
-        Ok(self.artifacts_for(spec_index))
-    }
-    fn artifacts_for(
-        &self,
-        id: usize,
-    ) -> impl Iterator<Item = io::Result<(ArtifactSource<'_>, &'_ Artifact)>> + '_ {
+    fn artifacts_for(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Artifact>> + '_ {
         let arch = self.arch.as_str();
         self.file
             .ancestors(id)
@@ -235,10 +224,6 @@ impl Manifest {
             .filter_map(move |artifact| {
                 artifact
                     .and_then(|artifact| {
-                        let base = self
-                            .path
-                            .as_deref()
-                            .ok_or_else(|| io::Error::other("no manifest path"))?;
                         let artifact = self.file.artifact(artifact).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
@@ -250,7 +235,7 @@ impl Manifest {
                                 .arch()
                                 .is_none_or(|target_arch| target_arch == arch)
                             {
-                                Some((ArtifactSource::new(artifact.uri(), base), artifact))
+                                Some(artifact)
                             } else {
                                 None
                             },
@@ -264,22 +249,22 @@ impl Manifest {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
         }
     }
-    pub async fn add_artifact<T>(
+    pub async fn add_artifact<T, C>(
         &mut self,
         spec_name: Option<&str>,
         artifact: &ArtifactArg,
         comment: Option<&str>,
         transport: &T,
+        cache: &C,
     ) -> io::Result<()>
     where
         T: TransportProvider + ?Sized,
+        C: CacheProvider + ?Sized,
     {
         let staged = Artifact::new(
-            self.path
-                .as_deref()
-                .ok_or_else(|| io::Error::other("no manifest path"))?,
             artifact,
             transport,
+            cache,
         )
         .await?;
         self.file.add_artifact(spec_name, staged, comment)?;
@@ -435,7 +420,7 @@ impl Manifest {
         .try_flatten()
         .map_ok(|(source, file)| async move {
             cache
-                .cached_file(
+                .cached_index_file(
                     file.hash().clone(),
                     file.size(),
                     &source.file_url(&file.path),
@@ -662,65 +647,6 @@ impl Manifest {
             })
             .cloned()
     }
-    pub async fn stage<FS, T, P, C>(
-        &self,
-        name: Option<&str>,
-        fs: &FS,
-        concurrency: NonZero<usize>,
-        transport: &T,
-        cache: &C,
-        pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
-    where
-        FS: StagingFileSystem + Send + Clone + 'static,
-        T: TransportProvider + ?Sized,
-        P: FnOnce(u64) -> ProgressBar,
-        C: CacheProvider<Target = FS> + Sync,
-    {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        let lock = self.lock.get_spec(spec_index);
-        if !lock.is_locked() {
-            return Err(io::Error::other(format!(
-                "no solution for spec \"{}\", update manifest lock",
-                spec_display_name(spec_name),
-            )));
-        }
-        let installables = lock
-            .installables()
-            .map(move |p| {
-                let src = self.file.get_source(p.src as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid source index {} in spec {}",
-                            p.src,
-                            spec_display_name(spec_name)
-                        ),
-                    )
-                })?;
-                Ok::<_, io::Error>((src, &p.file, p.order, &p.name))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let artifacts = self
-            .artifacts_for(spec_index)
-            .collect::<io::Result<Vec<_>>>()?;
-        let pb = pb.map(|f| {
-            let installables_size: u64 = installables.iter().map(|(_, file, _, _)| file.size).sum();
-            let artifacts_size: u64 = artifacts.iter().map(|(_, a)| a.size()).sum();
-            f(installables_size + artifacts_size)
-        });
-        stage_debs_mt(
-            None,
-            installables.iter().map(|(src, file, _, _)| (*src, *file)),
-            fs,
-            concurrency,
-            transport,
-            cache,
-            pb.clone(),
-        )
-        .await?;
-        unimplemented!()
-    }
     fn staging_sources(&self) -> io::Result<Vec<(&Source, &LockedSource)>> {
         self.file
             .sources()
@@ -743,7 +669,7 @@ impl Manifest {
         &'a self,
         spec_name: &str,
         spec_index: usize,
-    ) -> io::Result<Vec<(ArtifactSource<'a>, &'a Artifact)>> {
+    ) -> io::Result<Vec<&'a Artifact>> {
         self.artifacts_for(spec_index)
             .collect::<io::Result<Vec<_>>>()
             .map_err(|e| {
@@ -803,12 +729,12 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        Vec<(&'a Source, &'a LockedSource)>,     // sources
-        Vec<(ArtifactSource<'a>, &'a Artifact)>, // artifacts
-        Vec<(&'a Source, &'a RepositoryFile)>,   // installables
-        Vec<String>,                             // essentials
-        Vec<Vec<String>>,                        // prioritized packages
-        Vec<String>,                             // scripts
+        Vec<(&'a Source, &'a LockedSource)>,   // sources
+        Vec<&'a Artifact>,                     // artifacts
+        Vec<(&'a Source, &'a RepositoryFile)>, // installables
+        Vec<String>,                           // essentials
+        Vec<Vec<String>>,                      // prioritized packages
+        Vec<String>,                           // scripts
         Option<ProgressBar>,
     )>
     where
@@ -825,7 +751,7 @@ impl Manifest {
             .collect();
         let pb = pb.map(|f| {
             let installables_size: u64 = installables.iter().map(|(_, file)| file.size).sum();
-            let artifacts_size: u64 = artifacts.iter().map(|(_, a)| a.size()).sum();
+            let artifacts_size: u64 = artifacts.iter().map(|a| a.size()).sum();
             f(installables_size + artifacts_size)
         });
         Ok((
@@ -838,7 +764,7 @@ impl Manifest {
             pb,
         ))
     }
-    pub async fn stage_local_<FS, T, P, C>(
+    pub async fn stage_local<FS, T, P, C>(
         &self,
         name: Option<&str>,
         fs: &mut FS,
@@ -871,7 +797,7 @@ impl Manifest {
         crate::stage::stage_sources(sources.as_slice(), fs, concurrency, transport, cache).await?;
         Ok((essentials, other, scripts))
     }
-    pub async fn stage_<FS, T, P, C>(
+    pub async fn stage<FS, T, P, C>(
         &self,
         name: Option<&str>,
         fs: &FS,
@@ -886,6 +812,7 @@ impl Manifest {
         P: FnOnce(u64) -> ProgressBar,
         C: CacheProvider<Target = FS>,
     {
+        tracing::debug!("running stage_");
         let (sources, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
         crate::stage::stage(
@@ -904,412 +831,4 @@ impl Manifest {
         crate::stage::stage_sources(sources.as_slice(), fs, concurrency, transport, cache).await?;
         Ok((essentials, other, scripts))
     }
-    pub async fn stage_local<FS, T, P, C>(
-        &self,
-        name: Option<&str>,
-        fs: &mut FS,
-        concurrency: NonZero<usize>,
-        transport: &T,
-        cache: &C,
-        pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
-    where
-        FS: StagingFileSystem,
-        T: TransportProvider + ?Sized,
-        P: FnOnce(u64) -> ProgressBar,
-        C: CacheProvider<Target = FS>,
-    {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        let lock = self.lock.get_spec(spec_index);
-        if !lock.is_locked() {
-            return Err(io::Error::other(format!(
-                "no solution for spec \"{}\", update manifest lock",
-                spec_display_name(spec_name),
-            )));
-        }
-        let installables = lock
-            .installables()
-            .map(move |p| {
-                let src = self.file.get_source(p.src as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid source index {} in spec {}",
-                            p.src,
-                            spec_display_name(spec_name)
-                        ),
-                    )
-                })?;
-                Ok::<_, io::Error>((src, &p.file, p.order, &p.name))
-            })
-            .collect::<io::Result<Vec<_>>>()?;
-        let artifacts = self
-            .artifacts_for(spec_index)
-            .collect::<io::Result<Vec<_>>>()?;
-        let pb = pb.map(|f| {
-            let installables_size: u64 = installables.iter().map(|(_, file, _, _)| file.size).sum();
-            let artifacts_size: u64 = artifacts.iter().map(|(_, a)| a.size()).sum();
-            f(installables_size + artifacts_size)
-        });
-        stage_debs(
-            None,
-            installables.iter().map(|(src, file, _, _)| (*src, *file)),
-            fs,
-            concurrency,
-            transport,
-            cache,
-            pb.clone(),
-        )
-        .await?;
-        stage_artifacts_local(
-            artifacts.into_iter(),
-            fs,
-            concurrency,
-            transport,
-            cache,
-            pb.clone(),
-        )
-        .await?;
-        if let Some(pb) = pb {
-            pb.finish_using_style();
-        }
-        stage_sources(
-            self.file
-                .sources()
-                .iter()
-                .zip(self.lock.sources().iter())
-                .map(|(s, l)| {
-                    l.as_ref().map_or_else(
-                        || {
-                            Err(io::Error::other(format!(
-                                "source {} is not locked, run lock",
-                                s.url
-                            )))
-                        },
-                        |l| Ok((s, l)),
-                    )
-                }),
-            fs,
-            concurrency,
-            transport,
-            cache,
-        )
-        .await?;
-        let scripts = self
-            .scripts_for(spec_index)?
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let (essentials, other) = installables.into_iter().fold(
-            (Vec::new(), Vec::new()),
-            |(mut essentials, mut other), (_, _, order, name)| {
-                if order == 0 {
-                    essentials.push(name.clone());
-                } else {
-                    let order = order as usize - 1;
-                    if order >= other.len() {
-                        other.resize(order + 1, Vec::new());
-                    }
-                    other[order].push(name.clone());
-                }
-                (essentials, other)
-            },
-        );
-        Ok((essentials, other, scripts))
-    }
-}
-
-async fn stage_sources<'a, 's, I, FS, T, C>(
-    sources: I,
-    fs: &'s FS,
-    concurrency: NonZero<usize>,
-    transport: &T,
-    cache: &C,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem,
-    T: TransportProvider + ?Sized,
-    I: Iterator<Item = io::Result<(&'a Source, &'a LockedSource)>> + 'a,
-    C: CacheProvider,
-{
-    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
-        .await?;
-    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
-        .await?;
-    let mut sources_file = MutableControlFile::new();
-    stream::iter(sources.map(|src| {
-        src.map(|(source, locked)| {
-            sources_file.add(Into::<MutableControlStanza>::into(source));
-            (source, locked)
-        })
-    }))
-    .and_then(|(source, locked)| async move {
-        Ok::<_, io::Error>(stream::iter(
-            locked
-                .files()
-                .map(move |file| Ok::<_, io::Error>((source, file))),
-        ))
-    })
-    .try_flatten()
-    .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| async {
-        let target = format!(
-            "./var/lib/apt/lists/{}",
-            strip_comp_ext(
-                &crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
-            )
-        );
-        let file = cache
-            .cached_file(
-                file.hash().clone(),
-                file.size(),
-                &source.file_url(file.path()),
-                transport,
-            )
-            .await?;
-        fs.create_file_from_bytes(file.as_bytes(), 0, 0, 0o644)
-            .await?
-            .persist(target)
-            .await
-    })
-    .await?;
-    let sources_file = sources_file.to_string();
-    fs.create_file_from_bytes(sources_file.as_bytes(), 0, 0, 0o644)
-        .await?
-        .persist("./etc/apt/sources.list.d/manifest.sources")
-        .await
-}
-async fn stage_artifacts_local<'a, FS, I, T, C>(
-    artifacts: I,
-    fs: &FS,
-    concurrency: NonZero<usize>,
-    transport: &T,
-    cache: &C,
-    pb: Option<ProgressBar>,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem + ?Sized,
-    I: IntoIterator<Item = (ArtifactSource<'a>, &'a Artifact)> + 'a,
-    T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
-{
-    stream::iter(artifacts.into_iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| {
-            let pb = pb.clone();
-            async move {
-                let size = artifact.size();
-                let cached = cache.cached_artifact(artifact, source, transport).await?;
-                fs.stage(cached).await?;
-                if let Some(pb) = &pb {
-                    pb.inc(size);
-                }
-                Ok(())
-            }
-        })
-        .await
-}
-async fn stage_debs<'a, C, FS, S, T>(
-    installed: Option<&ControlFile<'_>>,
-    packages: S,
-    fs: &FS,
-    concurrency: NonZero<usize>,
-    transport: &T,
-    cache: &C,
-    pb: Option<ProgressBar>,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem + ?Sized,
-    S: Iterator<Item = (&'a Source, &'a RepositoryFile)> + 'a,
-    T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
-{
-    let new_installed = stream::iter(packages)
-        .map(|(source, file)| {
-            let pb = pb.clone();
-            async move {
-                let url = source.file_url(file.path());
-                let size = file.size();
-                let deb = cache
-                    .cached_deb(file.hash().clone(), file.size(), &url, transport)
-                    .await?;
-                let mut ctrl = fs.stage(deb).await?;
-                if let Some(pb) = &pb {
-                    pb.inc(size);
-                }
-                ctrl.set("Status", "install ok unpacked");
-                ctrl.sort_fields_deb_order();
-                Ok::<_, io::Error>(ctrl)
-            }
-        })
-        .buffer_unordered(concurrency.into())
-        .try_collect::<Vec<_>>()
-        .await?;
-    enum Installed<'a> {
-        Old(&'a ControlStanza<'a>),
-        New(&'a MutableControlStanza),
-    }
-    impl Installed<'_> {
-        fn package(&self) -> &str {
-            match self {
-                Installed::Old(s) => s.field("Package").unwrap(),
-                Installed::New(s) => s.field("Package").unwrap(),
-            }
-        }
-        fn len(&self) -> usize {
-            match self {
-                Installed::Old(s) => s.len(),
-                Installed::New(s) => s.len(),
-            }
-        }
-    }
-    impl std::fmt::Display for Installed<'_> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Installed::Old(s) => write!(f, "{}", s),
-                Installed::New(s) => write!(f, "{}", s),
-            }
-        }
-    }
-    let mut all_installed = installed
-        .iter()
-        .flat_map(|i| i.stanzas().map(Installed::Old))
-        .chain(new_installed.iter().map(Installed::New))
-        .collect::<Vec<_>>();
-    all_installed.sort_by(|a, b| a.package().cmp(b.package()));
-    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32).await?;
-    {
-        use smol::io::AsyncWriteExt;
-        let size = all_installed.iter().map(|i| i.len() + 1).sum();
-        let mut status = Vec::<u8>::with_capacity(size);
-        for i in all_installed.into_iter() {
-            status.write_all(format!("{}", &i).as_bytes()).await?;
-            status.write_all(b"\n").await?;
-        }
-        fs.create_file_from_bytes(status.as_slice(), 0, 0, 0o644)
-            .await?
-            .persist("./var/lib/dpkg/status")
-            .await?;
-    }
-    Ok(())
-}
-
-async fn stage_artifacts<FS, I, T, C>(
-    artifacts: I,
-    fs: &FS,
-    concurrency: NonZero<usize>,
-    transport: &T,
-    cache: &C,
-    pb: Option<ProgressBar>,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem + Clone + Send + ?Sized + 'static,
-    I: IntoIterator<Item = (ArtifactSource<'static>, &'static Artifact)> + 'static,
-    T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS> + Sync,
-{
-    stream::iter(artifacts.into_iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |(source, artifact)| {
-            let pb = pb.clone();
-            let size = artifact.size();
-            let fs = fs.clone();
-            async move {
-                let cached = cache.cached_artifact(artifact, source, transport).await?;
-                blocking::unblock(move || smol::block_on(async move { fs.stage(cached).await }))
-                    .await?;
-                if let Some(pb) = &pb {
-                    pb.inc(size);
-                }
-                Ok(())
-            }
-        })
-        .await
-}
-async fn stage_debs_mt<'a, C, FS, S, T>(
-    installed: Option<&ControlFile<'_>>,
-    packages: S,
-    fs: &FS,
-    concurrency: NonZero<usize>,
-    transport: &'a T,
-    cache: &'a C,
-    pb: Option<ProgressBar>,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem + Send + Clone + ?Sized + 'static,
-    S: Iterator<Item = (&'a Source, &'a RepositoryFile)> + 'a,
-    T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS> + Sync + 'a,
-{
-    let new_installed = stream::iter(packages)
-        .map(|(source, file)| {
-            let pb = pb.clone();
-            let url = source.file_url(file.path());
-            let size = file.size();
-            let hash = file.hash().clone();
-            let fs = fs.clone();
-            async move {
-                let deb = cache.cached_deb(hash, size, &url, transport).await?;
-                let ctrl = blocking::unblock(move || {
-                    smol::block_on(async move {
-                        let mut ctrl = fs.stage(deb).await?;
-                        ctrl.set("Status", "install ok unpacked");
-                        ctrl.sort_fields_deb_order();
-                        Ok::<_, io::Error>(ctrl)
-                    })
-                })
-                .await?;
-                if let Some(pb) = &pb {
-                    pb.inc(size);
-                }
-                Ok::<_, io::Error>(ctrl)
-            }
-        })
-        .buffer_unordered(concurrency.into())
-        .try_collect::<Vec<_>>()
-        .await?;
-    enum Installed<'a> {
-        Old(&'a ControlStanza<'a>),
-        New(&'a MutableControlStanza),
-    }
-    impl Installed<'_> {
-        fn package(&self) -> &str {
-            match self {
-                Installed::Old(s) => s.field("Package").unwrap(),
-                Installed::New(s) => s.field("Package").unwrap(),
-            }
-        }
-        fn len(&self) -> usize {
-            match self {
-                Installed::Old(s) => s.len(),
-                Installed::New(s) => s.len(),
-            }
-        }
-    }
-    impl std::fmt::Display for Installed<'_> {
-        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            match self {
-                Installed::Old(s) => write!(f, "{}", s),
-                Installed::New(s) => write!(f, "{}", s),
-            }
-        }
-    }
-    let mut all_installed = installed
-        .iter()
-        .flat_map(|i| i.stanzas().map(Installed::Old))
-        .chain(new_installed.iter().map(Installed::New))
-        .collect::<Vec<_>>();
-    all_installed.sort_by(|a, b| a.package().cmp(b.package()));
-    fs.create_dir_all("./var/lib/dpkg", 0, 0, 0o755u32).await?;
-    {
-        use smol::io::AsyncWriteExt;
-        let size = all_installed.iter().map(|i| i.len() + 1).sum();
-        let mut status = Vec::<u8>::with_capacity(size);
-        for i in all_installed.into_iter() {
-            status.write_all(format!("{}", &i).as_bytes()).await?;
-            status.write_all(b"\n").await?;
-        }
-        fs.create_file_from_bytes(status.as_slice(), 0, 0, 0o644)
-            .await?
-            .persist("./var/lib/dpkg/status")
-            .await?;
-    }
-    Ok(())
 }

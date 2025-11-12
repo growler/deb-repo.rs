@@ -602,6 +602,13 @@ impl<D: HashAlgo, R: AsyncRead + Send> HashingReader<D, R> {
             inner: reader,
         }
     }
+    pub fn new_with_digester(digester: D, reader: R) -> Self {
+        Self {
+            counter: 0,
+            digester,
+            inner: reader,
+        }
+    }
     pub fn into_hash(self) -> Hash {
         D::hash(self.digester.finalize_fixed())
     }
@@ -612,6 +619,7 @@ impl<D: HashAlgo, R: AsyncRead + Send> HashingReader<D, R> {
         (D::hash(self.digester.finalize_fixed()), self.counter)
     }
 }
+
 impl<D: HashAlgo, R: AsyncRead + Send> AsyncHashingRead for HashingReader<D, R> {
     fn hash(self: Pin<&mut Self>) -> Hash {
         D::hash(self.project().digester.finalize_fixed_reset())

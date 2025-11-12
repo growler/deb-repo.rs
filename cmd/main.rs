@@ -107,9 +107,33 @@ impl cli::Config for App {
     fn concurrency(&self) -> NonZero<usize> {
         self.concurrency
     }
-    fn cache(&self) -> &HostCache {
+    fn cache(&self) -> std::io::Result<&HostCache> {
         static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
-        PROVIDER.get_or_init(|| HostCache::new(self.cache_dir.as_deref()))
+        PROVIDER.get_or_try_init(|| {
+            let base = std::fs::canonicalize(&self.manifest).map_err(|err| {
+                std::io::Error::other(format!(
+                    "failed to find Maniest file {}: {}",
+                    self.manifest.display(),
+                    err
+                ))
+            })?;
+            let base = base.parent().ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "failed to find manifest file parent directory: {}",
+                    self.manifest.display()
+                ))
+            })?;
+            if let Some(path) = self.cache_dir.as_deref() {
+                std::fs::create_dir_all(path).map_err(|err| {
+                    std::io::Error::other(format!(
+                        "failed to create cache directory {}: {}",
+                        path.display(),
+                        err
+                    ))
+                })?;
+            }
+            Ok(HostCache::new(base, self.cache_dir.as_deref()))
+        })
     }
     fn transport(&self) -> &Self::Transport {
         static PROVIDER: once_cell::sync::OnceCell<HttpTransportProvider> =

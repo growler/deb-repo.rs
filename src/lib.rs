@@ -5,6 +5,7 @@ pub mod artifact;
 mod builder;
 pub mod cache;
 pub mod cli;
+pub mod comp;
 pub mod control;
 pub mod deb;
 pub mod hash;
@@ -19,12 +20,11 @@ mod repo;
 mod sandbox;
 mod source;
 mod spec;
+mod stage;
 mod staging;
 pub mod tar;
 pub mod universe;
 pub mod version;
-pub mod comp;
-mod stage;
 
 pub use {
     arch::DEFAULT_ARCH,

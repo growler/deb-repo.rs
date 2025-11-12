@@ -21,7 +21,7 @@ pub trait Config {
     fn arch(&self) -> &str;
     fn manifest(&self) -> &Path;
     fn concurrency(&self) -> NonZero<usize>;
-    fn cache(&self) -> &Self::Cache;
+    fn cache(&self) -> io::Result<&Self::Cache>;
     fn transport(&self) -> &Self::Transport;
 }
 
@@ -89,9 +89,9 @@ Examples:
                     comment.as_deref(),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(true, conf.concurrency(), conf.transport(), conf.cache())
+                mf.update(true, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
                 mf.store(conf.manifest()).await?;
                 Ok(())
@@ -139,12 +139,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if !self.requirements_only {
                     mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
                 }
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 mf.store(conf.manifest()).await?;
                 Ok(())
             })
@@ -178,6 +178,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     &self.artifact,
                     self.comment.as_deref(),
                     conf.transport(),
+                    conf.cache()?,
                 )
                 .await?;
                 mf.store(conf.manifest()).await?;
@@ -241,13 +242,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
                 mf.store(conf.manifest()).await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 Ok(())
             })
         }
@@ -282,13 +283,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
                 mf.store(conf.manifest()).await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 Ok(())
             })
         }
@@ -315,16 +316,16 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                conf.cache().init().await?;
+                conf.cache()?.init().await?;
                 mf.update(
                     self.force,
                     conf.concurrency(),
                     conf.transport(),
-                    conf.cache(),
+                    conf.cache()?,
                 )
                 .await?;
                 mf.store(conf.manifest()).await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 Ok(())
             })
         }
@@ -348,12 +349,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache())
+                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 let res = self
                     .pattern
                     .iter()
@@ -398,12 +399,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache())
+                mf.load_universe(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 let pkg = mf.packages()?.find(|p| self.package == p.name());
                 if let Some(pkg) = pkg {
                     let mut out = async_io::Async::new(std::io::stdout().lock())?;
@@ -433,13 +434,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.cache().init().await?;
-                mf.update(false, conf.concurrency(), conf.transport(), conf.cache())
+                conf.cache()?.init().await?;
+                mf.update(false, conf.concurrency(), conf.transport(), conf.cache()?)
                     .await?;
-                mf.resolve(conf.concurrency(), conf.transport(), conf.cache())
+                mf.resolve(conf.concurrency(), conf.transport(), conf.cache()?)
                     .await
                     .map_err(|e| anyhow!("failed to update specs: {e}"))?;
-                conf.cache().close().await?;
+                conf.cache()?.close().await?;
                 let mut pkgs = mf
                     .spec_packages(self.spec.as_deref())?
                     .filter(|p| !self.only_essential || p.essential())
@@ -471,15 +472,16 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         fn exec(&self, conf: &C) -> Result<()> {
             let mut builder = HostSandboxExecutor::new(&self.path)?;
             smol::block_on(async move {
-                let fs =
-                    HostFileSystem::new(&self.path, rustix::process::geteuid().is_root()).await.map_err(|err| {
+                let fs = HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                    .await
+                    .map_err(|err| {
                         anyhow!(
                             "failed to initialize staging filesystem at {}: {}",
                             self.path.display(),
                             err
                         )
                     })?;
-                conf.cache().init().await?;
+                conf.cache()?.init().await?;
                 let manifest = Manifest::from_file(conf.manifest(), conf.arch())
                     .await
                     .map_err(|err| {
@@ -508,12 +510,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.path.display()
                 );
                 let (essentials, other, scripts) = manifest
-                    .stage_(
+                    .stage(
                         self.spec.as_deref(),
                         &fs,
                         conf.concurrency(),
                         conf.transport(),
-                        conf.cache(),
+                        conf.cache()?,
                         pb,
                     )
                     .await?;

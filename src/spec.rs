@@ -109,7 +109,7 @@ impl LockedSource {
                     let path = source.release_path(suite);
                     if !locked.release.path.is_empty() && !force {
                         let rel = cache
-                            .cached_file(
+                            .cached_index_file(
                                 locked.release.hash.clone(),
                                 locked.release.size,
                                 &source.file_url(&path),
@@ -123,7 +123,7 @@ impl LockedSource {
                     }
                     tracing::debug!("forced load locked source for {} {}", source.url, suite,);
                     let (rel, hash, size) = cache
-                        .cache_file::<blake3::Hasher, _>(&source.file_url(&path), transport)
+                        .cache_index_file::<blake3::Hasher, _>(&source.file_url(&path), transport)
                         .and_then(|(rel, hash, size)| async move {
                             let rel = source.release_from_file(rel).await?;
                             Ok((rel, hash, size))

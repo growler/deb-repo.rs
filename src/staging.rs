@@ -1,5 +1,4 @@
 use {
-    futures::future::{BoxFuture, LocalBoxFuture},
     rustix::fs::{
         chown, chownat, fallocate, fchown, fstat, futimens, link, linkat, openat, stat, symlinkat,
         unlink, utimensat, AtFlags, FallocateFlags, Gid, Mode, OFlags, Timespec, Timestamps, Uid,
@@ -10,6 +9,7 @@ use {
         io,
         os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
+        pin::Pin,
         sync::Arc,
     },
     tempfile::TempPath,
@@ -19,6 +19,21 @@ pub trait Stage {
     type Output;
     type Target: StagingFileSystem;
     fn stage(self, fs: &Self::Target) -> impl Future<Output = io::Result<Self::Output>>;
+}
+
+pub trait Stage_ {
+    type Output;
+    type Target: StagingFileSystem + ?Sized;
+    fn stage_<'a>(
+        &'a mut self,
+        fs: &'a Self::Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Self::Output>> + 'a>>;
+}
+async fn s<FS: StagingFileSystem, T>(
+    mut s: Box<dyn Stage_<Output = T, Target = FS>>,
+    fs: &FS,
+) -> io::Result<T> {
+    s.stage_(fs).await
 }
 
 pub trait StagingFile {
@@ -55,7 +70,11 @@ pub trait StagingFileSystem {
         uid: u32,
         gid: u32,
     ) -> impl Future<Output = io::Result<()>>;
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, target: P, link: Q) -> impl Future<Output = io::Result<()>>;
+    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        target: P,
+        link: Q,
+    ) -> impl Future<Output = io::Result<()>>;
     /// Creates a file using content provided by the reader `r`.
     /// The resulting file must later be made persistent by calling `file.persist(path)`.
     ///
@@ -97,10 +116,12 @@ pub trait StagingFileSystem {
         self.create_file(r, uid, gid, mode, Some(r.len()))
     }
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>>;
-    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>>
+    fn stage<T>(
+        &self,
+        artifact: Box<dyn Stage_<Target = Self, Output = T>>,
+    ) -> impl Future<Output = io::Result<T>>
     where
-        T: Send + 'static,
-        A: Stage<Target = Self, Output = T> + Send + 'static;
+        T: Send + 'static;
 }
 
 #[derive(Clone)]
@@ -331,7 +352,11 @@ impl StagingFileSystem for HostFileSystem {
             utimensat(CWD, link, &EPOCH, AtFlags::SYMLINK_NOFOLLOW).map_err(Into::<io::Error>::into)
         })
     }
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> impl Future<Output = io::Result<()>> {
+    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(
+        &self,
+        from: P,
+        to: Q,
+    ) -> impl Future<Output = io::Result<()>> {
         let from = self.target_path(from.as_ref());
         let to = self.target_path(to.as_ref());
         blocking::unblock(move || {
@@ -390,12 +415,14 @@ impl StagingFileSystem for HostFileSystem {
         let target = self.target_path(path.as_ref());
         blocking::unblock(move || unlink(target?).map_err(Into::into))
     }
-    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>> 
+    fn stage<T>(
+        &self,
+        mut artifact: Box<dyn Stage_<Target = Self, Output = T> + 'static>,
+    ) -> impl Future<Output = io::Result<T>>
     where
         T: Send + 'static,
-        A: Stage<Target = Self, Output = T> + Send + 'static,
     {
-        artifact.stage(self)
+        async move { artifact.as_mut().stage_(self).await }
     }
 }
 
@@ -452,20 +479,16 @@ impl StagingFile for FileListFile {
     }
 }
 
-fn iofut<'a, T: 'a>(t: T) -> LocalBoxFuture<'a, io::Result<T>> {
-    async move { Ok(t) }.boxed_local()
-}
-
 // #[async_trait::async_trait(?Send)]
 impl StagingFileSystem for FileList {
     type File = FileListFile;
-    fn create_dir<P: AsRef<Path>>(
+    async fn create_dir<P: AsRef<Path>>(
         &self,
         path: P,
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> impl Future<Output = io::Result<()>> {
+    ) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -473,15 +496,15 @@ impl StagingFileSystem for FileList {
             uid,
             gid,
         ));
-        iofut(())
+        Ok(())
     }
-    fn create_dir_all<P: AsRef<Path>>(
+    async fn create_dir_all<P: AsRef<Path>>(
         &self,
         path: P,
         uid: u32,
         gid: u32,
         mode: u32,
-    ) -> impl Future<Output = io::Result<()>> {
+    ) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} {:o} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -489,15 +512,15 @@ impl StagingFileSystem for FileList {
             uid,
             gid,
         ));
-        iofut(())
+        Ok(())
     }
-    fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
+    async fn symlink<P: AsRef<Path>, Q: AsRef<Path>>(
         &self,
         target: P,
         path: Q,
         uid: u32,
         gid: u32,
-    ) -> impl Future<Output = io::Result<()>> {
+    ) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} -> {} {} {}",
             path.as_ref().as_os_str().to_string_lossy(),
@@ -505,48 +528,48 @@ impl StagingFileSystem for FileList {
             uid,
             gid,
         ));
-        iofut(())
+        Ok(())
     }
-    fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> impl Future<Output = io::Result<()>> {
+    async fn hardlink<P: AsRef<Path>, Q: AsRef<Path>>(&self, from: P, to: Q) -> io::Result<()> {
         self.out.lock().unwrap().insert(format!(
             "{} -> {}",
             from.as_ref().as_os_str().to_string_lossy(),
             to.as_ref().as_os_str().to_string_lossy(),
         ));
-        iofut(())
+        Ok(())
     }
-    fn create_file<'a, R: AsyncRead + Send + 'a>(
+    async fn create_file<'a, R: AsyncRead + Send + 'a>(
         &'a self,
         r: R,
         uid: u32,
         gid: u32,
         mode: u32,
         _size: Option<usize>,
-    ) -> impl Future<Output = io::Result<Self::File>> + 'a {
-        async move {
-            let size = smol::io::copy(r, &mut smol::io::sink()).await?;
-            Ok(FileListFile {
-                mode,
-                uid,
-                gid,
-                size,
-                out: Arc::clone(&self.out),
-            })
-        }
+    ) -> io::Result<Self::File> {
+        let size = smol::io::copy(r, &mut smol::io::sink()).await?;
+        Ok(FileListFile {
+            mode,
+            uid,
+            gid,
+            size,
+            out: Arc::clone(&self.out),
+        })
     }
-    fn remove_file<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<()>> {
+    async fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
         self.out
             .lock()
             .unwrap()
             .insert(format!("!{}", path.as_ref().as_os_str().to_string_lossy(),));
-        iofut(())
+        Ok(())
     }
-    fn stage<A, T>(&self, artifact: A) -> impl Future<Output = io::Result<T>>
+    fn stage<T>(
+        &self,
+        mut artifact: Box<dyn Stage_<Target = Self, Output = T>>,
+    ) -> impl Future<Output = io::Result<T>>
     where
         T: Send + 'static,
-        A: Stage<Target = Self, Output = T> + Send + 'static,
     {
-        artifact.stage(self).boxed_local()
+        async move { artifact.as_mut().stage_(self).await }
     }
 }
 
@@ -563,9 +586,8 @@ mod tests {
     {
     }
 
-    use static_assertions::{assert_impl_all, assert_not_impl_all};
+    use static_assertions::assert_impl_all;
     assert_impl_all!(HostFileSystem: Send, Sync, ThreadSafeStagingFS);
     assert_impl_all!(HostFile: Send, Sync);
     assert_impl_all!(FileList: Send, Sync);
-    // assert_not_impl_all!(FileList: ThreadSafeStagingFS);
 }

@@ -3,7 +3,7 @@ use {
         control::MutableControlStanza,
         hash::HashingReader,
         parse_size,
-        staging::{Stage, StagingFile},
+        staging::{Stage, Stage_, StagingFile},
         tar::{TarEntry, TarLink, TarReader},
         StagingFileSystem,
     },
@@ -277,7 +277,7 @@ where
 ///     }
 /// }
 /// ```
-pub struct Deb<'a, R>
+pub struct DebReader<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -329,7 +329,7 @@ impl Compression {
     }
 }
 
-impl<'a, R> Deb<'a, R>
+impl<'a, R> DebReader<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -362,7 +362,7 @@ where
             inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
         }
     }
-    pub async fn extract_to<FS>(mut self, fs: &FS) -> Result<MutableControlStanza>
+    pub async fn extract_to<FS>(&mut self, fs: &FS) -> Result<MutableControlStanza>
     where
         FS: StagingFileSystem + ?Sized,
     {
@@ -584,19 +584,19 @@ where
     }
 }
 
-pub struct DebReader<'a, R: AsyncRead + Send, FS> {
-    inner: Deb<'a, R>,
-    _phantom: std::marker::PhantomData<FS>,
+pub struct DebStage<'a, R: AsyncRead + Send, FS: ?Sized> {
+    inner: DebReader<'a, R>,
+    _phantom: std::marker::PhantomData<fn(&FS)>,
 }
 
-impl<'a, R, FS> DebReader<'a, R, FS>
+impl<'a, R, FS> DebStage<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
     FS: StagingFileSystem,
 {
     pub fn new(r: R) -> Self {
         Self {
-            inner: Deb {
+            inner: DebReader {
                 inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
             },
             _phantom: std::marker::PhantomData,
@@ -604,19 +604,34 @@ where
     }
 }
 
-impl<'a, R, FS> Stage for DebReader<'a, R, FS>
+impl<'a, R, FS> Stage_ for DebStage<'a, R, FS>
+where
+    R: AsyncRead + Send + 'a,
+    FS: StagingFileSystem + ?Sized,
+{
+    type Target = FS;
+    type Output = MutableControlStanza;
+    fn stage_<'b>(
+        &'b mut self,
+        fs: &'b Self::Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<MutableControlStanza>> + 'b>> {
+        Box::pin(self.inner.extract_to(fs))
+    }
+}
+
+impl<'a, R, FS> Stage for DebStage<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
     FS: StagingFileSystem,
 {
     type Target = FS;
     type Output = MutableControlStanza;
-    fn stage(self, fs: &Self::Target) -> impl Future<Output = io::Result<MutableControlStanza>> {
-        self.inner.extract_to(fs)
+    async fn stage(mut self, fs: &Self::Target) -> io::Result<MutableControlStanza> {
+        self.inner.extract_to(fs).await
     }
 }
 
-impl<'a, R> Stream for Deb<'a, R>
+impl<'a, R> Stream for DebReader<'a, R>
 where
     R: AsyncRead + Send + 'a,
 {
@@ -675,5 +690,5 @@ where
 mod tests {
     use super::*;
     use static_assertions::assert_impl_all;
-    assert_impl_all!(Deb<'_, smol::fs::File>: Send, Sync);
+    assert_impl_all!(DebReader<'_, smol::fs::File>: Send, Sync);
 }

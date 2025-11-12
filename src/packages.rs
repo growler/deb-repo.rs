@@ -18,7 +18,6 @@ use {
     std::{io, sync::Arc},
 };
 
-
 pub struct MemoryMappedUniverseFile {
     mmap: Arc<memmap2::Mmap>,
     begin: usize,
