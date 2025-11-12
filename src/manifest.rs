@@ -2,9 +2,10 @@ use {
     crate::{
         artifact::{Artifact, ArtifactArg},
         cache::CacheProvider,
+        control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
-        packages::{Package, Packages},
+        packages::Package,
         repo::TransportProvider,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
@@ -12,10 +13,7 @@ use {
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
     },
-    futures::{
-        stream::{self, StreamExt, TryStreamExt},
-        TryFutureExt,
-    },
+    futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
@@ -28,7 +26,59 @@ pub struct Manifest {
     hash: Option<Hash>,
     lock: LockFile,
     lock_updated: bool,
-    universe: Option<(Hash, Box<Universe>)>,
+    universe: Option<Box<Universe>>,
+}
+
+pub struct UniverseFiles<'a> {
+    sources: &'a [Source],
+    locked: &'a [Option<LockedSource>],
+}
+impl<'a> UniverseFiles<'a> {
+    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
+        UniverseFiles { sources, locked }
+    }
+    pub fn files(&self) -> impl Iterator<Item = (&'a Source, &'a RepositoryFile)> + '_ {
+        self.sources
+            .iter()
+            .zip(self.locked.iter())
+            .flat_map(|(src, locked)| {
+                locked.as_ref().into_iter().flat_map(move |locked| {
+                    locked.suites.iter().flat_map(move |suite| {
+                        std::iter::once((src, &suite.release))
+                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                    })
+                })
+            })
+    }
+    pub fn sources(&self) -> MutableControlFile {
+        self.sources
+            .iter()
+            .fold(MutableControlFile::new(), |mut ctrl, src| {
+                ctrl.add(Into::<MutableControlStanza>::into(src));
+                ctrl
+            })
+    }
+    pub fn hash(&self) -> Hash {
+        let mut digester = blake3::Hasher::new();
+        let mut file = blake3::Hasher::new();
+        self.sources
+            .iter()
+            .zip(self.locked.iter())
+            .flat_map(|(src, locked)| {
+                file.update(format!("{}\n", Into::<MutableControlStanza>::into(src)).as_bytes());
+                locked.as_ref().into_iter().flat_map(move |locked| {
+                    locked.suites.iter().flat_map(move |suite| {
+                        std::iter::once((src, &suite.release))
+                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                    })
+                })
+            })
+            .for_each(|(_, file)| {
+                digester.update(file.hash.as_ref());
+            });
+        digester.update(file.finalize().as_bytes());
+        digester.into_hash()
+    }
 }
 
 ///
@@ -347,6 +397,9 @@ impl Manifest {
         }
         Ok(())
     }
+    fn sources(&self) -> UniverseFiles<'_> {
+        UniverseFiles::new(self.file.sources(), self.lock.sources())
+    }
     async fn make_universe<T: TransportProvider + ?Sized, C: CacheProvider>(
         &mut self,
         concurrency: NonZero<usize>,
@@ -354,67 +407,10 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        // if let Some(cache) = self.cache.as_deref() {
-        //     if let Some(hash) = self.lock.universe_hash() {
-        //         let path = hash.store_name(Some(cache), 1);
-        //         match Universe::open(&path) {
-        //             Ok(u) => {
-        //                 tracing::debug!("loaded universe from cache {}", path.display());
-        //                 self.universe = Some((hash.clone(), Box::new(u)));
-        //                 return Ok(());
-        //             }
-        //             Err(err) => {
-        //                 tracing::debug!(
-        //                     "failed to load universe from cache {} ({}), rebuilding",
-        //                     err,
-        //                     path.display()
-        //                 );
-        //             }
-        //         }
-        //     }
-        // }
-        let packages: Vec<Packages> = stream::iter(
-            self.file
-                .sources()
-                .iter()
-                .zip(self.lock.sources().iter())
-                .map(|(source, locked_source)| {
-                    locked_source
-                        .as_ref()
-                        .ok_or_else(|| {
-                            io::Error::other("a source is not locked, call udpate first")
-                        })
-                        .map(|l| (source, l))
-                }),
-        )
-        .map_ok(|(source, locked_source)| {
-            stream::iter(
-                locked_source
-                    .suites
-                    .iter()
-                    .flat_map(|s| s.packages.iter())
-                    .map(move |f| Ok::<_, io::Error>((source, f))),
-            )
-        })
-        .try_flatten()
-        .map_ok(|(source, file)| async move {
-            cache
-                .cached_index_file(
-                    file.hash().clone(),
-                    file.size(),
-                    &source.file_url(&file.path),
-                    transport,
-                )
-                .and_then(|inp| source.packages_from_file(inp))
-                .await
-        })
-        .try_buffered(concurrency.into())
-        .try_collect()
-        .await?;
-        self.universe = Some((
-            self.lock.universe_hash().unwrap().clone(),
-            Box::new(Universe::new(&self.arch, packages)?),
-        ));
+        let packages = cache
+            .cached_universe(self.sources(), concurrency, transport)
+            .await?;
+        self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
         Ok(())
     }
     pub async fn set_snapshot(&mut self, stamp: SnapshotId) {
@@ -495,7 +491,7 @@ impl Manifest {
     ) -> io::Result<()> {
         let mut updated = false;
         self.load_universe(concurrency, transport, cache).await?;
-        let universe = self.universe.as_mut().map(|(_, u)| u.as_mut()).unwrap();
+        let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
         let sources = self.file.sources();
         let pkgs_idx = self.file.sources_pkgs();
         let artifacts = self.file.artifacts();
@@ -583,16 +579,12 @@ impl Manifest {
         Ok(())
     }
     async fn drop_universe(&mut self) {
-        if let Some((_hash, _)) = self.universe.take() {
-            // if let Some(cache) = self.cache.as_deref() {
-            //     let _ = smol::fs::remove_file(hash.store_name(Some(cache), 1)).await;
-            // }
-        }
+        self.universe.take();
     }
     pub fn packages(&self) -> io::Result<impl Iterator<Item = &'_ Package<'_>>> {
         self.universe
             .as_ref()
-            .map(|(_, u)| u.packages())
+            .map(|u| u.packages())
             .ok_or_else(|| io::Error::other("call resolve first"))
     }
     pub fn spec_packages<'a>(
@@ -604,7 +596,7 @@ impl Manifest {
         let universe = self
             .universe
             .as_ref()
-            .map(|(_, u)| u.as_ref())
+            .map(|u| u.as_ref())
             .expect("call resolve first");
         Ok(lock.installables().map(|p| p.idx).map(|i| {
             universe

@@ -1,7 +1,5 @@
 use {
-    crate::{
-        control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release, Packages,
-    },
+    crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::AsyncReadExt,
@@ -650,9 +648,6 @@ impl Source {
         } else {
             self.verify_signed_release(&r).await
         }
-    }
-    pub(crate) async fn packages_from_file(&self, r: IndexFile) -> io::Result<Packages> {
-        Packages::new(r, self.priority).map_err(Into::into)
     }
     async fn verify_signed_release<T: AsRef<str>>(&self, data: T) -> io::Result<Release> {
         let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;

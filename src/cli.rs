@@ -630,15 +630,15 @@ pub async fn pretty_print_packages<'a, W: smol::io::AsyncWrite + Unpin>(
     }
     let mut buffer = Vec::<u8>::new();
     for p in packages.iter() {
-        use smol::io::AsyncWriteExt;
         use std::io::Write;
         writeln!(
             &mut buffer,
             "{:>w0$} {:<w2$} {:>w3$} {:<w4$}",
             p.arch, p.name, p.ver, p.desc
         )?;
-        f.write_all(&buffer).await?;
     }
+    use smol::io::AsyncWriteExt;
+    f.write_all(&buffer).await?;
     Ok(packages.len())
 }
 

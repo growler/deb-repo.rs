@@ -1,7 +1,12 @@
-use std::{future::Future, path::PathBuf};
+use std::{future::Future, num::NonZero, path::PathBuf};
+
+use futures::{stream, TryStreamExt};
 
 pub use crate::indexfile::IndexFile;
-use crate::staging::Stage;
+use crate::{
+    comp::strip_comp_ext, control::MutableControlFile, manifest::UniverseFiles, staging::Stage,
+    Packages, StagingFile,
+};
 use {
     crate::{
         artifact::Artifact,
@@ -61,7 +66,53 @@ pub trait CacheProvider: Clone + Send {
     where
         T: TransportProvider + ?Sized,
         H: HashAlgo + 'static;
+    fn cached_universe<T: TransportProvider + ?Sized>(
+        &self,
+        sources: UniverseFiles<'_>,
+        concurrency: NonZero<usize>,
+        transport: &T,
+    ) -> impl Future<Output = io::Result<Vec<Packages>>>;
+    fn cached_universe_stage<'a, T: TransportProvider + ?Sized>(
+        &self,
+        sources: UniverseFiles<'a>,
+        transport: &T,
+    ) -> impl Future<
+        Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
+    >;
     fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
+}
+
+pub struct UniverseFilesStage<FS: StagingFileSystem + ?Sized> {
+    sources: MutableControlFile,
+    files: Vec<(String, IndexFile)>,
+    _phantom: std::marker::PhantomData<fn(&FS)>,
+}
+
+impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
+    type Output = ();
+    type Target = FS;
+    fn stage<'b>(
+        &'b mut self,
+        fs: &'b Self::Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
+        Box::pin(async move {
+            fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
+                .await?;
+            fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
+                .await?;
+            fs.create_file_from_bytes(self.sources.to_string().as_bytes(), 0, 0, 0o644)
+                .await?
+                .persist("./etc/apt/sources.list.d/manifest.sources")
+                .await?;
+            for (name, file) in &self.files {
+                fs.create_file_from_bytes(file.as_bytes(), 0, 0, 0o644)
+                    .await?
+                    .persist(&format!("./var/lib/apt/lists/{}", name))
+                    .await?;
+            }
+            Ok(())
+        })
+    }
 }
 
 pub struct HostCache {
@@ -226,6 +277,71 @@ impl CacheProvider for HostCache {
             })?;
             return artifact.remote(src);
         }
+    }
+    async fn cached_universe<T: TransportProvider + ?Sized>(
+        &self,
+        sources: UniverseFiles<'_>,
+        concurrency: NonZero<usize>,
+        transport: &T,
+    ) -> io::Result<Vec<Packages>> {
+        stream::iter(
+            sources
+                .files()
+                .filter(|(_, file)| !file.path.ends_with("Release"))
+                .map(Ok::<_, io::Error>),
+        )
+        .map_ok(|(src, file)| async move {
+            let prio = src.priority;
+            let url = src.file_url(file.path());
+            let file = self
+                .cached_index_file(
+                    file.hash.clone(),
+                    file.size,
+                    &src.file_url(file.path()),
+                    transport,
+                )
+                .await?;
+            let pkg = blocking::unblock(move || {
+                Packages::new(file, prio).map_err(|e| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("failed to parse Packages file {}: {}", &url, e),
+                    )
+                })
+            })
+            .await?;
+            Ok(pkg)
+        })
+        .try_buffered(concurrency.get())
+        .try_collect::<Vec<_>>()
+        .await
+    }
+    async fn cached_universe_stage<'a, T: TransportProvider + ?Sized>(
+        &self,
+        sources: UniverseFiles<'a>,
+        transport: &T,
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
+        let ctrl = sources.sources();
+        let files = stream::iter(sources.files().map(Ok::<_, io::Error>))
+            .map_ok(|(src, file)| async move {
+                let url = src.file_url(file.path());
+                let file = self
+                    .cached_index_file(file.hash.clone(), file.size, &url, transport)
+                    .await?;
+                let name = crate::strip_url_scheme(strip_comp_ext(&url)).replace('/', "_");
+                Ok((name, file))
+            })
+            .try_buffered(8)
+            .try_collect::<Vec<_>>()
+            .await?;
+        Ok(Box::new(UniverseFilesStage::<Self::Target> {
+            sources: ctrl,
+            files,
+            _phantom: std::marker::PhantomData,
+        })
+            as Box<
+                dyn Stage<Target = Self::Target, Output = ()> + Send + 'static,
+            >)
     }
     async fn cached_index_file<T: TransportProvider + ?Sized>(
         &self,

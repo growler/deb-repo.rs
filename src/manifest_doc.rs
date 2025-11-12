@@ -719,9 +719,6 @@ impl LockFile {
             self.sources.iter().map(|s| s.as_ref().unwrap()),
         ));
     }
-    pub(crate) fn universe_hash(&self) -> Option<&Hash> {
-        self.universe_hash.as_ref()
-    }
     pub fn specs_len(&self) -> usize {
         self.specs.len()
     }

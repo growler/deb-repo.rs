@@ -103,7 +103,6 @@ impl LockedSource {
         stream::iter(source.suites.iter().zip(self.suites.iter_mut()))
             .then(move |(suite, locked)| {
                 tracing::debug!("Refreshing locked source for {} {}", source.url, suite);
-                let cache = cache.clone();
                 async move {
                     tracing::debug!("Checking locked source for {} {}", source.url, suite,);
                     let path = source.release_path(suite);
