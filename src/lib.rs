@@ -24,6 +24,7 @@ pub mod tar;
 mod transport;
 pub mod universe;
 pub mod version;
+mod kvlist;
 
 pub use {
     arch::DEFAULT_ARCH,
@@ -139,7 +140,7 @@ pub(crate) async fn safe_store<P: AsRef<std::path::Path>, D: smol::io::AsyncRead
 }
 
 #[inline]
-pub(crate) fn is_url(s: &str) -> bool {
+pub fn is_url(s: &str) -> bool {
     let mut bytes = s.as_bytes();
     if bytes.len() < 4 {
         return false;
@@ -160,7 +161,7 @@ pub(crate) fn is_url(s: &str) -> bool {
     }
     bytes[0] == b':' && bytes[1] == b'/' && bytes[2] == b'/'
 }
-pub(crate) fn strip_url_scheme(s: &str) -> &str {
+pub fn strip_url_scheme(s: &str) -> &str {
     let mut bytes = s.as_bytes();
     if bytes.len() < 4 {
         return s;

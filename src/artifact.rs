@@ -13,7 +13,7 @@ use {
         fs::{fstat, openat, FileType, Mode, OFlags, CWD},
     },
     serde::{Deserialize, Serialize},
-    smol::{stream::StreamExt, io::AsyncRead},
+    smol::{io::AsyncRead, stream::StreamExt},
     std::{
         borrow::Cow,
         future::Future,
@@ -205,6 +205,19 @@ impl Artifact {
             Artifact::File(inner) => inner.hash_remote(r).await,
         }
     }
+    pub async fn hash_stage_remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized + 'static>(
+        &mut self,
+        r: R,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        match self {
+            Artifact::Dir(_) => Err(io::Error::other(
+                "directory artifacts do not support remote readers",
+            )),
+            Artifact::Tar(inner) => inner.hash_stage_remote(r, fs).await,
+            Artifact::File(inner) => inner.hash_stage_remote(r, fs).await,
+        }
+    }
     pub fn remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
         r: R,
@@ -215,6 +228,17 @@ impl Artifact {
             )),
             Artifact::Tar(inner) => inner.remote(r),
             Artifact::File(inner) => inner.remote(r),
+        }
+    }
+    pub async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        path: P,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        match self {
+            Artifact::Dir(inner) => inner.hash_stage_local(path, fs).await,
+            Artifact::Tar(inner) => inner.hash_stage_local(path, fs).await,
+            Artifact::File(inner) => inner.hash_stage_local(path, fs).await,
         }
     }
     pub async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
@@ -228,35 +252,42 @@ impl Artifact {
         &self,
         path: P,
     ) -> io::Result<Box<dyn Stage<Target = FS, Output = ()> + Send>> {
-        match &self {
+        match self {
             Artifact::Dir(inner) => inner.local(path).await,
             Artifact::Tar(inner) => inner.local(path).await,
             Artifact::File(inner) => inner.local(path).await,
         }
     }
     pub fn hash(&self) -> &Hash {
-        match &self {
+        match self {
             Artifact::Tar(inner) => &inner.hash,
             Artifact::Dir(inner) => &inner.hash,
             Artifact::File(inner) => &inner.hash,
         }
     }
     pub fn size(&self) -> u64 {
-        match &self {
+        match self {
             Artifact::Tar(inner) => inner.size,
             Artifact::Dir(inner) => inner.size,
             Artifact::File(inner) => inner.size,
         }
     }
     pub fn uri(&self) -> &str {
-        match &self {
+        match self {
             Artifact::Tar(inner) => &inner.uri,
             Artifact::Dir(inner) => &inner.path,
             Artifact::File(inner) => &inner.uri,
         }
     }
+    pub fn target(&self) -> Option<&str> {
+        match self {
+            Artifact::Tar(inner) => inner.target.as_deref(),
+            Artifact::Dir(inner) => inner.target.as_deref(),
+            Artifact::File(inner) => Some(&inner.target),
+        }
+    }
     pub fn arch(&self) -> Option<&str> {
-        match &self {
+        match self {
             Artifact::Tar(inner) => inner.arch.as_deref(),
             Artifact::Dir(inner) => inner.arch.as_deref(),
             Artifact::File(inner) => inner.arch.as_deref(),
@@ -305,6 +336,20 @@ impl Tar {
         })?)
             as Box<dyn Stage<Target = FS, Output = ()> + Send>)
     }
+    async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        path: P,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let file = smol::fs::File::open(path.as_ref()).await.map_err(|err| {
+            io::Error::other(format!(
+                "failed to open local tar file {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
+        self.hash_stage_remote(file, fs).await
+    }
     async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
         let file = smol::fs::File::open(path.as_ref()).await.map_err(|err| {
             io::Error::other(format!(
@@ -325,6 +370,23 @@ impl Tar {
             _marker: std::marker::PhantomData,
         })?)
             as Box<dyn Stage<Target = FS, Output = ()> + Send>)
+    }
+    async fn hash_stage_remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        r: R,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
+        TarReader {
+            inner: tar_reader(&self.uri, &mut reader)?,
+            target: self.target.clone(),
+            _marker: std::marker::PhantomData,
+        }
+        .stage(fs)
+        .await?;
+        self.size = reader.as_mut().size();
+        self.hash = reader.as_mut().hash();
+        Ok((self.hash.clone(), self.size))
     }
     async fn hash_remote<R: AsyncRead + Send + 'static>(
         &mut self,
@@ -445,6 +507,26 @@ where
 }
 
 impl Tree {
+    async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        path: P,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let fd = openat(
+            CWD,
+            path.as_ref(),
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to open local artifact directory {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
+        tree::copy_hash_dir(&fd, fs, self.target.as_deref()).await
+    }
     async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
         let fd = openat(
             CWD,
@@ -491,7 +573,7 @@ where
             if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
                 fs.create_dir_all(parent, 0, 0, 0o755).await?;
             }
-            let hash = tree::copy_hash_dir(&self.dir, fs, self.target.as_deref()).await?;
+            let (hash, _) = tree::copy_hash_dir(&self.dir, fs, self.target.as_deref()).await?;
             if hash != self.hash {
                 Err(io::Error::other("hash mismatch after copying local tree"))
             } else {
@@ -522,6 +604,44 @@ impl File {
             _marker_fs: std::marker::PhantomData,
         })
             as Box<dyn Stage<Target = FS, Output = ()> + Send>)
+    }
+    async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        path: P,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let fd = openat(
+            CWD,
+            path.as_ref(),
+            OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to open local artifact file {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
+        let stat = fstat(&fd)?;
+        if !FileType::from_raw_mode(stat.st_mode).is_file() {
+            return Err(io::Error::other(format!(
+                "artefact file {} ({}) is not a regular file",
+                &self.uri,
+                path.as_ref().display()
+            )));
+        }
+        let st_mode = stat.st_mode & 0o7777;
+        if st_mode == 0 {
+            return Err(io::Error::other(format!(
+                "file {} has invalid permissions set {:0o}",
+                &self.uri, st_mode,
+            )));
+        }
+        if self.mode.is_none() && st_mode != 0o644 {
+            self.mode = Some(NonZero::new(st_mode as u32).unwrap());
+        }
+        self.hash_stage_remote(smol::fs::File::from(fd), fs).await
     }
     async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
         let fd = openat(
@@ -588,6 +708,45 @@ impl File {
         self.hash = hash.clone();
         self.size = size;
         Ok((hash, size))
+    }
+    async fn hash_stage_remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        r: R,
+        fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let st_mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
+        let mut digester = blake3::Hasher::new();
+        digester.update(&u32::to_le_bytes(st_mode));
+        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new_with_digester(
+            digester, r
+        ));
+        if let Some(parent) = Path::new(&self.target).parent() {
+            fs.create_dir_all(parent, 0, 0, 0o755).await?;
+        }
+        if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
+            fs.create_file(
+                comp_reader(&self.uri, &mut reader),
+                0,
+                0,
+                self.mode.map_or(0o644, |m| m.get() & 0o7777),
+                None,
+            )
+            .await?
+        } else {
+            fs.create_file(
+                &mut reader,
+                0,
+                0,
+                self.mode.map_or(0o644, |m| m.get() & 0o7777),
+                None,
+            )
+            .await?
+        }
+        .persist(&self.target)
+        .await?;
+        self.size = reader.as_mut().size();
+        self.hash = reader.as_mut().hash();
+        Ok((self.hash.clone(), self.size))
     }
     async fn hash_remote<R: AsyncRead + Send + 'static>(
         &mut self,
@@ -744,7 +903,7 @@ mod tree {
         fd: Fd,
         fs: &FS,
         target_path: Option<&str>,
-    ) -> io::Result<Hash> {
+    ) -> io::Result<(Hash, u64)> {
         process(fd, &|obj| async {
             match obj {
                 Object::Symlink { path, target } => {
@@ -782,7 +941,6 @@ mod tree {
             }
         })
         .await
-        .map(|(hash, _)| hash)
     }
 
     pub(super) async fn hash_dir(fd: OwnedFd) -> io::Result<(Hash, u64)> {

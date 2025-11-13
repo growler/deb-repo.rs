@@ -30,8 +30,12 @@ pub mod cmd {
     use {
         super::*,
         crate::{
-            artifact::ArtifactArg, builder::Executor, content::HostCache, manifest::Manifest,
-            sandbox::HostSandboxExecutor, staging::HostFileSystem,
+            artifact::ArtifactArg,
+            builder::Executor,
+            content::{ContentProviderGuard, HostCache},
+            manifest::Manifest,
+            sandbox::HostSandboxExecutor,
+            staging::HostFileSystem,
         },
         anyhow::{anyhow, Result},
         clap::Parser,
@@ -80,15 +84,18 @@ Examples:
                     } else {
                         (vec![self.source.clone()], self.requirements.clone(), None)
                     };
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_sources(
                     conf.arch(),
                     sources.iter().cloned(),
                     comment.as_deref(),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(true, conf.concurrency(), conf.fetcher()?).await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
+                mf.update(true, conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -127,6 +134,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Drop {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if !self.constraints_only {
                     mf.remove_requirements(self.spec.as_deref(), self.cons.iter())?;
@@ -134,12 +143,10 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if !self.requirements_only {
                     mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
                 }
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
-                conf.fetcher()?.close().await?;
+                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -166,15 +173,18 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Stage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_artifact(
                     self.spec.as_deref(),
                     &self.artifact,
                     self.comment.as_deref(),
-                    conf.fetcher()?,
+                    fetcher,
                 )
                 .await?;
                 mf.store(conf.manifest()).await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -229,18 +239,18 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Include {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_requirements(
                     self.spec.as_deref(),
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
+                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
-                conf.fetcher()?.close().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -269,18 +279,18 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Exclude {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_constraints(
                     self.spec.as_deref(),
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
+                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
-                conf.fetcher()?.close().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -303,15 +313,15 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Update {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                conf.fetcher()?.init().await?;
-                mf.update(self.force, conf.concurrency(), conf.fetcher()?)
-                    .await?;
+                mf.update(self.force, conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
-                conf.fetcher()?.close().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -334,13 +344,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Search {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.load_universe(conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                conf.fetcher()?.close().await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                guard.commit().await?;
                 let res = self
                     .pattern
                     .iter()
@@ -384,13 +392,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Show {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.load_universe(conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                conf.fetcher()?.close().await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                guard.commit().await?;
                 let pkg = mf.packages()?.find(|p| self.package == p.name());
                 if let Some(pkg) = pkg {
                     let mut out = async_io::Async::new(std::io::stdout().lock())?;
@@ -419,14 +425,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for List {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                conf.fetcher()?.init().await?;
-                mf.update(false, conf.concurrency(), conf.fetcher()?)
-                    .await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?)
-                    .await
-                    .map_err(|e| anyhow!("failed to update specs: {e}"))?;
-                conf.fetcher()?.close().await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                guard.commit().await?;
                 let mut pkgs = mf
                     .spec_packages(self.spec.as_deref())?
                     .filter(|p| !self.only_essential || p.essential())
@@ -458,6 +461,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         fn exec(&self, conf: &C) -> Result<()> {
             let mut builder = HostSandboxExecutor::new(&self.path)?;
             smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
                 let fs = HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await
                     .map_err(|err| {
@@ -467,7 +472,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                             err
                         )
                     })?;
-                conf.fetcher()?.init().await?;
                 let manifest = Manifest::from_file(conf.manifest(), conf.arch())
                     .await
                     .map_err(|err| {
@@ -496,15 +500,10 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.path.display()
                 );
                 let (essentials, other, scripts) = manifest
-                    .stage(
-                        self.spec.as_deref(),
-                        &fs,
-                        conf.concurrency(),
-                        conf.fetcher()?,
-                        pb,
-                    )
+                    .stage(self.spec.as_deref(), &fs, conf.concurrency(), fetcher, pb)
                     .await?;
                 builder.build(&fs, essentials, other, scripts).await?;
+                guard.commit().await?;
                 Ok(())
             })
         }

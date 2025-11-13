@@ -4,6 +4,7 @@ use {
         hash::Hash,
         version::{Constraint, Dependency},
         RepositoryFile, Source,
+        kvlist::KVList,
     },
     futures::{
         stream::{self, LocalBoxStream},
@@ -31,6 +32,9 @@ pub struct Spec {
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub run: Option<String>,
+
+    #[serde(default, skip_serializing_if = "KVList::is_empty")]
+    pub meta: KVList<String>,
 }
 
 impl Spec {
@@ -40,6 +44,7 @@ impl Spec {
             include: Vec::new(),
             exclude: Vec::new(),
             stage: Vec::new(),
+            meta: KVList::new(),
             run: None,
         }
     }

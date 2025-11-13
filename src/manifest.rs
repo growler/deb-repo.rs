@@ -36,18 +36,26 @@ impl<'a> UniverseFiles<'a> {
     pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
         UniverseFiles { sources, locked }
     }
-    pub fn files(&self) -> impl Iterator<Item = (&'a Source, &'a RepositoryFile)> + '_ {
+    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
         self.sources
             .iter()
             .zip(self.locked.iter())
-            .flat_map(|(src, locked)| {
-                locked.as_ref().into_iter().flat_map(move |locked| {
-                    locked.suites.iter().flat_map(move |suite| {
-                        std::iter::once((src, &suite.release))
-                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
-                    })
+            .map(|(source, locked)| {
+                if let Some(locked) = locked.as_ref() {
+                    Ok((source, locked))
+                } else {
+                    Err(std::io::Error::other(
+                        "lock file is missed or outdated, run update",
+                    ))
+                }
+            })
+            .map_ok(|(src, locked)| {
+                locked.suites.iter().flat_map(move |suite| {
+                    std::iter::once((src, &suite.release))
+                        .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
                 })
             })
+            .flatten_ok()
     }
     pub fn sources(&self) -> MutableControlFile {
         self.sources
@@ -57,14 +65,14 @@ impl<'a> UniverseFiles<'a> {
                 ctrl
             })
     }
-    pub fn hash(&self) -> Hash {
+    pub fn sources_hash(&self) -> (MutableControlFile, Hash) {
+        let mut sources = MutableControlFile::new();
         let mut digester = blake3::Hasher::new();
-        let mut file = blake3::Hasher::new();
         self.sources
             .iter()
             .zip(self.locked.iter())
             .flat_map(|(src, locked)| {
-                file.update(format!("{}\n", Into::<MutableControlStanza>::into(src)).as_bytes());
+                sources.add(Into::<MutableControlStanza>::into(src));
                 locked.as_ref().into_iter().flat_map(move |locked| {
                     locked.suites.iter().flat_map(move |suite| {
                         std::iter::once((src, &suite.release))
@@ -75,8 +83,11 @@ impl<'a> UniverseFiles<'a> {
             .for_each(|(_, file)| {
                 digester.update(file.hash.as_ref());
             });
-        digester.update(file.finalize().as_bytes());
-        digester.into_hash()
+        digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
+        (sources, digester.into_hash())
+    }
+    pub fn hash(&self) -> Hash {
+        self.sources_hash().1
     }
 }
 
@@ -295,6 +306,7 @@ impl Manifest {
         let staged = Artifact::new(artifact, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
+        self.mark_lock_updated();
         Ok(())
     }
     pub fn remove_artifact<S: AsRef<str>>(
@@ -596,7 +608,6 @@ impl Manifest {
     }
     pub fn spec_hash(&self, name: Option<&str>) -> io::Result<Hash> {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-
         self.valid_lock(spec_name, spec_index)?
             .hash
             .as_ref()

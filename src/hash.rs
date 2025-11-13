@@ -327,9 +327,15 @@ impl Hash {
     {
         InnerHash::<D>::hashing_reader(reader)
     }
-    pub fn store_name<P: AsRef<Path>>(&self, prefix: Option<P>, mut levels: usize) -> PathBuf {
+    pub fn store_name<P: AsRef<Path>>(
+        &self,
+        prefix: Option<P>,
+        suffix: Option<&str>,
+        mut levels: usize,
+    ) -> PathBuf {
         let pref = prefix.as_ref().map(|p| p.as_ref().as_os_str());
         let total_len = pref.as_ref().map_or(0, |p| p.len() + 1)
+            + suffix.map_or(0, |s| s.len() + 1)
             + self.sri_name().len()
             + 1
             + self.size() * 2
@@ -354,6 +360,10 @@ impl Hash {
                 levels -= 1;
             }
             hash = &hash[1..];
+        }
+        if let Some(s) = suffix {
+            buffer.push(".");
+            buffer.push(s);
         }
         buffer.into()
     }

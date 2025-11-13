@@ -1,4 +1,7 @@
+use itertools::Itertools;
+
 pub use crate::indexfile::IndexFile;
+pub use crate::manifest::UniverseFiles;
 use {
     crate::{
         artifact::Artifact,
@@ -7,7 +10,6 @@ use {
         control::MutableControlStanza,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
-        manifest::UniverseFiles,
         staging::Stage,
         HostFileSystem, HttpTransport, Packages, StagingFile, StagingFileSystem, TransportProvider,
     },
@@ -25,10 +27,16 @@ use {
     },
 };
 
+pub trait ContentProviderGuard<'a> {
+    fn commit(self) -> impl Future<Output = io::Result<()>>;
+}
+
 pub trait ContentProvider {
     type Target: StagingFileSystem;
-    fn init(&self) -> impl Future<Output = io::Result<()>>;
-    fn close(&self) -> impl Future<Output = io::Result<()>>;
+    type Guard<'a>: ContentProviderGuard<'a>
+    where
+        Self: 'a;
+    fn init(&self) -> impl Future<Output = io::Result<Self::Guard<'_>>>;
     fn fetch_deb(
         &self,
         hash: Hash,
@@ -128,17 +136,30 @@ impl HostCache {
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
 
+pub struct HostCacheGuard<'a> {
+    phantom: std::marker::PhantomData<&'a ()>,
+}
+
+impl<'a> ContentProviderGuard<'a> for HostCacheGuard<'a> {
+    async fn commit(self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
 impl ContentProvider for HostCache {
     type Target = HostFileSystem;
-    async fn init(&self) -> io::Result<()> {
+    type Guard<'a>
+        = HostCacheGuard<'a>
+    where
+        Self: 'a;
+    async fn init(&self) -> io::Result<Self::Guard<'_>> {
         if let Some(path) = self.cache.as_ref() {
             tracing::debug!("Initializing cache at {}", path.display());
             smol::fs::create_dir_all(path).await?;
         }
-        Ok(())
-    }
-    async fn close(&self) -> io::Result<()> {
-        Ok(())
+        Ok(HostCacheGuard {
+            phantom: std::marker::PhantomData,
+        })
     }
     async fn fetch_deb(
         &self,
@@ -149,7 +170,7 @@ impl ContentProvider for HostCache {
         Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
     > {
         if let Some(cache) = self.cache.as_ref() {
-            let cache_path = hash.store_name(Some(cache.as_ref()), 1);
+            let cache_path = hash.store_name(Some(cache.as_ref()), Some("deb"), 1);
             if let Ok(file) = fs::File::open(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(Box::new(DebStage::new(
@@ -206,7 +227,7 @@ impl ContentProvider for HostCache {
                 io::copy(&mut src, &mut dst).await?;
                 dst.sync_data().await?;
                 let (hash, _) = artifact.hash_local(&path).await?;
-                let cache_path = hash.store_name(Some(cache.as_ref()), 1);
+                let cache_path = hash.store_name(Some(cache.as_ref()), Some("file"), 1);
                 smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
                 path.persist(&cache_path)?;
                 tracing::debug!("Cached {} at {}", artifact.uri(), cache_path.display());
@@ -226,7 +247,9 @@ impl ContentProvider for HostCache {
             return artifact.local(path).await;
         } else if let Some(cache) = self.cache.as_ref() {
             let url = artifact.uri();
-            let cache_path = artifact.hash().store_name(Some(cache.as_ref()), 1);
+            let cache_path = artifact
+                .hash()
+                .store_name(Some(cache.as_ref()), Some("file"), 1);
             let file = if let Ok(file) = fs::File::open(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 file
@@ -269,8 +292,7 @@ impl ContentProvider for HostCache {
         stream::iter(
             sources
                 .files()
-                .filter(|(_, file)| !file.path.ends_with("Release"))
-                .map(Ok::<_, io::Error>),
+                .filter_ok(|(_, file)| !file.path.ends_with("Release")),
         )
         .map_ok(|(src, file)| async move {
             let prio = src.priority;
@@ -299,7 +321,7 @@ impl ContentProvider for HostCache {
         concurrency: NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = sources.sources();
-        let files = stream::iter(sources.files().map(Ok::<_, io::Error>))
+        let files = stream::iter(sources.files())
             .map_ok(|(src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
@@ -322,7 +344,12 @@ impl ContentProvider for HostCache {
     }
     async fn fetch_index_file(&self, hash: Hash, size: u64, url: &str) -> io::Result<IndexFile> {
         if let Some(cache) = self.cache.as_ref() {
-            let cache_path = hash.store_name(Some(cache.as_ref()), 1);
+            let suff = if url.ends_with("Release") {
+                Some("rel")
+            } else {
+                Some("idx")
+            };
+            let cache_path = hash.store_name(Some(cache.as_ref()), suff, 1);
             if let Ok(file) = IndexFile::from_file(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(file);
@@ -364,7 +391,12 @@ impl ContentProvider for HostCache {
             io::copy(comp_reader(url, &mut src), &mut dst).await?;
             dst.sync_data().await?;
             let (hash, size) = src.into_hash_and_size();
-            let cache_path = hash.store_name(Some(cache.as_ref()), 1);
+            let suff = if url.ends_with("Release") {
+                Some("rel")
+            } else {
+                Some("idx")
+            };
+            let cache_path = hash.store_name(Some(cache.as_ref()), suff, 1);
             smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
             path.persist(&cache_path)?;
             tracing::debug!("Cached {} at {}", url, cache_path.display());
