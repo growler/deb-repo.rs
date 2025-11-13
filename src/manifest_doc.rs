@@ -24,7 +24,7 @@ pub fn valid_spec_name(s: &str) -> Result<&str, String> {
         Err(format!(
             "invalid spec name \"{s}\", only alphanumeric characters, '-' and '_' are allowed",
         ))
-    } else if ["include", "exclude", "extends", "stage", "run"].contains(&s) {
+    } else if ["include", "exclude", "extends", "stage", "run", "meta"].contains(&s) {
         Err(format!("invalid spec name \"{}\"", s))
     } else {
         Ok(s)
@@ -770,6 +770,9 @@ where
         if let Some(run) = def.run.as_deref() {
             map.serialize_entry("run", run)?;
         }
+        if !def.meta.is_empty() {
+            map.serialize_entry("meta", &def.meta)?;
+        }
     }
     for (k, v) in list.iter() {
         if k.is_empty() {
@@ -1112,12 +1115,16 @@ pub(crate) trait ManifestDoc {
         }
     }
     fn remove_spec_list_item(&mut self, spec_name: &str, kind: &str, index: usize) {
-        self.get_spec_table_mut(spec_name)
+        let spec = self.get_spec_table_mut(spec_name);
+        let arr = spec
             .get_mut(kind)
             .expect(kind)
             .as_array_mut()
-            .expect("an array")
-            .remove(index);
+            .expect("an array");
+        arr.remove(index);
+        if arr.is_empty() {
+            spec.remove(kind);
+        }
     }
     fn get_spec_table_items_mut(&mut self, spec_name: &str, kind: &str) -> &mut toml_edit::Array {
         table_items_mut(self.get_spec_table_mut(spec_name), kind)
@@ -1149,10 +1156,19 @@ impl ManifestDoc for toml_edit::DocumentMut {
             .as_table_mut()
             .expect("a table of artifacts")
             .set_implicit(true);
-        self.entry("spec")
+        let default_spec = self
+            .entry("spec")
             .or_insert_with(toml_edit::table)
-            .as_table()
+            .as_table_mut()
             .expect("a table of specs");
+        fn spec_entry_order(entry: &str) -> u8 {
+            match entry {
+                "include" | "exclude" | "extends" | "stage" | "run" => 0,
+                "meta" => 1,
+                _ => 2,
+            }
+        }
+        default_spec.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
         fn entry_order(entry: &str) -> u8 {
             match entry {
                 "source" => 0,

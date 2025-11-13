@@ -143,7 +143,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if !self.requirements_only {
                     mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
                 }
-                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;
@@ -247,7 +247,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;
@@ -287,7 +287,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;

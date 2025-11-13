@@ -159,19 +159,14 @@ impl Manifest {
         self.lock_updated = true;
     }
     pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
-        let hash = if let Some(hash) = self.hash.clone() {
-            hash
+        let (hash, hash_update) = if let Some(hash) = self.hash.clone() {
+            (hash, false)
         } else {
-            self.file.store(path.as_ref()).await?
+            (self.file.store(path.as_ref()).await?, true)
         };
-        if self.lock_updated {
+        if self.lock_updated || hash_update {
             self.lock.store(path.as_ref(), &self.arch, &hash).await?;
         }
-        // if let Some((hash, universe)) = self.universe.as_ref() {
-        //     if let Some(cache) = self.cache.as_deref() {
-        //         universe.store(hash.store_name(Some(cache), 1)).await?;
-        //     }
-        // }
         Ok(())
     }
     pub fn spec_names(&self) -> impl Iterator<Item = &str> {
@@ -306,7 +301,6 @@ impl Manifest {
         let staged = Artifact::new(artifact, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
-        self.mark_lock_updated();
         Ok(())
     }
     pub fn remove_artifact<S: AsRef<str>>(

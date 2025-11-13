@@ -31,6 +31,18 @@ where
     }
 }
 
+impl<R> std::fmt::Display for KVList<R>
+where
+    R: std::fmt::Display,
+{
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for (k, v) in self.iter() {
+            writeln!(f, "{}: {}", k, v)?;
+        }
+        Ok(())
+    }
+}
+
 impl<R> std::fmt::Debug for KVList<R>
 where
     R: std::fmt::Debug,
