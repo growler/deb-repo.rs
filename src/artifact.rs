@@ -1,6 +1,6 @@
 use {
     crate::{
-        cache::CacheProvider,
+        cache::ContentProvider,
         comp::{comp_reader, is_comp_ext, is_tar_ext, tar_reader},
         hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader},
         is_url,
@@ -119,7 +119,7 @@ impl Artifact {
     ) -> io::Result<Self>
     where
         T: TransportProvider + ?Sized,
-        C: CacheProvider,
+        C: ContentProvider,
     {
         let uri = artifact.url.clone();
         let target = artifact.target.clone();

@@ -3,7 +3,6 @@ use {
         hash::{AsyncHashingRead, Hash},
         repo::{TransportProvider, Url},
     },
-    async_trait::async_trait,
     isahc::{config::RedirectPolicy, http::StatusCode, prelude::*, HttpClient},
     once_cell::sync::Lazy,
     smol::{
@@ -126,7 +125,6 @@ impl HttpCachingTransportProvider {
     }
 }
 
-#[async_trait]
 impl TransportProvider for HttpCachingTransportProvider {
     async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         tracing::debug!("HTTP open {}", url);
@@ -262,7 +260,6 @@ impl HttpTransportProvider {
     }
 }
 
-#[async_trait]
 impl TransportProvider for HttpTransportProvider {
     async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
         let url = to_url(url)?;

@@ -24,7 +24,7 @@ use {
     std::{path::Path, pin::Pin, sync::Arc},
 };
 
-pub trait CacheProvider: Clone + Send {
+pub trait ContentProvider {
     type Target: StagingFileSystem;
     fn init(&self) -> impl Future<Output = io::Result<()>>;
     fn close(&self) -> impl Future<Output = io::Result<()>>;
@@ -139,7 +139,7 @@ impl Clone for HostCache {
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
 
-impl CacheProvider for HostCache {
+impl ContentProvider for HostCache {
     type Target = HostFileSystem;
     async fn init(&self) -> io::Result<()> {
         if let Some(path) = self.cache.as_ref() {

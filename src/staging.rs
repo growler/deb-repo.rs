@@ -467,7 +467,6 @@ impl StagingFile for FileListFile {
     }
 }
 
-// #[async_trait::async_trait(?Send)]
 impl StagingFileSystem for FileList {
     type File = FileListFile;
     async fn create_dir<P: AsRef<Path>>(

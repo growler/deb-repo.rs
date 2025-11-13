@@ -1,6 +1,6 @@
 use {
     crate::{
-        cache::CacheProvider,
+        cache::ContentProvider,
         hash::Hash,
         repo::TransportProvider,
         version::{Constraint, Dependency},
@@ -66,7 +66,7 @@ pub struct LockedSource {
 }
 
 impl LockedSource {
-    pub fn fetch_or_refresh<'a, T: TransportProvider + ?Sized, C: CacheProvider>(
+    pub fn fetch_or_refresh<'a, T: TransportProvider + ?Sized, C: ContentProvider>(
         locked: &'a mut Option<Self>,
         source: &'a Source,
         arch: &'a str,
@@ -87,7 +87,7 @@ impl LockedSource {
             }
         }
     }
-    fn refresh<'a, T: TransportProvider + ?Sized, C: CacheProvider>(
+    fn refresh<'a, T: TransportProvider + ?Sized, C: ContentProvider>(
         &'a mut self,
         source: &'a Source,
         arch: &'a str,

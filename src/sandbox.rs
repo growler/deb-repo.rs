@@ -52,7 +52,6 @@ impl HostSandboxExecutor {
     }
 }
 
-#[async_trait::async_trait(?Send)]
 impl Executor for HostSandboxExecutor {
     type Filesystem = HostFileSystem;
     async fn execute(&mut self, job: BuildJob<Self>) -> io::Result<()> {
@@ -252,7 +251,6 @@ where
     }
 }
 
-#[async_trait::async_trait(?Send)]
 impl<E: SandboxExecutor> Executor for Sandbox<'_, E> {
     type Filesystem = E::Filesystem;
     async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {

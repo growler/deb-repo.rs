@@ -1,6 +1,6 @@
 use {
     crate::{
-        cache::CacheProvider,
+        cache::ContentProvider,
         packages::{InstallPriority, Package},
         repo::TransportProvider,
         source::{SnapshotId, SnapshotIdArgParser, Source},
@@ -13,7 +13,7 @@ use {
 
 pub trait Config {
     type FS: StagingFileSystem;
-    type Cache: CacheProvider<Target = Self::FS>;
+    type Cache: ContentProvider<Target = Self::FS>;
     type Transport: TransportProvider;
     fn log_level(&self) -> i32 {
         0

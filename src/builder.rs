@@ -2,7 +2,7 @@ use {
     crate::staging::StagingFileSystem,
     serde::{Deserialize, Serialize},
     smol::io,
-    std::{ffi::OsStr, path::Path},
+    std::{ffi::OsStr, future::Future, path::Path},
 };
 
 #[derive(Serialize, Deserialize)]
@@ -92,19 +92,18 @@ impl<E: Executor> BuildJob<E> {
     }
 }
 
-#[async_trait::async_trait(?Send)]
 pub trait Executor {
     type Filesystem: StagingFileSystem + ?Sized;
     fn setup(&mut self) -> io::Result<()> {
         Ok(())
     }
-    async fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
-        Ok(())
+    fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> impl Future<Output = io::Result<()>> {
+        async { Ok(()) }
     }
-    async fn process_changes(&mut self, _fs: &Self::Filesystem) -> io::Result<()> {
-        Ok(())
+    fn process_changes(&mut self, _fs: &Self::Filesystem) -> impl Future<Output = io::Result<()>> {
+        async { Ok(()) }
     }
-    async fn execute(&mut self, job: BuildJob<Self>) -> io::Result<()>
+    fn execute(&mut self, job: BuildJob<Self>) -> impl Future<Output = io::Result<()>>
     where
         Self: Sized;
     fn env<K, V>(&mut self, k: K, v: V) -> io::Result<()>
@@ -131,19 +130,21 @@ pub trait Executor {
         content: C,
     ) -> io::Result<()>;
     fn remove_file<P: AsRef<Path>>(&self, path: P) -> io::Result<()>;
-    async fn build(
+    fn build(
         &mut self,
         fs: &Self::Filesystem,
         essentials: Vec<String>,
         packages: Vec<Vec<String>>,
         scripts: Vec<String>,
-    ) -> io::Result<()>
+    ) -> impl Future<Output = io::Result<()>>
     where
         Self: Sized,
     {
-        self.prepare_tree(fs).await?;
-        self.execute(BuildJob::<Self>::new(essentials, packages, scripts))
-            .await?;
-        self.process_changes(fs).await
+        async move {
+            self.prepare_tree(fs).await?;
+            self.execute(BuildJob::<Self>::new(essentials, packages, scripts))
+                .await?;
+            self.process_changes(fs).await
+        }
     }
 }

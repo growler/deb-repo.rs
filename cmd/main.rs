@@ -2,7 +2,7 @@ use {
     async_lock::OnceCell,
     clap::Parser,
     debrepo::{
-        cache::{CacheProvider, HostCache},
+        cache::{ContentProvider, HostCache},
         cli::{self, Command},
         maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpCachingTransportProvider,
         HttpTransportProvider, Manifest, TransportProvider,

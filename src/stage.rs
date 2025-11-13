@@ -1,7 +1,7 @@
 use {
     crate::{
         artifact::Artifact,
-        cache::CacheProvider,
+        cache::ContentProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         repo::{strip_comp_ext, TransportProvider},
         source::{RepositoryFile, Source},
@@ -26,7 +26,7 @@ pub async fn stage_sources<'a, FS, T, C>(
 where
     FS: StagingFileSystem,
     T: TransportProvider + ?Sized,
-    C: CacheProvider,
+    C: ContentProvider,
 {
     fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
         .await?;
@@ -89,7 +89,7 @@ pub async fn stage_local<'a, FS, T, C>(
 where
     FS: StagingFileSystem,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     stage_debs_local(
         None,
@@ -124,7 +124,7 @@ async fn stage_artifacts_local<'a, FS, T, C>(
 where
     FS: StagingFileSystem + ?Sized,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
@@ -154,7 +154,7 @@ async fn stage_debs_local<'a, C, FS, T>(
 where
     FS: StagingFileSystem + ?Sized,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
         .map(|(source, file)| {
@@ -240,7 +240,7 @@ pub async fn stage<'a, FS, T, C>(
 where
     FS: StagingFileSystem + Send + Clone + 'static,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     stage_debs(
         None,
@@ -274,7 +274,7 @@ async fn stage_artifacts<'a, FS, T, C>(
 where
     FS: StagingFileSystem + Clone + Send + 'static,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
         .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
@@ -306,7 +306,7 @@ async fn stage_debs<'a, C, FS, T>(
 where
     FS: StagingFileSystem + Send + Clone + 'static,
     T: TransportProvider + ?Sized,
-    C: CacheProvider<Target = FS>,
+    C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
         .map(|(source, file)| {

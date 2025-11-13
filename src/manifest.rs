@@ -1,7 +1,7 @@
 use {
     crate::{
         artifact::{Artifact, ArtifactArg},
-        cache::CacheProvider,
+        cache::ContentProvider,
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
@@ -13,7 +13,9 @@ use {
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
     },
-    futures::stream::{self, StreamExt, TryStreamExt},
+    futures::
+        stream::{self, StreamExt, TryStreamExt}
+    ,
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
@@ -293,7 +295,7 @@ impl Manifest {
     ) -> io::Result<()>
     where
         T: TransportProvider + ?Sized,
-        C: CacheProvider,
+        C: ContentProvider,
     {
         let staged = Artifact::new(artifact, transport, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
@@ -400,7 +402,7 @@ impl Manifest {
     fn sources(&self) -> UniverseFiles<'_> {
         UniverseFiles::new(self.file.sources(), self.lock.sources())
     }
-    async fn make_universe<T: TransportProvider + ?Sized, C: CacheProvider>(
+    async fn make_universe<T: TransportProvider + ?Sized, C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         transport: &T,
@@ -429,7 +431,7 @@ impl Manifest {
             self.mark_lock_updated();
         }
     }
-    async fn update_locked_sources<T: TransportProvider + ?Sized, C: CacheProvider>(
+    async fn update_locked_sources<T: TransportProvider + ?Sized, C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         force: bool,
@@ -450,7 +452,7 @@ impl Manifest {
         }
         Ok(updated)
     }
-    pub async fn update<T: TransportProvider + ?Sized, C: CacheProvider>(
+    pub async fn update<T: TransportProvider + ?Sized, C: ContentProvider>(
         &mut self,
         force: bool,
         concurrency: NonZero<usize>,
@@ -472,7 +474,7 @@ impl Manifest {
         }
         self.resolve(concurrency, transport, cache).await
     }
-    pub async fn load_universe<T: TransportProvider + ?Sized, C: CacheProvider>(
+    pub async fn load_universe<T: TransportProvider + ?Sized, C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         transport: &T,
@@ -483,7 +485,7 @@ impl Manifest {
         }
         Ok(())
     }
-    pub async fn resolve<T: TransportProvider + ?Sized, C: CacheProvider>(
+    pub async fn resolve<T: TransportProvider + ?Sized, C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         transport: &T,
@@ -748,7 +750,7 @@ impl Manifest {
         FS: StagingFileSystem,
         T: TransportProvider + ?Sized,
         P: FnOnce(u64) -> ProgressBar,
-        C: CacheProvider<Target = FS>,
+        C: ContentProvider<Target = FS>,
     {
         let (sources, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
@@ -781,7 +783,7 @@ impl Manifest {
         FS: StagingFileSystem + Send + Clone + 'static,
         T: TransportProvider + ?Sized,
         P: FnOnce(u64) -> ProgressBar,
-        C: CacheProvider<Target = FS>,
+        C: ContentProvider<Target = FS>,
     {
         tracing::debug!("running stage_");
         let (sources, artifacts, installables, essentials, other, scripts, pb) =
