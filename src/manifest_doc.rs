@@ -9,7 +9,7 @@ use {
         version::{Constraint, Dependency},
     },
     chrono::{DateTime, Utc},
-    futures_lite::AsyncReadExt,
+    smol::io::AsyncReadExt,
     itertools::Itertools,
     serde::{Deserialize, Serialize},
     std::{collections::HashMap, io, path::Path},

@@ -1,3 +1,4 @@
+pub use crate::indexfile::IndexFile;
 use {
     crate::{
         artifact::Artifact,
@@ -6,7 +7,6 @@ use {
         control::MutableControlStanza,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
-        indexfile::IndexFile,
         manifest::UniverseFiles,
         staging::Stage,
         HostFileSystem, HttpTransport, Packages, StagingFile, StagingFileSystem, TransportProvider,

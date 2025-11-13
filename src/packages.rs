@@ -13,7 +13,7 @@ use {
         SafeStoreFile,
     },
     futures::AsyncWriteExt,
-    futures_lite::io::{AsyncRead, AsyncReadExt},
+    smol::io::{AsyncRead, AsyncReadExt},
     ouroboros::self_referencing,
     std::{io, sync::Arc},
 };

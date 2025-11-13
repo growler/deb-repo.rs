@@ -12,8 +12,11 @@ use {
     },
     async_lock::Mutex,
     core::task::{self, Context, Poll},
-    futures_lite::{io::BufReader, AsyncRead, AsyncReadExt, Stream, StreamExt},
     pin_project_lite::pin_project,
+    smol::{
+        io::{AsyncRead, AsyncReadExt, BufReader},
+        stream::{Stream, StreamExt},
+    },
     std::{
         future::Future,
         io::{self, Result},

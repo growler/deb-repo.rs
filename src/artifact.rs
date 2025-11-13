@@ -8,13 +8,12 @@ use {
         tar,
     },
     clap::Args,
-    futures_lite::StreamExt,
     rustix::{
         fd::{AsRawFd, OwnedFd},
         fs::{fstat, openat, FileType, Mode, OFlags, CWD},
     },
     serde::{Deserialize, Serialize},
-    smol::io::AsyncRead,
+    smol::{stream::StreamExt, io::AsyncRead},
     std::{
         borrow::Cow,
         future::Future,

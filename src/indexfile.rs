@@ -1,5 +1,7 @@
-use smol::io::{AsyncRead, AsyncReadExt};
-use std::{io, pin::pin, sync::Arc};
+use {
+    smol::io::{AsyncRead, AsyncReadExt},
+    std::{io, pin::pin, sync::Arc},
+};
 
 pub struct IndexFile {
     inner: IndexFileInner,

@@ -1,21 +1,22 @@
 //! Digest verification
 
-use std::{
-    ffi::{OsStr, OsString},
-    path::{Path, PathBuf},
-};
-
-use base64::Engine;
 pub use digest::Output as HashOutput;
-use digest::OutputSizeUser;
 use {
     ::serde::{Deserialize, Deserializer, Serialize, Serializer},
-    digest::{FixedOutput, FixedOutputReset},
-    futures_lite::ready,
+    base64::Engine,
+    digest::{FixedOutput, FixedOutputReset, OutputSizeUser},
     pin_project_lite::pin_project,
-    smol::io::{AsyncRead, AsyncWrite},
-    std::task::{Context, Poll},
-    std::{fmt, pin::Pin},
+    smol::{
+        io::{AsyncRead, AsyncWrite},
+        ready,
+    },
+    std::{
+        ffi::{OsStr, OsString},
+        fmt,
+        path::{Path, PathBuf},
+        pin::Pin,
+        task::{Context, Poll},
+    },
 };
 
 pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
