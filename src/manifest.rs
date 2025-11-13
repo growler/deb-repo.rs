@@ -1,21 +1,18 @@
 use {
     crate::{
         artifact::{Artifact, ArtifactArg},
-        cache::ContentProvider,
+        content::ContentProvider,
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::Package,
-        transport::TransportProvider,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
         staging::StagingFileSystem,
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
     },
-    futures::
-        stream::{self, StreamExt, TryStreamExt}
-    ,
+    futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
@@ -285,19 +282,17 @@ impl Manifest {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
         }
     }
-    pub async fn add_artifact<T, C>(
+    pub async fn add_artifact<C>(
         &mut self,
         spec_name: Option<&str>,
         artifact: &ArtifactArg,
         comment: Option<&str>,
-        transport: &T,
         cache: &C,
     ) -> io::Result<()>
     where
-        T: TransportProvider + ?Sized,
         C: ContentProvider,
     {
-        let staged = Artifact::new(artifact, transport, cache).await?;
+        let staged = Artifact::new(artifact, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
         Ok(())
@@ -402,16 +397,13 @@ impl Manifest {
     fn sources(&self) -> UniverseFiles<'_> {
         UniverseFiles::new(self.file.sources(), self.lock.sources())
     }
-    async fn make_universe<T: TransportProvider + ?Sized, C: ContentProvider>(
+    async fn make_universe<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        let packages = cache
-            .cached_universe(self.sources(), concurrency, transport)
-            .await?;
+        let packages = cache.fetch_universe(self.sources(), concurrency).await?;
         self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
         Ok(())
     }
@@ -431,17 +423,16 @@ impl Manifest {
             self.mark_lock_updated();
         }
     }
-    async fn update_locked_sources<T: TransportProvider + ?Sized, C: ContentProvider>(
+    async fn update_locked_sources<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         force: bool,
-        transport: &T,
         cache: &C,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
         let updated = stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
             move |(source, locked)| {
-                LockedSource::fetch_or_refresh(locked, source, arch, force, transport, cache)
+                LockedSource::fetch_or_refresh(locked, source, arch, force, cache)
             },
         ))
         .flatten_unordered(concurrency.get())
@@ -452,16 +443,15 @@ impl Manifest {
         }
         Ok(updated)
     }
-    pub async fn update<T: TransportProvider + ?Sized, C: ContentProvider>(
+    pub async fn update<C: ContentProvider>(
         &mut self,
         force: bool,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("updating locked sources");
         let updated = self
-            .update_locked_sources(concurrency, force, transport, cache)
+            .update_locked_sources(concurrency, force, cache)
             .await?;
         if updated {
             tracing::debug!("sources updated, invalidating locked specs");
@@ -472,27 +462,25 @@ impl Manifest {
             tracing::debug!("sources up-to-date, all specs locked, skipping resolve");
             return Ok(());
         }
-        self.resolve(concurrency, transport, cache).await
+        self.resolve(concurrency, cache).await
     }
-    pub async fn load_universe<T: TransportProvider + ?Sized, C: ContentProvider>(
+    pub async fn load_universe<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
     ) -> io::Result<()> {
         if self.universe.is_none() {
-            self.make_universe(concurrency, transport, cache).await?;
+            self.make_universe(concurrency, cache).await?;
         }
         Ok(())
     }
-    pub async fn resolve<T: TransportProvider + ?Sized, C: ContentProvider>(
+    pub async fn resolve<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
     ) -> io::Result<()> {
         let mut updated = false;
-        self.load_universe(concurrency, transport, cache).await?;
+        self.load_universe(concurrency, cache).await?;
         let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
         let sources = self.file.sources();
         let pkgs_idx = self.file.sources_pkgs();
@@ -737,71 +725,50 @@ impl Manifest {
             pb,
         ))
     }
-    pub async fn stage_local<FS, T, P, C>(
+    pub async fn stage_local<FS, P, C>(
         &self,
         name: Option<&str>,
         fs: &mut FS,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
         pb: Option<P>,
     ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
     where
         FS: StagingFileSystem,
-        T: TransportProvider + ?Sized,
         P: FnOnce(u64) -> ProgressBar,
         C: ContentProvider<Target = FS>,
     {
         let (sources, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
-        crate::stage::stage_local(
-            installables,
-            artifacts,
-            fs,
-            concurrency,
-            transport,
-            cache,
-            pb.clone(),
-        )
-        .await?;
+        crate::stage::stage_local(installables, artifacts, fs, concurrency, cache, pb.clone())
+            .await?;
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, transport, cache).await?;
+        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, cache).await?;
         Ok((essentials, other, scripts))
     }
-    pub async fn stage<FS, T, P, C>(
+    pub async fn stage<FS, P, C>(
         &self,
         name: Option<&str>,
         fs: &FS,
         concurrency: NonZero<usize>,
-        transport: &T,
         cache: &C,
         pb: Option<P>,
     ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
     where
         FS: StagingFileSystem + Send + Clone + 'static,
-        T: TransportProvider + ?Sized,
         P: FnOnce(u64) -> ProgressBar,
         C: ContentProvider<Target = FS>,
     {
         tracing::debug!("running stage_");
         let (sources, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
-        crate::stage::stage(
-            installables,
-            artifacts,
-            fs,
-            concurrency,
-            transport,
-            cache,
-            pb.clone(),
-        )
-        .await?;
+        crate::stage::stage(installables, artifacts, fs, concurrency, cache, pb.clone()).await?;
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, transport, cache).await?;
+        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, cache).await?;
         Ok((essentials, other, scripts))
     }
 }

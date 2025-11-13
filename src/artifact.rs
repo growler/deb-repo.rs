@@ -1,12 +1,12 @@
 use {
     crate::{
-        cache::ContentProvider,
         comp::{comp_reader, is_comp_ext, is_tar_ext, tar_reader},
+        content::ContentProvider,
         hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader},
         is_url,
-        transport::TransportProvider,
         staging::{FileList, Stage},
-        tar, StagingFile, StagingFileSystem,
+        tar,
+        StagingFile, StagingFileSystem,
     },
     clap::Args,
     futures_lite::StreamExt,
@@ -112,13 +112,8 @@ pub struct FileReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
 }
 
 impl Artifact {
-    pub(crate) async fn new<T, C>(
-        artifact: &ArtifactArg,
-        transport: &T,
-        cache: &C,
-    ) -> io::Result<Self>
+    pub(crate) async fn new<C>(artifact: &ArtifactArg, cache: &C) -> io::Result<Self>
     where
-        T: TransportProvider + ?Sized,
         C: ContentProvider,
     {
         let uri = artifact.url.clone();
@@ -150,7 +145,7 @@ impl Artifact {
                     unpack,
                 })
             };
-            cache.cache_artifact(&mut artifact, transport).await?;
+            cache.ensure_artifact(&mut artifact).await?;
             Ok(artifact)
         } else {
             let path = cache.resolve_path(&artifact.url).await?;
@@ -186,7 +181,7 @@ impl Artifact {
                     unpack,
                 })
             };
-            cache.cache_artifact(&mut artifact, transport).await?;
+            cache.ensure_artifact(&mut artifact).await?;
             Ok(artifact)
         }
     }

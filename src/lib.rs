@@ -3,9 +3,9 @@
 mod arch;
 pub mod artifact;
 mod builder;
-pub mod cache;
 pub mod cli;
 pub mod comp;
+pub mod content;
 pub mod control;
 pub mod deb;
 pub mod hash;
@@ -16,13 +16,13 @@ mod manifest;
 mod manifest_doc;
 mod packages;
 mod release;
-mod transport;
 mod sandbox;
 mod source;
 mod spec;
 mod stage;
 mod staging;
 pub mod tar;
+mod transport;
 pub mod universe;
 pub mod version;
 
@@ -33,13 +33,13 @@ pub use {
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,
-    transport::TransportProvider,
     sandbox::{
         maybe_run_sandbox, unshare_root, unshare_user_ns, HostSandboxExecutor, Sandbox,
         SandboxExecutor,
     },
     source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
+    transport::TransportProvider,
     version::{Constraint, Dependency, Version},
 };
 

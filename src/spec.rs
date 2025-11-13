@@ -1,8 +1,7 @@
 use {
     crate::{
-        cache::ContentProvider,
+        content::ContentProvider,
         hash::Hash,
-        transport::TransportProvider,
         version::{Constraint, Dependency},
         RepositoryFile, Source,
     },
@@ -66,33 +65,28 @@ pub struct LockedSource {
 }
 
 impl LockedSource {
-    pub fn fetch_or_refresh<'a, T: TransportProvider + ?Sized, C: ContentProvider>(
+    pub fn fetch_or_refresh<'a, C: ContentProvider>(
         locked: &'a mut Option<Self>,
         source: &'a Source,
         arch: &'a str,
         force: bool,
-        transport: &'a T,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         match locked {
-            Some(locked) => locked.refresh(source, arch, force, transport, cache),
+            Some(locked) => locked.refresh(source, arch, force, cache),
             None => {
                 *locked = Some(LockedSource {
                     suites: vec![LockedSuite::default(); source.suites.len()],
                 });
-                locked
-                    .as_mut()
-                    .unwrap()
-                    .refresh(source, arch, true, transport, cache)
+                locked.as_mut().unwrap().refresh(source, arch, true, cache)
             }
         }
     }
-    fn refresh<'a, T: TransportProvider + ?Sized, C: ContentProvider>(
+    fn refresh<'a, C: ContentProvider>(
         &'a mut self,
         source: &'a Source,
         arch: &'a str,
         force: bool,
-        transport: &'a T,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         tracing::debug!(
@@ -108,11 +102,10 @@ impl LockedSource {
                     let path = source.release_path(suite);
                     if !locked.release.path.is_empty() && !force {
                         let rel = cache
-                            .cached_index_file(
+                            .fetch_index_file(
                                 locked.release.hash.clone(),
                                 locked.release.size,
                                 &source.file_url(&path),
-                                transport,
                             )
                             .await?;
                         let rel = source.release_from_file(rel).await;
@@ -122,7 +115,7 @@ impl LockedSource {
                     }
                     tracing::debug!("forced load locked source for {} {}", source.url, suite,);
                     let (rel, hash, size) = cache
-                        .cache_index_file::<blake3::Hasher, _>(&source.file_url(&path), transport)
+                        .ensure_index_file::<blake3::Hasher>(&source.file_url(&path))
                         .and_then(|(rel, hash, size)| async move {
                             let rel = source.release_from_file(rel).await?;
                             Ok((rel, hash, size))

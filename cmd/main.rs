@@ -1,11 +1,9 @@
 use {
-    async_lock::OnceCell,
     clap::Parser,
     debrepo::{
-        cache::{ContentProvider, HostCache},
         cli::{self, Command},
-        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpCachingTransportProvider,
-        HttpTransportProvider, Manifest, TransportProvider,
+        content::HostCache,
+        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpTransportProvider, Manifest,
     },
     std::{
         num::NonZero,
@@ -90,7 +88,6 @@ pub struct App {
 impl cli::Config for App {
     type FS = HostFileSystem;
     type Cache = HostCache;
-    type Transport = HttpTransportProvider;
     fn log_level(&self) -> i32 {
         if self.quiet {
             -1
@@ -107,7 +104,7 @@ impl cli::Config for App {
     fn concurrency(&self) -> NonZero<usize> {
         self.concurrency
     }
-    fn cache(&self) -> std::io::Result<&HostCache> {
+    fn fetcher(&self) -> std::io::Result<&HostCache> {
         static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
         PROVIDER.get_or_try_init(|| {
             let base = std::fs::canonicalize(&self.manifest).map_err(|err| {
@@ -132,13 +129,12 @@ impl cli::Config for App {
                     ))
                 })?;
             }
-            Ok(HostCache::new(base, self.cache_dir.as_deref()))
+            Ok(HostCache::new(
+                base,
+                HttpTransportProvider::new(self.insecure),
+                self.cache_dir.as_deref(),
+            ))
         })
-    }
-    fn transport(&self) -> &Self::Transport {
-        static PROVIDER: once_cell::sync::OnceCell<HttpTransportProvider> =
-            once_cell::sync::OnceCell::new();
-        PROVIDER.get_or_init(|| HttpTransportProvider::new(self.insecure))
     }
 }
 

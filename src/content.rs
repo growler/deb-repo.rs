@@ -5,7 +5,7 @@ use futures::{stream, TryStreamExt};
 pub use crate::indexfile::IndexFile;
 use crate::{
     comp::strip_comp_ext, control::MutableControlFile, manifest::UniverseFiles, staging::Stage,
-    Packages, StagingFile,
+    HttpTransportProvider, Packages, StagingFile,
 };
 use {
     crate::{
@@ -28,57 +28,48 @@ pub trait ContentProvider {
     type Target: StagingFileSystem;
     fn init(&self) -> impl Future<Output = io::Result<()>>;
     fn close(&self) -> impl Future<Output = io::Result<()>>;
-    fn cached_deb<T: TransportProvider + ?Sized>(
+    fn fetch_deb(
         &self,
         hash: Hash,
         size: u64,
         url: &str,
-        transport: &T,
     ) -> impl Future<
         Output = io::Result<
             Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
         >,
     >;
-    fn cached_artifact<'a, T: TransportProvider + ?Sized>(
+    fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
-        transport: &T,
     ) -> impl Future<
         Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
     >;
-    fn cache_artifact<T: TransportProvider + ?Sized>(
-        &self,
-        artifact: &mut Artifact,
-        transport: &T,
-    ) -> impl Future<Output = io::Result<()>>;
-    fn cached_index_file<T: TransportProvider + ?Sized>(
+    fn ensure_artifact(&self, artifact: &mut Artifact) -> impl Future<Output = io::Result<()>>;
+    fn fetch_index_file(
         &self,
         hash: Hash,
         size: u64,
         url: &str,
-        transport: &T,
     ) -> impl Future<Output = io::Result<IndexFile>>;
-    fn cache_index_file<H, T>(
+    fn ensure_index_file<H>(
         &self,
         url: &str,
-        transport: &T,
     ) -> impl Future<Output = io::Result<(IndexFile, Hash, u64)>>
     where
-        T: TransportProvider + ?Sized,
         H: HashAlgo + 'static;
-    fn cached_universe<T: TransportProvider + ?Sized>(
+    fn fetch_universe(
         &self,
         sources: UniverseFiles<'_>,
         concurrency: NonZero<usize>,
-        transport: &T,
     ) -> impl Future<Output = io::Result<Vec<Packages>>>;
-    fn cached_universe_stage<'a, T: TransportProvider + ?Sized>(
+    fn fetch_universe_stage<'a>(
         &self,
         sources: UniverseFiles<'a>,
-        transport: &T,
+        concurrency: NonZero<usize>,
     ) -> impl Future<
         Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
     >;
+    fn transport(&self) -> &impl TransportProvider;
     fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
 }
 
@@ -116,23 +107,20 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
 }
 
 pub struct HostCache {
+    transport: HttpTransportProvider,
     base: Arc<Path>,
     cache: Option<Arc<Path>>,
 }
 impl HostCache {
-    pub fn new<B: AsRef<Path>, P: AsRef<Path>>(base: B, path: Option<P>) -> Self {
+    pub fn new<B: AsRef<Path>, P: AsRef<Path>>(
+        base: B,
+        transport: HttpTransportProvider,
+        cache: Option<P>,
+    ) -> Self {
         Self {
+            transport,
             base: base.as_ref().to_owned().into(),
-            cache: path.map(|p| p.as_ref().to_owned().into()),
-        }
-    }
-}
-
-impl Clone for HostCache {
-    fn clone(&self) -> Self {
-        Self {
-            base: Arc::clone(&self.base),
-            cache: self.cache.as_ref().map(Arc::clone),
+            cache: cache.map(|p| p.as_ref().to_owned().into()),
         }
     }
 }
@@ -151,12 +139,11 @@ impl ContentProvider for HostCache {
     async fn close(&self) -> io::Result<()> {
         Ok(())
     }
-    async fn cached_deb<T: TransportProvider + ?Sized>(
+    async fn fetch_deb(
         &self,
         hash: Hash,
         size: u64,
         url: &str,
-        transport: &T,
     ) -> io::Result<
         Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
     > {
@@ -173,7 +160,7 @@ impl ContentProvider for HostCache {
                             + 'static,
                     >);
             }
-            let mut src = hash.verifying_reader(size, transport.open(url).await?);
+            let mut src = hash.verifying_reader(size, self.transport.open(url).await?);
             let (dst, path) = tempfile::Builder::new()
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
@@ -193,7 +180,7 @@ impl ContentProvider for HostCache {
                         + 'static,
                 >)
         } else {
-            let src = hash.verifying_reader(size, transport.open(url).await?);
+            let src = hash.verifying_reader(size, self.transport.open(url).await?);
             Ok(Box::new(DebStage::new(
                 Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
             ))
@@ -204,16 +191,12 @@ impl ContentProvider for HostCache {
                 >)
         }
     }
-    async fn cache_artifact<T: TransportProvider + ?Sized>(
-        &self,
-        artifact: &mut Artifact,
-        transport: &T,
-    ) -> io::Result<()> {
+    async fn ensure_artifact(&self, artifact: &mut Artifact) -> io::Result<()> {
         if artifact.is_local() {
             let path = self.base.join(artifact.uri());
             let _ = artifact.hash_local(&path).await;
         } else {
-            let mut src = transport.open(artifact.uri()).await?;
+            let mut src = self.transport.open(artifact.uri()).await?;
             if let Some(cache) = self.cache.as_ref() {
                 let (dst, path) = tempfile::Builder::new()
                     .tempfile_in(cache.as_ref())?
@@ -232,10 +215,9 @@ impl ContentProvider for HostCache {
         }
         Ok(())
     }
-    async fn cached_artifact<'a, T: TransportProvider + ?Sized>(
+    async fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
-        transport: &T,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         tracing::debug!("Fetching artifact_ {}", artifact.uri());
         if artifact.is_local() {
@@ -248,7 +230,7 @@ impl ContentProvider for HostCache {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 file
             } else {
-                let src = transport.open(url).await.map_err(|e| {
+                let src = self.transport.open(url).await.map_err(|e| {
                     io::Error::new(
                         e.kind(),
                         format!("failed to open remote artifact {}: {}", url, e),
@@ -269,7 +251,7 @@ impl ContentProvider for HostCache {
             return artifact.remote(file);
         } else {
             let url = artifact.uri();
-            let src = transport.open(url).await.map_err(|e| {
+            let src = self.transport.open(url).await.map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("failed to open remote artifact {}: {}", url, e),
@@ -278,11 +260,10 @@ impl ContentProvider for HostCache {
             return artifact.remote(src);
         }
     }
-    async fn cached_universe<T: TransportProvider + ?Sized>(
+    async fn fetch_universe(
         &self,
         sources: UniverseFiles<'_>,
         concurrency: NonZero<usize>,
-        transport: &T,
     ) -> io::Result<Vec<Packages>> {
         stream::iter(
             sources
@@ -294,12 +275,7 @@ impl ContentProvider for HostCache {
             let prio = src.priority;
             let url = src.file_url(file.path());
             let file = self
-                .cached_index_file(
-                    file.hash.clone(),
-                    file.size,
-                    &src.file_url(file.path()),
-                    transport,
-                )
+                .fetch_index_file(file.hash.clone(), file.size, &src.file_url(file.path()))
                 .await?;
             let pkg = blocking::unblock(move || {
                 Packages::new(file, prio).map_err(|e| {
@@ -316,22 +292,22 @@ impl ContentProvider for HostCache {
         .try_collect::<Vec<_>>()
         .await
     }
-    async fn cached_universe_stage<'a, T: TransportProvider + ?Sized>(
+    async fn fetch_universe_stage<'a>(
         &self,
         sources: UniverseFiles<'a>,
-        transport: &T,
+        concurrency: NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = sources.sources();
         let files = stream::iter(sources.files().map(Ok::<_, io::Error>))
             .map_ok(|(src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
-                    .cached_index_file(file.hash.clone(), file.size, &url, transport)
+                    .fetch_index_file(file.hash.clone(), file.size, &url)
                     .await?;
                 let name = crate::strip_url_scheme(strip_comp_ext(&url)).replace('/', "_");
                 Ok((name, file))
             })
-            .try_buffered(8)
+            .try_buffered(concurrency.get())
             .try_collect::<Vec<_>>()
             .await?;
         Ok(Box::new(UniverseFilesStage::<Self::Target> {
@@ -343,20 +319,14 @@ impl ContentProvider for HostCache {
                 dyn Stage<Target = Self::Target, Output = ()> + Send + 'static,
             >)
     }
-    async fn cached_index_file<T: TransportProvider + ?Sized>(
-        &self,
-        hash: Hash,
-        size: u64,
-        url: &str,
-        transport: &T,
-    ) -> io::Result<IndexFile> {
+    async fn fetch_index_file(&self, hash: Hash, size: u64, url: &str) -> io::Result<IndexFile> {
         if let Some(cache) = self.cache.as_ref() {
             let cache_path = hash.store_name(Some(cache.as_ref()), 1);
             if let Ok(file) = IndexFile::from_file(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(file);
             }
-            let mut src = hash.verifying_reader(size, transport.open(url).await?);
+            let mut src = hash.verifying_reader(size, self.transport.open(url).await?);
             let (dst, path) = tempfile::Builder::new()
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
@@ -370,23 +340,21 @@ impl ContentProvider for HostCache {
             Ok(file)
         } else {
             IndexFile::read(
-                unpacker_(url, hash.verifying_reader(size, transport.open(url).await?))
-                    .take(MAX_FILE_SIZE),
+                unpacker_(
+                    url,
+                    hash.verifying_reader(size, self.transport.open(url).await?),
+                )
+                .take(MAX_FILE_SIZE),
             )
             .await
         }
     }
-    async fn cache_index_file<H, T>(
-        &self,
-        url: &str,
-        transport: &T,
-    ) -> io::Result<(IndexFile, Hash, u64)>
+    async fn ensure_index_file<H>(&self, url: &str) -> io::Result<(IndexFile, Hash, u64)>
     where
-        T: TransportProvider + ?Sized,
         H: HashAlgo + 'static,
     {
         if let Some(cache) = self.cache.as_ref() {
-            let input = transport.open(url).await?;
+            let input = self.transport.open(url).await?;
             let mut src = HashingReader::<H, _>::new(input);
             let (dst, path) = tempfile::Builder::new()
                 .tempfile_in(cache.as_ref())?
@@ -402,11 +370,14 @@ impl ContentProvider for HostCache {
             let file = IndexFile::from_file(&cache_path).await?;
             Ok((file, hash, size))
         } else {
-            let mut input = HashingReader::<H, _>::new(transport.open(url).await?);
+            let mut input = HashingReader::<H, _>::new(self.transport.open(url).await?);
             let file = IndexFile::read(unpacker_(url, &mut input).take(MAX_FILE_SIZE)).await?;
             let (hash, size) = input.into_hash_and_size();
             Ok((file, hash, size))
         }
+    }
+    fn transport(&self) -> &impl TransportProvider {
+        &self.transport
     }
     async fn resolve_path<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         smol::fs::canonicalize(self.base.join(path.as_ref())).await

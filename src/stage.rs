@@ -1,12 +1,12 @@
 use {
     crate::{
         artifact::Artifact,
-        cache::ContentProvider,
+        content::ContentProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
-        transport::{strip_comp_ext, TransportProvider},
         source::{RepositoryFile, Source},
         spec::LockedSource,
         staging::{StagingFile, StagingFileSystem},
+        transport::{strip_comp_ext},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
@@ -16,16 +16,14 @@ use {
 
 // COMMON
 
-pub async fn stage_sources<'a, FS, T, C>(
+pub async fn stage_sources<'a, FS, C>(
     sources: &[(&'a Source, &'a LockedSource)],
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem,
-    T: TransportProvider + ?Sized,
     C: ContentProvider,
 {
     fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
@@ -54,11 +52,10 @@ where
         );
         async move {
             let file = cache
-                .cached_index_file(
+                .fetch_index_file(
                     file.hash().clone(),
                     file.size(),
                     &source.file_url(file.path()),
-                    transport,
                 )
                 .await?;
             fs.create_file_from_bytes(file.as_bytes(), 0, 0, 0o644)
@@ -77,18 +74,16 @@ where
 
 // LOCAL
 
-pub async fn stage_local<'a, FS, T, C>(
+pub async fn stage_local<'a, FS, C>(
     installables: Vec<(&'a Source, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     stage_debs_local(
@@ -96,34 +91,23 @@ where
         installables.as_slice(),
         fs,
         concurrency,
-        transport,
         cache,
         pb.clone(),
     )
     .await?;
-    stage_artifacts_local(
-        artifacts.as_slice(),
-        fs,
-        concurrency,
-        transport,
-        cache,
-        pb.clone(),
-    )
-    .await?;
+    stage_artifacts_local(artifacts.as_slice(), fs, concurrency, cache, pb.clone()).await?;
     Ok(())
 }
 
-async fn stage_artifacts_local<'a, FS, T, C>(
+async fn stage_artifacts_local<'a, FS, C>(
     artifacts: &'a [&'a Artifact],
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
@@ -131,7 +115,7 @@ where
             let pb = pb.clone();
             async move {
                 let size = artifact.size();
-                let cached = cache.cached_artifact(artifact, transport).await?;
+                let cached = cache.fetch_artifact(artifact).await?;
                 fs.stage(cached).await?;
                 if let Some(pb) = &pb {
                     pb.inc(size);
@@ -142,18 +126,16 @@ where
         .await
 }
 
-async fn stage_debs_local<'a, C, FS, T>(
+async fn stage_debs_local<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
     packages: &'a [(&'a Source, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
@@ -162,9 +144,7 @@ where
             async move {
                 let url = source.file_url(file.path());
                 let size = file.size();
-                let deb = cache
-                    .cached_deb(file.hash().clone(), size, &url, transport)
-                    .await?;
+                let deb = cache.fetch_deb(file.hash().clone(), size, &url).await?;
                 let mut ctrl = fs.stage(deb).await?;
                 if let Some(pb) = &pb {
                     pb.inc(size);
@@ -228,18 +208,16 @@ where
 
 // THREAD SAFE
 //
-pub async fn stage<'a, FS, T, C>(
+pub async fn stage<'a, FS, C>(
     installables: Vec<(&'a Source, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Send + Clone + 'static,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     stage_debs(
@@ -247,33 +225,22 @@ where
         installables.as_slice(),
         fs,
         concurrency,
-        transport,
         cache,
         pb.clone(),
     )
     .await?;
-    stage_artifacts(
-        artifacts.as_slice(),
-        fs,
-        concurrency,
-        transport,
-        cache,
-        pb.clone(),
-    )
-    .await?;
+    stage_artifacts(artifacts.as_slice(), fs, concurrency, cache, pb.clone()).await?;
     Ok(())
 }
-async fn stage_artifacts<'a, FS, T, C>(
+async fn stage_artifacts<'a, FS, C>(
     artifacts: &'a [&'a Artifact],
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Clone + Send + 'static,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
@@ -282,7 +249,7 @@ where
             let size = artifact.size();
             let fs = fs.clone();
             async move {
-                let cached = cache.cached_artifact(artifact, transport).await?;
+                let cached = cache.fetch_artifact(artifact).await?;
                 blocking::unblock(move || smol::block_on(async move { fs.stage(cached).await }))
                     .await?;
                 if let Some(pb) = &pb {
@@ -294,18 +261,16 @@ where
         .await
 }
 
-async fn stage_debs<'a, C, FS, T>(
+async fn stage_debs<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
     packages: &'a [(&'a Source, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
-    transport: &T,
     cache: &C,
     pb: Option<ProgressBar>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Send + Clone + 'static,
-    T: TransportProvider + ?Sized,
     C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
@@ -316,12 +281,9 @@ where
             let hash = file.hash().clone();
             let fs = fs.clone();
             async move {
-                let deb = cache
-                    .cached_deb(hash, size, &url, transport)
-                    .await
-                    .map_err(|e| {
-                        io::Error::new(e.kind(), format!("Error getting deb {}: {}", &url, e))
-                    })?;
+                let deb = cache.fetch_deb(hash, size, &url).await.map_err(|e| {
+                    io::Error::new(e.kind(), format!("Error getting deb {}: {}", &url, e))
+                })?;
                 let ctrl = blocking::unblock(move || {
                     smol::block_on(async move {
                         let mut ctrl = fs.stage(deb).await?;
