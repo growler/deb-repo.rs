@@ -13,7 +13,7 @@ use {
         control::MutableControlStanza,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
-        repo::unpacker_,
+        transport::unpacker_,
         HostFileSystem, StagingFileSystem, TransportProvider,
     },
     futures::AsyncReadExt,

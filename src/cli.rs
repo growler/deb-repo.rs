@@ -2,7 +2,7 @@ use {
     crate::{
         cache::ContentProvider,
         packages::{InstallPriority, Package},
-        repo::TransportProvider,
+        transport::TransportProvider,
         source::{SnapshotId, SnapshotIdArgParser, Source},
         version::{Constraint, Dependency, Version},
         StagingFileSystem,

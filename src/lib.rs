@@ -9,14 +9,14 @@ pub mod comp;
 pub mod control;
 pub mod deb;
 pub mod hash;
-mod httprepo;
+mod httptransport;
 mod idmap;
 mod indexfile;
 mod manifest;
 mod manifest_doc;
 mod packages;
 mod release;
-mod repo;
+mod transport;
 mod sandbox;
 mod source;
 mod spec;
@@ -29,11 +29,11 @@ pub mod version;
 pub use {
     arch::DEFAULT_ARCH,
     builder::{BuildJob, Executor},
-    httprepo::{HttpCachingTransportProvider, HttpTransportProvider},
+    httptransport::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,
-    repo::TransportProvider,
+    transport::TransportProvider,
     sandbox::{
         maybe_run_sandbox, unshare_root, unshare_user_ns, HostSandboxExecutor, Sandbox,
         SandboxExecutor,

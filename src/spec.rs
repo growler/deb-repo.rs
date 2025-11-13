@@ -2,7 +2,7 @@ use {
     crate::{
         cache::ContentProvider,
         hash::Hash,
-        repo::TransportProvider,
+        transport::TransportProvider,
         version::{Constraint, Dependency},
         RepositoryFile, Source,
     },

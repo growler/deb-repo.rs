@@ -6,7 +6,7 @@ use {
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile},
         packages::Package,
-        repo::TransportProvider,
+        transport::TransportProvider,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
         staging::StagingFileSystem,

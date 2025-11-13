@@ -4,7 +4,7 @@ use {
         comp::{comp_reader, is_comp_ext, is_tar_ext, tar_reader},
         hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader},
         is_url,
-        repo::TransportProvider,
+        transport::TransportProvider,
         staging::{FileList, Stage},
         tar, StagingFile, StagingFileSystem,
     },

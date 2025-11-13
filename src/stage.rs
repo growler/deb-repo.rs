@@ -3,7 +3,7 @@ use {
         artifact::Artifact,
         cache::ContentProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
-        repo::{strip_comp_ext, TransportProvider},
+        transport::{strip_comp_ext, TransportProvider},
         source::{RepositoryFile, Source},
         spec::LockedSource,
         staging::{StagingFile, StagingFileSystem},
