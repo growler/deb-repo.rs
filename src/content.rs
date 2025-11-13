@@ -1,27 +1,28 @@
-use std::{future::Future, num::NonZero, path::PathBuf};
-
-use futures::{stream, TryStreamExt};
-
-pub use crate::indexfile::IndexFile;
-use crate::{
-    comp::strip_comp_ext, control::MutableControlFile, manifest::UniverseFiles, staging::Stage,
-    HttpTransportProvider, Packages, StagingFile,
-};
 use {
     crate::{
         artifact::Artifact,
+        comp::{comp_reader, strip_comp_ext},
+        control::MutableControlFile,
         control::MutableControlStanza,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
-        transport::unpacker_,
-        HostFileSystem, StagingFileSystem, TransportProvider,
+        indexfile::IndexFile,
+        manifest::UniverseFiles,
+        staging::Stage,
+        HostFileSystem, HttpTransport, Packages, StagingFile, StagingFileSystem, TransportProvider,
     },
-    futures::AsyncReadExt,
+    futures::{stream, TryStreamExt},
     smol::{
         fs,
-        io::{self, AsyncRead},
+        io::{self, AsyncRead, AsyncReadExt},
     },
-    std::{path::Path, pin::Pin, sync::Arc},
+    std::{
+        future::Future,
+        num::NonZero,
+        path::{Path, PathBuf},
+        pin::Pin,
+        sync::Arc,
+    },
 };
 
 pub trait ContentProvider {
@@ -107,14 +108,14 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
 }
 
 pub struct HostCache {
-    transport: HttpTransportProvider,
+    transport: HttpTransport,
     base: Arc<Path>,
     cache: Option<Arc<Path>>,
 }
 impl HostCache {
     pub fn new<B: AsRef<Path>, P: AsRef<Path>>(
         base: B,
-        transport: HttpTransportProvider,
+        transport: HttpTransport,
         cache: Option<P>,
     ) -> Self {
         Self {
@@ -331,7 +332,7 @@ impl ContentProvider for HostCache {
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
             let mut dst: smol::fs::File = dst.into();
-            io::copy(unpacker_(url, &mut src), &mut dst).await?;
+            io::copy(comp_reader(url, &mut src), &mut dst).await?;
             dst.sync_data().await?;
             smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
             path.persist(&cache_path)?;
@@ -340,7 +341,7 @@ impl ContentProvider for HostCache {
             Ok(file)
         } else {
             IndexFile::read(
-                unpacker_(
+                comp_reader(
                     url,
                     hash.verifying_reader(size, self.transport.open(url).await?),
                 )
@@ -360,7 +361,7 @@ impl ContentProvider for HostCache {
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
             let mut dst: smol::fs::File = dst.into();
-            io::copy(unpacker_(url, &mut src), &mut dst).await?;
+            io::copy(comp_reader(url, &mut src), &mut dst).await?;
             dst.sync_data().await?;
             let (hash, size) = src.into_hash_and_size();
             let cache_path = hash.store_name(Some(cache.as_ref()), 1);
@@ -371,7 +372,7 @@ impl ContentProvider for HostCache {
             Ok((file, hash, size))
         } else {
             let mut input = HashingReader::<H, _>::new(self.transport.open(url).await?);
-            let file = IndexFile::read(unpacker_(url, &mut input).take(MAX_FILE_SIZE)).await?;
+            let file = IndexFile::read(comp_reader(url, &mut input).take(MAX_FILE_SIZE)).await?;
             let (hash, size) = input.into_hash_and_size();
             Ok((file, hash, size))
         }

@@ -3,7 +3,7 @@ use {
     debrepo::{
         cli::{self, Command},
         content::HostCache,
-        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpTransportProvider, Manifest,
+        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpTransport, Manifest,
     },
     std::{
         num::NonZero,
@@ -131,7 +131,7 @@ impl cli::Config for App {
             }
             Ok(HostCache::new(
                 base,
-                HttpTransportProvider::new(self.insecure),
+                HttpTransport::new(self.insecure),
                 self.cache_dir.as_deref(),
             ))
         })

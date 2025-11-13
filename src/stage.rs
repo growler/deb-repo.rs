@@ -1,12 +1,12 @@
 use {
     crate::{
         artifact::Artifact,
+        comp::strip_comp_ext,
         content::ContentProvider,
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         source::{RepositoryFile, Source},
         spec::LockedSource,
         staging::{StagingFile, StagingFileSystem},
-        transport::{strip_comp_ext},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,

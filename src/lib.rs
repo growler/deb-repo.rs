@@ -9,7 +9,6 @@ pub mod content;
 pub mod control;
 pub mod deb;
 pub mod hash;
-mod httptransport;
 mod idmap;
 mod indexfile;
 mod manifest;
@@ -29,7 +28,6 @@ pub mod version;
 pub use {
     arch::DEFAULT_ARCH,
     builder::{BuildJob, Executor},
-    httptransport::{HttpCachingTransportProvider, HttpTransportProvider},
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,
@@ -39,7 +37,7 @@ pub use {
     },
     source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
-    transport::TransportProvider,
+    transport::{HttpTransport, TransportProvider},
     version::{Constraint, Dependency, Version},
 };
 

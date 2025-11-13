@@ -1,13 +1,18 @@
 use std::future::Future;
 
+use isahc::{
+    config::{Configurable, RedirectPolicy},
+    http::StatusCode,
+    HttpClient,
+};
+use once_cell::sync::Lazy;
 pub use url::Url;
+
+use crate::comp::comp_reader;
 
 use {
     crate::hash::{AsyncHashingRead, Hash},
-    async_compression::futures::bufread::{
-        BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
-    },
-    smol::io::{self, AsyncRead, BufReader},
+    smol::io::{self, AsyncRead},
     std::pin::Pin,
 };
 
@@ -35,45 +40,79 @@ pub trait TransportProvider: Sync + Send {
         &self,
         url: &str,
     ) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncRead + Send>>>> {
-        async move { Ok(unpacker(url, self.open(url).await?)) }
+        async move { Ok(comp_reader(url, self.open(url).await?)) }
     }
 }
 
-pub(crate) fn strip_comp_ext(str: &str) -> &str {
-    if let Some(pos) = str.rfind('.') {
-        match &str[pos + 1..] {
-            "xz" | "gz" | "bz2" | "lzma" | "zstd" | "zst" => &str[..pos],
-            _ => str,
-        }
+fn client(insecure: bool) -> &'static HttpClient {
+    static SHARED: Lazy<HttpClient> = Lazy::new(|| {
+        HttpClient::builder()
+            .redirect_policy(RedirectPolicy::Limit(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .build()
+            .expect("Failed to create HTTP client")
+    });
+    static SHARED_INSECURE: Lazy<HttpClient> = Lazy::new(|| {
+        use isahc::config::SslOption;
+        HttpClient::builder()
+            .redirect_policy(RedirectPolicy::Limit(10))
+            .timeout(std::time::Duration::from_secs(30))
+            .ssl_options(
+                SslOption::DANGER_ACCEPT_INVALID_CERTS
+                    | SslOption::DANGER_ACCEPT_REVOKED_CERTS
+                    | SslOption::DANGER_ACCEPT_INVALID_HOSTS,
+            )
+            .build()
+            .expect("Failed to create insecure HTTP client")
+    });
+    if insecure {
+        &SHARED_INSECURE
     } else {
-        str
+        &SHARED
     }
 }
 
-pub(crate) fn unpacker<'a>(
-    u: &str,
-    r: Pin<Box<dyn AsyncRead + Send + 'a>>,
-) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
-    match u.rsplit('.').next().unwrap_or("") {
-        "xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
-        "gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
-        "bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
-        "lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
-        "zstd" | "zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
-        _ => r,
+#[derive(Clone)]
+pub struct HttpTransport {
+    insecure: bool,
+}
+
+impl HttpTransport {
+    pub fn new(insecure: bool) -> Self {
+        Self { insecure }
     }
 }
 
-pub(crate) fn unpacker_<'a, R: AsyncRead + Send + 'a>(
-    u: &str,
-    r: R,
-) -> Pin<Box<dyn AsyncRead + Send + 'a>> {
-    match u.rsplit('.').next().unwrap_or("") {
-        "xz" => Box::pin(XzDecoder::new(BufReader::new(r))),
-        "gz" => Box::pin(GzipDecoder::new(BufReader::new(r))),
-        "bz2" => Box::pin(BzDecoder::new(BufReader::new(r))),
-        "lzma" => Box::pin(LzmaDecoder::new(BufReader::new(r))),
-        "zstd" | "zst" => Box::pin(ZstdDecoder::new(BufReader::new(r))),
-        _ => Box::pin(r),
+impl TransportProvider for HttpTransport {
+    async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+        let url = to_url(url)?;
+        match url.scheme() {
+            "http" | "https" => {
+                let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                match rsp.status() {
+                    StatusCode::OK => {
+                        Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send>>)
+                    }
+                    StatusCode::NOT_FOUND => {
+                        Err(io::Error::new(io::ErrorKind::NotFound, url.to_string()))
+                    }
+                    code => Err(io::Error::other(format!(
+                        "unexpected HTTP response {}",
+                        code
+                    ))),
+                }
+            }
+            "file" => Ok(Box::pin(smol::fs::File::open(url.path()).await?)),
+            s => Err(io::Error::other(format!("unsupported transport {}", s))),
+        }
     }
+}
+
+fn to_url(url: &str) -> io::Result<Url> {
+    Url::parse(url).map_err(|err| match err {
+        url::ParseError::RelativeUrlWithoutBase => {
+            io::Error::other(format!("expects absolute path: {}", url))
+        }
+        other => io::Error::other(format!("invalid URL {}: {}", url, other)),
+    })
 }
