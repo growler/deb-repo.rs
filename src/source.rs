@@ -576,7 +576,8 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
 
-    /// Allow the repository to be insecure (without checking release signature)
+    /// Allow the repository to be insecure (skip checking release signature)
+    #[arg(short = 'k', long = "allow-insecure", action)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_insecure: Option<bool>,
 
@@ -599,7 +600,7 @@ pub struct Source {
     pub suites: Vec<String>,
 
     /// Space separated list of components (i.e. "main", "contrib", "non-free", etc.)
-    #[arg(short = 'c', long = "components", value_name = "COMPONENT")]
+    #[arg(short = 'C', long = "components", value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 

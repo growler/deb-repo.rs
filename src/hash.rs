@@ -167,41 +167,65 @@ impl<D: HashAlgo> InnerHash<D> {
     }
     fn from_base64(value: &str) -> Result<Self, std::io::Error> {
         let mut inner = HashOutput::<D>::default();
+        let expected: usize = <D as OutputSizeUser>::output_size();
         match base64::engine::general_purpose::URL_SAFE_NO_PAD.decode_slice(value, &mut inner) {
-            Ok(n) if n == <D as OutputSizeUser>::output_size() => Ok(InnerHash { inner }),
-            Ok(n) => Err(base64::DecodeSliceError::DecodeError(
-                base64::DecodeError::InvalidLength(n),
+            Ok(n) if n == expected => Ok(InnerHash { inner }),
+            Ok(n) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "error decoding base64 digest, expected {} bytes, got {}",
+                    expected, n
+                ),
             )),
-            Err(err) => Err(err),
+            Err(err) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("error decoding base64 digest: {}", err),
+            )),
         }
-        .map_err(|err| std::io::Error::other(format!("error decoding base64 digest: {}", err)))
     }
     fn to_base64(&self) -> String {
         base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(&self.inner)
     }
     fn from_sri(value: &str) -> std::io::Result<Self> {
         let mut parts = value.splitn(2, '-');
-        let name = parts
-            .next()
-            .ok_or_else(|| std::io::Error::other("missing hash name"))?;
-        let b64 = parts
-            .next()
-            .ok_or_else(|| std::io::Error::other("missing base64 digest"))?;
+        let name = parts.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "error decoding SRI hash: missing hash name",
+            )
+        })?;
+        let b64 = parts.next().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "error decoding SRI hash: missing base64 digest",
+            )
+        })?;
         if name != D::SRI_NAME {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
-                format!("invalid hash name {}, expected {}", name, D::SRI_NAME),
+                format!(
+                    "error decoding SRI hash: invalid hash name {}, expected {}",
+                    name,
+                    D::SRI_NAME
+                ),
             ));
         }
         let mut inner = HashOutput::<D>::default();
+        let expected: usize = <D as OutputSizeUser>::output_size();
         match base64::engine::general_purpose::STANDARD.decode_slice(b64, &mut inner) {
-            Ok(n) if n == <D as OutputSizeUser>::output_size() => Ok(InnerHash { inner }),
-            Ok(n) => Err(base64::DecodeSliceError::DecodeError(
-                base64::DecodeError::InvalidLength(n),
+            Ok(n) if n == expected => Ok(InnerHash { inner }),
+            Ok(n) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "error decoding SRI hash: expected {} bytes, got {}",
+                    expected, n
+                ),
             )),
-            Err(err) => Err(err),
+            Err(err) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("error decoding SRI hash: base64 error: {}", err),
+            )),
         }
-        .map_err(|err| std::io::Error::other(format!("error decoding base64 digest: {}", err)))
     }
     fn to_sri(&self) -> String {
         format!(
@@ -310,7 +334,7 @@ impl Hash {
         delegate_block! { hash => hash_name {
                 Ok(Self::hashing_reader::<D, _>(reader))
             } or |err| {
-                Err(std::io::Error::other(format!("hash {} not supported", err)))
+                Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("hash {} not supported", err)))
             }
         }
     }
@@ -774,19 +798,25 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Send> AsyncRead for VerifyingR
                 this.digester.update(&buf[0..size]);
                 *this.read += size as u64;
                 if this.read > this.size {
-                    Err(std::io::Error::other(format!(
-                        "unexpected stream size {} (expected {})",
-                        this.read, this.size
-                    )))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "error verifying stream: expected {}, got {} bytes",
+                            this.size, this.read
+                        ),
+                    ))
                 } else {
                     Ok(size)
                 }
             } else if this.read < this.size {
                 // size == 0, EOF
-                Err(std::io::Error::other(format!(
-                    "unexpected stream size {} (expected {})",
-                    this.read, this.size
-                )))
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "error verifying stream: expected {}, got {} bytes",
+                        this.size, this.read
+                    ),
+                ))
             } else if this.read == this.size {
                 // size == 0, EOF
                 *this.read += 1;
@@ -794,12 +824,15 @@ impl<D: HashAlgo + Default + Send, R: AsyncRead + Send> AsyncRead for VerifyingR
                 if this.digest == &digest {
                     Ok(0)
                 } else {
-                    Err(std::io::Error::other(format!(
-                        "unexpected stream {} `{}` (expected `{}`)",
-                        D::NAME,
-                        hex::encode(&digest),
-                        hex::encode(&this.digest),
-                    )))
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "error verifying stream by {}: expected `{}`, got `{}`",
+                            D::NAME,
+                            hex::encode(&this.digest),
+                            hex::encode(&digest),
+                        ),
+                    ))
                 }
             } else {
                 // size = 0, EOF
@@ -874,8 +907,8 @@ mod tests {
 
             // Reading to the end should result in a digest verification error
             let err = reader.read(&mut buf).await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::Other);
-            assert!(err.to_string().contains("unexpected stream digest"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("error verifying stream by"));
         }
     }
 
@@ -897,8 +930,8 @@ mod tests {
 
             // Reading to the end should result in a size mismatch error
             let err = reader.read(&mut buf).await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::Other);
-            assert!(err.to_string().contains("unexpected stream size"));
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
+            assert!(err.to_string().contains("error verifying stream:"));
         }
     }
 }

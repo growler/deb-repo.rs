@@ -1,7 +1,7 @@
 use criterion::{criterion_group, criterion_main, Criterion};
 use debrepo::{
-    content::IndexFile, control::ControlParser, hash::Hash, universe::Universe,
-    version::Dependency, Package, Packages,
+    content::IndexFile, control::ControlParser, hash::Hash, universe::Universe, Dependency,
+    Package, Packages,
 };
 use std::path::PathBuf;
 

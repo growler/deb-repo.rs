@@ -15,7 +15,7 @@ mod manifest;
 mod manifest_doc;
 mod packages;
 mod release;
-mod sandbox;
+pub mod sandbox;
 mod source;
 mod spec;
 mod stage;
@@ -23,8 +23,10 @@ mod staging;
 pub mod tar;
 mod transport;
 pub mod universe;
-pub mod version;
+mod version;
 mod kvlist;
+pub mod error;
+pub mod exec;
 
 pub use {
     arch::DEFAULT_ARCH,
@@ -32,14 +34,10 @@ pub use {
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,
-    sandbox::{
-        maybe_run_sandbox, unshare_root, unshare_user_ns, HostSandboxExecutor, Sandbox,
-        SandboxExecutor,
-    },
     source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
     transport::{HttpTransport, TransportProvider},
-    version::{Constraint, Dependency, Version},
+    version::{Constraint, Dependency, Version, VersionSet},
 };
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {

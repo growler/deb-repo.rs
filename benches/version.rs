@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, Criterion};
-use debrepo::version::Version;
+use debrepo::Version;
 
 macro_rules! bench {
     ($c:expr, $left:tt $op:tt $right:tt) => {{

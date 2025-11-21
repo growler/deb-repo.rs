@@ -1,19 +1,21 @@
-use itertools::Itertools;
-
+use crate::deb::DebReader;
 pub use crate::indexfile::IndexFile;
-pub use crate::manifest::UniverseFiles;
 use {
     crate::{
         artifact::Artifact,
         comp::{comp_reader, strip_comp_ext},
-        control::MutableControlFile,
-        control::MutableControlStanza,
+        control::{MutableControlFile, MutableControlStanza},
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
+        packages::Packages,
+        source::{RepositoryFile, Source},
+        spec::LockedSource,
         staging::Stage,
-        HostFileSystem, HttpTransport, Packages, StagingFile, StagingFileSystem, TransportProvider,
+        staging::{HostFileSystem, StagingFile, StagingFileSystem},
+        transport::{HttpTransport, TransportProvider},
     },
     futures::{stream, TryStreamExt},
+    itertools::Itertools,
     smol::{
         fs,
         io::{self, AsyncRead, AsyncReadExt},
@@ -47,6 +49,10 @@ pub trait ContentProvider {
             Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
         >,
     >;
+    fn ensure_deb(
+        &self,
+        path: &str,
+    ) -> impl Future<Output = io::Result<(MutableControlStanza, Hash, u64)>>;
     fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
@@ -80,6 +86,69 @@ pub trait ContentProvider {
     >;
     fn transport(&self) -> &impl TransportProvider;
     fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
+}
+
+pub struct UniverseFiles<'a> {
+    sources: &'a [Source],
+    locked: &'a [Option<LockedSource>],
+}
+impl<'a> UniverseFiles<'a> {
+    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
+        UniverseFiles { sources, locked }
+    }
+    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
+        self.sources
+            .iter()
+            .zip(self.locked.iter())
+            .map(|(source, locked)| {
+                if let Some(locked) = locked.as_ref() {
+                    Ok((source, locked))
+                } else {
+                    Err(std::io::Error::other(
+                        "lock file is missed or outdated, run update",
+                    ))
+                }
+            })
+            .map_ok(|(src, locked)| {
+                locked.suites.iter().flat_map(move |suite| {
+                    std::iter::once((src, &suite.release))
+                        .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                })
+            })
+            .flatten_ok()
+    }
+    pub fn sources(&self) -> MutableControlFile {
+        self.sources
+            .iter()
+            .fold(MutableControlFile::new(), |mut ctrl, src| {
+                ctrl.add(Into::<MutableControlStanza>::into(src));
+                ctrl
+            })
+    }
+    pub fn sources_hash(&self) -> (MutableControlFile, Hash) {
+        let mut sources = MutableControlFile::new();
+        let mut digester = blake3::Hasher::new();
+        self.sources
+            .iter()
+            .zip(self.locked.iter())
+            .flat_map(|(src, locked)| {
+                sources.add(Into::<MutableControlStanza>::into(src));
+                locked.as_ref().into_iter().flat_map(move |locked| {
+                    locked.suites.iter().flat_map(move |suite| {
+                        std::iter::once((src, &suite.release))
+                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                    })
+                })
+            })
+            .for_each(|(_, file)| {
+                digester.update(file.hash.as_ref());
+            });
+        digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
+        (sources, digester.into_hash())
+    }
+    pub fn hash(&self) -> Hash {
+        self.sources_hash().1
+    }
 }
 
 pub struct UniverseFilesStage<FS: StagingFileSystem + ?Sized> {
@@ -212,6 +281,18 @@ impl ContentProvider for HostCache {
                         + 'static,
                 >)
         }
+    }
+    async fn ensure_deb(&self, path: &str) -> io::Result<(MutableControlStanza, Hash, u64)> {
+        let file_path = self.base.join(path);
+        let file = smol::fs::File::open(&file_path).await?;
+        let mut rdr = HashingReader::<sha2::Sha256, _>::new(file);
+        let mut deb = DebReader::new(&mut rdr);
+        let mut ctrl = deb.extract_control().await?;
+        let (hash, size) = rdr.into_hash_and_size();
+        ctrl.set("Filename", path.to_string());
+        ctrl.set("Sha256", hash.to_hex());
+        ctrl.set("Size", size.to_string());
+        Ok((ctrl, hash, size))
     }
     async fn ensure_artifact(&self, artifact: &mut Artifact) -> io::Result<()> {
         if artifact.is_local() {

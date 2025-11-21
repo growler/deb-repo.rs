@@ -57,6 +57,10 @@ Examples:
         #[arg(long)]
         pub force: bool,
 
+        /// Comment to add to the manifest file
+        #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+        comment: Option<String>,
+
         /// Package to add (can be used multiple times)
         #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
         requirements: Vec<String>,
@@ -89,7 +93,7 @@ Examples:
                 let mut mf = Manifest::from_sources(
                     conf.arch(),
                     sources.iter().cloned(),
-                    comment.as_deref(),
+                    self.comment.as_deref().or(comment.as_deref()),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
                 mf.update(true, conf.concurrency(), fetcher).await?;
@@ -100,6 +104,155 @@ Examples:
             })
         }
     }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Adds a source",
+        long_about = "Add a source to the manifest file."
+    )]
+    pub struct AddSource {
+        #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+        comment: Option<String>,
+        #[command(flatten)]
+        source: Source,
+    }
+    impl<C: Config> Command<C> for AddSource {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.add_source(self.source.clone(), self.comment.as_deref())?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
+                mf.store(conf.manifest()).await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Remove requirements or constraints from a spec",
+        long_about = "Remove requirements and/or constraints from a spec
+Use --requirements-only or --constraints-only to limit the operation scope."
+    )]
+    pub struct AddLocalPackage {
+        #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+        comment: Option<String>,
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    }
+    impl<C: Config> Command<C> for AddLocalPackage {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
+                mf.store(conf.manifest()).await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum AddCommands {
+        Source(AddSource),
+        Local(AddLocalPackage),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Adds a source or a local package")]
+    pub struct Add {
+        #[command(subcommand)]
+        cmd: AddCommands,
+    }
+    impl<C: Config> Command<C> for Add {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                AddCommands::Source(cmd) => cmd.exec(conf),
+                AddCommands::Local(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Remove a source",
+        long_about = "Remove a source from the manifest file."
+    )]
+    pub struct RemoveSource {
+        #[command(flatten)]
+        source: Source,
+    }
+    impl<C: Config> Command<C> for RemoveSource {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
+                mf.store(conf.manifest()).await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Remove local package",
+        long_about = "Remove a local package from the manifest file."
+    )]
+    pub struct RemoveLocalPackage {
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+    }
+    impl<C: Config> Command<C> for RemoveLocalPackage {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
+                mf.store(conf.manifest()).await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum RemoveCommands {
+        Source(AddSource),
+        Local(AddLocalPackage),
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Remove requirements or constraints from a spec",
+        long_about = "Remove requirements and/or constraints from a spec
+Use --requirements-only or --constraints-only to limit the operation scope."
+    )]
+    pub struct Remove {
+        #[command(subcommand)]
+        cmd: RemoveCommands,
+    }
+    impl<C: Config> Command<C> for Remove {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                RemoveCommands::Source(cmd) => cmd.exec(conf),
+                RemoveCommands::Local(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
     #[derive(Parser)]
     #[command(
         about = "Remove requirements or constraints from a spec",
@@ -218,11 +371,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     #[command(
         about = "Add package requirements to a spec",
-        long_about = "Add one or more package requirements to a spec. Each requirement can be a bare name or set, and can include a version relation, e.g.:
+        long_about = "Add one or more package requirements to a spec. Each requirement can be a bare package name or a set, and can include a version relation, e.g.:
   foo
   foo (= 1.2.3)
   bar (>= 2.0)
-  foo | bar (<< 3.0)"
+  foo | bar (<< 3.0)
+
+  Alternatively, requirement might be a path to .deb file to include directly."
     )]
     pub struct Include {
         /// Target spec (omit to use the default spec)

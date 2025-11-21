@@ -1,11 +1,11 @@
-use crate::{hash::HashAlgo, source::SnapshotId};
+use crate::{control::MutableControlStanza, hash::HashAlgo, source::SnapshotId};
 
 use {
     crate::{
         artifact::Artifact,
         hash::Hash,
         kvlist::{KVList, KVListSet},
-        source::{Snapshot, Source},
+        source::{RepositoryFile, Snapshot, Source},
         spec::*,
         version::{Constraint, Dependency},
     },
@@ -48,6 +48,9 @@ pub struct ManifestFile {
     #[serde(default, rename = "source", skip_serializing_if = "Vec::is_empty")]
     sources: Vec<Source>,
 
+    #[serde(default, rename = "local", skip_serializing_if = "Vec::is_empty")]
+    local_pkgs: Vec<RepositoryFile>,
+
     // an index mapping packages files to their sources in `sources`
     #[serde(default, skip)]
     sources_pkgs: Vec<usize>,
@@ -78,6 +81,12 @@ enum DFSNodeState {
     Done,
 }
 
+pub enum UpdateOp {
+    None,
+    Add,
+    Update(usize),
+}
+
 fn sources_pkgs(sources: &[Source]) -> Vec<usize> {
     sources
         .iter()
@@ -96,6 +105,7 @@ impl ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
             sources: Vec::new(),
             sources_pkgs: Vec::new(),
+            local_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
@@ -109,6 +119,7 @@ impl ManifestFile {
             doc,
             sources_pkgs: sources_pkgs(&sources),
             sources,
+            local_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
@@ -158,6 +169,7 @@ impl ManifestFile {
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
             sources: self.sources().iter().map(|_| None).collect(),
+            local_pkgs: self.local_pkgs().iter().map(|_| None).collect(),
             specs: self
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
@@ -387,13 +399,35 @@ impl ManifestFile {
     pub fn sources(&self) -> &'_ [Source] {
         &self.sources
     }
+    pub fn sources_mut(&mut self) -> &'_ mut [Source] {
+        &mut self.sources
+    }
+    pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
+        &self.local_pkgs
+    }
     pub fn sources_pkgs(&self) -> &'_ [usize] {
         &self.sources_pkgs
     }
-    pub fn add_source(&mut self, source: Source, comment: Option<&str>) {
-        self.doc.push_sources(std::iter::once(&source), comment);
-        self.sources.push(source);
-        self.sources_pkgs = sources_pkgs(&self.sources);
+    pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> UpdateOp {
+        if let Some((i, src)) = self
+            .sources
+            .iter_mut()
+            .enumerate()
+            .find(|(_, s)| s.url == source.url)
+        {
+            if src == &source {
+                return UpdateOp::None;
+            }
+            self.doc.update_source(i, &source, comment);
+            *src = source;
+            self.sources_pkgs = sources_pkgs(&self.sources);
+            UpdateOp::Update(i)
+        } else {
+            self.doc.push_sources(std::iter::once(&source), comment);
+            self.sources.push(source);
+            self.sources_pkgs = sources_pkgs(&self.sources);
+            UpdateOp::Add
+        }
     }
     pub fn remove_source(&mut self, index: usize) -> Source {
         self.doc.drop_source(index);
@@ -588,6 +622,7 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> H
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     sources: Vec<Option<LockedSource>>,
+    local_pkgs: Vec<Option<MutableControlStanza>>,
     specs: KVList<LockedSpec>,
     #[serde(skip, default)]
     universe_hash: Option<Hash>,
@@ -599,6 +634,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             sources: Vec::new(),
+            local_pkgs: Vec::new(),
             specs: KVList::new(),
         }
     }
@@ -606,6 +642,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             sources: vec![None; sources],
+            local_pkgs: Vec::new(),
             specs: KVList::new(),
         }
     }
@@ -640,6 +677,7 @@ impl LockFile {
                     arch: String,
                     hash: Hash,
                     sources: Vec<LockedSource>,
+                    locals: Vec<Option<MutableControlStanza>>,
                     specs: KVList<LockedSpec>,
                 }
                 r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
@@ -655,6 +693,7 @@ impl LockFile {
                             Some(LockFile {
                                 universe_hash: Some(universe_hash(lock.sources.iter())),
                                 sources: lock.sources.into_iter().map(Some).collect(),
+                                local_pkgs: lock.locals,
                                 specs: lock.specs,
                             })
                         } else {
@@ -975,6 +1014,11 @@ pub(crate) trait ManifestDoc {
             .as_array_of_tables_mut()
             .expect("a list of sources")
     }
+    fn get_local_packages(&mut self) -> &mut toml_edit::ArrayOfTables {
+        self.get_doc_entry_mut("local", toml_edit::array)
+            .as_array_of_tables_mut()
+            .expect("a list of local packages")
+    }
     fn get_spec_table_mut(&mut self, spec_name: &str) -> &mut toml_edit::Table {
         if spec_name.is_empty() {
             self.get_doc_entry_mut("spec", toml_edit::table)
@@ -1078,6 +1122,28 @@ pub(crate) trait ManifestDoc {
             .expect("a table of artifacts");
         artifacts.remove(uri);
     }
+    fn update_source(&mut self, index: usize, source: &Source, comment: Option<&str>) {
+        let sources_arr = self.get_sources();
+        let mut source_table = toml_edit::ser::to_document(source)
+            .expect("failed to serialize table")
+            .into_table();
+        let comment = toml_edit::RawString::from(if index == 0 {
+            comment
+                .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                .unwrap_or_default()
+        } else {
+            format!(
+                "\n{}",
+                comment
+                    .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                    .unwrap_or_default()
+            )
+        });
+        source_table.decor_mut().set_prefix(comment);
+        if let Some(table) = sources_arr.get_mut(index) {
+            *table = source_table;
+        }
+    }
     fn push_sources<'a, I: Iterator<Item = &'a Source> + 'a>(
         &mut self,
         sources: I,
@@ -1151,6 +1217,10 @@ impl ManifestDoc for toml_edit::DocumentMut {
             .or_insert_with(toml_edit::array)
             .as_array_of_tables()
             .expect("a list of sources");
+        self.entry("local")
+            .or_insert_with(toml_edit::array)
+            .as_array_of_tables()
+            .expect("a list of local packages");
         self.entry("artifact")
             .or_insert_with(toml_edit::table)
             .as_table_mut()
@@ -1172,9 +1242,10 @@ impl ManifestDoc for toml_edit::DocumentMut {
         fn entry_order(entry: &str) -> u8 {
             match entry {
                 "source" => 0,
-                "artifact" => 1,
-                "spec" => 2,
-                _ => 3,
+                "local" => 1,
+                "artifact" => 2,
+                "spec" => 3,
+                _ => 4,
             }
         }
         self.sort_values_by(|k1, _, k2, _| entry_order(k1).cmp(&entry_order(k2)));

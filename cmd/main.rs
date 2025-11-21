@@ -3,7 +3,9 @@ use {
     debrepo::{
         cli::{self, Command},
         content::HostCache,
-        maybe_run_sandbox, HostFileSystem, HostSandboxExecutor, HttpTransport, Manifest,
+        exec::maybe_run_helper,
+        sandbox::{run_sandbox, HostSandboxExecutor},
+        HostFileSystem, HttpTransport, Manifest,
     },
     std::{
         num::NonZero,
@@ -17,6 +19,7 @@ use {
 #[derive(Parser)]
 #[command(
     version,
+    next_line_help = false,
     about = "Bootstrap Debian-based system tree from a manifest file",
     long_about = "Bootstrap a Debian root filesystem from a manifest file.
 This tool resolves packages from configured repositories, locks and updates
@@ -142,12 +145,13 @@ debrepo::cli_commands! {
     enum Commands<App> {
         Init(cli::cmd::Init),
         Update(cli::cmd::Update),
-        Build(cli::cmd::Build),
+        Add(cli::cmd::Add),
         Include(cli::cmd::Include),
         Exclude(cli::cmd::Exclude),
         Drop(cli::cmd::Drop),
         Stage(cli::cmd::Stage),
         Unstage(cli::cmd::Unstage),
+        Build(cli::cmd::Build),
         List(cli::cmd::List),
         Search(cli::cmd::Search),
         Show(cli::cmd::Show),
@@ -187,7 +191,7 @@ fn init_logging(quiet: bool, debug: u8) {
 }
 
 fn main() -> ExitCode {
-    maybe_run_sandbox::<HostSandboxExecutor>();
+    maybe_run_helper(run_sandbox::<HostSandboxExecutor>);
     let mut app = App::parse();
     init_logging(app.quiet, app.debug);
     if !app.no_cache {

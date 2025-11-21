@@ -45,7 +45,7 @@ where
     )
     .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| {
         let target = format!(
-            "./etc/apt/sources.list.d/{}.list",
+            "./var/lib/apt/lists/{}",
             strip_comp_ext(
                 &crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
             )
@@ -75,7 +75,7 @@ where
 // LOCAL
 
 pub async fn stage_local<'a, FS, C>(
-    installables: Vec<(&'a Source, &'a RepositoryFile)>,
+    installables: Vec<(Option<&'a Source>, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
@@ -128,7 +128,7 @@ where
 
 async fn stage_debs_local<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(&'a Source, &'a RepositoryFile)],
+    packages: &'a [(Option<&'a Source>, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -142,7 +142,11 @@ where
         .map(|(source, file)| {
             let pb = pb.clone();
             async move {
-                let url = source.file_url(file.path());
+                let url = if let Some(source) = source {
+                    source.file_url(file.path())
+                } else {
+                    file.path().to_string()
+                };
                 let size = file.size();
                 let deb = cache.fetch_deb(file.hash().clone(), size, &url).await?;
                 let mut ctrl = fs.stage(deb).await?;
@@ -209,7 +213,7 @@ where
 // THREAD SAFE
 //
 pub async fn stage<'a, FS, C>(
-    installables: Vec<(&'a Source, &'a RepositoryFile)>,
+    installables: Vec<(Option<&'a Source>, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
@@ -263,7 +267,7 @@ where
 
 async fn stage_debs<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(&'a Source, &'a RepositoryFile)],
+    packages: &'a [(Option<&'a Source>, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -276,7 +280,11 @@ where
     let new_installed = stream::iter(packages)
         .map(|(source, file)| {
             let pb = pb.clone();
-            let url = source.file_url(file.path());
+            let url = if let Some(source) = source {
+                source.file_url(file.path())
+            } else {
+                file.path().to_string()
+            };
             let size = file.size();
             let hash = file.hash().clone();
             let fs = fs.clone();

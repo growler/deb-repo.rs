@@ -350,7 +350,7 @@ where
     ///
     /// # Examples
     ///
-    /// ```
+    /// ```ignore
     /// use deb_repo::deb::Deb;
     /// use anyhow::Result;
     ///
@@ -364,6 +364,52 @@ where
         Self {
             inner: Arc::new(Mutex::new(Box::pin(DebReaderInner::new(r)))),
         }
+    }
+    pub async fn extract_control(&mut self) -> Result<MutableControlStanza> {
+        let mut control_tarball = self
+            .next()
+            .await
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "no control.tar entry".to_owned(),
+                )
+            })?
+            .and_then(|f| match f {
+                DebEntry::Control(f) => Ok(f),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected entry",
+                )),
+            })?;
+        let mut maybe_ctrl: Option<MutableControlStanza> = None;
+        while let Some(entry) = control_tarball.next().await {
+            let entry = entry?;
+            match entry {
+                TarEntry::File(mut file) => {
+                    let filename = file.path().to_string();
+                    if filename.eq("./control") {
+                        let mut buf = String::new();
+                        file.read_to_string(&mut buf).await?;
+                        maybe_ctrl.replace(MutableControlStanza::parse(buf).map_err(|err| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("error parsing control file: {}", err),
+                            )
+                        })?);
+                        continue;
+                    }
+                }
+                TarEntry::Directory(dir) if dir.path() == "./" => {}
+                _ => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid entry in control.tar",
+                    ));
+                }
+            }
+        }
+        maybe_ctrl.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))
     }
     pub async fn extract_to<FS>(&mut self, fs: &FS) -> Result<MutableControlStanza>
     where

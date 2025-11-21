@@ -1,10 +1,9 @@
 use {
     crate::{
         artifact::{Artifact, ArtifactArg},
-        content::ContentProvider,
-        control::{MutableControlFile, MutableControlStanza},
+        content::{ContentProvider, UniverseFiles},
         hash::{Hash, HashAlgo},
-        manifest_doc::{spec_display_name, LockFile, ManifestFile},
+        manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateOp},
         packages::Package,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
@@ -26,69 +25,6 @@ pub struct Manifest {
     lock: LockFile,
     lock_updated: bool,
     universe: Option<Box<Universe>>,
-}
-
-pub struct UniverseFiles<'a> {
-    sources: &'a [Source],
-    locked: &'a [Option<LockedSource>],
-}
-impl<'a> UniverseFiles<'a> {
-    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
-        UniverseFiles { sources, locked }
-    }
-    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
-        self.sources
-            .iter()
-            .zip(self.locked.iter())
-            .map(|(source, locked)| {
-                if let Some(locked) = locked.as_ref() {
-                    Ok((source, locked))
-                } else {
-                    Err(std::io::Error::other(
-                        "lock file is missed or outdated, run update",
-                    ))
-                }
-            })
-            .map_ok(|(src, locked)| {
-                locked.suites.iter().flat_map(move |suite| {
-                    std::iter::once((src, &suite.release))
-                        .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
-                })
-            })
-            .flatten_ok()
-    }
-    pub fn sources(&self) -> MutableControlFile {
-        self.sources
-            .iter()
-            .fold(MutableControlFile::new(), |mut ctrl, src| {
-                ctrl.add(Into::<MutableControlStanza>::into(src));
-                ctrl
-            })
-    }
-    pub fn sources_hash(&self) -> (MutableControlFile, Hash) {
-        let mut sources = MutableControlFile::new();
-        let mut digester = blake3::Hasher::new();
-        self.sources
-            .iter()
-            .zip(self.locked.iter())
-            .flat_map(|(src, locked)| {
-                sources.add(Into::<MutableControlStanza>::into(src));
-                locked.as_ref().into_iter().flat_map(move |locked| {
-                    locked.suites.iter().flat_map(move |suite| {
-                        std::iter::once((src, &suite.release))
-                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
-                    })
-                })
-            })
-            .for_each(|(_, file)| {
-                digester.update(file.hash.as_ref());
-            });
-        digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
-        (sources, digester.into_hash())
-    }
-    pub fn hash(&self) -> Hash {
-        self.sources_hash().1
-    }
 }
 
 ///
@@ -184,14 +120,15 @@ impl Manifest {
         })
     }
     pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> io::Result<()> {
-        if self.file.sources().iter().any(|s| s.url == source.url) {
-            return Err(io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("source {} already exists", source.url),
-            ));
+        match self.file.add_source(source, comment) {
+            UpdateOp::None => return Ok(()),
+            UpdateOp::Add => {
+                self.lock.push_source(None);
+            }
+            UpdateOp::Update(i) => {
+                self.lock.invalidate_source(i);
+            }
         }
-        self.file.add_source(source, comment);
-        self.lock.push_source(None);
         self.mark_file_updated();
         self.lock
             .specs_mut()
@@ -225,23 +162,29 @@ impl Manifest {
     pub fn installables<'a>(
         &'a self,
         name: Option<&'a str>,
-    ) -> io::Result<impl Iterator<Item = io::Result<(&'a Source, usize, &'a RepositoryFile)>> + 'a>
-    {
+    ) -> io::Result<
+        impl Iterator<Item = io::Result<(Option<&'a Source>, usize, &'a RepositoryFile)>> + 'a,
+    > {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
         Ok(self
             .valid_lock(spec_name, spec_index)?
             .installables()
             .map(move |p| {
-                let src = self.file.get_source(p.src as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid source index {} in spec {}",
-                            p.src,
-                            spec_display_name(spec_name)
-                        ),
-                    )
-                })?;
+                let src = p
+                    .src
+                    .map(|id| {
+                        self.file.get_source(id as usize).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid source index {} in spec {}",
+                                    id,
+                                    spec_display_name(spec_name)
+                                ),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 Ok::<_, io::Error>((src, p.order as usize, &p.file))
             }))
     }
@@ -555,7 +498,7 @@ impl Manifest {
                             },
                             idx: solvable.into(),
                             order: order as u32,
-                            src: src as u32,
+                            src: Some(src as u32),
                             name,
                         })
                     })
@@ -655,7 +598,7 @@ impl Manifest {
         spec_name: &str,
         spec_index: usize,
     ) -> io::Result<(
-        Vec<(&'a Source, &'a RepositoryFile)>,
+        Vec<(Option<&'a Source>, &'a RepositoryFile)>,
         Vec<String>,
         Vec<Vec<String>>,
     )> {
@@ -665,16 +608,21 @@ impl Manifest {
         let installables = lock
             .installables()
             .map(|p| {
-                let src = self.file.get_source(p.src as usize).ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "invalid source index {} in spec {}",
-                            p.src,
-                            spec_display_name(spec_name)
-                        ),
-                    )
-                })?;
+                let src = p
+                    .src
+                    .map(|id| {
+                        self.file.get_source(id as usize).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "invalid source index {} in spec {}",
+                                    id,
+                                    spec_display_name(spec_name)
+                                ),
+                            )
+                        })
+                    })
+                    .transpose()?;
                 if p.order == 0 {
                     essentials.push(p.name.clone());
                 } else {
@@ -695,12 +643,12 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        Vec<(&'a Source, &'a LockedSource)>,   // sources
-        Vec<&'a Artifact>,                     // artifacts
-        Vec<(&'a Source, &'a RepositoryFile)>, // installables
-        Vec<String>,                           // essentials
-        Vec<Vec<String>>,                      // prioritized packages
-        Vec<String>,                           // scripts
+        Vec<(&'a Source, &'a LockedSource)>,           // sources
+        Vec<&'a Artifact>,                             // artifacts
+        Vec<(Option<&'a Source>, &'a RepositoryFile)>, // installables
+        Vec<String>,                                   // essentials
+        Vec<Vec<String>>,                              // prioritized packages
+        Vec<String>,                                   // scripts
         Option<ProgressBar>,
     )>
     where

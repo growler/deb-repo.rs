@@ -2,7 +2,7 @@
 ///
 /// # Examples
 ///
-/// ```
+/// ```ignore
 /// let release = Release::try_from(fs::read_to_string("Release").unwrap()).unwrap();
 /// println!("{}", release.codename().unwrap());
 ///

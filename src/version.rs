@@ -656,15 +656,24 @@ impl<'a, R> Iterator for DependencyRefIterator<'a, R> {
     }
 }
 
+/// A version set of a package.
 #[derive(Serialize, Deserialize, Clone)]
 pub enum VersionSet<V> {
+    /// Any version of the package.
     Any,
+    /// Any version that is strictly earlier than the given version. ( "<< 1.0")
     StrictlyEarlierThan(V),
+    /// Any version that is earlier than or equal to the given version. ( "<= 1.0")
     EarlierOrEqualThan(V),
+    /// An exact version. ( "= 1.0")
     Exactly(V),
+    /// Any version except the given version. There is no debian syntax for this.
     Except(V),
+    /// Any version that is later than or equal to the given version. ( ">= 1.0")
     LaterOrEqualThan(V),
+    /// Any version that is strictly later than the given version. (">> 1.0")
     StrictlyLaterThan(V),
+    /// None version of the package.
     None,
 }
 
@@ -850,6 +859,21 @@ impl<V> VersionSet<V> {
             | Self::StrictlyLaterThan(version) => Some(version),
         }
     }
+    pub fn from<OtherV>(other: &VersionSet<OtherV>) -> Self
+    where
+        for<'a> &'a OtherV: Into<V>,
+    {
+       match other {
+            VersionSet::Any => VersionSet::Any,
+            VersionSet::StrictlyEarlierThan(v) => VersionSet::StrictlyEarlierThan(v.into()),
+            VersionSet::EarlierOrEqualThan(v) => VersionSet::EarlierOrEqualThan(v.into()),
+            VersionSet::Exactly(v) => VersionSet::Exactly(v.into()),
+            VersionSet::Except(v) => VersionSet::Except(v.into()),
+            VersionSet::LaterOrEqualThan(v) => VersionSet::LaterOrEqualThan(v.into()),
+            VersionSet::StrictlyLaterThan(v) => VersionSet::StrictlyLaterThan(v.into()),
+            VersionSet::None => VersionSet::None,
+        }
+    }
     pub fn translate<OtherV, TV>(&self, tv: TV) -> VersionSet<OtherV>
     where
         TV: FnMut(&V) -> OtherV,
@@ -887,6 +911,14 @@ impl<'a> Version<&'a str> {
 }
 
 impl<V> Version<V> {
+    pub fn from<OtherV>(other: &Version<OtherV>) -> Self
+    where
+        for<'a> &'a OtherV: Into<V>,
+    {
+        Version {
+            inner: (&other.inner).into(),
+        }
+    }
     pub(crate) fn translate<OtherV, TV>(&self, tv: TV) -> Version<OtherV>
     where
         TV: FnMut(&V) -> OtherV,

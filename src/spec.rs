@@ -150,7 +150,7 @@ impl LockedSource {
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 pub struct LockedPackage {
-    pub src: u32,
+    pub src: Option<u32>,
     pub idx: u32,
     pub name: String,
     pub order: u32,
