@@ -1,6 +1,6 @@
 [package]
-name = "debrepo"
-version = "0.0.0"
+name = "rdebootstrap"
+version = "0.0.1"
 publish = false
 rust-version = "1.85"
 edition = "2021"
