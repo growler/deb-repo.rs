@@ -2,8 +2,9 @@ use {
     crate::{
         artifact::{Artifact, ArtifactArg},
         content::{ContentProvider, UniverseFiles},
+        control::MutableControlStanza,
         hash::{Hash, HashAlgo},
-        manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateOp},
+        manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
         packages::Package,
         source::{RepositoryFile, SnapshotId, Source},
         spec::{LockedPackage, LockedSource, LockedSpec},
@@ -119,13 +120,35 @@ impl Manifest {
             ))
         })
     }
+    pub fn add_local_package(
+        &mut self,
+        file: RepositoryFile,
+        ctrl: MutableControlStanza,
+        comment: Option<&str>,
+    ) -> io::Result<()> {
+        match self.file.add_local_pkg(file, comment) {
+            UpdateResult::None => return Ok(()),
+            UpdateResult::Added => {
+                self.lock.push_local_package(ctrl);
+            }
+            UpdateResult::Updated(i) => {
+                self.lock.update_local_package(i, ctrl);
+            }
+        }
+        self.mark_file_updated();
+        self.lock
+            .specs_mut()
+            .for_each(|(_, r)| r.invalidate_solution());
+        self.mark_lock_updated();
+        Ok(())
+    }
     pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> io::Result<()> {
         match self.file.add_source(source, comment) {
-            UpdateOp::None => return Ok(()),
-            UpdateOp::Add => {
+            UpdateResult::None => return Ok(()),
+            UpdateResult::Added => {
                 self.lock.push_source(None);
             }
-            UpdateOp::Update(i) => {
+            UpdateResult::Updated(i) => {
                 self.lock.invalidate_source(i);
             }
         }

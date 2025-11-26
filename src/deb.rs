@@ -382,7 +382,7 @@ where
                     "unexpected entry",
                 )),
             })?;
-        let mut maybe_ctrl: Option<MutableControlStanza> = None;
+        let mut maybe_ctrl = None;
         while let Some(entry) = control_tarball.next().await {
             let entry = entry?;
             match entry {
@@ -409,6 +409,7 @@ where
                 }
             }
         }
+        self.try_for_each(|_| Ok::<_, io::Error>(())).await?;
         maybe_ctrl.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))
     }
     pub async fn extract_to<FS>(&mut self, fs: &FS) -> Result<MutableControlStanza>

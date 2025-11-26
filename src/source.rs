@@ -1,7 +1,7 @@
 use {
     crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
-    clap::Args,
+    clap::{ArgAction, Args},
     futures::AsyncReadExt,
     serde::{Deserialize, Serialize},
     smol::{fs, io},
@@ -577,7 +577,7 @@ pub struct Source {
     pub arch: Vec<String>,
 
     /// Allow the repository to be insecure (skip checking release signature)
-    #[arg(short = 'k', long = "allow-insecure", action)]
+    #[arg(short = 'k', long = "allow-insecure")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_insecure: Option<bool>,
 
@@ -591,6 +591,9 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<String>,
 
+    /// Snapshot ID to use.
+    ///
+    /// Snapshot ID format is a timestamp in UTC timezone in one of the following formats:
     #[arg(long = "snapshot", value_name = "SNAPSHOT", value_parser = ClapSnapshotParser)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
@@ -606,10 +609,11 @@ pub struct Source {
 
     /// Hash type for veryfing repository files
     #[arg(
+        hide = true,
         long = "hash",
         value_parser = SourceHashKindValueParser,
-        value_name = "md5|sha256|sha512",
-        default_value = "sha256"
+        value_name = "md5|sha1|sha256|sha512",
+        default_value = "sha256",
     )]
     #[serde(default, skip_serializing_if = "SourceHashKind::is_sha256")]
     pub hash: SourceHashKind,

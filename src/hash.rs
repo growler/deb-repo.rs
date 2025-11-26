@@ -28,6 +28,14 @@ pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
     }
 }
 
+impl HashAlgo for sha1::Sha1 {
+    const NAME: &'static str = "SHA1";
+    const SRI_NAME: &'static str = "sha1";
+    fn hash(hash: HashOutput<Self>) -> Hash {
+        Hash::SHA1(InnerHash { inner: hash })
+    }
+}
+
 impl HashAlgo for sha2::Sha256 {
     const NAME: &'static str = "SHA256";
     const SRI_NAME: &'static str = "sha256";
@@ -254,6 +262,7 @@ impl<D: HashAlgo> From<InnerHash<D>> for HashOutput<D> {
 #[derive(Clone, PartialEq)]
 pub enum Hash {
     MD5sum(InnerHash<md5::Md5>),
+    SHA1(InnerHash<sha1::Sha1>),
     SHA256(InnerHash<sha2::Sha256>),
     SHA512(InnerHash<sha2::Sha512>),
     Blake3(InnerHash<blake3::Hasher>),
@@ -270,6 +279,7 @@ macro_rules! delegate {
         (&self $(, $p:ident : $ty:ty)* $(,)?) -> $ret:ty $(where $($where:tt)* )? ) => {
         $vis fn $name $(< $($gen),* >)? (&self $(, $p : $ty)*) -> $ret $(where $($where)* )? {
             match self {
+                Self::SHA1(h) => h.$name($($p),*),
                 Self::MD5sum(h) => h.$name($($p),*),
                 Self::SHA256(h) => h.$name($($p),*),
                 Self::SHA512(h) => h.$name($($p),*),

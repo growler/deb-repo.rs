@@ -52,7 +52,7 @@ pub trait ContentProvider {
     fn ensure_deb(
         &self,
         path: &str,
-    ) -> impl Future<Output = io::Result<(MutableControlStanza, Hash, u64)>>;
+    ) -> impl Future<Output = io::Result<(RepositoryFile, MutableControlStanza)>>;
     fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
@@ -282,7 +282,7 @@ impl ContentProvider for HostCache {
                 >)
         }
     }
-    async fn ensure_deb(&self, path: &str) -> io::Result<(MutableControlStanza, Hash, u64)> {
+    async fn ensure_deb(&self, path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
         let file_path = self.base.join(path);
         let file = smol::fs::File::open(&file_path).await?;
         let mut rdr = HashingReader::<sha2::Sha256, _>::new(file);
@@ -290,9 +290,14 @@ impl ContentProvider for HostCache {
         let mut ctrl = deb.extract_control().await?;
         let (hash, size) = rdr.into_hash_and_size();
         ctrl.set("Filename", path.to_string());
-        ctrl.set("Sha256", hash.to_hex());
+        ctrl.set(hash.name(), hash.to_hex());
         ctrl.set("Size", size.to_string());
-        Ok((ctrl, hash, size))
+        let file = RepositoryFile {
+            path: path.to_string(),
+            hash,
+            size,
+        };
+        Ok((file, ctrl))
     }
     async fn ensure_artifact(&self, artifact: &mut Artifact) -> io::Result<()> {
         if artifact.is_local() {

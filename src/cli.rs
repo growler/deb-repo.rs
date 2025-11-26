@@ -41,6 +41,7 @@ pub mod cmd {
         clap::Parser,
         indicatif::ProgressBar,
         itertools::Itertools,
+        rustix::path::Arg,
         smol::io::AsyncWriteExt,
         std::path::PathBuf,
     };
@@ -123,6 +124,7 @@ Examples:
                 let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_source(self.source.clone(), self.comment.as_deref())?;
+                mf.update(false, conf.concurrency(), fetcher).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
@@ -149,7 +151,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
+                let path = self
+                    .path
+                    .as_str()
+                    .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (file, ctrl) = fetcher.ensure_deb(path).await?;
+                mf.add_local_package(file, ctrl, self.comment.as_deref())?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;

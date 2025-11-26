@@ -54,6 +54,7 @@ regex = "1.11"
 resolvo = "0.10.0"
 rustix = { version = "1", features = [ "fs", "pipe", "thread", "mount" ] }
 serde = { version = "1.0.219", features = ["derive"] }
+sha1 = "0.10.6"
 sha2 = "0.10"
 smallvec = { version = "1.13", features = ["serde", "union"] }
 smol = "2"

@@ -81,10 +81,10 @@ enum DFSNodeState {
     Done,
 }
 
-pub enum UpdateOp {
+pub enum UpdateResult {
     None,
-    Add,
-    Update(usize),
+    Added,
+    Updated(usize),
 }
 
 fn sources_pkgs(sources: &[Source]) -> Vec<usize> {
@@ -169,7 +169,7 @@ impl ManifestFile {
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
             sources: self.sources().iter().map(|_| None).collect(),
-            local_pkgs: self.local_pkgs().iter().map(|_| None).collect(),
+            local_pkgs: Vec::new(),
             specs: self
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
@@ -399,16 +399,32 @@ impl ManifestFile {
     pub fn sources(&self) -> &'_ [Source] {
         &self.sources
     }
-    pub fn sources_mut(&mut self) -> &'_ mut [Source] {
-        &mut self.sources
-    }
     pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
         &self.local_pkgs
     }
     pub fn sources_pkgs(&self) -> &'_ [usize] {
         &self.sources_pkgs
     }
-    pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> UpdateOp {
+    pub fn add_local_pkg(&mut self, pkg: RepositoryFile, comment: Option<&str>) -> UpdateResult {
+        if let Some((i, file)) = self
+            .local_pkgs
+            .iter_mut()
+            .enumerate()
+            .find(|(_, f)| f.path == pkg.path)
+        {
+            if file.hash == pkg.hash && file.size == pkg.size {
+                return UpdateResult::None;
+            }
+            self.doc.update_local_pkg(i, &pkg, comment);
+            *file = pkg;
+            UpdateResult::Updated(i)
+        } else {
+            self.doc.push_local_pkg(&pkg, comment);
+            self.local_pkgs.push(pkg);
+            UpdateResult::Added
+        }
+    }
+    pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> UpdateResult {
         if let Some((i, src)) = self
             .sources
             .iter_mut()
@@ -416,17 +432,17 @@ impl ManifestFile {
             .find(|(_, s)| s.url == source.url)
         {
             if src == &source {
-                return UpdateOp::None;
+                return UpdateResult::None;
             }
             self.doc.update_source(i, &source, comment);
             *src = source;
             self.sources_pkgs = sources_pkgs(&self.sources);
-            UpdateOp::Update(i)
+            UpdateResult::Updated(i)
         } else {
             self.doc.push_sources(std::iter::once(&source), comment);
             self.sources.push(source);
             self.sources_pkgs = sources_pkgs(&self.sources);
-            UpdateOp::Add
+            UpdateResult::Added
         }
     }
     pub fn remove_source(&mut self, index: usize) -> Source {
@@ -622,7 +638,7 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> H
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     sources: Vec<Option<LockedSource>>,
-    local_pkgs: Vec<Option<MutableControlStanza>>,
+    local_pkgs: Vec<MutableControlStanza>,
     specs: KVList<LockedSpec>,
     #[serde(skip, default)]
     universe_hash: Option<Hash>,
@@ -677,7 +693,7 @@ impl LockFile {
                     arch: String,
                     hash: Hash,
                     sources: Vec<LockedSource>,
-                    locals: Vec<Option<MutableControlStanza>>,
+                    locals: Vec<MutableControlStanza>,
                     specs: KVList<LockedSpec>,
                 }
                 r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
@@ -739,6 +755,14 @@ impl LockFile {
     }
     pub fn sources_mut(&mut self) -> &'_ mut [Option<LockedSource>] {
         &mut self.sources
+    }
+    pub fn push_local_package(&mut self, pkg: MutableControlStanza) {
+        self.local_pkgs.push(pkg);
+        self.universe_hash.take();
+    }
+    pub fn update_local_package(&mut self, id: usize, pkg: MutableControlStanza) {
+        self.local_pkgs[id] = pkg;
+        self.universe_hash.take();
     }
     pub fn push_source(&mut self, source: Option<LockedSource>) {
         self.sources.push(source);
@@ -1121,6 +1145,48 @@ pub(crate) trait ManifestDoc {
             .as_table_mut()
             .expect("a table of artifacts");
         artifacts.remove(uri);
+    }
+    fn update_local_pkg(&mut self, index: usize, pkg: &RepositoryFile, comment: Option<&str>) {
+        let local_arr = self.get_local_packages();
+        let mut pkg_table = toml_edit::ser::to_document(pkg)
+            .expect("failed to serialize table")
+            .into_table();
+        let comment = toml_edit::RawString::from(if index == 0 {
+            comment
+                .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                .unwrap_or_default()
+        } else {
+            format!(
+                "\n{}",
+                comment
+                    .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                    .unwrap_or_default()
+            )
+        });
+        pkg_table.decor_mut().set_prefix(comment);
+        if let Some(table) = local_arr.get_mut(index) {
+            *table = pkg_table;
+        }
+    }
+    fn push_local_pkg(&mut self, pkg: &RepositoryFile, comment: Option<&str>) {
+        let local_arr = self.get_local_packages();
+        let mut pkg_table = toml_edit::ser::to_document(pkg)
+            .expect("failed to serialize table")
+            .into_table();
+        let comment = toml_edit::RawString::from(if local_arr.is_empty() {
+            comment
+                .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                .unwrap_or_default()
+        } else {
+            format!(
+                "\n{}",
+                comment
+                    .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
+                    .unwrap_or_default()
+            )
+        });
+        pkg_table.decor_mut().set_prefix(comment);
+        local_arr.push(pkg_table);
     }
     fn update_source(&mut self, index: usize, source: &Source, comment: Option<&str>) {
         let sources_arr = self.get_sources();
