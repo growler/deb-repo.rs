@@ -1,0 +1,28 @@
+#!/usr/bin/make -f
+
+export DEB_BUILD_MAINT_OPTIONS = hardening=+all
+export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export CARGO_TARGET_DIR := $(CURDIR)/target
+
+%:
+	dh $@
+
+override_dh_auto_configure:
+	mkdir -p $(CARGO_HOME)
+	cargo fetch --locked
+
+override_dh_auto_build:
+	cargo build --release --locked --bin rdebootstrap
+
+override_dh_auto_test:
+ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
+	cargo test --locked --workspace --all-targets -- --nocapture
+endif
+
+override_dh_auto_install:
+	install -Dm755 target/release/rdebootstrap \
+		$(CURDIR)/debian/rdebootstrap/usr/bin/rdebootstrap
+
+override_dh_auto_clean:
+	-cargo clean
+	rm -rf $(CARGO_HOME)

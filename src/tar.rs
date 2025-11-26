@@ -505,6 +505,45 @@ pub enum TarEntry<'a, R: AsyncRead + Send + 'a> {
     Directory(TarDirectory),
 }
 
+impl<'a, R: AsyncRead + Send + 'a> std::fmt::Debug for TarEntry<'a, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::File(file) => f
+                .debug_struct("TarEntry::File")
+                .field("path_name", &file.path_name)
+                .field("size", &file.size)
+                .field("mode", &file.mode)
+                .field("mtime", &file.mtime)
+                .field("uid", &file.uid)
+                .field("gid", &file.gid)
+                .finish(),
+            Self::Link(link) => f
+                .debug_struct("TarEntry::Link")
+                .field("path_name", &link.path_name)
+                .field("link_name", &link.link_name)
+                .finish(),
+            Self::Symlink(symlink) => f
+                .debug_struct("TarEntry::Symlink")
+                .field("path_name", &symlink.path_name)
+                .field("link_name", &symlink.link_name)
+                .field("mode", &symlink.mode)
+                .field("mtime", &symlink.mtime)
+                .field("uid", &symlink.uid)
+                .field("gid", &symlink.gid)
+                .finish(),
+            Self::Directory(dir) => f
+                .debug_struct("TarEntry::Directory")
+                .field("path_name", &dir.path_name)
+                .field("size", &dir.size)
+                .field("mode", &dir.mode)
+                .field("mtime", &dir.mtime)
+                .field("uid", &dir.uid)
+                .field("gid", &dir.gid)
+                .finish(),
+        }
+    }
+}
+
 fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>> {
     let long_path = exts.drain(..).fold(None, |p, e| match e {
         ExtensionHeader::LongName(name) => Some(name),
@@ -521,7 +560,7 @@ fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>>
     match hdr.kind() {
         HeaderKind::Gnu(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
         HeaderKind::Ustar(hdr) => hdr.path_name(),
-        HeaderKind::Old(hdr) => hdr.link_name(),
+        HeaderKind::Old(hdr) => hdr.path_name(),
     }
 }
 fn entry_name_link(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<(Box<str>, Box<str>)> {
@@ -648,7 +687,7 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                                 }
                             })
                         }
-                        Kind::Directory if !this.header.is_old() => {
+                        Kind::Directory => {
                             let size = this.header.size()?;
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
@@ -671,7 +710,7 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                                 link_name,
                             }))
                         }
-                        Kind::Symlink if !this.header.is_old() => {
+                        Kind::Symlink => {
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
                             let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
@@ -724,9 +763,9 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                             }
                             continue;
                         }
-                        _ => Err(Error::new(
+                        kind => Err(Error::new(
                             ErrorKind::InvalidData,
-                            "invalid tar entry header",
+                            format!("invalid tar entry header {}", kind),
                         )),
                     }));
                 }

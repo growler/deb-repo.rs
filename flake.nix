@@ -59,6 +59,7 @@
         ]);
         nativeBuildInputs = with pkgs; [ 
             cargo-debstatus
+            cargo-deb
             cargo-show-asm
             cargo-expand
             cargo-bloat

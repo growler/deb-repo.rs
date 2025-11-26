@@ -1,0 +1,28 @@
+Source: rdebootstrap
+Section: utils
+Priority: optional
+Maintainer: Aleksei Naidenov <alexey.naidyonov@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ cargo,
+ rustc,
+ pkg-config,
+ libcurl4-openssl-dev,
+ libssl-dev,
+ libgpgme-dev,
+ libgpg-error-dev,
+ liblzma-dev,
+ liblz4-dev,
+ libbz2-dev,
+ libzstd-dev,
+ zlib1g-dev
+Standards-Version: 4.7.0
+Rules-Requires-Root: binary-targets
+
+Package: rdebootstrap
+Architecture: any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Description: Manifest-driven Debian bootstrapper
+ rdebootstrap consumes a declarative manifest, resolves Debian packages,
+ stages extra artifacts, and builds a root filesystem tree inside an
+ isolated sandbox so maintainer scripts stay contained.

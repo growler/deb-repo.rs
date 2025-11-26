@@ -8,6 +8,21 @@ edition = "2021"
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
 
+[package.metadata.deb]
+maintainer = "Alekséi Naidénov <alexey.naidyonov@gmail.com>"
+section = "utility"
+priority = "optional"
+depends = [
+    "libc6 (>= 2.39)", 
+    "libcurl4t64 (>= 7.18.0)", 
+    "libgpg-error0 (>= 1.14)", 
+    "libgpgme11t64 (>= 1.23.2)", 
+    "liblzma5 (>= 5.4.0)", 
+]
+assets = [
+    [ "target/release/rdebootstrap", "usr/bin/rdebootstrap", "0755" ],
+]
+
 [lib]
 name = "debrepo"
 path = "src/lib.rs"

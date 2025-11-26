@@ -5,6 +5,12 @@
 /.vscode/
 /.idea/
 /out/
+/debian/files
+/debian/.debhelper/
+/debian/*.substvars
+/debian/debhelper*
+/debian/rdebootstrap/
+/debian/cargo-home/
 **/*.log
 **/*.tmp
 **/Packages

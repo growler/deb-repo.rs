@@ -185,9 +185,20 @@ where
                     *this.read = 0;
                 }
                 State::Content => {
-                    // skipping content
-                    let mut buf = [0u8; 8192];
-                    while ready_opt!(self.as_mut().poll_read(ctx, &mut buf[..])) != 0 {}
+                    #[allow(unused_assignments)]
+                    if self.size > self.read {
+                        // skipping content
+                        let mut smoll_buf = None;
+                        let mut large_buf = None;
+                        let buf = if self.size - self.read < 8192 {
+                            smoll_buf = Some([0u8; 8192]);
+                            smoll_buf.as_mut().unwrap()
+                        } else {
+                            large_buf = Some(vec![0u8; 256 * 1024]);
+                            large_buf.as_mut().unwrap().as_mut_slice()
+                        };
+                        while ready_opt!(self.as_mut().poll_read(ctx, &mut buf[..])) != 0 {}
+                    }
                     let this = self.as_mut().project();
                     *this.state = State::Header;
                     *this.size = AR_HEADER_SIZE;
@@ -213,6 +224,9 @@ where
                 State::Header => {
                     // reding header
                     while ready_opt!(self.as_mut().poll_read_header(ctx)) != 0 {}
+                    if self.read == 0 {
+                        return Poll::Ready(None);
+                    }
                     let (size_with_padding, name) = {
                         let this = self.as_mut().project();
                         let size = parse_size(&this.hdr[48..58])?;
@@ -383,8 +397,10 @@ where
                 )),
             })?;
         let mut maybe_ctrl = None;
+        println!("Extracting control file...");
         while let Some(entry) = control_tarball.next().await {
             let entry = entry?;
+            println!("Found entry: {:?}", &entry);
             match entry {
                 TarEntry::File(mut file) => {
                     let filename = file.path().to_string();
@@ -409,6 +425,7 @@ where
                 }
             }
         }
+        println!("Finished extracting control file, skipping remaining entries...");
         self.try_for_each(|_| Ok::<_, io::Error>(())).await?;
         maybe_ctrl.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))
     }

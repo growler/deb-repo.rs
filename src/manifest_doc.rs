@@ -638,6 +638,7 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> H
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     sources: Vec<Option<LockedSource>>,
+    #[serde(rename = "locals", skip_serializing_if = "Vec::is_empty", default)]
     local_pkgs: Vec<MutableControlStanza>,
     specs: KVList<LockedSpec>,
     #[serde(skip, default)]
@@ -693,6 +694,7 @@ impl LockFile {
                     arch: String,
                     hash: Hash,
                     sources: Vec<LockedSource>,
+                    #[serde(default)]
                     locals: Vec<MutableControlStanza>,
                     specs: KVList<LockedSpec>,
                 }
