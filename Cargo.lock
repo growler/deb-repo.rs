@@ -712,60 +712,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
 
 [[package]]
-name = "debrepo"
-version = "0.0.0"
-dependencies = [
- "anyhow",
- "async-channel 2.5.0",
- "async-compression",
- "async-io",
- "async-lock",
- "base64",
- "blake3",
- "blocking",
- "chrono",
- "clap",
- "clap_mangen",
- "criterion",
- "digest",
- "filetime",
- "futures",
- "futures-lite 2.3.0",
- "gpgme",
- "hex",
- "indicatif",
- "isahc",
- "itertools 0.13.0",
- "libc",
- "macro_rules_attribute",
- "md-5",
- "memchr",
- "memmap2",
- "num_cpus",
- "once_cell",
- "ouroboros",
- "petgraph",
- "pin-project-lite",
- "regex",
- "resolvo",
- "rustix",
- "serde",
- "sha1",
- "sha2",
- "smallvec",
- "smol",
- "smol-macros",
- "static_assertions",
- "tempfile",
- "thiserror",
- "toml_edit",
- "tracing",
- "tracing-futures",
- "tracing-subscriber",
- "url",
-]
-
-[[package]]
 name = "digest"
 version = "0.10.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1889,6 +1835,60 @@ checksum = "22e18b0f0062d30d4230b2e85ff77fdfe4326feb054b9783a3460d8435c8ab91"
 dependencies = [
  "crossbeam-deque",
  "crossbeam-utils",
+]
+
+[[package]]
+name = "rdebootstrap"
+version = "0.0.1"
+dependencies = [
+ "anyhow",
+ "async-channel 2.5.0",
+ "async-compression",
+ "async-io",
+ "async-lock",
+ "base64",
+ "blake3",
+ "blocking",
+ "chrono",
+ "clap",
+ "clap_mangen",
+ "criterion",
+ "digest",
+ "filetime",
+ "futures",
+ "futures-lite 2.3.0",
+ "gpgme",
+ "hex",
+ "indicatif",
+ "isahc",
+ "itertools 0.13.0",
+ "libc",
+ "macro_rules_attribute",
+ "md-5",
+ "memchr",
+ "memmap2",
+ "num_cpus",
+ "once_cell",
+ "ouroboros",
+ "petgraph",
+ "pin-project-lite",
+ "regex",
+ "resolvo",
+ "rustix",
+ "serde",
+ "sha1",
+ "sha2",
+ "smallvec",
+ "smol",
+ "smol-macros",
+ "static_assertions",
+ "tempfile",
+ "thiserror",
+ "toml_edit",
+ "tracing",
+ "tracing-futures",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

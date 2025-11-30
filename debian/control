@@ -1,7 +1,7 @@
 Source: rdebootstrap
 Section: utils
 Priority: optional
-Maintainer: Aleksei Naidenov <alexey.naidyonov@gmail.com>
+Maintainer: Alekséi Naidénov <alexey.naidyonov@gmail.com>
 Build-Depends:
  debhelper-compat (= 13),
  cargo,
