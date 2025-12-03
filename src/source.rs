@@ -1,7 +1,7 @@
 use {
     crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
-    clap::{ArgAction, Args},
+    clap::Args,
     futures::AsyncReadExt,
     serde::{Deserialize, Serialize},
     smol::{fs, io},

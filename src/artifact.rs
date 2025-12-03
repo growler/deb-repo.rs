@@ -205,7 +205,10 @@ impl Artifact {
             Artifact::File(inner) => inner.hash_remote(r).await,
         }
     }
-    pub async fn hash_stage_remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized + 'static>(
+    pub async fn hash_stage_remote<
+        R: AsyncRead + Send + 'static,
+        FS: StagingFileSystem + ?Sized + 'static,
+    >(
         &mut self,
         r: R,
         fs: &FS,
@@ -488,6 +491,13 @@ where
                 }
                 tar::TarEntry::Link(link) => {
                     links.push(link);
+                }
+                _ => {
+                    return Err(io::Error::other(format!(
+                        "unsupported tar entry in artifact {} {:?}",
+                        &self.target.as_deref().unwrap_or("<no-target>"),
+                        &entry,
+                    )));
                 }
             }
         }

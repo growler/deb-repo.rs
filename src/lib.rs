@@ -8,9 +8,12 @@ pub mod comp;
 pub mod content;
 pub mod control;
 pub mod deb;
+pub mod error;
+pub mod exec;
 pub mod hash;
 mod idmap;
 mod indexfile;
+mod kvlist;
 mod manifest;
 mod manifest_doc;
 mod packages;
@@ -24,11 +27,9 @@ pub mod tar;
 mod transport;
 pub mod universe;
 mod version;
-mod kvlist;
-pub mod error;
-pub mod exec;
 
 pub use {
+    async_compression::Level as CompressionLevel,
     arch::DEFAULT_ARCH,
     builder::{BuildJob, Executor},
     manifest::Manifest,
@@ -183,6 +184,24 @@ pub fn strip_url_scheme(s: &str) -> &str {
         unsafe { std::str::from_utf8_unchecked(&bytes[3..]) }
     } else {
         s
+    }
+}
+
+pub fn packer<'a, W: smol::io::AsyncWrite + Send + 'a>(
+    u: &str,
+    w: W,
+    level: async_compression::Level,
+) -> std::pin::Pin<Box<dyn smol::io::AsyncWrite + Send + 'a>> {
+    use async_compression::futures::write::{
+        BzEncoder, GzipEncoder, LzmaEncoder, XzEncoder, ZstdEncoder,
+    };
+    match u.rsplit('.').next().unwrap_or("") {
+        "xz" => Box::pin(XzEncoder::with_quality(w, level)),
+        "gz" => Box::pin(GzipEncoder::with_quality(w, level)),
+        "bz2" => Box::pin(BzEncoder::with_quality(w, level)),
+        "lzma" => Box::pin(LzmaEncoder::with_quality(w, level)),
+        "zstd" | "zst" => Box::pin(ZstdEncoder::with_quality(w, level)),
+        _ => Box::pin(w),
     }
 }
 

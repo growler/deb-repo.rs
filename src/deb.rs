@@ -605,6 +605,12 @@ where
                     TarEntry::Link(link) => {
                         links.push(link);
                     }
+                    _ => {
+                        return Err(io::Error::other(format!(
+                            "unsupported tar entry in debian package: {:?}",
+                            &entry,
+                        )));
+                    }
                 }
             }
             for link in links.drain(..) {

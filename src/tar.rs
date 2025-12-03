@@ -1,6 +1,12 @@
+/// This is by no means a complete tar implementation. It provides enough support
+/// for GNU and POSIX formats to unpack debian packages and pack OCI images.
 use {
     async_lock::Mutex,
-    futures_lite::{io::AsyncRead, Stream},
+    futures::Sink,
+    futures_lite::{
+        io::{AsyncRead, AsyncWrite},
+        Stream,
+    },
     pin_project_lite::pin_project,
     std::{
         future::Future,
@@ -167,6 +173,28 @@ impl Header {
                 )
             })
     }
+    #[inline]
+    fn dev_major(&self) -> Result<u32> {
+        parse_octal(&unsafe { self.cast::<GnuHeader>() }.dev_major)
+            .map(|r| r as u32)
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                )
+            })
+    }
+    #[inline]
+    fn dev_minor(&self) -> Result<u32> {
+        parse_octal(&unsafe { self.cast::<GnuHeader>() }.dev_minor)
+            .map(|r| r as u32)
+            .map_err(|err| {
+                Error::new(
+                    ErrorKind::InvalidData,
+                    format!("invalid octal digit: {:?}", String::from_utf8_lossy(err)),
+                )
+            })
+    }
     fn is_zero(&self) -> bool {
         self.record.iter().all(|b| *b == b'\0')
     }
@@ -179,7 +207,11 @@ enum Kind {
     File = b'0',
     Link = b'1',
     Symlink = b'2',
+    CharDevice = b'3',
+    BlockDevice = b'4',
     Directory = b'5',
+    Fifo = b'6',
+    Continous = b'7',
     GNULongLink = b'K',
     GNULongName = b'L',
     PAXLocal = b'x',
@@ -188,10 +220,13 @@ enum Kind {
 impl std::fmt::Display for Kind {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         f.write_str(match self {
-            Self::File | Self::File0 => "regular file",
+            Self::File | Self::File0 | Self::Continous => "regular file",
             Self::Link => "link",
             Self::Symlink => "symlink",
+            Self::CharDevice => "character device",
+            Self::BlockDevice => "block device",
             Self::Directory => "directory",
+            Self::Fifo => "FIFO",
             Self::GNULongName => "GNU long name extension",
             Self::GNULongLink => "GNU long link extension",
             Self::PAXLocal => "PAX next file extension",
@@ -245,11 +280,13 @@ impl OldHeader {
     }
 }
 
-/// Representation of the header of an entry in an archive
+const NAME_LEN: usize = 100;
+const PREFIX_LEN: usize = 155;
+
 #[repr(C)]
 #[allow(missing_docs)]
 struct UstarHeader {
-    name: [u8; 100],
+    name: [u8; NAME_LEN],
     mode: [u8; 8],
     uid: [u8; 8],
     gid: [u8; 8],
@@ -257,14 +294,14 @@ struct UstarHeader {
     mtime: [u8; 12],
     cksum: [u8; 8],
     typeflag: [u8; 1],
-    linkname: [u8; 100],
+    linkname: [u8; NAME_LEN],
     magic: [u8; 6],
     version: [u8; 2],
     uname: [u8; 32],
     gname: [u8; 32],
     dev_major: [u8; 8],
     dev_minor: [u8; 8],
-    prefix: [u8; 155],
+    prefix: [u8; PREFIX_LEN],
     pad: [u8; 12],
 }
 impl HeaderVariant for UstarHeader {}
@@ -275,9 +312,92 @@ impl UstarHeader {
     fn link_name(&self) -> Result<Box<str>> {
         path_name(&self.linkname).map(|p| p.to_string().into_boxed_str())
     }
+    unsafe fn from_buf(buf: &mut [u8]) -> &mut Self {
+        buf[..BLOCK_SIZE].fill(0);
+        let hdr = &mut *(buf.as_mut_ptr() as *mut Self);
+        hdr.magic = *b"ustar\0";
+        hdr.version = *b"00";
+        hdr
+    }
+    unsafe fn from_buf_no_init(buf: &mut [u8]) -> &mut Self {
+        &mut *(buf.as_mut_ptr() as *mut Self)
+    }
+    fn set_dev_major(&mut self, major: u32) -> std::io::Result<()> {
+        format_octal(major as u64, &mut self.dev_major)
+    }
+    fn set_dev_minor(&mut self, minor: u32) -> std::io::Result<()> {
+        format_octal(minor as u64, &mut self.dev_minor)
+    }
+    fn set_uid(&mut self, uid: u32) -> std::io::Result<()> {
+        format_octal(uid as u64, &mut self.uid)
+    }
+    fn set_gid(&mut self, gid: u32) -> std::io::Result<()> {
+        format_octal(gid as u64, &mut self.gid)
+    }
+    fn set_mode(&mut self, mode: u32) -> std::io::Result<()> {
+        format_octal(mode as u64, &mut self.mode)
+    }
+    fn set_mtime(&mut self, mtime: u32) -> std::io::Result<()> {
+        format_octal(mtime as u64, &mut self.mtime)
+    }
+    fn set_size(&mut self, size: u64) -> std::io::Result<()> {
+        format_octal(size, &mut self.size)
+    }
+    fn set_typeflag(&mut self, kind: Kind) {
+        self.typeflag[0] = kind.byte();
+    }
+    fn set_path(&mut self, path: &str) -> bool {
+        let mut bytes = path.as_bytes();
+        if bytes.len() <= self.name.len() {
+            self.name[..bytes.len()].copy_from_slice(bytes);
+            return false;
+        }
+        if let Some(split_idx) = bytes
+            .iter()
+            .enumerate()
+            .rfind(|(i, b)| **b == b'/' && i <= &self.prefix.len())
+            .map(|(i, _)| i)
+        {
+            self.prefix[..split_idx].copy_from_slice(&bytes[..split_idx]);
+            bytes = &bytes[split_idx + 1..];
+        }
+        copy_utf8_truncate(&mut self.name, unsafe {
+            // SAFETY: the source string was an str, and a break, if any, was made at '/',
+            // which is a valid codepoint
+            std::str::from_utf8_unchecked(bytes)
+        })
+    }
+    fn set_link_path(&mut self, name: &str) -> bool {
+        copy_utf8_truncate(&mut self.linkname, name)
+    }
+    fn finalize(&mut self) -> std::io::Result<()> {
+        self.cksum.fill(b' ');
+        let buf =
+            unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, BLOCK_SIZE) };
+        let checksum: u32 = buf.iter().map(|b| *b as u32).sum();
+        format_octal(checksum as u64, &mut self.cksum)
+    }
 }
 
-/// Representation of the header of an entry in an archive
+fn copy_utf8_truncate(field: &mut [u8], bytes: &str) -> bool {
+    if bytes.len() <= field.len() {
+        field[..bytes.len()].copy_from_slice(bytes.as_bytes());
+        return false;
+    }
+    let mut cut = 0;
+    for (i, c) in bytes.char_indices() {
+        if i <= field.len() {
+            if c != '/' {
+                cut = i;
+            }
+        } else {
+            break;
+        }
+    }
+    field[..cut].copy_from_slice(&bytes.as_bytes()[..cut]);
+    true
+}
+
 #[repr(C)]
 #[allow(missing_docs)]
 struct GnuHeader {
@@ -329,6 +449,8 @@ enum Entry {
     Link(TarLink),
     Symlink(TarSymlink),
     Directory(TarDirectory),
+    Device(TarDevice),
+    Fifo(TarFifo),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -336,6 +458,7 @@ enum State {
     Header,
     Extension((u32, Kind)),
     Entry,
+    SkipEntry,
     Padding,
     Eof,
     Eoff,
@@ -457,11 +580,83 @@ pin_project! {
     }
 }
 
-pub struct TarReader<'a, R: AsyncRead + Send + 'a> {
+pub struct TarRegularFileReader<'a, R: AsyncRead + 'a> {
+    eof: u64,
     inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
 }
 
-impl<'a, R: AsyncRead + Send + 'a> TarReader<'a, R> {
+impl<R: AsyncRead> Drop for TarRegularFileReader<'_, R> {
+    fn drop(&mut self) {
+        let inner = self.inner.clone();
+        let eof = self.eof;
+        let mut g = inner.lock_blocking();
+        let this_pin = g.as_mut();
+        let this = this_pin.project();
+        if *this.pos < eof {
+            *this.state = SkipEntry;
+        }
+    }
+}
+
+impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        ctx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<Result<usize>> {
+        let this = self.as_mut();
+        let eof = this.eof;
+        let fut = this.inner.lock();
+        let mut g = task::ready!(pin!(fut).poll(ctx));
+        let inner_pin: Pin<&mut TarReaderInner<'a, R>> = g.as_mut();
+        let inner = inner_pin.project();
+        tracing::trace!(
+            target: "tar",
+            "file.poll_read: buf.len={} pos={} eof={}",
+            buf.len(),
+            *inner.pos,
+            eof
+        );
+        if *inner.pos >= eof {
+            return Poll::Ready(Ok(0));
+        }
+        let remain = *inner.nxt - *inner.pos;
+        let n = if remain > 0 {
+            let size = std::cmp::min(remain, buf.len() as u64);
+            let n = ready!(pin!(inner.reader).poll_read(ctx, &mut buf[0..size as usize]));
+            if n == 0 {
+                return Poll::Ready(Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "unexpected EOF while reading archie file",
+                )));
+            }
+            n
+        } else {
+            0
+        };
+        *inner.pos += n as u64;
+        Poll::Ready(Ok(if (n as u64) < remain {
+            n
+        } else {
+            ctx.waker().wake_by_ref();
+            let nxt = padded_size(*inner.nxt);
+            if *inner.pos == nxt {
+                *inner.nxt = nxt + BLOCK_SIZE as u64;
+                *inner.state = Header;
+            } else {
+                *inner.nxt = nxt;
+                *inner.state = Padding;
+            }
+            n
+        }))
+    }
+}
+
+pub struct TarReader<'a, R: AsyncRead + 'a> {
+    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
+}
+
+impl<'a, R: AsyncRead + 'a> TarReader<'a, R> {
     pub fn new(r: R) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Box::pin(TarReaderInner::new(r)))),
@@ -472,6 +667,202 @@ pub struct TarLink {
     path_name: Box<str>,
     link_name: Box<str>,
 }
+impl<R: AsyncRead> From<TarLink> for TarEntry<'_, R> {
+    fn from(link: TarLink) -> Self {
+        Self::Link(link)
+    }
+}
+impl TarLink {
+    pub fn new<N: Into<Box<str>>, L: Into<Box<str>>>(path_name: N, link_name: L) -> TarLink {
+        TarLink {
+            path_name: path_name.into(),
+            link_name: link_name.into(),
+        }
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn link(&'_ self) -> &'_ str {
+        &self.link_name
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            None,
+            Kind::Link,
+            0,    // size
+            0,    // mode
+            0,    // uid
+            0,    // gid
+            0,    // mtime
+            None, // device
+        )
+    }
+}
+pub enum DeviceKind {
+    Char,
+    Block,
+}
+pub struct TarDevice {
+    path_name: Box<str>,
+    mode: u32,
+    mtime: u32,
+    uid: u32,
+    gid: u32,
+    kind: DeviceKind,
+    major: u32,
+    minor: u32,
+}
+impl<R: AsyncRead> From<TarDevice> for TarEntry<'_, R> {
+    fn from(device: TarDevice) -> Self {
+        Self::Device(device)
+    }
+}
+impl TarDevice {
+    pub fn new_char<N: Into<Box<str>>>(
+        path_name: N,
+        major: u32,
+        minor: u32,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+    ) -> TarDevice {
+        TarDevice {
+            path_name: path_name.into(),
+            mode,
+            mtime,
+            uid,
+            gid,
+            major,
+            minor,
+            kind: DeviceKind::Char,
+        }
+    }
+    pub fn new_block<N: Into<Box<str>>>(
+        path_name: N,
+        major: u32,
+        minor: u32,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+    ) -> TarDevice {
+        TarDevice {
+            path_name: path_name.into(),
+            mode,
+            mtime,
+            uid,
+            gid,
+            major,
+            minor,
+            kind: DeviceKind::Block,
+        }
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    pub fn is_char(&self) -> bool {
+        matches!(self.kind, DeviceKind::Char)
+    }
+    pub fn is_block(&self) -> bool {
+        matches!(self.kind, DeviceKind::Block)
+    }
+    pub fn major(&self) -> u32 {
+        self.major
+    }
+    pub fn minor(&self) -> u32 {
+        self.minor
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            None,
+            match self.kind {
+                DeviceKind::Char => Kind::CharDevice,
+                DeviceKind::Block => Kind::BlockDevice,
+            },
+            0, // size
+            self.mode,
+            self.uid,
+            self.gid,
+            self.mtime,
+            Some((self.major, self.minor)),
+        )
+    }
+}
+pub struct TarFifo {
+    path_name: Box<str>,
+    mode: u32,
+    mtime: u32,
+    uid: u32,
+    gid: u32,
+}
+impl<R: AsyncRead> From<TarFifo> for TarEntry<'_, R> {
+    fn from(fifo: TarFifo) -> Self {
+        Self::Fifo(fifo)
+    }
+}
+impl TarFifo {
+    pub fn new<N: Into<Box<str>>>(
+        path_name: N,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+    ) -> TarFifo {
+        TarFifo {
+            path_name: path_name.into(),
+            mode,
+            mtime,
+            uid,
+            gid,
+        }
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            None,
+            Kind::Fifo,
+            0, // size
+            self.mode,
+            self.uid,
+            self.gid,
+            self.mtime,
+            None, // device
+        )
+    }
+}
 pub struct TarSymlink {
     path_name: Box<str>,
     link_name: Box<str>,
@@ -479,6 +870,62 @@ pub struct TarSymlink {
     mtime: u32,
     uid: u32,
     gid: u32,
+}
+impl<R: AsyncRead> From<TarSymlink> for TarEntry<'_, R> {
+    fn from(symlink: TarSymlink) -> Self {
+        Self::Symlink(symlink)
+    }
+}
+impl TarSymlink {
+    pub fn new<N: Into<Box<str>>, L: Into<Box<str>>>(
+        path_name: N,
+        link_name: L,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+    ) -> TarSymlink {
+        TarSymlink {
+            path_name: path_name.into(),
+            link_name: link_name.into(),
+            mode,
+            mtime,
+            uid,
+            gid,
+        }
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn link(&'_ self) -> &'_ str {
+        &self.link_name
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            Some(self.link_name.as_ref()),
+            Kind::Symlink,
+            0, // size
+            self.mode,
+            self.uid,
+            self.gid,
+            self.mtime,
+            None, // device
+        )
+    }
 }
 pub struct TarDirectory {
     path_name: Box<str>,
@@ -488,24 +935,157 @@ pub struct TarDirectory {
     gid: u32,
     size: u64,
 }
-pub struct TarRegularFile<'a, R: AsyncRead + Send + 'a> {
-    path_name: Box<str>,
-    size: u64,
-    mode: u32,
-    mtime: u32,
-    uid: u32,
-    gid: u32,
-    eof: u64,
-    inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
+impl<R: AsyncRead> From<TarDirectory> for TarEntry<'_, R> {
+    fn from(dir: TarDirectory) -> Self {
+        Self::Directory(dir)
+    }
 }
-pub enum TarEntry<'a, R: AsyncRead + Send + 'a> {
+impl TarDirectory {
+    pub fn new<N: Into<Box<str>>>(
+        path_name: N,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+    ) -> TarDirectory {
+        TarDirectory {
+            path_name: path_name.into(),
+            size: 0,
+            mode,
+            mtime,
+            uid,
+            gid,
+        }
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            None,
+            Kind::Directory,
+            self.size,
+            self.mode,
+            self.uid,
+            self.gid,
+            self.mtime,
+            None, // device
+        )
+    }
+}
+
+pin_project! {
+    pub struct TarRegularFile<'a, R> {
+        path_name: Box<str>,
+        size: u64,
+        mode: u32,
+        mtime: u32,
+        uid: u32,
+        gid: u32,
+        #[pin]
+        inner: R,
+        marker: std::marker::PhantomData<&'a ()>,
+    }
+}
+impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
+    pub fn new<N: Into<Box<str>>>(
+        path_name: N,
+        size: u64,
+        uid: u32,
+        gid: u32,
+        mode: u32,
+        mtime: u32,
+        inner: R,
+    ) -> TarRegularFile<'a, R> {
+        TarRegularFile {
+            path_name: path_name.into(),
+            size,
+            mode,
+            mtime,
+            uid,
+            gid,
+            inner,
+            marker: std::marker::PhantomData,
+        }
+    }
+    pub fn size(&self) -> u64 {
+        self.size
+    }
+    pub fn path(&'_ self) -> &'_ str {
+        &self.path_name
+    }
+    pub fn mode(&self) -> u32 {
+        self.mode
+    }
+    pub fn mtime(&self) -> u32 {
+        self.mtime
+    }
+    pub fn uid(&self) -> u32 {
+        self.uid
+    }
+    pub fn gid(&self) -> u32 {
+        self.gid
+    }
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        write_header(
+            buffer,
+            self.path_name.as_ref(),
+            None,
+            Kind::File,
+            self.size,
+            self.mode,
+            self.uid,
+            self.gid,
+            self.mtime,
+            None, // device
+        )
+    }
+}
+impl<'a, R: AsyncRead + 'a> From<TarRegularFile<'a, R>> for TarEntry<'a, R> {
+    fn from(file: TarRegularFile<'a, R>) -> Self {
+        Self::File(file)
+    }
+}
+pub enum TarEntry<'a, R: AsyncRead + 'a> {
     File(TarRegularFile<'a, R>),
     Link(TarLink),
     Symlink(TarSymlink),
     Directory(TarDirectory),
+    Device(TarDevice),
+    Fifo(TarFifo),
 }
 
-impl<'a, R: AsyncRead + Send + 'a> std::fmt::Debug for TarEntry<'a, R> {
+impl<'a, R: AsyncRead + 'a> TarEntry<'a, R> {
+    fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        match self {
+            Self::Directory(dir) => dir.write_header(buffer),
+            Self::Device(device) => device.write_header(buffer),
+            Self::Fifo(fifo) => fifo.write_header(buffer),
+            Self::File(file) => file.write_header(buffer),
+            Self::Link(link) => link.write_header(buffer),
+            Self::Symlink(symlink) => symlink.write_header(buffer),
+        }
+    }
+}
+
+impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::File(file) => f
@@ -516,6 +1096,31 @@ impl<'a, R: AsyncRead + Send + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &file.mtime)
                 .field("uid", &file.uid)
                 .field("gid", &file.gid)
+                .finish(),
+            Self::Device(device) => f
+                .debug_struct("TarEntry::Device")
+                .field("path_name", &device.path_name)
+                .field("mode", &device.mode)
+                .field("mtime", &device.mtime)
+                .field("uid", &device.uid)
+                .field("gid", &device.gid)
+                .field(
+                    "kind",
+                    match device.kind {
+                        DeviceKind::Char => &"char",
+                        DeviceKind::Block => &"block",
+                    },
+                )
+                .field("major", &device.major)
+                .field("minor", &device.minor)
+                .finish(),
+            Self::Fifo(fifo) => f
+                .debug_struct("TarEntry::Fifo")
+                .field("path_name", &fifo.path_name)
+                .field("mode", &fifo.mode)
+                .field("mtime", &fifo.mtime)
+                .field("uid", &fifo.uid)
+                .field("gid", &fifo.gid)
                 .finish(),
             Self::Link(link) => f
                 .debug_struct("TarEntry::Link")
@@ -549,6 +1154,7 @@ fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>>
         ExtensionHeader::LongName(name) => Some(name),
         ExtensionHeader::PosixExtension(ext) => {
             for (key, val) in ext.iter() {
+                tracing::trace!(target: "tar", "PAX ext key={} val={}", key, val);
                 if key == "path" {
                     return Some(val.to_string().into_boxed_str());
                 }
@@ -557,9 +1163,10 @@ fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>>
         }
         _ => p,
     });
+    tracing::trace!(target: "tar", "long_path={:?}", long_path);
     match hdr.kind() {
         HeaderKind::Gnu(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
-        HeaderKind::Ustar(hdr) => hdr.path_name(),
+        HeaderKind::Ustar(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
         HeaderKind::Old(hdr) => hdr.path_name(),
     }
 }
@@ -585,7 +1192,10 @@ fn entry_name_link(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<(Box
             long_path.map_or_else(|| hdr.path_name(), Ok)?,
             long_link.map_or_else(|| hdr.link_name(), Ok)?,
         )),
-        HeaderKind::Ustar(hdr) => Ok((hdr.path_name()?, hdr.link_name()?)),
+        HeaderKind::Ustar(hdr) => Ok((
+            long_path.map_or_else(|| hdr.path_name(), Ok)?,
+            long_link.map_or_else(|| hdr.link_name(), Ok)?,
+        )),
         HeaderKind::Old(hdr) => Ok((hdr.path_name()?, hdr.link_name()?)),
     }
 }
@@ -606,7 +1216,7 @@ fn ext_as_str(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Resul
     .map(|p| p.to_string().into_boxed_str())
 }
 
-impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
+impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
     fn new(r: R) -> Self {
         Self {
             state: Header,
@@ -626,7 +1236,11 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
     ) -> Poll<Option<Result<Entry>>> {
         let mut this = self.project();
         loop {
-            // println!("st={:?} pos={} nxt={}", *this.state, *this.pos, *this.nxt);
+            tracing::trace!(
+                target: "tar",
+                "tar.poll_read_header: state={:?} pos={} nxt={}",
+                *this.state, *this.pos, *this.nxt
+            );
             match this.state {
                 Header => {
                     let remaining = *this.nxt - *this.pos;
@@ -659,7 +1273,7 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                         )
                     })?;
                     return Poll::Ready(Some(match kind {
-                        Kind::File | Kind::File0 => {
+                        Kind::File | Kind::File0 | Kind::Continous => {
                             let size = this.header.size()?;
                             let path_name = entry_name(this.header, this.exts)?;
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
@@ -699,6 +1313,37 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                                 uid: this.header.uid()?,
                                 gid: this.header.gid()?,
                                 path_name,
+                            }))
+                        }
+                        Kind::Fifo => {
+                            *this.nxt += BLOCK_SIZE as u64;
+                            *this.state = Header;
+                            let path_name = entry_name(this.header, this.exts)?;
+                            Ok(Entry::Fifo(TarFifo {
+                                path_name,
+                                mode: this.header.mode()?,
+                                mtime: this.header.mtime()?,
+                                uid: this.header.uid()?,
+                                gid: this.header.gid()?,
+                            }))
+                        }
+                        Kind::CharDevice | Kind::BlockDevice => {
+                            *this.nxt += BLOCK_SIZE as u64;
+                            *this.state = Header;
+                            let path_name = entry_name(this.header, this.exts)?;
+                            Ok(Entry::Device(TarDevice {
+                                path_name,
+                                mode: this.header.mode()?,
+                                mtime: this.header.mtime()?,
+                                uid: this.header.uid()?,
+                                gid: this.header.gid()?,
+                                kind: match kind {
+                                    Kind::CharDevice => DeviceKind::Char,
+                                    Kind::BlockDevice => DeviceKind::Block,
+                                    _ => unreachable!(),
+                                },
+                                major: this.header.dev_major()?,
+                                minor: this.header.dev_minor()?,
                             }))
                         }
                         Kind::Link => {
@@ -832,6 +1477,11 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
                     continue;
                 }
                 Entry => {
+                    // there is a file entry that must be either dropped or
+                    // read fully to move further
+                    return Poll::Pending;
+                }
+                SkipEntry => {
                     // skipping a entry
                     let nxt = padded_size(*this.nxt);
                     let remaining =
@@ -901,8 +1551,8 @@ impl<'a, R: AsyncRead + Send + 'a> TarReaderInner<'a, R> {
     }
 }
 
-impl<'a, R: AsyncRead + Send + 'a> Stream for TarReader<'a, R> {
-    type Item = Result<TarEntry<'a, R>>;
+impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
+    type Item = Result<TarEntry<'a, TarRegularFileReader<'a, R>>>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.as_mut();
         let fut = this.inner.lock();
@@ -932,145 +1582,48 @@ impl<'a, R: AsyncRead + Send + 'a> Stream for TarReader<'a, R> {
                 mtime,
                 uid,
                 gid,
-                eof,
-                inner: Arc::clone(&this.inner),
+                inner: TarRegularFileReader {
+                    eof,
+                    inner: Arc::clone(&this.inner),
+                },
+                marker: std::marker::PhantomData,
             }),
             Entry::Directory(d) => TarEntry::Directory(d),
             Entry::Link(l) => TarEntry::Link(l),
             Entry::Symlink(l) => TarEntry::Symlink(l),
+            Entry::Device(d) => TarEntry::Device(d),
+            Entry::Fifo(f) => TarEntry::Fifo(f),
         })))
     }
 }
 
-impl<'a, R: AsyncRead + Send + 'a> Stream for TarReaderInner<'a, R> {
+impl<'a, R: AsyncRead + 'a> Stream for TarReaderInner<'a, R> {
     type Item = Result<Entry>;
     fn poll_next(mut self: Pin<&mut Self>, ctx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         self.as_mut().poll_read_header(ctx)
     }
 }
-impl<'a, R: AsyncRead + Send + 'a> TarEntry<'a, R> {
+impl<'a, R: AsyncRead + 'a> TarEntry<'a, R> {
     pub fn path(&'_ self) -> &'_ str {
         match self {
             Self::File(f) => &f.path_name,
             Self::Link(l) => &l.path_name,
             Self::Symlink(l) => &l.path_name,
             Self::Directory(d) => &d.path_name,
+            Self::Device(d) => &d.path_name,
+            Self::Fifo(f) => &f.path_name,
         }
     }
 }
 
-impl<'a, R: AsyncRead + Send + 'a> TarRegularFile<'a, R> {
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    pub fn path(&'_ self) -> &'_ str {
-        &self.path_name
-    }
-    pub fn mode(&self) -> u32 {
-        self.mode
-    }
-    pub fn mtime(&self) -> u32 {
-        self.mtime
-    }
-    pub fn uid(&self) -> u32 {
-        self.uid
-    }
-    pub fn gid(&self) -> u32 {
-        self.gid
-    }
-}
-impl TarLink {
-    pub fn path(&'_ self) -> &'_ str {
-        &self.path_name
-    }
-    pub fn link(&'_ self) -> &'_ str {
-        &self.link_name
-    }
-}
-impl TarSymlink {
-    pub fn path(&'_ self) -> &'_ str {
-        &self.path_name
-    }
-    pub fn link(&'_ self) -> &'_ str {
-        &self.link_name
-    }
-    pub fn mode(&self) -> u32 {
-        self.mode
-    }
-    pub fn mtime(&self) -> u32 {
-        self.mtime
-    }
-    pub fn uid(&self) -> u32 {
-        self.uid
-    }
-    pub fn gid(&self) -> u32 {
-        self.gid
-    }
-}
-impl TarDirectory {
-    pub fn path(&'_ self) -> &'_ str {
-        &self.path_name
-    }
-    pub fn size(&self) -> u64 {
-        self.size
-    }
-    pub fn mode(&self) -> u32 {
-        self.mode
-    }
-    pub fn mtime(&self) -> u32 {
-        self.mtime
-    }
-    pub fn uid(&self) -> u32 {
-        self.uid
-    }
-    pub fn gid(&self) -> u32 {
-        self.gid
-    }
-}
-
-impl<'a, R: AsyncRead + Send + 'a> AsyncRead for TarRegularFile<'a, R> {
+impl<'a, R: AsyncRead + 'a> AsyncRead for TarRegularFile<'a, R> {
     fn poll_read(
-        mut self: Pin<&mut Self>,
+        self: Pin<&mut Self>,
         ctx: &mut Context<'_>,
         buf: &mut [u8],
     ) -> Poll<std::io::Result<usize>> {
-        let eof = self.eof;
-        let this = self.as_mut();
-        let fut = this.inner.lock();
-        let mut g = task::ready!(pin!(fut).poll(ctx));
-        let inner_pin: Pin<&mut TarReaderInner<R>> = g.as_mut();
-        let inner = inner_pin.project();
-        if *inner.pos >= eof {
-            return Poll::Ready(Ok(0));
-        }
-        let remain = eof - *inner.pos;
-        let n = if remain > 0 {
-            let size = std::cmp::min(remain, buf.len() as u64);
-            let n = ready!(pin!(inner.reader).poll_read(ctx, &mut buf[0..size as usize]));
-            if n == 0 {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading archie file",
-                )));
-            }
-            n
-        } else {
-            0
-        };
-        *inner.pos += n as u64;
-        Poll::Ready(Ok(if (n as u64) < remain {
-            n
-        } else {
-            let nxt = padded_size(*inner.nxt);
-            if *inner.pos == nxt {
-                *inner.nxt = nxt + BLOCK_SIZE as u64;
-                *inner.state = Header;
-            } else {
-                *inner.nxt = nxt;
-                *inner.state = Padding;
-            }
-            n
-        }))
+        let this = self.project();
+        pin!(this.inner).poll_read(ctx, buf)
     }
 }
 
@@ -1126,7 +1679,315 @@ const fn padded_size(n: u64) -> u64 {
     if n == 0 {
         0
     } else {
-        (n + 511) & !511
+        n.saturating_add(511) & !511
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn write_header(
+    buffer: &mut [u8],
+    name: &str,
+    link_name: Option<&str>,
+    kind: Kind,
+    size: u64,
+    mode: u32,
+    uid: u32,
+    gid: u32,
+    mtime: u32,
+    device: Option<(u32, u32)>,
+) -> std::io::Result<usize> {
+    if buffer.len() < BLOCK_SIZE {
+        return Err(std::io::Error::other("buffer too small for tar header"));
+    }
+    let (header_buf, data_buf) = buffer.split_at_mut(BLOCK_SIZE);
+    let header = unsafe { UstarHeader::from_buf(header_buf) };
+    let mut total = BLOCK_SIZE;
+
+    header.set_uid(uid)?;
+    header.set_gid(gid)?;
+    header.set_mode(mode)?;
+    header.set_mtime(mtime)?;
+    let path_truncated = header.set_path(name);
+
+    let link_path_truncated = if let Some(link_name) = link_name.as_ref() {
+        header.set_link_path(link_name)
+    } else {
+        false
+    };
+
+    if !path_truncated && !link_path_truncated {
+        header.set_size(size)?;
+        header.set_typeflag(kind);
+        if let Some((major, minor)) = device {
+            header.set_dev_major(major)?;
+            header.set_dev_minor(minor)?;
+        }
+        header.finalize()?;
+    } else {
+        use std::io::Write;
+        header.set_typeflag(Kind::PAXLocal);
+        let mut ext_size = 0;
+        if path_truncated {
+            let rec_len = pax_record_len("path", name.len());
+            if data_buf.len() < rec_len {
+                return Err(std::io::Error::other("buffer too small for pax header"));
+            }
+            writeln!(
+                &mut data_buf[ext_size..rec_len],
+                "{} path={}",
+                rec_len,
+                name
+            )?;
+            ext_size += rec_len;
+        }
+        if link_path_truncated {
+            let name = link_name.unwrap();
+            let rec_len = pax_record_len("linkpath", name.len());
+            if data_buf.len() < ext_size + rec_len {
+                return Err(std::io::Error::other("buffer too small for pax header"));
+            }
+            writeln!(
+                &mut data_buf[ext_size..ext_size + rec_len],
+                "{} linkpath={}",
+                rec_len,
+                name
+            )?;
+            ext_size += rec_len;
+        }
+        header.set_size(ext_size as u64)?;
+        header.finalize()?;
+        let padded = padded_size(ext_size as u64);
+        if data_buf.len() < padded as usize {
+            return Err(std::io::Error::other("buffer too small for pax header"));
+        }
+        data_buf[ext_size..padded as usize].fill(0);
+        total += padded as usize;
+        if data_buf.len() < padded as usize + BLOCK_SIZE {
+            return Err(std::io::Error::other("buffer too small for pax header"));
+        }
+        data_buf[padded as usize..padded as usize + BLOCK_SIZE].copy_from_slice(header_buf);
+        let file_header = unsafe {
+            UstarHeader::from_buf_no_init(
+                &mut data_buf[padded as usize..padded as usize + BLOCK_SIZE],
+            )
+        };
+        total += BLOCK_SIZE;
+        file_header.set_typeflag(kind);
+        file_header.set_size(size)?;
+        if let Some((major, minor)) = device {
+            file_header.set_dev_major(major)?;
+            file_header.set_dev_minor(minor)?;
+        }
+        file_header.finalize()?;
+    }
+    Ok(total)
+}
+
+fn pax_record_len(key: &str, val_len: usize) -> usize {
+    // <LEN> SP <KEY>=<VALUE>\n
+    let payload_len = key.len() + 1 + val_len + 1;
+    let mut len = payload_len + 1 + 1;
+    loop {
+        let d = num_decimal_digits(len);
+        let new_len = payload_len + 1 + d;
+
+        if new_len == len {
+            return len;
+        }
+        len = new_len;
+    }
+}
+#[inline]
+fn num_decimal_digits(mut n: usize) -> usize {
+    let mut c = 1;
+    while n >= 10 {
+        n /= 10;
+        c += 1;
+    }
+    c
+}
+
+fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {
+    let mut value = val;
+    let mut len = field.len() - 1;
+    field[len] = 0; // null terminator
+    while len > 0 {
+        len -= 1;
+        field[len] = b'0' + (value & 0o7) as u8;
+        value >>= 3;
+    }
+    if value != 0 {
+        return Err(std::io::Error::other(format!(
+            "value {} too large to fit in octal field of len {}",
+            val,
+            field.len()
+        )));
+    }
+    Ok(())
+}
+
+pin_project! {
+    pub struct TarWriter<'a, 'b, W, R> {
+        // internal buffer for writing headers and file data
+        buf: [u8; BLOCK_SIZE * 32],
+        // length of valid data in the buffer
+        len: usize,
+        // current position in the buffer
+        pos: usize,
+        // current global position (number of bytes written)
+        total: u64,
+        // the end position of the current entry being written
+        eof: u64,
+        // closed
+        closed: bool,
+        // reader for the current file being written
+        reader: Option<R>,
+        marker_: std::marker::PhantomData<&'b ()>,
+        // the underlying writer
+        #[pin]
+        writer: W,
+        marker: std::marker::PhantomData<&'a ()>,
+    }
+}
+
+impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> TarWriter<'a, 'b, W, R> {
+    pub fn new(writer: W) -> Self {
+        Self {
+            buf: [0; BLOCK_SIZE * 32],
+            len: 0,
+            pos: 0,
+            total: 0,
+            eof: 0,
+            closed: false,
+            reader: None,
+            marker_: std::marker::PhantomData,
+            writer,
+            marker: std::marker::PhantomData,
+        }
+    }
+
+    /// Drain internal buffer and current file reader to the underlying writer.
+    fn poll_drain(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        let mut this = self.project();
+        loop {
+            tracing::trace!(
+                target: "tar",
+                "tar_writer.poll_drain, len = {}, pos = {}, total = {}, eof = {}, reader is {}",
+                *this.len,
+                *this.pos,
+                *this.total,
+                *this.eof,
+                if this.reader.is_some() {
+                    "Some"
+                } else {
+                    "None"
+                }
+            );
+            while *this.pos < *this.len {
+                let n = task::ready!(this
+                    .writer
+                    .as_mut()
+                    .poll_write(cx, &this.buf[*this.pos..*this.len]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        "error writing buffer",
+                    )));
+                }
+                *this.pos += n;
+                *this.total += n as u64;
+            }
+
+            *this.pos = 0;
+            *this.len = 0;
+
+            if let Some(reader) = this.reader.as_mut() {
+                let remain = this.eof.saturating_sub(*this.total);
+                if remain == 0 {
+                    *this.reader = None;
+                    let padded = padded_size(*this.eof);
+                    let padding = padded.saturating_sub(*this.eof);
+                    tracing::trace!(
+                        target: "tar",
+                        "tar_writer.poll_drain: reader EOF reached, total = {}, eof = {}, padding = {}",
+                        *this.total, *this.eof, padding
+                    );
+                    if padding > 0 {
+                        *this.len = padding as usize;
+                        this.buf[..*this.len].fill(0);
+                        *this.eof = padded;
+                        continue;
+                    } else {
+                        return Poll::Ready(Ok(()));
+                    }
+                }
+                let buf_len = std::cmp::min(this.buf.len() as u64, remain) as usize;
+                let n = task::ready!(pin!(reader).poll_read(cx, &mut this.buf[..buf_len]))?;
+                if n == 0 {
+                    return Poll::Ready(Err(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading file",
+                    )));
+                }
+                *this.pos = 0;
+                *this.len = n;
+                continue;
+            } else {
+                return Poll::Ready(Ok(()));
+            }
+        }
+    }
+}
+
+impl<'a, 'b, W: AsyncWrite + 'a, R: AsyncRead + Unpin + 'b> Sink<TarEntry<'b, R>>
+    for TarWriter<'a, 'b, W, R>
+{
+    type Error = std::io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        self.poll_drain(cx)
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: TarEntry<'b, R>) -> std::io::Result<()> {
+        let this = self.project();
+
+        if *this.len != 0 || this.reader.is_some() {
+            return Err(std::io::Error::other(
+                "start_send called while previous entry still in progress",
+            ));
+        }
+
+        let header_len = item.write_header(this.buf)?;
+        *this.len = header_len;
+
+        if let TarEntry::File(file) = item {
+            this.reader.replace(file.inner);
+            *this.eof = *this.total + (header_len as u64) + file.size;
+        }
+
+        Ok(())
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        task::ready!(self.as_mut().poll_drain(cx))?;
+        let mut this = self.project();
+        task::ready!(this.writer.as_mut().poll_flush(cx))?;
+        Poll::Ready(Ok(()))
+    }
+
+    fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        task::ready!(self.as_mut().poll_drain(cx))?;
+        {
+            let this = self.as_mut().project();
+            if !*this.closed {
+                this.buf[..BLOCK_SIZE * 2].fill(0);
+                *this.len = BLOCK_SIZE * 2;
+                *this.closed = true;
+            }
+        }
+        task::ready!(self.as_mut().poll_drain(cx))?;
+        let mut this = self.project();
+        this.writer.as_mut().poll_close(cx)
     }
 }
 
