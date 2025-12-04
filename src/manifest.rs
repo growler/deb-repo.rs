@@ -370,7 +370,6 @@ impl Manifest {
         UniverseFiles::new(
             self.file.sources(),
             self.lock.sources(),
-            self.lock.local_pkgs(),
         )
     }
     async fn make_universe<C: ContentProvider>(
@@ -379,7 +378,11 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        let packages = cache.fetch_universe(self.sources(), concurrency).await?;
+        let mut packages = cache.fetch_universe(self.sources(), concurrency).await?;
+        if let Some(pkgs) = self.lock.local_pkgs() {
+            // local packages have highest priority
+            packages.push(pkgs.clone().with_prio(0))
+        }
         self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
         Ok(())
     }

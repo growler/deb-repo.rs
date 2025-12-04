@@ -555,7 +555,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         #[command(subcommand)]
         cmd: ShowCommands,
     }
-    impl<C: Config> Command<C> for Show{
+    impl<C: Config> Command<C> for Show {
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
                 ShowCommands::Package(cmd) => cmd.exec(conf),
@@ -657,6 +657,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 let mut out = std::io::stdout().lock();
                 let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
                 pretty_print_packages(&mut out, pkgs, false).await?;
+                out.flush().await?;
                 Ok(())
             })
         }
@@ -796,7 +797,9 @@ impl<'a> From<&'a Package<'a>> for PackageDisplay<'a> {
             name: pkg.name(),
             arch: pkg.arch(),
             ver: pkg.raw_version(),
-            desc: pkg.field("Description").unwrap_or(""),
+            desc: pkg
+                .field("Description")
+                .map_or("", |d| d.split('\n').next().unwrap_or("")),
             prio: pkg.install_priority(),
         }
     }
@@ -831,17 +834,18 @@ pub async fn pretty_print_packages<'a, W: smol::io::AsyncWrite + Unpin>(
             other => other,
         });
     }
-    let mut buffer = Vec::<u8>::new();
+    let mut buf = Vec::new();
     for p in packages.iter() {
+        use smol::io::AsyncWriteExt;
         use std::io::Write;
+        buf.truncate(0);
         writeln!(
-            &mut buffer,
+            &mut buf,
             "{:>w0$} {:<w2$} {:>w3$} {:<w4$}",
             p.arch, p.name, p.ver, p.desc
         )?;
+        f.write_all(&buf).await?;
     }
-    use smol::io::AsyncWriteExt;
-    f.write_all(&buffer).await?;
     Ok(packages.len())
 }
 

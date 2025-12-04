@@ -1,9 +1,7 @@
-use futures::StreamExt;
-
-use crate::deb::DebReader;
 pub use crate::indexfile::IndexFile;
 use {
     crate::{
+        deb::DebReader,
         artifact::Artifact,
         comp::{comp_reader, strip_comp_ext},
         control::{MutableControlFile, MutableControlStanza},
@@ -107,18 +105,15 @@ pub trait ContentProvider {
 pub struct UniverseFiles<'a> {
     sources: &'a [Source],
     locked: &'a [Option<LockedSource>],
-    local_pkgs: Option<&'a Packages>,
 }
 impl<'a> UniverseFiles<'a> {
     pub(crate) fn new(
         sources: &'a [Source],
         locked: &'a [Option<LockedSource>],
-        local_pkgs: Option<&'a Packages>,
     ) -> Self {
         UniverseFiles {
             sources,
             locked,
-            local_pkgs,
         }
     }
     pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
@@ -265,7 +260,8 @@ impl ContentProvider for HostCache {
     > {
         match url {
             DebLocation::Local { path } => {
-                let file = smol::fs::File::open(self.base.join(path)).await?;
+                let file =
+                    hash.verifying_reader(size, smol::fs::File::open(self.base.join(path)).await?);
                 Ok(Box::new(DebStage::new(
                     Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
                 ))
@@ -444,10 +440,6 @@ impl ContentProvider for HostCache {
             Ok(pkg)
         })
         .try_buffered(concurrency.get())
-        .chain(stream::iter(sources.local_pkgs.iter().map(|pkgs| {
-            // local packages have highest priority
-            Ok((*pkgs).clone().with_prio(0))
-        })))
         .try_collect::<Vec<_>>()
         .await
     }
