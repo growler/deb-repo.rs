@@ -129,9 +129,11 @@ impl Manifest {
         match self.file.add_local_pkg(file, comment) {
             UpdateResult::None => return Ok(()),
             UpdateResult::Added => {
+                tracing::debug!("adding new local package to lock");
                 self.lock.push_local_package(ctrl)?;
             }
             UpdateResult::Updated(i) => {
+                tracing::debug!("updating existing local package in lock");
                 self.lock.update_local_package(i, ctrl)?;
             }
         }
@@ -367,10 +369,7 @@ impl Manifest {
         Ok(())
     }
     fn sources(&self) -> UniverseFiles<'_> {
-        UniverseFiles::new(
-            self.file.sources(),
-            self.lock.sources(),
-        )
+        UniverseFiles::new(self.file.sources(), self.lock.sources())
     }
     async fn make_universe<C: ContentProvider>(
         &mut self,
@@ -405,13 +404,14 @@ impl Manifest {
     async fn update_locked_sources<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
-        force: bool,
+        force_sources: bool,
+        force_locals: bool,
         cache: &C,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
         let updated = stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
             move |(source, locked)| {
-                LockedSource::fetch_or_refresh(locked, source, arch, force, cache)
+                LockedSource::fetch_or_refresh(locked, source, arch, force_sources, cache)
             },
         ))
         .flatten_unordered(concurrency.get())
@@ -424,12 +424,6 @@ impl Manifest {
                     .zip(self.file.local_pkgs())
                     .any(|(ctrl, file)| {
                         if let Ok((path, size, hash)) = ctrl.repo_file("SHA256") {
-                            tracing::debug!(
-                                "checking local package file {} (expected size={} hash={})",
-                                file.path,
-                                file.size,
-                                file.hash.to_hex()
-                            );
                             path != file.path || size != file.size || hash != file.hash
                         } else {
                             true
@@ -441,23 +435,31 @@ impl Manifest {
         } else {
             !self.file.local_pkgs().is_empty()
         };
-        if force || local_pkgs_update {
-            let local_pkgs = stream::iter(self.file.local_pkgs().iter())
+        if force_locals || local_pkgs_update {
+            let (local_pkgs, updates) = stream::iter(self.file.local_pkgs().iter())
                 .map(|file| async {
                     let (real_file, ctrl) = cache.ensure_deb(&file.path).await?;
                     if real_file.size != file.size || real_file.hash != file.hash {
-                        return Err(io::Error::other(format!(
-                            "local package file {} has changed on disk (expected size={} hash={}, got size={} hash={})",
-                            file.path,
-                            file.size, file.hash.to_hex(),
-                            real_file.size, real_file.hash.to_hex(),
-                        )));
+                        if force_locals {
+                            Ok((ctrl, Some(real_file)))
+                        } else {
+                            Err(io::Error::other(format!(
+                                "local package file {} has changed on disk (expected size={} hash={}, got size={} hash={})",
+                                file.path,
+                                file.size, file.hash.to_hex(),
+                                real_file.size, real_file.hash.to_hex(),
+                            )))
+                        }
+                    } else {
+                        Ok((ctrl, None))
                     }
-                    Ok(ctrl)
                 })
                 .buffered(concurrency.get())
-                .try_collect::<MutableControlFile>().await?;
+                .try_collect::<(MutableControlFile, Vec<_>)>().await?;
             self.lock.set_local_packages(local_pkgs.try_into()?);
+            if self.file.update_local_pkgs(updates) {
+                self.mark_file_updated();
+            }
         }
         if updated || local_pkgs_update {
             self.lock.update_universe_hash();
@@ -466,13 +468,14 @@ impl Manifest {
     }
     pub async fn update<C: ContentProvider>(
         &mut self,
-        force: bool,
+        force_sources: bool,
+        force_locals: bool,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("updating locked sources");
         let updated = self
-            .update_locked_sources(concurrency, force, cache)
+            .update_locked_sources(concurrency, force_sources, force_locals, cache)
             .await?;
         if updated {
             tracing::debug!("sources updated, invalidating locked specs");

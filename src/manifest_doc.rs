@@ -412,6 +412,22 @@ impl ManifestFile {
     pub fn sources_pkgs(&self) -> &'_ [usize] {
         &self.sources_pkgs
     }
+    pub(crate) fn update_local_pkgs<I: IntoIterator<Item = Option<RepositoryFile>>>(
+        &mut self,
+        it: I,
+    ) -> bool {
+        let mut updated = false;
+        for ((id, item), file) in self.local_pkgs.iter_mut().enumerate().zip(it.into_iter()) {
+            if let Some(file) = file {
+                *item = file;
+                self.doc.update_local_pkg(id, item, None);
+                if !updated {
+                    updated = true;
+                }
+            }
+        }
+        updated
+    }
     pub fn add_local_pkg(&mut self, pkg: RepositoryFile, comment: Option<&str>) -> UpdateResult {
         if let Some((i, file)) = self
             .local_pkgs
@@ -1190,19 +1206,13 @@ pub(crate) trait ManifestDoc {
         let mut pkg_table = toml_edit::ser::to_document(pkg)
             .expect("failed to serialize table")
             .into_table();
-        let comment = toml_edit::RawString::from(if index == 0 {
-            comment
-                .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
-                .unwrap_or_default()
-        } else {
-            format!(
+        if let Some(comment) = comment {
+            let comment = toml_edit::RawString::from(format!(
                 "\n{}",
-                comment
-                    .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
-                    .unwrap_or_default()
-            )
-        });
-        pkg_table.decor_mut().set_prefix(comment);
+                comment.split('\n').map(|s| format!("# {}\n", s)).join("")
+            ));
+            pkg_table.decor_mut().set_prefix(comment);
+        }
         if let Some(table) = local_arr.get_mut(index) {
             *table = pkg_table;
         }
@@ -1212,18 +1222,12 @@ pub(crate) trait ManifestDoc {
         let mut pkg_table = toml_edit::ser::to_document(pkg)
             .expect("failed to serialize table")
             .into_table();
-        let comment = toml_edit::RawString::from(if local_arr.is_empty() {
+        let comment = toml_edit::RawString::from(format!(
+            "\n{}",
             comment
                 .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
                 .unwrap_or_default()
-        } else {
-            format!(
-                "\n{}",
-                comment
-                    .map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""))
-                    .unwrap_or_default()
-            )
-        });
+        ));
         pkg_table.decor_mut().set_prefix(comment);
         local_arr.push(pkg_table);
     }

@@ -97,7 +97,7 @@ Examples:
                     self.comment.as_deref().or(comment.as_deref()),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(true, conf.concurrency(), fetcher).await?;
+                mf.update(true, false, conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;
@@ -124,7 +124,7 @@ Examples:
                 let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_source(self.source.clone(), self.comment.as_deref())?;
-                mf.update(false, conf.concurrency(), fetcher).await?;
+                mf.update(false, false, conf.concurrency(), fetcher).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
@@ -469,6 +469,9 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         /// Re-fetch sources even if they appear up to date. Do not use cache.
         #[arg(short = 'f', long = "force", action)]
         force: bool,
+        /// Force update only local packages
+        #[arg(short = 'l', long = "only-locals", requires = "force", action)]
+        only_locals: bool,
         /// Snapshot to use for all sources that support it and have snapshotting enabled
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
@@ -483,7 +486,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                mf.update(self.force, conf.concurrency(), fetcher).await?;
+                mf.update(self.force && !self.only_locals, self.force, conf.concurrency(), fetcher).await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
