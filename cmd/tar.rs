@@ -7,21 +7,19 @@ fn main() {
 
     let base_format = fmt::format()
         .without_time()
-        .with_level(true)
+        .with_level(false)
         .with_target(true);
 
     fmt()
         .with_env_filter(filter)
         .event_format(base_format)
-        .with_thread_ids(true) // include thread IDs only in debug mode
-        .with_thread_names(true) // include thread names only in debug mode
-        .with_file(true) // include file path only in debug mode
-        .with_line_number(true) // include line number only in debug mode
+        .with_thread_ids(true)
+        .with_thread_names(true)
+        .with_file(true)
+        .with_line_number(true)
         .with_writer(std::io::stderr)
         .try_init()
         .unwrap();
-
-    tracing::trace!(target: "tar-test", "About to create TarReader and TarWriter");
 
     smol::block_on(async {
         let rd = TarReader::new(Async::new(std::io::stdin()).unwrap());
@@ -29,7 +27,7 @@ fn main() {
         let fwd = rd
             .map(|e| {
                 if let Ok(entry) = e {
-                    eprintln!(" entry: {:?}", &entry);
+                    tracing::trace!(target: "tar-cmd", " entry: {:?}", &entry);
                     Ok(entry)
                 } else {
                     e
