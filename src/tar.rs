@@ -330,9 +330,6 @@ impl UstarHeader {
         hdr.version = *b"00";
         hdr
     }
-    unsafe fn from_buf_no_init(buf: &mut [u8]) -> &mut Self {
-        &mut *(buf.as_mut_ptr() as *mut Self)
-    }
     fn set_dev_major(&mut self, major: u32) -> std::io::Result<()> {
         format_octal(major as u64, &mut self.dev_major)
     }
@@ -374,7 +371,7 @@ impl UstarHeader {
             copy_utf8_truncate(&mut self.name, unsafe {
                 // SAFETY: the source string was an str, and a break, if any, was made at '/',
                 // which is a valid codepoint
-                std::str::from_utf8_unchecked(&path.as_bytes()[pos+1..])
+                std::str::from_utf8_unchecked(&path.as_bytes()[pos + 1..])
             });
         } else {
             copy_utf8_truncate(&mut self.name, path);
@@ -641,38 +638,41 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
             *inner.pos,
             eof
         );
-        if *inner.pos >= eof {
+        let n;
+        if *inner.pos > eof || (*inner.pos == eof && !matches!(*inner.state, Entry)) {
             return Poll::Ready(Ok(0));
-        }
-        let remain = *inner.nxt - *inner.pos;
-        let n = if remain > 0 {
-            let size = std::cmp::min(remain, buf.len() as u64);
-            let n = ready!(pin!(inner.reader).poll_read(ctx, &mut buf[0..size as usize]));
-            if n == 0 {
-                return Poll::Ready(Err(Error::new(
-                    ErrorKind::UnexpectedEof,
-                    "unexpected EOF while reading archie file",
-                )));
-            }
-            n
-        } else {
-            0
-        };
-        *inner.pos += n as u64;
-        Poll::Ready(Ok(if (n as u64) < remain {
-            n
-        } else {
-            ctx.waker().wake_by_ref();
-            let nxt = padded_size(*inner.nxt);
-            if *inner.pos == nxt {
-                *inner.nxt = nxt + BLOCK_SIZE as u64;
-                *inner.state = Header;
+        } else if *inner.pos < eof {
+            let remain = *inner.nxt - *inner.pos;
+            n = if remain > 0 {
+                let size = std::cmp::min(remain, buf.len() as u64);
+                let n = ready!(pin!(inner.reader).poll_read(ctx, &mut buf[0..size as usize]));
+                if n == 0 {
+                    return Poll::Ready(Err(Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "unexpected EOF while reading archie file",
+                    )));
+                }
+                n
             } else {
-                *inner.nxt = nxt;
-                *inner.state = Padding;
+                0
+            };
+            *inner.pos += n as u64;
+            if (n as u64) < remain {
+                return Poll::Ready(Ok(n));
             }
-            n
-        }))
+        } else {
+            n = 0;
+        };
+        ctx.waker().wake_by_ref();
+        let nxt = padded_size(*inner.nxt);
+        if *inner.pos == nxt {
+            *inner.nxt = nxt + BLOCK_SIZE as u64;
+            *inner.state = Header;
+        } else {
+            *inner.nxt = nxt;
+            *inner.state = Padding;
+        }
+        Poll::Ready(Ok(n))
     }
 }
 
@@ -1836,9 +1836,7 @@ fn write_header(
             return Err(std::io::Error::other("buffer too small for pax header"));
         }
         let header = unsafe {
-            UstarHeader::from_buf(
-                &mut data_buf[padded as usize..padded as usize + BLOCK_SIZE],
-            )
+            UstarHeader::from_buf(&mut data_buf[padded as usize..padded as usize + BLOCK_SIZE])
         };
         total += BLOCK_SIZE;
         header.set_uid(uid)?;

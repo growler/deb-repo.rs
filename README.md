@@ -1,50 +1,50 @@
 # rdebootstrap
 
-`rdebootstrap` is a Rust implementation of a manifest-driven Debian bootstrapper. It consumes a declarative `Manifest.toml`, resolves packages from one or more APT repositories (optionally pinned to snapshot IDs), stages additional artifacts, and builds a root filesystem tree inside a sandbox so maintainer scripts run in a controlled environment. The crate also exposes the same functionality as a reusable library (`debrepo`).
+`rdebootstrap` is a manifest-driven Debian/Ubuntu bootstrapper written in Rust. It resolves packages from user-defined APT sources, locks the full dependency graph, stages arbitrary artifacts, and builds a root filesystem tree inside a sandbox so maintainer scripts run in a controlled environment. The same engine is exposed as the `debrepo` library for embedding in other tooling.
 
-## Features
-- **Manifest-first workflow** – describe sources, specs, staged files, and local `.deb` artifacts in `Manifest.toml` and keep the resulting lockfile (`Manifest.<arch>.lock`) under version control.
-- **Deterministic package resolution** – fetches and verifies Release files with GPGME, supports Debian snapshot URLs, and locks every spec before builds.
-- **Rich spec management** – add/remove requirements and constraints, include local packages, and stage arbitrary files into a spec.
-- **Sandboxed builds** – `build` runs maintainer scripts inside an isolated namespace; run as root to preserve ownership or as an unprivileged user when testing.
-- **Fast downloads** – concurrent fetcher (`-n/--downloads`) backed by a shared cache (`~/.cache/rdebootstrap` or `XDG_CACHE_HOME`), with opt-outs for air‑gapped builds.
+## Highlights
+- **Declarative input** – `Manifest.toml` lists sources, specs, staged files, local `.deb`s, and metadata while `Manifest.<arch>.lock` captures the fully resolved set for reproducible builds.
+- **Deterministic resolution** – Release and Packages files are fetched with GPG verification, optional snapshot pinning, and a solver that locks each spec before anything is installed.
+- **Sandboxed builds** – `build` expands packages inside an isolated helper namespace; run as root for production ownership or unprivileged while iterating.
+- **Rich spec tooling** – add/drop requirements and constraints per spec, stage local files or HTTP artifacts, and include local packages that ship alongside the manifest.
+- **Fast, resumable downloads** – concurrent fetcher (`-n/--downloads`) backed by a shared cache and optional transport relaxations for air-gapped or test environments.
 
 ## Requirements
-- Linux host with user namespaces enabled (needed for the sandbox helper).
+- Linux host with user namespaces enabled (required by the sandbox helper).
 - Rust toolchain ≥ 1.85 (`rustup toolchain install 1.85.0`).
-- System dependencies required by `cargo` (SSL, libz, etc.) plus `gpgme`/`libgpg-error` for Release verification.
-- Optional: `sudo` if you need to set ownership inside the target rootfs.
+- System packages needed by `cargo` plus `gpgme`/`libgpg-error` for Release verification.
+- Optional `sudo` when you need ownership preserved inside the target rootfs.
 
-## Build and Install
+## Installation
 ```bash
-# clone this repository, then
+# clone this repo
 cargo build --release
+
 # or install into ~/.cargo/bin
 cargo install --path .
+
+# nix users
+nix build .#rdebootstrap
 ```
 
-The resulting binary is `target/release/rdebootstrap`.
+The resulting binary lives at `target/release/rdebootstrap` (or in `~/.cargo/bin` when installed).
 
-## Quick Start
-```bash
-# 1. Create a manifest with Debian sources and a base package set
-rdebootstrap init --url debian --package ca-certificates --package vim
+## Typical Workflow
+1. **Create a manifest**  
+   `rdebootstrap init --url debian --package ca-certificates --package vim`
+2. **Iterate on specs**  
+   `rdebootstrap include --spec desktop openssh-server network-manager`  
+   `rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'`
+3. **Update and lock**  
+   `rdebootstrap update --snapshot 20241007T030925Z`  
+   This downloads Release/Packages data, solves the specs, and writes `Manifest.<arch>.lock`.
+4. **Build a filesystem tree**  
+   `sudo rdebootstrap build --spec desktop --path ./out/rootfs`
 
-# 2. Add more requirements or constraints to a spec
-rdebootstrap include --spec desktop 'openssh-server' 'network-manager'
-rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'
-
-# 3. Pin repositories (optional) and update the lock file
-rdebootstrap update --snapshot 20241007T030925Z
-
-# 4. Build the spec into a target directory
-sudo rdebootstrap build --spec desktop --path ./out/rootfs
-```
-
-During `build`, packages are staged into `./out/rootfs` and maintainer scripts execute inside a helper namespace. The cache lives next to the manifest unless `--cache-dir` or `--no-cache` is supplied.
+`build` unpacks packages into the target directory, stages artifacts, and runs maintainer scripts in the sandbox so the host stays clean.
 
 ## Manifest Layout
-`Manifest.toml` sits at the repo root by default (override with `--manifest`). A minimal file looks like:
+`Manifest.toml` sits at the project root unless `--manifest <path>` is supplied. A small example:
 
 ```toml
 [[source]]
@@ -62,37 +62,42 @@ path = "target/debian/mytool_0.1.0_amd64.deb"
 hash = "sha256-..."
 ```
 
-Sections you can mix in:
-- `[[source]]` entries describe APT repositories, suites, components, and optional snapshot templates or trusted keys.
-- `[[local]]` registers local `.deb` files so they are copied into the cache and treated like repository packages.
-- `[artifact."<name>"]` entries stage arbitrary files or URLs into the tree.
-- `[spec]` (and named specs like `[spec.desktop]`) declare requirements/constraints, staged artifacts, and metadata.
+Key sections:
+- `[[source]]` — APT repositories with suites, components, optional snapshot templates, trusted keys, and priorities.
+- `[[local]]` — Local `.deb` files copied into the cache and treated like repo packages.
+- `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
+- `[spec]` and `[spec.<name>]` — Package requirements/constraints, staged artifacts, and metadata per spec. Specs can inherit from each other via `extends`.
 
-`rdebootstrap update` rewrites `Manifest.<arch>.lock` with the resolved versions, while `build` consumes the manifest + lock pair.
+`rdebootstrap update` keeps the lock file aligned with the manifest, and `build` refuses to run if the lock is missing or stale.
 
-## CLI Overview
+## Cache and Fetching
+- By default caching is enabled and lives in `XDG_CACHE_HOME/rdebootstrap` or `~/.cache/rdebootstrap` if `XDG_CACHE_HOME` is unset.  
+- Use `--cache-dir <dir>` to point elsewhere or `--no-cache` to disable it entirely.  
+- Local artifacts are hashed relative to the manifest directory, so keeping manifests and artifacts in the same repository ensures stable paths.  
+- Content integrity is enforced via the hashes recorded in the lock file; disabling cache does not bypass verification.
+
+## CLI Tour
 - `init` – bootstrap a manifest from vendor presets or explicit sources.
-- `add source|local` – append repositories or register a local `.deb`.
-- `include` / `exclude` – manage package requirements and version constraints per spec.
-- `drop` – remove requirements or constraints from a spec.
-- `stage` / `unstage` – add or remove arbitrary files/URLs that should appear in the tree.
-- `update` – refresh Release/Packages metadata, solve dependencies, and refresh the lockfile (optionally pinning `--snapshot`).
-- `list`, `search`, `show` – inspect the currently resolved universe.
-- `build` – expand a spec into a directory, running maintainer scripts inside the sandbox helper.
+- `add source`, `add local` – append repositories or register a local `.deb`.
+- `include` / `exclude` – add requirements or version constraints to a spec.
+- `drop` – remove requirements or constraints.
+- `stage` / `unstage` – add or remove artifacts (local files or URLs).
+- `update` – refresh metadata, solve dependencies, and rewrite the lock file (supports `--snapshot`).
+- `list`, `search`, `show` – inspect the resolved package universe.
+- `build` – expand a spec into a directory, running maintainer scripts within the sandbox helper.
 
-Global flags worth knowing:
-- `--manifest <PATH>` selects an alternate manifest.
-- `--arch <ARCH>` targets a different architecture (defaults to the host arch).
-- `-n/--downloads <N>` controls concurrent downloads (default 20).
-- `--cache-dir <DIR>` or `--no-cache` to override caching.
-- `-K/--no-verify` and `-k/--insecure` relax Release or TLS verification (not recommended).
+Global flags of note:
+- `--manifest <path>` selects an alternate manifest.
+- `--arch <arch>` switches the target architecture (default: host arch).
+- `-n/--downloads <N>` controls concurrent downloads (default: 20).
+- `--cache-dir`, `--no-cache`, `-K/--no-verify`, and `-k/--insecure` adjust caching and verification.
 
-Run `rdebootstrap <command> --help` for the full option list.
+Run `rdebootstrap <command> --help` for exhaustive usage information.
 
 ## Development
-- `cargo fmt` and `cargo clippy --all-targets` keep the codebase tidy.
-- `cargo test` exercises the parsing, solver, and staging layers.
-- `cargo bench -p debrepo version` (etc.) runs the Criterion benches under `benches/`.
+- `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` keep the codebase healthy.
+- `cargo bench -p debrepo version` (and other benches under `benches/`) run Criterion benchmarks.
+- The crate can also be embedded directly by depending on `debrepo` and driving `Manifest`/`HostCache` from your own host tooling.
 
 ## License
 Licensed under the [MIT License](LICENSE).

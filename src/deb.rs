@@ -480,6 +480,7 @@ where
                                     )
                                 },
                             )?);
+                            tracing::debug!(target: "deb", "extracing package {}", maybe_ctrl.as_ref().unwrap().package_name()?);
                             continue;
                         } else if filename.eq("./conffiles") {
                             let mut buf = String::with_capacity(file.size() as usize);
@@ -653,6 +654,7 @@ where
         if !ctrl_files_list.is_empty() {
             ctrl.set("Controlfiles", ctrl_files_list);
         }
+        tracing::debug!(target: "deb", "finished extracting package {}", ctrl.package_name().unwrap());
         Ok(ctrl)
     }
 }
