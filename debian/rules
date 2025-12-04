@@ -1,7 +1,7 @@
 #!/usr/bin/make -f
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
-export CARGO_HOME := $(CURDIR)/debian/cargo-home
+export CARGO_HOME := $(CURDIR)/target/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target
 
 %:
@@ -24,5 +24,4 @@ override_dh_auto_install:
 		$(CURDIR)/debian/rdebootstrap/usr/bin/rdebootstrap
 
 override_dh_auto_clean:
-	-cargo clean
-	rm -rf $(CARGO_HOME)
+	-cargo clean -r

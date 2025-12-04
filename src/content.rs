@@ -1,3 +1,5 @@
+use futures::StreamExt;
+
 use crate::deb::DebReader;
 pub use crate::indexfile::IndexFile;
 use {
@@ -33,6 +35,20 @@ pub trait ContentProviderGuard<'a> {
     fn commit(self) -> impl Future<Output = io::Result<()>>;
 }
 
+#[derive(Clone, Debug)]
+pub enum DebLocation<'a> {
+    Repository { url: &'a str, path: &'a str },
+    Local { path: &'a str },
+}
+impl std::fmt::Display for DebLocation<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DebLocation::Repository { url, path } => write!(f, "{}/{}", url, path),
+            DebLocation::Local { path } => write!(f, "local:{}", path),
+        }
+    }
+}
+
 pub trait ContentProvider {
     type Target: StagingFileSystem;
     type Guard<'a>: ContentProviderGuard<'a>
@@ -43,7 +59,7 @@ pub trait ContentProvider {
         &self,
         hash: Hash,
         size: u64,
-        url: &str,
+        url: &DebLocation<'_>,
     ) -> impl Future<
         Output = io::Result<
             Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
@@ -91,10 +107,19 @@ pub trait ContentProvider {
 pub struct UniverseFiles<'a> {
     sources: &'a [Source],
     locked: &'a [Option<LockedSource>],
+    local_pkgs: Option<&'a Packages>,
 }
 impl<'a> UniverseFiles<'a> {
-    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
-        UniverseFiles { sources, locked }
+    pub(crate) fn new(
+        sources: &'a [Source],
+        locked: &'a [Option<LockedSource>],
+        local_pkgs: Option<&'a Packages>,
+    ) -> Self {
+        UniverseFiles {
+            sources,
+            locked,
+            local_pkgs,
+        }
     }
     pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
         self.sources
@@ -234,52 +259,73 @@ impl ContentProvider for HostCache {
         &self,
         hash: Hash,
         size: u64,
-        url: &str,
+        url: &DebLocation<'_>,
     ) -> io::Result<
         Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
     > {
-        if let Some(cache) = self.cache.as_ref() {
-            let cache_path = hash.store_name(Some(cache.as_ref()), Some("deb"), 1);
-            if let Ok(file) = fs::File::open(&cache_path).await {
-                tracing::debug!("Using cached {} at {}", url, cache_path.display());
-                return Ok(Box::new(DebStage::new(
+        match url {
+            DebLocation::Local { path } => {
+                let file = smol::fs::File::open(self.base.join(path)).await?;
+                Ok(Box::new(DebStage::new(
                     Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
                 ))
                     as Box<
                         dyn Stage<Target = Self::Target, Output = MutableControlStanza>
                             + Send
                             + 'static,
-                    >);
+                    >)
             }
-            let mut src = hash.verifying_reader(size, self.transport.open(url).await?);
-            let (dst, path) = tempfile::Builder::new()
-                .tempfile_in(cache.as_ref())?
-                .into_parts();
-            let mut dst: smol::fs::File = dst.into();
-            io::copy(&mut src, &mut dst).await?;
-            dst.sync_data().await?;
-            smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
-            path.persist(&cache_path)?;
-            tracing::debug!("Cached {} at {}", url, cache_path.display());
-            let file = fs::File::open(&cache_path).await?;
-            Ok(Box::new(DebStage::new(
-                Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
-            ))
-                as Box<
-                    dyn Stage<Target = Self::Target, Output = MutableControlStanza>
-                        + Send
-                        + 'static,
-                >)
-        } else {
-            let src = hash.verifying_reader(size, self.transport.open(url).await?);
-            Ok(Box::new(DebStage::new(
-                Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
-            ))
-                as Box<
-                    dyn Stage<Target = Self::Target, Output = MutableControlStanza>
-                        + Send
-                        + 'static,
-                >)
+            DebLocation::Repository { url, path } => {
+                if let Some(cache) = self.cache.as_ref() {
+                    let cache_path = hash.store_name(Some(cache.as_ref()), Some("deb"), 1);
+                    if let Ok(file) = fs::File::open(&cache_path).await {
+                        tracing::debug!("Using cached {} at {}", url, cache_path.display());
+                        return Ok(Box::new(DebStage::new(
+                            Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
+                        ))
+                            as Box<
+                                dyn Stage<Target = Self::Target, Output = MutableControlStanza>
+                                    + Send
+                                    + 'static,
+                            >);
+                    }
+                    let mut src = hash.verifying_reader(
+                        size,
+                        self.transport.open(&format!("{}/{}", url, path)).await?,
+                    );
+                    let (dst, path) = tempfile::Builder::new()
+                        .tempfile_in(cache.as_ref())?
+                        .into_parts();
+                    let mut dst: smol::fs::File = dst.into();
+                    io::copy(&mut src, &mut dst).await?;
+                    dst.sync_data().await?;
+                    smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
+                    path.persist(&cache_path)?;
+                    tracing::debug!("Cached {} at {}", url, cache_path.display());
+                    let file = fs::File::open(&cache_path).await?;
+                    Ok(Box::new(DebStage::new(
+                        Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
+                    ))
+                        as Box<
+                            dyn Stage<Target = Self::Target, Output = MutableControlStanza>
+                                + Send
+                                + 'static,
+                        >)
+                } else {
+                    let src = hash.verifying_reader(
+                        size,
+                        self.transport.open(&format!("{}/{}", url, path)).await?,
+                    );
+                    Ok(Box::new(DebStage::new(
+                        Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
+                    ))
+                        as Box<
+                            dyn Stage<Target = Self::Target, Output = MutableControlStanza>
+                                + Send
+                                + 'static,
+                        >)
+                }
+            }
         }
     }
     async fn ensure_deb(&self, path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
@@ -398,6 +444,10 @@ impl ContentProvider for HostCache {
             Ok(pkg)
         })
         .try_buffered(concurrency.get())
+        .chain(stream::iter(sources.local_pkgs.iter().map(|pkgs| {
+            // local packages have highest priority
+            Ok((*pkgs).clone().with_prio(0))
+        })))
         .try_collect::<Vec<_>>()
         .await
     }

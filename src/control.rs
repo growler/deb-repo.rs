@@ -7,7 +7,11 @@
 /// interpret Debian-style comments and is not a full implementation of the
 /// Debian policy — it is intended for parsing and extracting fields rather
 /// than preserving formatting or comments when serializing.
-use {crate::idmap::IntoBoxed, serde::{Deserialize, Serialize}, std::borrow::Cow};
+use {
+    crate::packages::Packages,
+    serde::{Deserialize, Serialize},
+    std::{borrow::Cow, sync::Arc},
+};
 
 /// Represents parsing error
 #[derive(Debug, Clone)]
@@ -153,7 +157,7 @@ pub struct MutableControlStanza {
 
 #[ouroboros::self_referencing]
 struct MutableControlStanzaInner {
-    src: Box<str>,
+    src: Arc<str>,
     #[borrows(src)]
     #[not_covariant]
     fields: Vec<MutableControlField<'this>>,
@@ -179,19 +183,19 @@ impl MutableControlStanza {
     pub fn new() -> Self {
         MutableControlStanza {
             inner: MutableControlStanzaInnerBuilder {
-                src: "".into_boxed(),
+                src: Arc::from("".to_string()),
                 fields_builder: |_| vec![],
             }
             .build(),
         }
     }
     /// Parses a string into a ControlStanza, ensuring that the entire `src` string is consumed.
-    pub fn parse<S: IntoBoxed<str>>(src: S) -> Result<Self, ParseError> {
+    pub fn parse<S: Into<Arc<str>>>(src: S) -> Result<Self, ParseError> {
         Ok(MutableControlStanza {
             inner: MutableControlStanzaInnerTryBuilder {
-                src: src.into_boxed(),
+                src: src.into(),
                 #[allow(clippy::borrowed_box)]
-                fields_builder: |src: &'_ Box<str>| {
+                fields_builder: |src: &'_ Arc<str>| {
                     let fields = ControlParser::new(src)
                         .map(|f| match f {
                             Ok(f) => Ok(MutableControlField::from(f)),
@@ -293,13 +297,18 @@ impl MutableControlStanza {
 }
 
 impl Serialize for MutableControlStanza {
-    fn serialize<S: serde::Serializer>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error> {
+    fn serialize<S: serde::Serializer>(
+        &self,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error> {
         serializer.serialize_str(self.to_string().as_str())
     }
 }
 
 impl<'de> Deserialize<'de> for MutableControlStanza {
-    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> std::result::Result<Self, D::Error> {
+    fn deserialize<D: serde::Deserializer<'de>>(
+        deserializer: D,
+    ) -> std::result::Result<Self, D::Error> {
         let s = String::deserialize(deserializer)?;
         MutableControlStanza::parse(s).map_err(serde::de::Error::custom)
     }
@@ -513,11 +522,21 @@ impl MutableControlFile {
     pub fn add(&mut self, stanza: MutableControlStanza) {
         self.stanzas.push(stanza)
     }
+    pub fn set_at(&mut self, index:usize, stanza: MutableControlStanza) {
+        self.stanzas[index] = stanza
+    }
     /// Creates a new stanza and returns a mutable reference to it.
     pub fn new_stanza(&mut self) -> &'_ mut MutableControlStanza {
         let l = self.stanzas.len();
         self.stanzas.push(MutableControlStanza::new());
         &mut self.stanzas[l]
+    }
+}
+
+impl TryFrom<MutableControlFile> for Packages {
+    type Error = ParseError;
+    fn try_from(cf: MutableControlFile) -> std::result::Result<Self, ParseError> {
+        Packages::new(cf.to_string().into(), None)
     }
 }
 
@@ -536,6 +555,11 @@ impl std::iter::FromIterator<MutableControlStanza> for MutableControlFile {
     fn from_iter<T: IntoIterator<Item = MutableControlStanza>>(iter: T) -> Self {
         let stanzas: Vec<MutableControlStanza> = iter.into_iter().collect();
         Self { stanzas }
+    }
+}
+impl std::iter::Extend<MutableControlStanza> for MutableControlFile {
+    fn extend<T: IntoIterator<Item = MutableControlStanza>>(&mut self, iter: T) {
+        self.stanzas.extend(iter)
     }
 }
 

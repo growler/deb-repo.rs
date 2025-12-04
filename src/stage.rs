@@ -2,7 +2,7 @@ use {
     crate::{
         artifact::Artifact,
         comp::strip_comp_ext,
-        content::ContentProvider,
+        content::{ContentProvider, DebLocation},
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
         source::{RepositoryFile, Source},
         spec::LockedSource,
@@ -143,9 +143,12 @@ where
             let pb = pb.clone();
             async move {
                 let url = if let Some(source) = source {
-                    source.file_url(file.path())
+                    DebLocation::Repository {
+                        url: source.base(),
+                        path: file.path(),
+                    }
                 } else {
-                    file.path().to_string()
+                    DebLocation::Local { path: file.path() }
                 };
                 let size = file.size();
                 let deb = cache.fetch_deb(file.hash().clone(), size, &url).await?;
@@ -280,11 +283,14 @@ where
     let new_installed = stream::iter(packages)
         .map(|(source, file)| {
             let pb = pb.clone();
-            let url = if let Some(source) = source {
-                source.file_url(file.path())
-            } else {
-                file.path().to_string()
-            };
+                let url = if let Some(source) = source {
+                    DebLocation::Repository {
+                        url: source.base(),
+                        path: file.path(),
+                    }
+                } else {
+                    DebLocation::Local { path: file.path() }
+                };
             let size = file.size();
             let hash = file.hash().clone();
             let fs = fs.clone();

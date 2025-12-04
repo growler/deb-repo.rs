@@ -1,10 +1,15 @@
-use crate::{control::MutableControlStanza, hash::HashAlgo, source::SnapshotId};
+use crate::{
+    control::{MutableControlFile, MutableControlStanza},
+    hash::HashAlgo,
+    source::SnapshotId,
+};
 
 use {
     crate::{
         artifact::Artifact,
         hash::Hash,
         kvlist::{KVList, KVListSet},
+        packages::Packages,
         source::{RepositoryFile, Snapshot, Source},
         spec::*,
         version::{Constraint, Dependency},
@@ -112,9 +117,10 @@ impl ManifestFile {
     }
 
     // A new manifest with sources
-    pub fn new_with_sources(sources: Vec<Source>, comment: Option<&str>) -> Self {
+    pub fn new_with_sources(mut sources: Vec<Source>, comment: Option<&str>) -> Self {
         let mut doc = toml_edit::DocumentMut::new().init_manifest(comment);
         doc.push_sources(sources.iter(), None);
+        sources.iter_mut().for_each(|s| s.set_base());
         ManifestFile {
             doc,
             sources_pkgs: sources_pkgs(&sources),
@@ -154,6 +160,7 @@ impl ManifestFile {
             })?
             .init_manifest(None);
         manifest.doc = doc;
+        manifest.sources.iter_mut().for_each(|s| s.set_base());
         manifest.sources_pkgs = sources_pkgs(&manifest.sources);
         Ok((manifest, hash))
     }
@@ -169,7 +176,7 @@ impl ManifestFile {
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
             sources: self.sources().iter().map(|_| None).collect(),
-            local_pkgs: Vec::new(),
+            local_pkgs: None,
             specs: self
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
@@ -623,11 +630,18 @@ impl<'a> Iterator for SpecIterator<'a> {
     }
 }
 
-fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> Hash {
+fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(
+    sources: I,
+    locals: Option<&Packages>,
+) -> Hash {
+    let mut hasher = blake3::Hasher::new();
+    if let Some(locals) = locals {
+        hasher.update(locals.src().as_bytes());
+    }
     sources
         .flat_map(|s| s.suites.iter())
         .flat_map(|s| s.packages.iter())
-        .fold(blake3::Hasher::new(), |mut hasher, file| {
+        .fold(hasher, |mut hasher, file| {
             hasher.update(file.hash.as_bytes());
             hasher
         })
@@ -638,8 +652,8 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(sources: I) -> H
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     sources: Vec<Option<LockedSource>>,
-    #[serde(rename = "locals", skip_serializing_if = "Vec::is_empty", default)]
-    local_pkgs: Vec<MutableControlStanza>,
+    #[serde(rename = "locals", skip_serializing_if = "Option::is_none", default)]
+    local_pkgs: Option<Packages>,
     specs: KVList<LockedSpec>,
     #[serde(skip, default)]
     universe_hash: Option<Hash>,
@@ -651,7 +665,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             sources: Vec::new(),
-            local_pkgs: Vec::new(),
+            local_pkgs: None,
             specs: KVList::new(),
         }
     }
@@ -659,7 +673,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             sources: vec![None; sources],
-            local_pkgs: Vec::new(),
+            local_pkgs: None,
             specs: KVList::new(),
         }
     }
@@ -695,7 +709,7 @@ impl LockFile {
                     hash: Hash,
                     sources: Vec<LockedSource>,
                     #[serde(default)]
-                    locals: Vec<MutableControlStanza>,
+                    locals: Option<Packages>,
                     specs: KVList<LockedSpec>,
                 }
                 r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
@@ -709,7 +723,10 @@ impl LockFile {
                     .map(|lock| {
                         if &lock.hash == manifest_hash && lock.arch.as_str() == arch.as_ref() {
                             Some(LockFile {
-                                universe_hash: Some(universe_hash(lock.sources.iter())),
+                                universe_hash: Some(universe_hash(
+                                    lock.sources.iter(),
+                                    lock.locals.as_ref(),
+                                )),
                                 sources: lock.sources.into_iter().map(Some).collect(),
                                 local_pkgs: lock.locals,
                                 specs: lock.specs,
@@ -755,16 +772,35 @@ impl LockFile {
     pub fn sources(&self) -> &'_ [Option<LockedSource>] {
         &self.sources
     }
+    pub fn local_pkgs(&self) -> Option<&'_ Packages> {
+        self.local_pkgs.as_ref()
+    }
     pub fn sources_mut(&mut self) -> &'_ mut [Option<LockedSource>] {
         &mut self.sources
     }
-    pub fn push_local_package(&mut self, pkg: MutableControlStanza) {
-        self.local_pkgs.push(pkg);
+    pub fn set_local_packages(&mut self, pkgs: Packages) {
+        self.local_pkgs.replace(pkgs);
         self.universe_hash.take();
     }
-    pub fn update_local_package(&mut self, id: usize, pkg: MutableControlStanza) {
-        self.local_pkgs[id] = pkg;
+    pub fn push_local_package(&mut self, pkg: MutableControlStanza) -> io::Result<()> {
+        let mut pkgs: MutableControlFile = self
+            .local_pkgs
+            .as_ref()
+            .map_or_else(MutableControlFile::new, MutableControlFile::from);
+        pkgs.add(pkg);
+        self.local_pkgs.replace(pkgs.try_into()?);
         self.universe_hash.take();
+        Ok(())
+    }
+    pub fn update_local_package(&mut self, id: usize, pkg: MutableControlStanza) -> io::Result<()> {
+        let mut pkgs: MutableControlFile = self
+            .local_pkgs
+            .as_ref()
+            .map_or_else(MutableControlFile::new, MutableControlFile::from);
+        pkgs.set_at(id, pkg);
+        self.local_pkgs.replace(pkgs.try_into()?);
+        self.universe_hash.take();
+        Ok(())
     }
     pub fn push_source(&mut self, source: Option<LockedSource>) {
         self.sources.push(source);
@@ -781,6 +817,7 @@ impl LockFile {
     pub(crate) fn update_universe_hash(&mut self) {
         self.universe_hash = Some(universe_hash(
             self.sources.iter().map(|s| s.as_ref().unwrap()),
+            self.local_pkgs.as_ref(),
         ));
     }
     pub fn specs_len(&self) -> usize {

@@ -22,18 +22,33 @@ fn main() {
         .unwrap();
 
     smol::block_on(async {
-        let rd = TarReader::new(Async::new(std::io::stdin()).unwrap());
-        let mut wr = TarWriter::new(Async::new(std::io::stdout()).unwrap());
-        let fwd = rd
-            .map(|e| {
-                if let Ok(entry) = e {
+        let mut rd = TarReader::new(Async::new(std::io::stdin()).unwrap());
+        while let Some(entry) = rd.next().await {
+            match entry {
+                Ok(entry) => {
                     tracing::trace!(target: "tar-cmd", " entry: {:?}", &entry);
-                    Ok(entry)
-                } else {
-                    e
+                    if let TarEntry::File(mut f) = entry {
+                        if let Err(e) = smol::io::copy(&mut f, &mut smol::io::sink()).await {
+                            tracing::error!(target: "tar-cmd", " copy error: {:?}", &e);
+                        }
+                    }
                 }
-            })
-            .forward(&mut wr);
-        fwd.await.unwrap();
+                Err(e) => {
+                    tracing::error!(target: "tar-cmd", " error: {:?}", &e);
+                }
+            }
+        }
+        // let mut wr = TarWriter::new(Async::new(std::io::stdout()).unwrap());
+        // let fwd = rd
+        //     .map(|e| {
+        //         if let Ok(entry) = e {
+        //             tracing::trace!(target: "tar-cmd", " entry: {:?}", &entry);
+        //             Ok(entry)
+        //         } else {
+        //             e
+        //         }
+        //     })
+        //     .forward(&mut wr);
+        // fwd.await.unwrap();
     });
 }

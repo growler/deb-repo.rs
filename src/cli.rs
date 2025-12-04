@@ -167,6 +167,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         }
     }
 
+    #[allow(clippy::large_enum_variant)]
     #[derive(Parser)]
     pub enum AddCommands {
         Source(AddSource),
@@ -543,16 +544,71 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     }
 
     #[derive(Parser)]
+    pub enum ShowCommands {
+        Package(ShowPackage),
+        SpecHash(ShowSpecHash),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Adds a source or a local package")]
+    pub struct Show {
+        #[command(subcommand)]
+        cmd: ShowCommands,
+    }
+    impl<C: Config> Command<C> for Show{
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                ShowCommands::Package(cmd) => cmd.exec(conf),
+                ShowCommands::SpecHash(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
     #[command(
+        name = "spec-hash",
         about = "Show a package's control record",
         long_about = "Print the raw control record for the given package."
     )]
-    pub struct Show {
+    pub struct ShowSpecHash {
+        /// Use SRI format for the hash output
+        ///
+        /// Outpus the hash as SRI (Subresource Integrity) format, e.g.
+        /// sha256-<base64-encoded-hash>. If not specified, the hash is printed
+        /// as a hexadecimal string.
+        #[arg(long = "sri", action)]
+        sri: bool,
+        #[arg(value_name = "SPEC")]
+        spec: Option<String>,
+    }
+
+    impl<C: Config> Command<C> for ShowSpecHash {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let hash = mf.spec_hash(self.spec.as_deref())?;
+                if self.sri {
+                    println!("{}", hash.to_sri());
+                } else {
+                    println!("{}", hash.to_hex());
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        name = "package",
+        about = "Show a package's control record",
+        long_about = "Print the raw control record for the given package."
+    )]
+    pub struct ShowPackage {
         #[arg(value_name = "PACKAGE")]
         package: String,
     }
 
-    impl<C: Config> Command<C> for Show {
+    impl<C: Config> Command<C> for ShowPackage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;

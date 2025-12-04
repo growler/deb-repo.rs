@@ -397,10 +397,8 @@ where
                 )),
             })?;
         let mut maybe_ctrl = None;
-        println!("Extracting control file...");
         while let Some(entry) = control_tarball.next().await {
             let entry = entry?;
-            println!("Found entry: {:?}", &entry);
             match entry {
                 TarEntry::File(mut file) => {
                     let filename = file.path().to_string();
@@ -425,7 +423,6 @@ where
                 }
             }
         }
-        println!("Finished extracting control file, skipping remaining entries...");
         self.try_for_each(|_| Ok::<_, io::Error>(())).await?;
         maybe_ctrl.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))
     }

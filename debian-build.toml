@@ -21,7 +21,6 @@ include = [
     "devscripts",
     "libdistro-info-perl",
     "debhelper",
-    "git-buildpackage",
     "cargo",
     "debcargo",
     "dh-cargo",
@@ -34,5 +33,4 @@ include = [
     "libssl-dev",
     "libunistring-dev",
     "libzstd-dev",
-    "btop",
 ]

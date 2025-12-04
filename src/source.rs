@@ -571,6 +571,10 @@ pub struct Source {
     #[arg(value_name = "URL")]
     pub url: String,
 
+    #[clap(skip)]
+    #[serde(skip)]
+    real_url: Option<String>,
+
     /// Only include listed architecture
     #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -700,6 +704,20 @@ impl Source {
                 .map_err(Into::into)
             })
             .collect::<io::Result<Vec<_>>>()
+    }
+    pub(crate) fn set_base(&mut self) {
+        if let Some(snapshots_template) = &self.snapshots {
+            if let Some(Snapshot::Use(snap)) = &self.snapshot {
+                self.real_url = Some(
+                    snapshots_template
+                        .trim_end_matches('/')
+                        .replace("@SNAPSHOTID@", &snap.format("%Y%m%dT%H%M%SZ").to_string()),
+                );
+            }
+        }
+    }
+    pub(crate) fn base(&self) -> &str {
+        self.real_url.as_deref().unwrap_or(&self.url)
     }
     pub fn file_url<P: AsRef<str>>(&self, path: P) -> String {
         if let Some(snapshots_template) = &self.snapshots {

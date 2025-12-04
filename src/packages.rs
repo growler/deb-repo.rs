@@ -1,8 +1,8 @@
 use {
     crate::{
         control::{
-            ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlStanza,
-            ParseError,
+            ControlField, ControlParser, ControlStanza, Field, FindFields, MutableControlFile,
+            MutableControlStanza, ParseError,
         },
         hash::Hash,
         indexfile::IndexFile,
@@ -13,8 +13,9 @@ use {
         SafeStoreFile,
     },
     futures::AsyncWriteExt,
-    smol::io::{AsyncRead, AsyncReadExt},
     ouroboros::self_referencing,
+    serde::{Deserialize, Serialize},
+    smol::io::{AsyncRead, AsyncReadExt},
     std::{io, sync::Arc},
 };
 
@@ -441,12 +442,24 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 
 pub struct Packages {
     prio: u32,
-    inner: PackagesInner,
+    inner: Arc<PackagesInner>,
+}
+
+impl Clone for Packages {
+    fn clone(&self) -> Self {
+        Packages {
+            prio: self.prio,
+            inner: Arc::clone(&self.inner),
+        }
+    }
 }
 
 impl Packages {
     pub fn get(&self, index: usize) -> Option<&Package<'_>> {
         self.inner.with_packages(|packages| packages.get(index))
+    }
+    pub fn len(&self) -> usize {
+        self.inner.with_packages(|packages| packages.len())
     }
     pub fn repo_file(
         &self,
@@ -462,6 +475,9 @@ impl Packages {
             })
             .and_then(|p| p.repo_file(hash_field_name))
     }
+    pub fn src(&self) -> &str {
+        self.inner.with_data(|d| d.as_str())
+    }
     pub fn package_by_name(&self, name: &str) -> Option<&Package<'_>> {
         self.inner
             .with_packages(|packages| packages.iter().find(|package| package.name() == name))
@@ -472,21 +488,30 @@ impl Packages {
     pub fn prio(&self) -> u32 {
         self.prio
     }
+    pub fn with_prio(self, prio: u32) -> Self {
+        Self {
+            prio,
+            inner: self.inner,
+        }
+    }
     pub fn new(data: IndexFile, prio: Option<u32>) -> Result<Self, ParseError> {
         Ok(Packages {
             prio: prio.unwrap_or(500),
-            inner: PackagesInnerTryBuilder {
-                data,
-                packages_builder: |data: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> {
-                    let mut parser = ControlParser::new(data.as_str());
-                    let mut packages: Vec<Package<'_>> = vec![];
-                    while let Some(package) = Package::try_parse_from(&mut parser)? {
-                        packages.push(package)
-                    }
-                    Ok(packages)
-                },
-            }
-            .try_build()?,
+            inner: Arc::new(
+                PackagesInnerTryBuilder {
+                    data,
+                    packages_builder:
+                        |data: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> {
+                            let mut parser = ControlParser::new(data.as_str());
+                            let mut packages: Vec<Package<'_>> = vec![];
+                            while let Some(package) = Package::try_parse_from(&mut parser)? {
+                                packages.push(package)
+                            }
+                            Ok(packages)
+                        },
+                }
+                .try_build()?,
+            ),
         })
     }
     pub async fn read<R: AsyncRead + Unpin + Send>(r: &mut R) -> io::Result<Self> {
@@ -498,6 +523,34 @@ impl Packages {
                 format!("Error parsing packages file: {}", err),
             )
         })
+    }
+}
+
+impl From<&Packages> for MutableControlFile {
+    fn from(pkgs: &Packages) -> Self {
+        pkgs.inner
+            .with_packages(|pkgs| pkgs.iter())
+            .map(|pkg| MutableControlStanza::from(pkg))
+            .collect()
+    }
+}
+
+impl Serialize for Packages {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        let s = self.inner.with_data(|d| d.as_str());
+        serializer.serialize_str(s)
+    }
+}
+impl<'de> Deserialize<'de> for Packages {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Packages::try_from(s).map_err(serde::de::Error::custom)
     }
 }
 

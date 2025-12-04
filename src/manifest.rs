@@ -2,7 +2,7 @@ use {
     crate::{
         artifact::{Artifact, ArtifactArg},
         content::{ContentProvider, UniverseFiles},
-        control::MutableControlStanza,
+        control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
         packages::Package,
@@ -129,10 +129,10 @@ impl Manifest {
         match self.file.add_local_pkg(file, comment) {
             UpdateResult::None => return Ok(()),
             UpdateResult::Added => {
-                self.lock.push_local_package(ctrl);
+                self.lock.push_local_package(ctrl)?;
             }
             UpdateResult::Updated(i) => {
-                self.lock.update_local_package(i, ctrl);
+                self.lock.update_local_package(i, ctrl)?;
             }
         }
         self.mark_file_updated();
@@ -367,7 +367,11 @@ impl Manifest {
         Ok(())
     }
     fn sources(&self) -> UniverseFiles<'_> {
-        UniverseFiles::new(self.file.sources(), self.lock.sources())
+        UniverseFiles::new(
+            self.file.sources(),
+            self.lock.sources(),
+            self.lock.local_pkgs(),
+        )
     }
     async fn make_universe<C: ContentProvider>(
         &mut self,
@@ -410,7 +414,49 @@ impl Manifest {
         .flatten_unordered(concurrency.get())
         .try_fold(false, |a, r| async move { Ok(a || r) })
         .await?;
-        if updated {
+        let local_pkgs_update = if let Some(local_pkgs) = self.lock.local_pkgs() {
+            if local_pkgs.len() == self.file.local_pkgs().len() {
+                local_pkgs
+                    .packages()
+                    .zip(self.file.local_pkgs())
+                    .any(|(ctrl, file)| {
+                        if let Ok((path, size, hash)) = ctrl.repo_file("SHA256") {
+                            tracing::debug!(
+                                "checking local package file {} (expected size={} hash={})",
+                                file.path,
+                                file.size,
+                                file.hash.to_hex()
+                            );
+                            path != file.path || size != file.size || hash != file.hash
+                        } else {
+                            true
+                        }
+                    })
+            } else {
+                true
+            }
+        } else {
+            !self.file.local_pkgs().is_empty()
+        };
+        if force || local_pkgs_update {
+            let local_pkgs = stream::iter(self.file.local_pkgs().iter())
+                .map(|file| async {
+                    let (real_file, ctrl) = cache.ensure_deb(&file.path).await?;
+                    if real_file.size != file.size || real_file.hash != file.hash {
+                        return Err(io::Error::other(format!(
+                            "local package file {} has changed on disk (expected size={} hash={}, got size={} hash={})",
+                            file.path,
+                            file.size, file.hash.to_hex(),
+                            real_file.size, real_file.hash.to_hex(),
+                        )));
+                    }
+                    Ok(ctrl)
+                })
+                .buffered(concurrency.get())
+                .try_collect::<MutableControlFile>().await?;
+            self.lock.set_local_packages(local_pkgs.try_into()?);
+        }
+        if updated || local_pkgs_update {
             self.lock.update_universe_hash();
         }
         Ok(updated)
@@ -501,9 +547,20 @@ impl Manifest {
                     })
                     .map(|(order, solvable)| {
                         let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
-                        let src = pkgs_idx[pkgs as usize];
+                        let src = pkgs_idx.get(pkgs as usize);
                         let name = pkg.name().to_string();
-                        let hash_kind = sources.get(src).unwrap().hash.name();
+                        let hash_kind = src.map_or(Ok("SHA256"), |src| {
+                            sources.get(*src).map_or_else(
+                                || {
+                                    Err(io::Error::other(format!(
+                                        "invalid source index {} in spec {}",
+                                        src,
+                                        spec_display_name(spec_name)
+                                    )))
+                                },
+                                |src| Ok(src.hash.name()),
+                            )
+                        })?;
                         let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
                             io::Error::other(format!(
                                 "failed to parse package {} record while processing spec {}: {}",
@@ -521,7 +578,7 @@ impl Manifest {
                             },
                             idx: solvable.into(),
                             order: order as u32,
-                            src: Some(src as u32),
+                            src: src.map(|s| *s as u32),
                             name,
                         })
                     })

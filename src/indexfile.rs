@@ -7,12 +7,6 @@ pub struct IndexFile {
     inner: IndexFileInner,
 }
 
-impl std::fmt::Display for IndexFile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_ref())
-    }
-}
-
 impl Clone for IndexFile {
     fn clone(&self) -> Self {
         Self {
@@ -32,6 +26,13 @@ impl Clone for IndexFile {
         }
     }
 }
+
+impl std::fmt::Display for IndexFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_ref())
+    }
+}
+
 
 impl std::ops::Deref for IndexFile {
     type Target = str;
