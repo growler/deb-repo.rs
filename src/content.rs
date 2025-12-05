@@ -326,6 +326,7 @@ impl ContentProvider for HostCache {
     }
     async fn ensure_deb(&self, path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
         let file_path = self.base.join(path);
+        tracing::debug!("Ensuring deb at {}", file_path.display());
         let file = smol::fs::File::open(&file_path).await?;
         let mut rdr = HashingReader::<sha2::Sha256, _>::new(file);
         let mut deb = DebReader::new(&mut rdr);

@@ -22,6 +22,7 @@ Rules-Requires-Root: binary-targets
 Package: rdebootstrap
 Architecture: any
 Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: podman
 Description: Manifest-driven Debian bootstrapper
  rdebootstrap consumes a declarative manifest, resolves Debian packages,
  stages extra artifacts, and builds a root filesystem tree inside an

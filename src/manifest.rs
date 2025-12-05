@@ -435,10 +435,15 @@ impl Manifest {
         } else {
             !self.file.local_pkgs().is_empty()
         };
-        if force_locals || local_pkgs_update {
+        let local_pkgs_update = if force_locals || local_pkgs_update {
             let (local_pkgs, updates) = stream::iter(self.file.local_pkgs().iter())
                 .map(|file| async {
-                    let (real_file, ctrl) = cache.ensure_deb(&file.path).await?;
+                    let (real_file, ctrl) = cache.ensure_deb(&file.path).await.map_err(|e| {
+                        io::Error::new(
+                            e.kind(),
+                            format!("failed to read local package file {}: {}", file.path, e),
+                        )
+                    })?;
                     if real_file.size != file.size || real_file.hash != file.hash {
                         if force_locals {
                             Ok((ctrl, Some(real_file)))
@@ -457,14 +462,18 @@ impl Manifest {
                 .buffered(concurrency.get())
                 .try_collect::<(MutableControlFile, Vec<_>)>().await?;
             self.lock.set_local_packages(local_pkgs.try_into()?);
-            if self.file.update_local_pkgs(updates) {
+            let local_pkgs_update = self.file.update_local_pkgs(updates);
+            if local_pkgs_update {
                 self.mark_file_updated();
             }
-        }
+            local_pkgs_update
+        } else {
+            false
+        };
         if updated || local_pkgs_update {
             self.lock.update_universe_hash();
         }
-        Ok(updated)
+        Ok(updated || local_pkgs_update)
     }
     pub async fn update<C: ContentProvider>(
         &mut self,

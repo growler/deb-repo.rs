@@ -112,18 +112,14 @@ impl cli::Config for App {
         PROVIDER.get_or_try_init(|| {
             let base = std::fs::canonicalize(&self.manifest)
                 .ok()
-                .or_else(|| {
-                    self.manifest
-                        .parent()
-                        .map(std::fs::canonicalize)
-                        .transpose()
-                        .ok()
-                        .flatten()
-                })
-                .ok_or_else(|| {
+                .and_then(|path| path.parent().map(Path::to_path_buf))
+                .or_else(|| self.manifest.parent().map(Path::to_path_buf))
+                .map_or_else(std::env::current_dir, std::fs::canonicalize)
+                .map_err(|err| {
                     std::io::Error::other(format!(
-                        "failed to find manifest file parent directory: {}",
-                        self.manifest.display()
+                        "failed to find manifest file parent directory {}: {}",
+                        self.manifest.display(),
+                        err
                     ))
                 })?;
             if let Some(path) = self.cache_dir.as_deref() {
