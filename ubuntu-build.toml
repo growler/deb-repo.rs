@@ -1,0 +1,32 @@
+# default manifest file for ubuntu
+[[source]]
+url = "https://archive.ubuntu.com/ubuntu/"
+snapshots = "https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/"
+suites = ["noble", "noble-updates", "noble-backports", "noble-security"]
+components = ["main", "universe"]
+snapshot = "20251205T103606Z"
+
+[spec]
+include = [
+    "build-essential",
+    "ca-certificates",
+    "cargo-1.85",
+    "debhelper",
+    "devscripts",
+    "libbz2-dev",
+    "libcurl4-openssl-dev",
+    "libgpg-error-dev",
+    "libgpgme-dev",
+    "liblz4-dev",
+    "liblzma-dev",
+    "libssl-dev",
+    "libunistring-dev",
+    "libzstd-dev",
+    "pkg-config",
+    "rustc-1.85",
+    "zlib1g-dev",
+]
+run = """
+update-alternatives --install /usr/bin/cargo cargo /usr/bin/cargo-1.85 10
+update-alternatives --install /usr/bin/rustc rustc /usr/bin/rustc-1.85 10
+"""

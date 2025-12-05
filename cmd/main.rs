@@ -110,19 +110,22 @@ impl cli::Config for App {
     fn fetcher(&self) -> std::io::Result<&HostCache> {
         static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
         PROVIDER.get_or_try_init(|| {
-            let base = std::fs::canonicalize(&self.manifest).map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to find Maniest file {}: {}",
-                    self.manifest.display(),
-                    err
-                ))
-            })?;
-            let base = base.parent().ok_or_else(|| {
-                std::io::Error::other(format!(
-                    "failed to find manifest file parent directory: {}",
-                    self.manifest.display()
-                ))
-            })?;
+            let base = std::fs::canonicalize(&self.manifest)
+                .ok()
+                .or_else(|| {
+                    self.manifest
+                        .parent()
+                        .map(std::fs::canonicalize)
+                        .transpose()
+                        .ok()
+                        .flatten()
+                })
+                .ok_or_else(|| {
+                    std::io::Error::other(format!(
+                        "failed to find manifest file parent directory: {}",
+                        self.manifest.display()
+                    ))
+                })?;
             if let Some(path) = self.cache_dir.as_deref() {
                 std::fs::create_dir_all(path).map_err(|err| {
                     std::io::Error::other(format!(

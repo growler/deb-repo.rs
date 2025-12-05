@@ -495,6 +495,10 @@ impl ManifestFile {
                             Some(i)
                         }
                     }
+                } else if source.snapshots.is_some() {
+                    doc.update_source_snapshot(i, stamp);
+                    source.snapshot = Some(Snapshot::Use(stamp));
+                    Some(i)
                 } else {
                     None
                 }

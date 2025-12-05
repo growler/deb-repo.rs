@@ -4,8 +4,8 @@ Priority: optional
 Maintainer: Alekséi Naidénov <alexey.naidyonov@gmail.com>
 Build-Depends:
  debhelper-compat (= 13),
- cargo,
- rustc,
+ cargo | cargo-1.85,
+ rustc | rustc-1.85,
  pkg-config,
  libcurl4-openssl-dev,
  libssl-dev,
