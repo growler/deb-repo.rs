@@ -147,9 +147,16 @@ impl cli::Config for App {
                     ))
                 })?;
             }
+            let auth_file = base.join("auth.toml");
+            let auth_file = std::fs::canonicalize(&auth_file)
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok());
             Ok(HostCache::new(
                 base,
-                HttpTransport::new(AuthProvider::from_arg(self.auth.as_deref())?, self.insecure),
+                HttpTransport::new(
+                    AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?,
+                    self.insecure,
+                ),
                 self.cache_dir.as_deref(),
             ))
         })

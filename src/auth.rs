@@ -30,8 +30,7 @@ pub enum Auth {
 
 pub struct AuthProvider {
     cache: async_lock::RwLock<HashMap<String, Option<Arc<Auth>>>>,
-    entries: HashMap<String, Vec<AuthDefinition>>,
-    base_dir: PathBuf,
+    entries: HashMap<String, smallvec::SmallVec<[AuthDefinition; 1]>>,
     vault: Option<VaultAuth>,
 }
 
@@ -92,45 +91,25 @@ struct ValueSpecSource {
 }
 
 impl AuthProvider {
-    pub fn new<P: AsRef<Path>>(p: Option<P>) -> std::io::Result<Self> {
-        let as_string = p.map(|p| p.as_ref().to_string_lossy().into_owned());
-        Self::from_arg(as_string.as_deref())
-    }
-
-    pub fn from_arg<S: AsRef<str>>(arg: Option<S>) -> std::io::Result<Self> {
-        let explicit = arg.is_some();
-        let (maybe_path, vault) = match arg.as_ref().map(|s| s.as_ref().to_owned()) {
-            None => (Some(PathBuf::from("./auth.toml")), None),
+    pub fn new<S: AsRef<str>>(arg: Option<S>) -> std::io::Result<Self> {
+        let (entries, vault) = match arg.as_ref().map(|s| s.as_ref().to_owned()) {
+            None => (None, None),
             Some(ref value) if value.starts_with("vault:") => {
                 let rest = value.trim_start_matches("vault:");
                 (None, Some(VaultAuth::new(rest)?))
             }
             Some(value) => {
-                if let Some(rest) = value.strip_prefix("file:") {
-                    (Some(PathBuf::from(rest)), None)
-                } else {
-                    (Some(PathBuf::from(value)), None)
-                }
+                let file_path = Path::new(value.strip_prefix("file:").unwrap_or(&value));
+                let entries = Self::load_file(file_path)?;
+                (Some(entries), None)
             }
         };
 
-        let mut provider = Self {
+        let provider = Self {
             cache: async_lock::RwLock::new(HashMap::new()),
-            entries: HashMap::new(),
-            base_dir: PathBuf::from("."),
+            entries: entries.unwrap_or_else(HashMap::new),
             vault,
         };
-
-        if let Some(path) = maybe_path {
-            if path.exists() {
-                provider.load_file(&path)?;
-            } else if explicit {
-                return Err(std::io::Error::other(format!(
-                    "auth file {} not found",
-                    path.display()
-                )));
-            }
-        }
 
         Ok(provider)
     }
@@ -166,7 +145,15 @@ impl AuthProvider {
         None
     }
 
-    fn load_file(&mut self, path: &Path) -> std::io::Result<()> {
+    fn load_file(
+        path: &Path,
+    ) -> std::io::Result<HashMap<String, smallvec::SmallVec<[AuthDefinition; 1]>>> {
+        let file_path = fs::canonicalize(path).map_err(|err| {
+            std::io::Error::other(format!("no auth file {}: {}", path.display(), err))
+        })?;
+        let base_dir = file_path.parent().ok_or_else(|| {
+            std::io::Error::other(format!("invalid auth file path: {}", file_path.display()))
+        })?;
         let content = fs::read_to_string(path)?;
         let parsed: AuthFile = toml_edit::de::from_str(&content).map_err(|err| {
             std::io::Error::other(format!(
@@ -175,29 +162,17 @@ impl AuthProvider {
                 err
             ))
         })?;
-        self.base_dir = path
-            .parent()
-            .map(|p| {
-                if p.as_os_str().is_empty() {
-                    PathBuf::from(".")
-                } else {
-                    p.to_path_buf()
-                }
-            })
-            .unwrap_or_else(|| PathBuf::from("."));
-        self.entries.clear();
-        self.cache = async_lock::RwLock::new(HashMap::new());
-        self.vault = None;
+        let mut entries: HashMap<String, smallvec::SmallVec<[AuthDefinition; 1]>> = HashMap::new();
         for spec in parsed.auth {
-            match AuthDefinition::from_spec(&spec, &self.base_dir) {
+            match AuthDefinition::from_spec(&spec, base_dir) {
                 Ok(Some(def)) => {
-                    self.entries.entry(spec.host.clone()).or_default().push(def);
+                    entries.entry(spec.host.clone()).or_default().push(def);
                 }
                 Ok(None) => warn!("auth entry for {} is missing credentials", spec.host),
                 Err(err) => warn!("skipping auth entry for {}: {}", spec.host, err),
             }
         }
-        Ok(())
+        Ok(entries)
     }
 }
 
@@ -388,7 +363,7 @@ password = "secret"
         )?;
 
         smol::block_on(async {
-            let provider = AuthProvider::new(Some(&path))?;
+            let provider = AuthProvider::new(Some(path.to_string_lossy()))?;
             let url = Url::parse("https://deb.company.com").unwrap();
             match provider.auth(&url).await.as_deref() {
                 Some(Auth::Basic { login, password }) => {
@@ -421,7 +396,7 @@ token.cmd = "printf token-from-cmd"
         std::env::set_var("AUTH_PASSWORD", "from-env");
 
         smol::block_on(async {
-            let provider = AuthProvider::new(Some(&path))?;
+            let provider = AuthProvider::new(Some(path.to_string_lossy()))?;
 
             let env_url = Url::parse("https://env.example").unwrap();
             match provider.auth(&env_url).await.as_deref() {
@@ -465,7 +440,7 @@ password = "cert-password"
         )?;
 
         smol::block_on(async {
-            let provider = AuthProvider::new(Some(&path))?;
+            let provider = AuthProvider::new(Some(path.to_string_lossy()))?;
             let url = Url::parse("https://tls.example").unwrap();
             match provider.auth(&url).await.as_deref() {
                 Some(Auth::Cert {
