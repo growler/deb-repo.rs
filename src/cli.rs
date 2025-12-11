@@ -486,7 +486,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                mf.update(self.force && !self.only_locals, self.force, conf.concurrency(), fetcher).await?;
+                mf.update(
+                    self.force && !self.only_locals,
+                    self.force,
+                    conf.concurrency(),
+                    fetcher,
+                )
+                .await?;
                 mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())

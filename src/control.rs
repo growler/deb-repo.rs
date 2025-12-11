@@ -522,7 +522,7 @@ impl MutableControlFile {
     pub fn add(&mut self, stanza: MutableControlStanza) {
         self.stanzas.push(stanza)
     }
-    pub fn set_at(&mut self, index:usize, stanza: MutableControlStanza) {
+    pub fn set_at(&mut self, index: usize, stanza: MutableControlStanza) {
         self.stanzas[index] = stanza
     }
     /// Creates a new stanza and returns a mutable reference to it.

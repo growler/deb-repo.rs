@@ -8,6 +8,5 @@ pub enum Error {
     Io(#[from] std::io::Error),
 
     #[error("parsing error: {0}")]
-    Parse(#[from] ParseError)
+    Parse(#[from] ParseError),
 }
-

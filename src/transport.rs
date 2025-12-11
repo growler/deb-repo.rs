@@ -1,47 +1,23 @@
 use std::future::Future;
 
 use isahc::{
-    config::{Configurable, RedirectPolicy},
+    auth::{Authentication, Credentials},
+    config::{ClientCertificate, Configurable, PrivateKey, RedirectPolicy},
     http::StatusCode,
-    HttpClient,
+    HttpClient, Request,
 };
 use once_cell::sync::Lazy;
 pub use url::Url;
 
-use crate::comp::comp_reader;
+use crate::auth::{Auth, AuthProvider};
 
 use {
-    crate::hash::{AsyncHashingRead, Hash},
     smol::io::{self, AsyncRead},
     std::pin::Pin,
 };
 
 pub trait TransportProvider: Sync + Send {
     fn open(&self, url: &str) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncRead + Send>>>>;
-
-    fn open_verified(
-        &self,
-        url: &str,
-        size: u64,
-        hash: &Hash,
-    ) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncHashingRead + Send>>>> {
-        async move { Ok(hash.verifying_reader(size, self.open(url).await?)) }
-    }
-
-    fn open_hashed(
-        &self,
-        url: &str,
-        hash_name: &str,
-    ) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncHashingRead + Send>>>> {
-        async move { Hash::hashing_reader_for(hash_name, self.open(url).await?) }
-    }
-
-    fn open_unpacked(
-        &self,
-        url: &str,
-    ) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncRead + Send>>>> {
-        async move { Ok(comp_reader(url, self.open(url).await?)) }
-    }
 }
 
 fn client(insecure: bool) -> &'static HttpClient {
@@ -72,14 +48,14 @@ fn client(insecure: bool) -> &'static HttpClient {
     }
 }
 
-#[derive(Clone)]
 pub struct HttpTransport {
     insecure: bool,
+    auth: AuthProvider,
 }
 
 impl HttpTransport {
-    pub fn new(insecure: bool) -> Self {
-        Self { insecure }
+    pub fn new(auth: AuthProvider, insecure: bool) -> Self {
+        Self { insecure, auth }
     }
 }
 
@@ -88,7 +64,33 @@ impl TransportProvider for HttpTransport {
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {
-                let rsp = client(self.insecure).get_async(url.as_str()).await?;
+                let mut request = Request::get(url.as_str());
+                request = match self.auth.auth(&url).await.as_deref() {
+                    None => request,
+                    Some(Auth::Basic { login, password }) => {
+                        tracing::debug!("using basic/digest auth for {}", url);
+                        request
+                            .authentication(Authentication::basic() | Authentication::digest())
+                            .credentials(Credentials::new(login, password))
+                    }
+                    Some(Auth::Token { token }) => {
+                        request.header("Authorization", format!("Bearer {}", token))
+                    }
+                    Some(Auth::Cert {
+                        cert,
+                        key,
+                        password,
+                    }) => request.ssl_client_certificate(ClientCertificate::pem(
+                        cert.clone(),
+                        key.as_ref().map(|k| {
+                            PrivateKey::pem(k.clone(), password.as_deref().map(|s| s.to_string()))
+                        }),
+                    )),
+                };
+                let request = request.body(()).map_err(|err| {
+                    io::Error::other(format!("failed to build request for {}: {}", url, err))
+                })?;
+                let rsp = client(self.insecure).send_async(request).await?;
                 match rsp.status() {
                     StatusCode::OK => {
                         Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send>>)

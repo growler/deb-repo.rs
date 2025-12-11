@@ -622,11 +622,6 @@ pub struct Source {
     #[serde(default, skip_serializing_if = "SourceHashKind::is_sha256")]
     pub hash: SourceHashKind,
 
-    /// Index files extension (default is .xz, empty for the unpacked)
-    #[arg(long = "extension", value_name = ".EXT")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub ext: Option<String>,
-
     /// Source priority (higher number means higher priority)
     #[arg(long = "priority", value_name = "N")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -691,12 +686,7 @@ impl Source {
         arch: &str,
     ) -> io::Result<Vec<RepositoryFile>> {
         release
-            .files(
-                &self.components,
-                self.hash.name(),
-                arch,
-                self.ext.as_deref(),
-            )?
+            .files(&self.components, self.hash.name(), arch)?
             .map(|file| {
                 file.map(|(path, hash, size)| {
                     RepositoryFile::new(format!("dists/{}/{}", suite, path), hash, size)

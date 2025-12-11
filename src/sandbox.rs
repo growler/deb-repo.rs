@@ -1,9 +1,7 @@
 use {
     crate::{
         builder::{BuildJob, Executor},
-        exec::{
-            setup_root, spawn_helper, unshare_root, unshare_user_ns, HelperStatus,
-        },
+        exec::{setup_root, spawn_helper, unshare_root, unshare_user_ns, HelperStatus},
         staging::HostFileSystem,
     },
     rustix::{

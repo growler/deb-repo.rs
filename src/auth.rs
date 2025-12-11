@@ -1,0 +1,485 @@
+use {
+    crate::auth_vault::VaultAuth,
+    serde::{Deserialize, Serialize},
+    smol::process::Command,
+    std::{
+        collections::HashMap,
+        env, fs,
+        path::{Path, PathBuf},
+        sync::Arc,
+    },
+    tracing::warn,
+    url::Url,
+};
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
+pub enum Auth {
+    Basic {
+        login: String,
+        password: String,
+    },
+    Token {
+        token: String,
+    },
+    Cert {
+        cert: Vec<u8>,
+        key: Option<Vec<u8>>,
+        password: Option<String>,
+    },
+}
+
+pub struct AuthProvider {
+    cache: async_lock::RwLock<HashMap<String, Option<Arc<Auth>>>>,
+    entries: HashMap<String, Vec<AuthDefinition>>,
+    base_dir: PathBuf,
+    vault: Option<VaultAuth>,
+}
+
+#[derive(Debug, Clone)]
+enum AuthDefinition {
+    Basic {
+        login: String,
+        password: ValueSource,
+    },
+    Token {
+        token: ValueSource,
+    },
+    Cert {
+        cert: ValueSource,
+        key: Option<ValueSource>,
+        password: Option<ValueSource>,
+    },
+}
+
+#[derive(Debug, Clone)]
+enum ValueSource {
+    Inline(String),
+    Env(String),
+    File(PathBuf),
+    Command { command: String, cwd: PathBuf },
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthFile {
+    #[serde(default)]
+    auth: Vec<AuthSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuthSpec {
+    host: String,
+    login: Option<String>,
+    password: Option<ValueSpec>,
+    token: Option<ValueSpec>,
+    cert: Option<ValueSpec>,
+    key: Option<ValueSpec>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+enum ValueSpec {
+    Simple(String),
+    Source(ValueSpecSource),
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct ValueSpecSource {
+    env: Option<String>,
+    cmd: Option<String>,
+    file: Option<String>,
+    path: Option<String>,
+    key: Option<String>,
+}
+
+impl AuthProvider {
+    pub fn new<P: AsRef<Path>>(p: Option<P>) -> std::io::Result<Self> {
+        let as_string = p.map(|p| p.as_ref().to_string_lossy().into_owned());
+        Self::from_arg(as_string.as_deref())
+    }
+
+    pub fn from_arg<S: AsRef<str>>(arg: Option<S>) -> std::io::Result<Self> {
+        let explicit = arg.is_some();
+        let (maybe_path, vault) = match arg.as_ref().map(|s| s.as_ref().to_owned()) {
+            None => (Some(PathBuf::from("./auth.toml")), None),
+            Some(ref value) if value.starts_with("vault:") => {
+                let rest = value.trim_start_matches("vault:");
+                (None, Some(VaultAuth::new(rest)?))
+            }
+            Some(value) => {
+                if let Some(rest) = value.strip_prefix("file:") {
+                    (Some(PathBuf::from(rest)), None)
+                } else {
+                    (Some(PathBuf::from(value)), None)
+                }
+            }
+        };
+
+        let mut provider = Self {
+            cache: async_lock::RwLock::new(HashMap::new()),
+            entries: HashMap::new(),
+            base_dir: PathBuf::from("."),
+            vault,
+        };
+
+        if let Some(path) = maybe_path {
+            if path.exists() {
+                provider.load_file(&path)?;
+            } else if explicit {
+                return Err(std::io::Error::other(format!(
+                    "auth file {} not found",
+                    path.display()
+                )));
+            }
+        }
+
+        Ok(provider)
+    }
+
+    pub async fn auth(&self, url: &Url) -> Option<Arc<Auth>> {
+        let host = url.host_str()?;
+
+        if let Some(entry) = self.cache.read().await.get(host) {
+            return entry.as_ref().map(Arc::clone);
+        }
+
+        let resolved = self.resolve_for_host(host).await.map(Arc::new);
+        let mut cache = self.cache.write().await;
+        cache.insert(host.to_string(), resolved.as_ref().map(Arc::clone));
+        resolved
+    }
+
+    async fn resolve_for_host(&self, host: &str) -> Option<Auth> {
+        if let Some(entries) = self.entries.get(host) {
+            for entry in entries {
+                match entry.resolve().await {
+                    Ok(auth) => return Some(auth),
+                    Err(err) => warn!("failed to resolve auth for {}: {}", host, err),
+                }
+            }
+        }
+        if let Some(vault) = &self.vault {
+            match vault.fetch(host).await {
+                Ok(auth) => return auth,
+                Err(err) => warn!("failed to fetch auth for {} from vault: {}", host, err),
+            }
+        }
+        None
+    }
+
+    fn load_file(&mut self, path: &Path) -> std::io::Result<()> {
+        let content = fs::read_to_string(path)?;
+        let parsed: AuthFile = toml_edit::de::from_str(&content).map_err(|err| {
+            std::io::Error::other(format!(
+                "failed to parse auth file {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
+        self.base_dir = path
+            .parent()
+            .map(|p| {
+                if p.as_os_str().is_empty() {
+                    PathBuf::from(".")
+                } else {
+                    p.to_path_buf()
+                }
+            })
+            .unwrap_or_else(|| PathBuf::from("."));
+        self.entries.clear();
+        self.cache = async_lock::RwLock::new(HashMap::new());
+        self.vault = None;
+        for spec in parsed.auth {
+            match AuthDefinition::from_spec(&spec, &self.base_dir) {
+                Ok(Some(def)) => {
+                    self.entries.entry(spec.host.clone()).or_default().push(def);
+                }
+                Ok(None) => warn!("auth entry for {} is missing credentials", spec.host),
+                Err(err) => warn!("skipping auth entry for {}: {}", spec.host, err),
+            }
+        }
+        Ok(())
+    }
+}
+
+impl AuthDefinition {
+    fn from_spec(spec: &AuthSpec, base_dir: &Path) -> std::io::Result<Option<AuthDefinition>> {
+        if let Some(token) = spec
+            .token
+            .as_ref()
+            .map(|t| value_spec_to_source(t, base_dir, false))
+            .transpose()?
+        {
+            return Ok(Some(AuthDefinition::Token { token }));
+        }
+
+        if let Some(cert) = spec
+            .cert
+            .as_ref()
+            .map(|c| value_spec_to_source(c, base_dir, true))
+            .transpose()?
+        {
+            let key = spec
+                .key
+                .as_ref()
+                .map(|k| value_spec_to_source(k, base_dir, true))
+                .transpose()?;
+            let password = spec
+                .password
+                .as_ref()
+                .map(|p| value_spec_to_source(p, base_dir, false))
+                .transpose()?;
+            return Ok(Some(AuthDefinition::Cert {
+                cert,
+                key,
+                password,
+            }));
+        }
+
+        if let (Some(login), Some(password)) = (
+            spec.login.as_ref(),
+            spec.password
+                .as_ref()
+                .map(|p| value_spec_to_source(p, base_dir, false))
+                .transpose()?,
+        ) {
+            return Ok(Some(AuthDefinition::Basic {
+                login: login.clone(),
+                password,
+            }));
+        }
+
+        Ok(None)
+    }
+
+    async fn resolve(&self) -> std::io::Result<Auth> {
+        match self {
+            AuthDefinition::Basic { login, password } => Ok(Auth::Basic {
+                login: login.clone(),
+                password: password.load_string().await?,
+            }),
+            AuthDefinition::Token { token } => Ok(Auth::Token {
+                token: token.load_string().await?,
+            }),
+            AuthDefinition::Cert {
+                cert,
+                key,
+                password,
+            } => Ok(Auth::Cert {
+                cert: cert.load_bytes().await?,
+                key: match key {
+                    Some(k) => Some(k.load_bytes().await?),
+                    None => None,
+                },
+                password: match password {
+                    Some(p) => Some(p.load_string().await?),
+                    None => None,
+                },
+            }),
+        }
+    }
+}
+
+impl ValueSource {
+    async fn load_bytes(&self) -> std::io::Result<Vec<u8>> {
+        match self {
+            ValueSource::Inline(value) => Ok(value.clone().into_bytes()),
+            ValueSource::Env(var) => env::var(var)
+                .map(|v| v.into_bytes())
+                .map_err(|err| std::io::Error::other(format!("missing env {}: {}", var, err))),
+            ValueSource::File(path) => smol::fs::read(path).await.map_err(|err| {
+                std::io::Error::other(format!("failed to read {}: {}", path.display(), err))
+            }),
+            ValueSource::Command { command, cwd } => {
+                let output = Command::new("sh")
+                    .arg("-c")
+                    .arg(command)
+                    .current_dir(cwd)
+                    .output()
+                    .await?;
+                if !output.status.success() {
+                    return Err(std::io::Error::other(format!(
+                        "command '{}' exited with {}",
+                        command, output.status
+                    )));
+                }
+                Ok(output.stdout)
+            }
+        }
+    }
+
+    async fn load_string(&self) -> std::io::Result<String> {
+        let raw = self.load_bytes().await?;
+        let mut value =
+            String::from_utf8(raw).map_err(|err| std::io::Error::other(err.to_string()))?;
+        if matches!(self, ValueSource::Command { .. } | ValueSource::File(_)) {
+            while value.ends_with('\n') || value.ends_with('\r') {
+                value.pop();
+            }
+        }
+        Ok(value)
+    }
+}
+
+fn value_spec_to_source(
+    value: &ValueSpec,
+    base_dir: &Path,
+    prefer_file: bool,
+) -> std::io::Result<ValueSource> {
+    match value {
+        ValueSpec::Simple(v) => {
+            if prefer_file && !looks_like_inline(v) {
+                Ok(ValueSource::File(resolve_path(base_dir, v)))
+            } else {
+                Ok(ValueSource::Inline(v.clone()))
+            }
+        }
+        ValueSpec::Source(source) => {
+            if let Some(env) = &source.env {
+                Ok(ValueSource::Env(env.clone()))
+            } else if let Some(cmd) = &source.cmd {
+                Ok(ValueSource::Command {
+                    command: cmd.clone(),
+                    cwd: base_dir.to_path_buf(),
+                })
+            } else if let Some(file) = source.file.as_ref().or(source.path.as_ref()).or(source
+                .key
+                .as_ref()
+                .filter(|_| prefer_file || source.env.is_none()))
+            {
+                Ok(ValueSource::File(resolve_path(base_dir, file)))
+            } else {
+                Err(std::io::Error::other("no value source provided"))
+            }
+        }
+    }
+}
+
+fn looks_like_inline(value: &str) -> bool {
+    value.contains('\n') || value.contains("-----BEGIN")
+}
+
+fn resolve_path(base: &Path, path: &str) -> PathBuf {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base.join(path)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn parses_basic_inline() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("auth.toml");
+        fs::write(
+            &path,
+            r#"
+[[auth]]
+host = "deb.company.com"
+login = "user"
+password = "secret"
+"#,
+        )?;
+
+        smol::block_on(async {
+            let provider = AuthProvider::new(Some(&path))?;
+            let url = Url::parse("https://deb.company.com").unwrap();
+            match provider.auth(&url).await.as_deref() {
+                Some(Auth::Basic { login, password }) => {
+                    assert_eq!(login, "user");
+                    assert_eq!(password, "secret");
+                }
+                other => panic!("unexpected auth: {:?}", other),
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn parses_env_and_command_sources() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let path = dir.path().join("auth.toml");
+        fs::write(
+            &path,
+            r#"
+[[auth]]
+host = "env.example"
+login = "user"
+password.env = "AUTH_PASSWORD"
+
+[[auth]]
+host = "cmd.example"
+token.cmd = "printf token-from-cmd"
+"#,
+        )?;
+        std::env::set_var("AUTH_PASSWORD", "from-env");
+
+        smol::block_on(async {
+            let provider = AuthProvider::new(Some(&path))?;
+
+            let env_url = Url::parse("https://env.example").unwrap();
+            match provider.auth(&env_url).await.as_deref() {
+                Some(Auth::Basic { login, password }) => {
+                    assert_eq!(login, "user");
+                    assert_eq!(password, "from-env");
+                }
+                other => panic!("unexpected auth: {:?}", other),
+            }
+
+            let cmd_url = Url::parse("https://cmd.example").unwrap();
+            match provider.auth(&cmd_url).await.as_deref() {
+                Some(Auth::Token { token }) => assert_eq!(token, "token-from-cmd"),
+                other => panic!("unexpected auth: {:?}", other),
+            }
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn parses_cert_paths_and_password() -> std::io::Result<()> {
+        let dir = tempdir()?;
+        let cert_path = dir.path().join("cert.pem");
+        let key_path = dir.path().join("key.pem");
+        fs::write(&cert_path, "CERTDATA")?;
+        fs::write(&key_path, "KEYDATA")?;
+        let path = dir.path().join("auth.toml");
+        fs::write(
+            &path,
+            format!(
+                r#"
+[[auth]]
+host = "tls.example"
+cert = "{}"
+key = "{}"
+password = "cert-password"
+"#,
+                cert_path.file_name().unwrap().to_string_lossy(),
+                key_path.file_name().unwrap().to_string_lossy()
+            ),
+        )?;
+
+        smol::block_on(async {
+            let provider = AuthProvider::new(Some(&path))?;
+            let url = Url::parse("https://tls.example").unwrap();
+            match provider.auth(&url).await.as_deref() {
+                Some(Auth::Cert {
+                    cert,
+                    key,
+                    password,
+                }) => {
+                    assert_eq!(cert, b"CERTDATA");
+                    assert_eq!(key.as_deref(), Some(b"KEYDATA".as_slice()));
+                    assert_eq!(password.as_deref(), Some("cert-password"));
+                }
+                other => panic!("unexpected auth: {:?}", other),
+            }
+            Ok(())
+        })
+    }
+}

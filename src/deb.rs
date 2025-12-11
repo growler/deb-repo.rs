@@ -276,7 +276,7 @@ where
 /// Asynchronous debian package reader
 /// # Example
 ///
-/// ```
+/// ```ignore
 /// let mut deb = Deb::new(input).await?;
 /// while let Some(entry) = deb.next().await {
 ///     match entry? {

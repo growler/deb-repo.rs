@@ -283,14 +283,14 @@ where
     let new_installed = stream::iter(packages)
         .map(|(source, file)| {
             let pb = pb.clone();
-                let url = if let Some(source) = source {
-                    DebLocation::Repository {
-                        url: source.base(),
-                        path: file.path(),
-                    }
-                } else {
-                    DebLocation::Local { path: file.path() }
-                };
+            let url = if let Some(source) = source {
+                DebLocation::Repository {
+                    url: source.base(),
+                    path: file.path(),
+                }
+            } else {
+                DebLocation::Local { path: file.path() }
+            };
             let size = file.size();
             let hash = file.hash().clone();
             let fs = fs.clone();

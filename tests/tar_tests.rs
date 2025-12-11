@@ -15,7 +15,9 @@ use futures_lite::{
 };
 
 fn fixture(name: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/data").join(name)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data")
+        .join(name)
 }
 
 #[test]
@@ -145,16 +147,26 @@ impl VecAsyncWriter {
 }
 
 impl AsyncWrite for VecAsyncWriter {
-    fn poll_write(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>, buf: &[u8]) -> Poll<std::io::Result<usize>> {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
         self.inner.lock().unwrap().extend_from_slice(buf);
         Poll::Ready(Ok(buf.len()))
     }
 
-    fn poll_flush(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: std::pin::Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<std::io::Result<()>> {
         Poll::Ready(Ok(()))
     }
 }
@@ -166,11 +178,7 @@ fn tar_writer_round_trip() -> Result<()> {
         let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
         writer
             .send(TarEntry::Directory(TarDirectory::new(
-                "dir/",
-                0,
-                0,
-                0o755,
-                1,
+                "dir/", 0, 0, 0o755, 1,
             )))
             .await?;
         const DATA: &[u8] = b"writer round trip";
@@ -187,23 +195,12 @@ fn tar_writer_round_trip() -> Result<()> {
             .await?;
         writer
             .send(TarEntry::Device(TarDevice::new_char(
-                "dir/dev",
-                1,
-                3,
-                0,
-                0,
-                0o600,
-                3,
+                "dir/dev", 1, 3, 0, 0, 0o600, 3,
             )))
             .await?;
         writer
             .send(TarEntry::Symlink(TarSymlink::new(
-                "dir/link",
-                "file.txt",
-                0,
-                0,
-                0o777,
-                4,
+                "dir/link", "file.txt", 0, 0, 0o777, 4,
             )))
             .await?;
         writer.close().await?;

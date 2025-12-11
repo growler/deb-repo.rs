@@ -2,6 +2,8 @@
 
 mod arch;
 pub mod artifact;
+pub mod auth;
+mod auth_vault;
 mod builder;
 pub mod cli;
 pub mod comp;
@@ -29,8 +31,8 @@ pub mod universe;
 mod version;
 
 pub use {
-    async_compression::Level as CompressionLevel,
     arch::DEFAULT_ARCH,
+    async_compression::Level as CompressionLevel,
     builder::{BuildJob, Executor},
     manifest::Manifest,
     packages::{Package, Packages},
@@ -233,19 +235,6 @@ pub fn strip_compression_ext(str: &str) -> &str {
         str
     }
 }
-
-macro_rules! matches_path {
-    ($input:expr, [ * ]) => {  true };
-    ($input:expr, [ $component:tt ]) => { $input == $component };
-    ($input:expr, [ $component:tt $($rest:tt)* ]) => {
-        if let Some(rest) = $input.strip_prefix($component) {
-           matches_path!(rest, [$($rest)*])
-        } else {
-            false
-        }
-    };
-}
-pub(crate) use matches_path;
 
 /// A small enum dispatch macro for defining CLI commands.
 ///

@@ -33,7 +33,6 @@ impl std::fmt::Display for IndexFile {
     }
 }
 
-
 impl std::ops::Deref for IndexFile {
     type Target = str;
     fn deref(&self) -> &Self::Target {

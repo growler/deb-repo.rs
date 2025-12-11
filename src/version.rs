@@ -863,7 +863,7 @@ impl<V> VersionSet<V> {
     where
         for<'a> &'a OtherV: Into<V>,
     {
-       match other {
+        match other {
             VersionSet::Any => VersionSet::Any,
             VersionSet::StrictlyEarlierThan(v) => VersionSet::StrictlyEarlierThan(v.into()),
             VersionSet::EarlierOrEqualThan(v) => VersionSet::EarlierOrEqualThan(v.into()),

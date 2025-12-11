@@ -17,7 +17,7 @@ use {
         control::{ControlStanza, ParseError},
         hash::Hash,
         indexfile::IndexFile,
-        matches_path, parse_size,
+        parse_size,
     },
     chrono::{DateTime, Utc},
     itertools::Itertools,
@@ -44,10 +44,7 @@ impl Release {
         components: &'a [S],
         hash_name: &'a str,
         arch: &'a str,
-        ext: Option<&'a str>,
-    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>> + 'a, ParseError>
-    {
-        let ext = ext.unwrap_or(".xz");
+    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
         let release_components = self.field("Components").unwrap_or("");
         if components.iter().any(|c| {
             !release_components.split_ascii_whitespace().any(|rc| {
@@ -69,46 +66,69 @@ impl Release {
                 release_components
             )));
         }
-        self.field(hash_name)
-            .ok_or_else(|| {
-                ParseError::from(format!("Field {} not found in the release file", hash_name,))
+        let field = self.field(hash_name).ok_or_else(|| {
+            ParseError::from(format!("Field {} not found in the release file", hash_name,))
+        })?;
+        let files = field
+            .lines()
+            .map(|l| l.trim())
+            .filter(|l| l != &"")
+            .map(|line| {
+                let parts: SmallVec<[&'_ str; 3]> = line.split_ascii_whitespace().collect();
+                if let [digest, size, path] = parts[..] {
+                    let size = parse_size(size.as_bytes()).map_err(|err| {
+                        ParseError::from(format!("invalid size: {:?} {}", size, err))
+                    })?;
+                    Ok((path, digest, size))
+                } else {
+                    Err(ParseError::from(format!("Invalid release line: {}", line)))
+                }
             })
-            .map(|field| {
-                field
-                    .lines()
-                    .map(|l| l.trim())
-                    .filter(|l| l != &"")
-                    .map(|line| {
-                        let parts: SmallVec<[&'_ str; 3]> = line.split_ascii_whitespace().collect();
-                        if let [digest, size, path] = parts[..] {
-                            Ok((digest, size, path))
-                        } else {
-                            Err(ParseError::from(format!("Invalid release line: {}", line)))
-                        }
-                    })
-                    .map_ok(move |(digest, size, path)| {
-                        components.iter().filter_map(move |comp| {
-                            let comp = comp.as_ref();
-                            if matches_path!(path, [ comp "/binary-" arch "/Packages" ext ]) {
-                                Some((digest, size, path))
-                            } else {
-                                None
+            .try_fold(
+                components
+                    .iter()
+                    .map(|c| (c.as_ref(), None::<(&str, Hash, u64)>))
+                    .collect::<Vec<_>>(),
+                move |mut files, file| {
+                    let (path, digest, size) = file?;
+                    for (comp, entry) in files.iter_mut() {
+                        if let Some(rest) = path.strip_prefix(*comp) {
+                            if let Some(rest) = rest.strip_prefix("/binary-") {
+                                if let Some(rest) = rest.strip_prefix(arch) {
+                                    if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
+                                        rest.strip_prefix("/Packages")
+                                    {
+                                        if size
+                                            < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size)
+                                        {
+                                            let hash = Hash::from_hex(hash_name, digest).map_err(
+                                                |err| {
+                                                    ParseError::from(format!(
+                                                        "invalid hash: {} {}",
+                                                        digest, err
+                                                    ))
+                                                },
+                                            )?;
+                                            *entry = Some((path, hash, size));
+                                        }
+                                    }
+                                }
                             }
-                        })
-                    })
-                    .flatten_ok()
-                    .map(|file| {
-                        file.and_then(|(digest, size, path)| {
-                            let size = parse_size(size.as_bytes()).map_err(|err| {
-                                ParseError::from(format!("invalid size: {:?} {}", size, err))
-                            })?;
-                            let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
-                                ParseError::from(format!("invalid hash: {} {}", digest, err))
-                            })?;
-                            Ok::<_, ParseError>((path, hash, size))
-                        })
-                    })
-            })
+                        }
+                    }
+                    Ok::<_, ParseError>(files)
+                },
+            )?;
+        Ok(files.into_iter().map(|(comp, entry)| {
+            if let Some(entry) = entry {
+                Ok(entry)
+            } else {
+                Err(ParseError::from(format!(
+                    "no Packages file found for component {}",
+                    comp
+                )))
+            }
+        }))
     }
     fn field(&self, name: &str) -> Option<&str> {
         self.inner.with_control(|ctrl| ctrl.field(name))

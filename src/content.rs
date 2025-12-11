@@ -1,10 +1,10 @@
 pub use crate::indexfile::IndexFile;
 use {
     crate::{
-        deb::DebReader,
         artifact::Artifact,
         comp::{comp_reader, strip_comp_ext},
         control::{MutableControlFile, MutableControlStanza},
+        deb::DebReader,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
         packages::Packages,
@@ -107,14 +107,8 @@ pub struct UniverseFiles<'a> {
     locked: &'a [Option<LockedSource>],
 }
 impl<'a> UniverseFiles<'a> {
-    pub(crate) fn new(
-        sources: &'a [Source],
-        locked: &'a [Option<LockedSource>],
-    ) -> Self {
-        UniverseFiles {
-            sources,
-            locked,
-        }
+    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
+        UniverseFiles { sources, locked }
     }
     pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
         self.sources
@@ -426,6 +420,7 @@ impl ContentProvider for HostCache {
         .map_ok(|(src, file)| async move {
             let prio = src.priority;
             let url = src.file_url(file.path());
+            tracing::debug!("Fetching Packages file from {}", &url);
             let file = self
                 .fetch_index_file(file.hash.clone(), file.size, &src.file_url(file.path()))
                 .await?;

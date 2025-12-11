@@ -2,9 +2,9 @@ use {
     crate::{
         content::ContentProvider,
         hash::Hash,
+        kvlist::KVList,
         version::{Constraint, Dependency},
         RepositoryFile, Source,
-        kvlist::KVList,
     },
     futures::{
         stream::{self, LocalBoxStream},

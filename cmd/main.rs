@@ -1,6 +1,7 @@
 use {
     clap::Parser,
     debrepo::{
+        auth::AuthProvider,
         cli::{self, Command},
         content::HostCache,
         exec::maybe_run_helper,
@@ -80,6 +81,10 @@ pub struct App {
     #[arg(short = 'k', long = "insecure", action, display_order = 0, action)]
     pub insecure: bool,
 
+    /// Auth source (file:<path>, <path>, or vault:<mount>/<path>)
+    #[arg(short = 'a', long = "auth", value_name = "AUTH", display_order = 0)]
+    auth: Option<String>,
+
     /// Path to the manifest file
     #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE, display_order = 0)]
     manifest: PathBuf,
@@ -110,18 +115,29 @@ impl cli::Config for App {
     fn fetcher(&self) -> std::io::Result<&HostCache> {
         static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
         PROVIDER.get_or_try_init(|| {
-            let base = std::fs::canonicalize(&self.manifest)
-                .ok()
-                .and_then(|path| path.parent().map(Path::to_path_buf))
-                .or_else(|| self.manifest.parent().map(Path::to_path_buf))
-                .map_or_else(std::env::current_dir, std::fs::canonicalize)
-                .map_err(|err| {
+            let base = self
+                .manifest
+                .parent()
+                .map(|s| {
+                    if s.as_os_str().is_empty() {
+                        Path::new(".")
+                    } else {
+                        s
+                    }
+                })
+                .ok_or_else(|| {
                     std::io::Error::other(format!(
-                        "failed to find manifest file parent directory {}: {}",
-                        self.manifest.display(),
-                        err
+                        "invalid manifest file path: {}",
+                        self.manifest.display()
                     ))
                 })?;
+            let base = std::fs::canonicalize(base).map_err(|err| {
+                std::io::Error::other(format!(
+                    "failed to find manifest file parent directory {}: {}",
+                    self.manifest.parent().unwrap_or(Path::new(".")).display(),
+                    err
+                ))
+            })?;
             if let Some(path) = self.cache_dir.as_deref() {
                 std::fs::create_dir_all(path).map_err(|err| {
                     std::io::Error::other(format!(
@@ -133,7 +149,7 @@ impl cli::Config for App {
             }
             Ok(HostCache::new(
                 base,
-                HttpTransport::new(self.insecure),
+                HttpTransport::new(AuthProvider::from_arg(self.auth.as_deref())?, self.insecure),
                 self.cache_dir.as_deref(),
             ))
         })
