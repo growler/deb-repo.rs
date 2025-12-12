@@ -15,12 +15,11 @@ pub struct VaultAuth {
     client: HttpClient,
     base: Url,
     token: String,
-    mount: String,
     path: String,
 }
 
 impl VaultAuth {
-    pub fn new(spec: &str) -> std::io::Result<Self> {
+    pub fn new(path: &str) -> std::io::Result<Self> {
         let addr = env::var("VAULT_ADDR").map_err(|err| {
             std::io::Error::other(format!("VAULT_ADDR must be set for vault auth: {}", err))
         })?;
@@ -36,13 +35,11 @@ impl VaultAuth {
         let base = Url::parse(&addr).map_err(|err| {
             std::io::Error::other(format!("invalid VAULT_ADDR {}: {}", addr, err))
         })?;
-        let (mount, path) = parse_spec(spec)?;
-
+        let path = format!("v1/{}/", path.trim_start_matches('/').trim_end_matches('/'));
         Ok(Self {
             client,
             base,
             token,
-            mount,
             path,
         })
     }
@@ -64,7 +61,7 @@ impl VaultAuth {
                 let parsed: VaultResponse = serde_json::from_str(&body).map_err(|err| {
                     std::io::Error::other(format!("invalid vault response: {}", err))
                 })?;
-                let secret = match parsed.data.and_then(|d| d.data) {
+                let secret = match parsed.data {
                     Some(secret) => secret,
                     None => return Ok(None),
                 };
@@ -79,27 +76,14 @@ impl VaultAuth {
     }
 
     fn secret_url(&self, host: &str) -> std::io::Result<Url> {
-        let mut full = format!("v1/{}/data/", self.mount);
-        if !self.path.is_empty() {
-            full.push_str(self.path.trim_start_matches('/'));
-            if !full.ends_with('/') {
-                full.push('/');
-            }
-        }
-        full.push_str(host);
         self.base
-            .join(&full)
+            .join(&format!("{}{}", self.path, host))
             .map_err(|err| std::io::Error::other(format!("invalid vault URL: {}", err)))
     }
 }
 
 #[derive(Debug, Deserialize)]
 struct VaultResponse {
-    data: Option<VaultData>,
-}
-
-#[derive(Debug, Deserialize)]
-struct VaultData {
     data: Option<VaultSecret>,
 }
 
@@ -152,22 +136,6 @@ impl VaultSecret {
             ))),
         }
     }
-}
-
-fn parse_spec(spec: &str) -> std::io::Result<(String, String)> {
-    let mut parts = spec.trim_start_matches('/').splitn(2, '/');
-    let mount = parts
-        .next()
-        .ok_or_else(|| std::io::Error::other("vault spec must include a mount"))?;
-    let path = parts
-        .next()
-        .ok_or_else(|| std::io::Error::other("vault spec must include a path"))?;
-    if mount.is_empty() || path.is_empty() {
-        return Err(std::io::Error::other(
-            "vault spec must be in the form vault:mount/path",
-        ));
-    }
-    Ok((mount.to_string(), path.to_string()))
 }
 
 fn build_client(skip_verify: bool, ca_cert: Option<PathBuf>) -> std::io::Result<HttpClient> {
