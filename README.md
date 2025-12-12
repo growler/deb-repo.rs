@@ -86,6 +86,42 @@ Key sections:
 - `list`, `search`, `show` – inspect the resolved package universe.
 - `build` – expand a spec into a directory, running maintainer scripts within the sandbox helper.
 
+## Authentication
+- `-a/--auth` selects the source: omit for optional `auth.toml` in the same directory where Manifest is located, 
+use `file:/path/to/auth.toml` (or just a path), or `vault:<prefix>` to read secrets from Vault.
+
+- Auth file (`auth.toml`) supports per-host entries:
+```toml
+[[auth]]
+host = "deb.example.com"
+login = "user"
+password = "inline"                # or password.env / password.cmd
+
+[[auth]]
+host = "deb.other.com"
+token = "token-string"
+
+[[auth]]
+host = "deb.tls.com"
+cert = "relative/cert.pem"         # relative paths are resolved from the auth file directory
+key = "relative/key.pem"
+# password/env/cmd/file are also supported for passwords
+```
+`password.env` reads an env var, `password.cmd` runs a shell command (cwd = auth file dir), 
+and `password.file`/`password.path` load file content. Tokens and cert/key accept the same source forms.
+
+- Vault secrets: pass `--auth vault:<prefix>`, where `<prefix>` is the full API path 
+prefix (e.g. `secret/repos` for KV v1, `secret/data/repos` for KV v2). Each host lives 
+at `<prefix>/<host>` with JSON like:
+
+```json
+{ "type": "basic", "login": "user", "password": "secret" }
+{ "type": "token", "token": "token-string" }
+{ "type": "mtls", "cert": "PEM string", "key": "PEM key (decrypted)" }
+```
+
+`VAULT_ADDR`, `VAULT_TOKEN`, `VAULT_CACERT`, and `VAULT_SKIP_VERIFY` influence the Vault client.
+
 Global flags of note:
 - `--manifest <path>` selects an alternate manifest.
 - `--arch <arch>` switches the target architecture (default: host arch).

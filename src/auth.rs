@@ -1,3 +1,5 @@
+//! Authentication provider for transports.
+//! Supports static `auth.toml` files and Vault prefixes (see README for full format details).
 use {
     crate::auth_vault::VaultAuth,
     serde::{Deserialize, Serialize},
@@ -12,15 +14,14 @@ use {
     url::Url,
 };
 
+/// Authentication material resolved per host.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub enum Auth {
-    Basic {
-        login: String,
-        password: String,
-    },
-    Token {
-        token: String,
-    },
+    /// HTTP Basic/Digest credentials.
+    Basic { login: String, password: String },
+    /// Bearer token sent as `Authorization: Bearer <token>`.
+    Token { token: String },
+    /// Client certificate (PEM). `key` and `password` are optional.
     Cert {
         cert: Vec<u8>,
         key: Option<Vec<u8>>,
@@ -28,6 +29,7 @@ pub enum Auth {
     },
 }
 
+/// Provides per-host authentication from a file (`auth.toml` by default) or Vault prefix.
 pub struct AuthProvider {
     cache: async_lock::RwLock<HashMap<String, Option<Arc<Auth>>>>,
     entries: HashMap<String, smallvec::SmallVec<[AuthDefinition; 1]>>,
@@ -64,6 +66,7 @@ struct AuthFile {
     auth: Vec<AuthSpec>,
 }
 
+/// Single auth entry from `auth.toml`.
 #[derive(Debug, Deserialize)]
 struct AuthSpec {
     host: String,
@@ -91,6 +94,10 @@ struct ValueSpecSource {
 }
 
 impl AuthProvider {
+    /// Build an auth provider from:
+    /// - `None` (default) -> `./auth.toml`
+    /// - `file:/path/to/auth.toml` or `/path/to/auth.toml`
+    /// - `vault:<prefix>` where `<prefix>/<host>` contains a Vault secret
     pub fn new<S: AsRef<str>>(arg: Option<S>) -> std::io::Result<Self> {
         let (entries, vault) = match arg.as_ref().map(|s| s.as_ref().to_owned()) {
             None => (None, None),
