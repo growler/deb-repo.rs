@@ -461,6 +461,9 @@ impl Packages {
     pub fn len(&self) -> usize {
         self.inner.with_packages(|packages| packages.len())
     }
+    pub fn is_empty(&self) -> bool {
+        self.inner.with_packages(|packages| packages.is_empty())
+    }
     pub fn repo_file(
         &self,
         index: usize,
@@ -530,7 +533,7 @@ impl From<&Packages> for MutableControlFile {
     fn from(pkgs: &Packages) -> Self {
         pkgs.inner
             .with_packages(|pkgs| pkgs.iter())
-            .map(|pkg| MutableControlStanza::from(pkg))
+            .map(MutableControlStanza::from)
             .collect()
     }
 }
