@@ -762,7 +762,7 @@ impl Source {
                 }
                 let mut sources = vec![source];
                 sources.extend(security);
-                Some((sources, vec!["ca-certificates".to_string()]))
+                Some((sources, vec![]))
             }
             "ubuntu" => {
                 const DEFAULT_SUITE: &str = "noble";
@@ -786,7 +786,7 @@ impl Source {
                         .map(|f| format!("{}{}", s, f))
                         .collect();
                 }
-                Some((vec![source], vec!["ca-certificates".to_string()]))
+                Some((vec![source], vec![]))
             }
             "devuan" => {
                 const DEFAULT_SUITE: &str = "daedalus";
@@ -814,7 +814,7 @@ impl Source {
                 }
                 Some((
                     vec![source],
-                    vec!["ca-certificates".to_string(), "devuan-keyring".to_string()],
+                    vec!["devuan-keyring".to_string()],
                 ))
             }
             _ => None,
