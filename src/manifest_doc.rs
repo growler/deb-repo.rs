@@ -1,7 +1,7 @@
 use crate::{
     control::{MutableControlFile, MutableControlStanza},
     hash::HashAlgo,
-    source::SnapshotId,
+    archive::SnapshotId,
 };
 
 use {
@@ -10,7 +10,7 @@ use {
         hash::Hash,
         kvlist::{KVList, KVListSet},
         packages::Packages,
-        source::{RepositoryFile, Snapshot, Source},
+        archive::{RepositoryFile, Snapshot, Archive},
         spec::*,
         version::{Constraint, Dependency},
     },
@@ -50,15 +50,15 @@ pub struct ManifestFile {
     #[serde(skip)]
     doc: toml_edit::DocumentMut,
 
-    #[serde(default, rename = "source", skip_serializing_if = "Vec::is_empty")]
-    sources: Vec<Source>,
+    #[serde(default, rename = "archive", skip_serializing_if = "Vec::is_empty")]
+    archives: Vec<Archive>,
 
     #[serde(default, rename = "local", skip_serializing_if = "Vec::is_empty")]
     local_pkgs: Vec<RepositoryFile>,
 
-    // an index mapping packages files to their sources in `sources`
+    // an index mapping packages files to their origins in `archives`
     #[serde(default, skip)]
-    sources_pkgs: Vec<usize>,
+    archives_pkgs: Vec<usize>,
 
     #[serde(
         default,
@@ -92,8 +92,8 @@ pub enum UpdateResult {
     Updated(usize),
 }
 
-fn sources_pkgs(sources: &[Source]) -> Vec<usize> {
-    sources
+fn archives_pkgs(archives: &[Archive]) -> Vec<usize> {
+    archives
         .iter()
         .enumerate()
         .flat_map(|(i, s)| s.suites.iter().map(move |_| (i, s)))
@@ -108,23 +108,23 @@ impl ManifestFile {
     pub fn new(comment: Option<&str>) -> Self {
         ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
-            sources: Vec::new(),
-            sources_pkgs: Vec::new(),
+            archives: Vec::new(),
+            archives_pkgs: Vec::new(),
             local_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
     }
 
-    // A new manifest with sources
-    pub fn new_with_sources(mut sources: Vec<Source>, comment: Option<&str>) -> Self {
+    // A new manifest with archives 
+    pub fn new_with_archives(mut archives: Vec<Archive>, comment: Option<&str>) -> Self {
         let mut doc = toml_edit::DocumentMut::new().init_manifest(comment);
-        doc.push_sources(sources.iter(), None);
-        sources.iter_mut().for_each(|s| s.set_base());
+        doc.push_archives(archives.iter(), None);
+        archives.iter_mut().for_each(|s| s.set_base());
         ManifestFile {
             doc,
-            sources_pkgs: sources_pkgs(&sources),
-            sources,
+            archives_pkgs: archives_pkgs(&archives),
+            archives,
             local_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
@@ -160,8 +160,8 @@ impl ManifestFile {
             })?
             .init_manifest(None);
         manifest.doc = doc;
-        manifest.sources.iter_mut().for_each(|s| s.set_base());
-        manifest.sources_pkgs = sources_pkgs(&manifest.sources);
+        manifest.archives.iter_mut().for_each(|s| s.set_base());
+        manifest.archives_pkgs = archives_pkgs(&manifest.archives);
         Ok((manifest, hash))
     }
 
@@ -175,7 +175,7 @@ impl ManifestFile {
 
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
-            sources: self.sources().iter().map(|_| None).collect(),
+            archives: self.archives().iter().map(|_| None).collect(),
             local_pkgs: None,
             specs: self
                 .specs()
@@ -403,14 +403,14 @@ impl ManifestFile {
             }
         }
     }
-    pub fn sources(&self) -> &'_ [Source] {
-        &self.sources
+    pub fn archives(&self) -> &'_ [Archive] {
+        &self.archives
     }
     pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
         &self.local_pkgs
     }
-    pub fn sources_pkgs(&self) -> &'_ [usize] {
-        &self.sources_pkgs
+    pub fn archives_pkgs(&self) -> &'_ [usize] {
+        &self.archives_pkgs
     }
     pub(crate) fn update_local_pkgs<I: IntoIterator<Item = Option<RepositoryFile>>>(
         &mut self,
@@ -447,57 +447,57 @@ impl ManifestFile {
             UpdateResult::Added
         }
     }
-    pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> UpdateResult {
+    pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> UpdateResult {
         if let Some((i, src)) = self
-            .sources
+            .archives
             .iter_mut()
             .enumerate()
-            .find(|(_, s)| s.url == source.url)
+            .find(|(_, s)| s.url == archive.url)
         {
-            if src == &source {
+            if src == &archive {
                 return UpdateResult::None;
             }
-            self.doc.update_source(i, &source, comment);
-            *src = source;
-            self.sources_pkgs = sources_pkgs(&self.sources);
+            self.doc.update_archives(i, &archive, comment);
+            *src = archive;
+            self.archives_pkgs = archives_pkgs(&self.archives);
             UpdateResult::Updated(i)
         } else {
-            self.doc.push_sources(std::iter::once(&source), comment);
-            self.sources.push(source);
-            self.sources_pkgs = sources_pkgs(&self.sources);
+            self.doc.push_archives(std::iter::once(&archive), comment);
+            self.archives.push(archive);
+            self.archives_pkgs = archives_pkgs(&self.archives);
             UpdateResult::Added
         }
     }
-    pub fn remove_source(&mut self, index: usize) -> Source {
-        self.doc.drop_source(index);
-        let source = self.sources.remove(index);
-        self.sources_pkgs = sources_pkgs(&self.sources);
-        source
+    pub fn remove_archive(&mut self, index: usize) -> Archive {
+        self.doc.drop_archive(index);
+        let archive = self.archives.remove(index);
+        self.archives_pkgs = archives_pkgs(&self.archives);
+        archive
     }
-    pub fn get_source(&self, index: usize) -> Option<&'_ Source> {
-        self.sources.get(index)
+    pub fn get_archive(&self, index: usize) -> Option<&'_ Archive> {
+        self.archives.get(index)
     }
-    pub fn update_source_snapshots(
+    pub fn update_archive_snapshots(
         &mut self,
         stamp: SnapshotId,
     ) -> impl Iterator<Item = usize> + '_ {
         let doc = &mut self.doc;
-        self.sources
+        self.archives
             .iter_mut()
             .enumerate()
-            .filter_map(move |(i, source)| {
-                if let Some(snapshot) = source.snapshot.as_mut() {
+            .filter_map(move |(i, archive)| {
+                if let Some(snapshot) = archive.snapshot.as_mut() {
                     match snapshot {
                         Snapshot::Disable => None,
                         Snapshot::Enable | Snapshot::Use(_) => {
-                            doc.update_source_snapshot(i, stamp);
+                            doc.update_archive_snapshot(i, stamp);
                             *snapshot = Snapshot::Use(stamp);
                             Some(i)
                         }
                     }
-                } else if source.snapshots.is_some() {
-                    doc.update_source_snapshot(i, stamp);
-                    source.snapshot = Some(Snapshot::Use(stamp));
+                } else if archive.snapshots.is_some() {
+                    doc.update_archive_snapshot(i, stamp);
+                    archive.snapshot = Some(Snapshot::Use(stamp));
                     Some(i)
                 } else {
                     None
@@ -650,15 +650,15 @@ impl<'a> Iterator for SpecIterator<'a> {
     }
 }
 
-fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(
-    sources: I,
+fn universe_hash<'a, I: Iterator<Item = &'a LockedArchive> + 'a>(
+    archives: I,
     locals: Option<&Packages>,
 ) -> Hash {
     let mut hasher = blake3::Hasher::new();
     if let Some(locals) = locals {
         hasher.update(locals.src().as_bytes());
     }
-    sources
+    archives
         .flat_map(|s| s.suites.iter())
         .flat_map(|s| s.packages.iter())
         .fold(hasher, |mut hasher, file| {
@@ -671,7 +671,7 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedSource> + 'a>(
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
-    sources: Vec<Option<LockedSource>>,
+    archives: Vec<Option<LockedArchive>>,
     #[serde(rename = "locals", skip_serializing_if = "Option::is_none", default)]
     local_pkgs: Option<Packages>,
     specs: KVList<LockedSpec>,
@@ -684,15 +684,15 @@ impl LockFile {
     pub fn new() -> Self {
         LockFile {
             universe_hash: None,
-            sources: Vec::new(),
+            archives: Vec::new(),
             local_pkgs: None,
             specs: KVList::new(),
         }
     }
-    pub fn new_with_sources(sources: usize) -> Self {
+    pub fn new_with_archives(archives: usize) -> Self {
         LockFile {
             universe_hash: None,
-            sources: vec![None; sources],
+            archives: vec![None; archives],
             local_pkgs: None,
             specs: KVList::new(),
         }
@@ -727,7 +727,7 @@ impl LockFile {
                     _timestamp: DateTime<Utc>,
                     arch: String,
                     hash: Hash,
-                    sources: Vec<LockedSource>,
+                    archives: Vec<LockedArchive>,
                     #[serde(default)]
                     locals: Option<Packages>,
                     specs: KVList<LockedSpec>,
@@ -744,10 +744,10 @@ impl LockFile {
                         if &lock.hash == manifest_hash && lock.arch.as_str() == arch.as_ref() {
                             Some(LockFile {
                                 universe_hash: Some(universe_hash(
-                                    lock.sources.iter(),
+                                    lock.archives.iter(),
                                     lock.locals.as_ref(),
                                 )),
-                                sources: lock.sources.into_iter().map(Some).collect(),
+                                archives: lock.archives.into_iter().map(Some).collect(),
                                 local_pkgs: lock.locals,
                                 specs: lock.specs,
                             })
@@ -789,14 +789,14 @@ impl LockFile {
         crate::safe_store(lock_path, smol::io::Cursor::new(out)).await?;
         Ok(())
     }
-    pub fn sources(&self) -> &'_ [Option<LockedSource>] {
-        &self.sources
+    pub fn archives(&self) -> &'_ [Option<LockedArchive>] {
+        &self.archives
     }
     pub fn local_pkgs(&self) -> Option<&'_ Packages> {
         self.local_pkgs.as_ref()
     }
-    pub fn sources_mut(&mut self) -> &'_ mut [Option<LockedSource>] {
-        &mut self.sources
+    pub fn archives_mut(&mut self) -> &'_ mut [Option<LockedArchive>] {
+        &mut self.archives
     }
     pub fn set_local_packages(&mut self, pkgs: Packages) {
         self.local_pkgs.replace(pkgs);
@@ -822,21 +822,21 @@ impl LockFile {
         self.universe_hash.take();
         Ok(())
     }
-    pub fn push_source(&mut self, source: Option<LockedSource>) {
-        self.sources.push(source);
+    pub fn push_archive(&mut self, archive: Option<LockedArchive>) {
+        self.archives.push(archive);
         self.universe_hash.take();
     }
-    pub fn invalidate_source(&mut self, index: usize) {
-        self.sources[index] = None;
+    pub fn invalidate_archive(&mut self, index: usize) {
+        self.archives[index] = None;
         self.universe_hash.take();
     }
-    pub fn remove_source(&mut self, index: usize) {
-        self.sources.remove(index);
+    pub fn remove_archive(&mut self, index: usize) {
+        self.archives.remove(index);
         self.universe_hash.take();
     }
     pub(crate) fn update_universe_hash(&mut self) {
         self.universe_hash = Some(universe_hash(
-            self.sources.iter().map(|s| s.as_ref().unwrap()),
+            self.archives.iter().map(|s| s.as_ref().unwrap()),
             self.local_pkgs.as_ref(),
         ));
     }
@@ -864,7 +864,7 @@ impl LockFile {
         self.specs.push(name, spec);
     }
     pub fn is_uptodate(&self) -> bool {
-        self.sources.iter().all(|s| s.is_some())
+        self.archives.iter().all(|s| s.is_some())
             && self.specs.iter_values().all(|spec| spec.is_locked())
     }
 }
@@ -1092,10 +1092,10 @@ pub(crate) trait ManifestDoc {
         entry: &str,
         dflt: impl Fn() -> toml_edit::Item,
     ) -> &mut toml_edit::Item;
-    fn get_sources(&mut self) -> &mut toml_edit::ArrayOfTables {
-        self.get_doc_entry_mut("source", toml_edit::array)
+    fn get_archives(&mut self) -> &mut toml_edit::ArrayOfTables {
+        self.get_doc_entry_mut("archive", toml_edit::array)
             .as_array_of_tables_mut()
-            .expect("a list of sources")
+            .expect("a list of archives")
     }
     fn get_local_packages(&mut self) -> &mut toml_edit::ArrayOfTables {
         self.get_doc_entry_mut("local", toml_edit::array)
@@ -1235,9 +1235,9 @@ pub(crate) trait ManifestDoc {
         pkg_table.decor_mut().set_prefix(comment);
         local_arr.push(pkg_table);
     }
-    fn update_source(&mut self, index: usize, source: &Source, comment: Option<&str>) {
-        let sources_arr = self.get_sources();
-        let mut source_table = toml_edit::ser::to_document(source)
+    fn update_archives(&mut self, index: usize, archive: &Archive, comment: Option<&str>) {
+        let archives_arr = self.get_archives();
+        let mut archive_table = toml_edit::ser::to_document(archive)
             .expect("failed to serialize table")
             .into_table();
         let comment = toml_edit::RawString::from(if index == 0 {
@@ -1252,39 +1252,39 @@ pub(crate) trait ManifestDoc {
                     .unwrap_or_default()
             )
         });
-        source_table.decor_mut().set_prefix(comment);
-        if let Some(table) = sources_arr.get_mut(index) {
-            *table = source_table;
+        archive_table.decor_mut().set_prefix(comment);
+        if let Some(table) = archives_arr.get_mut(index) {
+            *table = archive_table;
         }
     }
-    fn push_sources<'a, I: Iterator<Item = &'a Source> + 'a>(
+    fn push_archives<'a, I: Iterator<Item = &'a Archive> + 'a>(
         &mut self,
-        sources: I,
+        archives: I,
         comment: Option<&str>,
     ) {
-        let sources_arr = self.get_sources();
+        let archives_arr = self.get_archives();
         let mut comment = comment.map(|s| s.split('\n').map(|s| format!("# {}\n", s)).join(""));
-        for source in sources {
-            let mut source_table = toml_edit::ser::to_document(source)
+        for archive in archives {
+            let mut archive_table = toml_edit::ser::to_document(archive)
                 .expect("failed to serialize table")
                 .into_table();
-            let comment = toml_edit::RawString::from(if sources_arr.is_empty() {
+            let comment = toml_edit::RawString::from(if archives_arr.is_empty() {
                 comment.take().unwrap_or_default()
             } else {
                 format!("\n{}", comment.take().unwrap_or_default())
             });
-            source_table.decor_mut().set_prefix(comment);
-            sources_arr.push(source_table);
+            archive_table.decor_mut().set_prefix(comment);
+            archives_arr.push(archive_table);
         }
     }
-    fn drop_source(&mut self, index: usize) {
-        let sources = self.get_sources();
-        sources.remove(index);
+    fn drop_archive(&mut self, index: usize) {
+        let archives = self.get_archives();
+        archives.remove(index);
     }
-    fn update_source_snapshot(&mut self, index: usize, stamp: SnapshotId) {
-        let sources = self.get_sources();
-        let source_table = sources.get_mut(index).expect("a valid source");
-        match source_table.entry("snapshot") {
+    fn update_archive_snapshot(&mut self, index: usize, stamp: SnapshotId) {
+        let archives = self.get_archives();
+        let archive_table = archives.get_mut(index).expect("a valid archive");
+        match archive_table.entry("snapshot") {
             toml_edit::Entry::Occupied(ref mut e) => {
                 *(e.get_mut()) = toml_edit::value(stamp.to_string());
             }
@@ -1326,10 +1326,10 @@ impl ManifestDoc for toml_edit::DocumentMut {
             self.decor_mut()
                 .set_prefix(comment.split('\n').map(|s| format!("# {}\n", s)).join(""));
         }
-        self.entry("source")
+        self.entry("archive")
             .or_insert_with(toml_edit::array)
             .as_array_of_tables()
-            .expect("a list of sources");
+            .expect("a list of archives");
         self.entry("local")
             .or_insert_with(toml_edit::array)
             .as_array_of_tables()
@@ -1354,7 +1354,7 @@ impl ManifestDoc for toml_edit::DocumentMut {
         default_spec.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
         fn entry_order(entry: &str) -> u8 {
             match entry {
-                "source" => 0,
+                "archive" => 0,
                 "local" => 1,
                 "artifact" => 2,
                 "spec" => 3,

@@ -8,8 +8,8 @@ use {
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
         packages::Packages,
-        source::{RepositoryFile, Source},
-        spec::LockedSource,
+        archive::{RepositoryFile, Archive},
+        spec::LockedArchive,
         staging::Stage,
         staging::{HostFileSystem, StagingFile, StagingFileSystem},
         transport::{HttpTransport, TransportProvider},
@@ -88,12 +88,12 @@ pub trait ContentProvider {
         H: HashAlgo + 'static;
     fn fetch_universe(
         &self,
-        sources: UniverseFiles<'_>,
+        archives: UniverseFiles<'_>,
         concurrency: NonZero<usize>,
     ) -> impl Future<Output = io::Result<Vec<Packages>>>;
     fn fetch_universe_stage<'a>(
         &self,
-        sources: UniverseFiles<'a>,
+        archives: UniverseFiles<'a>,
         concurrency: NonZero<usize>,
     ) -> impl Future<
         Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
@@ -103,20 +103,20 @@ pub trait ContentProvider {
 }
 
 pub struct UniverseFiles<'a> {
-    sources: &'a [Source],
-    locked: &'a [Option<LockedSource>],
+    archives: &'a [Archive],
+    locked: &'a [Option<LockedArchive>],
 }
 impl<'a> UniverseFiles<'a> {
-    pub(crate) fn new(sources: &'a [Source], locked: &'a [Option<LockedSource>]) -> Self {
-        UniverseFiles { sources, locked }
+    pub(crate) fn new(archives: &'a [Archive], locked: &'a [Option<LockedArchive>]) -> Self {
+        UniverseFiles { archives, locked }
     }
-    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Source, &'a RepositoryFile)>> + '_ {
-        self.sources
+    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Archive, &'a RepositoryFile)>> + '_ {
+        self.archives
             .iter()
             .zip(self.locked.iter())
-            .map(|(source, locked)| {
+            .map(|(archive, locked)| {
                 if let Some(locked) = locked.as_ref() {
-                    Ok((source, locked))
+                    Ok((archive, locked))
                 } else {
                     Err(std::io::Error::other(
                         "lock file is missed or outdated, run update",
@@ -131,26 +131,26 @@ impl<'a> UniverseFiles<'a> {
             })
             .flatten_ok()
     }
-    pub fn sources(&self) -> MutableControlFile {
-        self.sources
+    pub fn apt_sources(&self) -> MutableControlFile {
+        self.archives
             .iter()
             .fold(MutableControlFile::new(), |mut ctrl, src| {
                 ctrl.add(Into::<MutableControlStanza>::into(src));
                 ctrl
             })
     }
-    pub fn sources_hash(&self) -> (MutableControlFile, Hash) {
+    pub fn apt_sources_hash(&self) -> (MutableControlFile, Hash) {
         let mut sources = MutableControlFile::new();
         let mut digester = blake3::Hasher::new();
-        self.sources
+        self.archives
             .iter()
             .zip(self.locked.iter())
-            .flat_map(|(src, locked)| {
-                sources.add(Into::<MutableControlStanza>::into(src));
+            .flat_map(|(archive, locked)| {
+                sources.add(Into::<MutableControlStanza>::into(archive));
                 locked.as_ref().into_iter().flat_map(move |locked| {
                     locked.suites.iter().flat_map(move |suite| {
-                        std::iter::once((src, &suite.release))
-                            .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                        std::iter::once((archive, &suite.release))
+                            .chain(suite.packages.iter().map(move |pkg| (archive, pkg)))
                     })
                 })
             })
@@ -161,12 +161,12 @@ impl<'a> UniverseFiles<'a> {
         (sources, digester.into_hash())
     }
     pub fn hash(&self) -> Hash {
-        self.sources_hash().1
+        self.apt_sources_hash().1
     }
 }
 
 pub struct UniverseFilesStage<FS: StagingFileSystem + ?Sized> {
-    sources: MutableControlFile,
+    apt_sources: MutableControlFile,
     files: Vec<(String, IndexFile)>,
     _phantom: std::marker::PhantomData<fn(&FS)>,
 }
@@ -183,7 +183,7 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
                 .await?;
             fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
                 .await?;
-            fs.create_file_from_bytes(self.sources.to_string().as_bytes(), 0, 0, 0o644)
+            fs.create_file_from_bytes(self.apt_sources.to_string().as_bytes(), 0, 0, 0o644)
                 .await?
                 .persist("./etc/apt/sources.list.d/manifest.sources")
                 .await?;
@@ -409,11 +409,11 @@ impl ContentProvider for HostCache {
     }
     async fn fetch_universe(
         &self,
-        sources: UniverseFiles<'_>,
+        archives: UniverseFiles<'_>,
         concurrency: NonZero<usize>,
     ) -> io::Result<Vec<Packages>> {
         stream::iter(
-            sources
+            archives
                 .files()
                 .filter_ok(|(_, file)| !file.path.ends_with("Release")),
         )
@@ -441,11 +441,11 @@ impl ContentProvider for HostCache {
     }
     async fn fetch_universe_stage<'a>(
         &self,
-        sources: UniverseFiles<'a>,
+        archives: UniverseFiles<'a>,
         concurrency: NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
-        let ctrl = sources.sources();
-        let files = stream::iter(sources.files())
+        let ctrl = archives.apt_sources();
+        let files = stream::iter(archives.files())
             .map_ok(|(src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
@@ -458,7 +458,7 @@ impl ContentProvider for HostCache {
             .try_collect::<Vec<_>>()
             .await?;
         Ok(Box::new(UniverseFilesStage::<Self::Target> {
-            sources: ctrl,
+            apt_sources: ctrl,
             files,
             _phantom: std::marker::PhantomData,
         })

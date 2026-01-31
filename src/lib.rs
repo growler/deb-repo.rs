@@ -21,7 +21,7 @@ mod manifest_doc;
 mod packages;
 mod release;
 pub mod sandbox;
-mod source;
+mod archive;
 mod spec;
 mod stage;
 mod staging;
@@ -37,7 +37,7 @@ pub use {
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,
-    source::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Source},
+    archive::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Archive},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
     transport::{HttpTransport, TransportProvider},
     version::{Constraint, Dependency, Version, VersionSet},

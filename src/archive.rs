@@ -466,43 +466,43 @@ impl clap::builder::TypedValueParser for ClapSnapshotParser {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, Default)]
-pub enum SourceHashKind {
+pub enum ArchiveHashKind {
     #[default]
     SHA256,
     SHA512,
     MD5sum,
 }
 
-impl SourceHashKind {
+impl ArchiveHashKind {
     pub fn is_sha256(&self) -> bool {
-        *self == SourceHashKind::SHA256
+        *self == ArchiveHashKind::SHA256
     }
     pub fn name(&self) -> &'static str {
         match self {
-            SourceHashKind::MD5sum => "MD5",
-            SourceHashKind::SHA256 => "SHA256",
-            SourceHashKind::SHA512 => "SHA512",
+            ArchiveHashKind::MD5sum => "MD5",
+            ArchiveHashKind::SHA256 => "SHA256",
+            ArchiveHashKind::SHA512 => "SHA512",
         }
     }
 }
 
-impl std::str::FromStr for SourceHashKind {
+impl std::str::FromStr for ArchiveHashKind {
     type Err = String;
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_ascii_lowercase().as_str() {
-            "md5" | "md5sum" => Ok(SourceHashKind::MD5sum),
-            "sha256" => Ok(SourceHashKind::SHA256),
-            "sha512" => Ok(SourceHashKind::SHA512),
+            "md5" | "md5sum" => Ok(ArchiveHashKind::MD5sum),
+            "sha256" => Ok(ArchiveHashKind::SHA256),
+            "sha512" => Ok(ArchiveHashKind::SHA512),
             other => Err(format!("unsupported hash: {other}")),
         }
     }
 }
 
 #[derive(Clone)]
-struct SourceHashKindValueParser;
+struct ArchiveHashKindValueParser;
 
-impl clap::builder::TypedValueParser for SourceHashKindValueParser {
-    type Value = SourceHashKind;
+impl clap::builder::TypedValueParser for ArchiveHashKindValueParser {
+    type Value = ArchiveHashKind;
 
     fn parse_ref(
         &self,
@@ -510,7 +510,7 @@ impl clap::builder::TypedValueParser for SourceHashKindValueParser {
         arg: Option<&clap::Arg>,
         value: &std::ffi::OsStr,
     ) -> Result<Self::Value, clap::Error> {
-        let val: SourceHashKind = value
+        let val: ArchiveHashKind = value
             .to_str()
             .ok_or_else(|| {
                 let mut err = clap::Error::new(clap::error::ErrorKind::InvalidUtf8).with_cmd(cmd);
@@ -571,7 +571,7 @@ impl RepositoryFile {
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 #[group(required = true, multiple = true)]
-pub struct Source {
+pub struct Archive {
     /// Repository URL
     #[arg(value_name = "URL")]
     pub url: String,
@@ -620,20 +620,20 @@ pub struct Source {
     #[arg(
         hide = true,
         long = "hash",
-        value_parser = SourceHashKindValueParser,
+        value_parser = ArchiveHashKindValueParser,
         value_name = "md5|sha1|sha256|sha512",
         default_value = "sha256",
     )]
-    #[serde(default, skip_serializing_if = "SourceHashKind::is_sha256")]
-    pub hash: SourceHashKind,
+    #[serde(default, skip_serializing_if = "ArchiveHashKind::is_sha256")]
+    pub hash: ArchiveHashKind,
 
-    /// Source priority (higher number means higher priority)
+    /// Archive priority (higher number means higher priority)
     #[arg(long = "priority", value_name = "N")]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
 }
 
-impl Source {
+impl Archive {
     pub fn should_include_arch(&self, arch: &str) -> bool {
         self.arch.is_empty() || self.arch.iter().any(|s| s == arch)
     }
@@ -741,16 +741,16 @@ impl Source {
         match self.url.to_ascii_lowercase().as_str() {
             "debian" => {
                 const DEFAULT_SUITE: &str = "trixie";
-                let mut source = self.clone();
-                let mut security: Option<Source> = None;
-                source.url = "https://ftp.debian.org/debian/".to_string();
+                let mut archive = self.clone();
+                let mut security: Option<Archive> = None;
+                archive.url = "https://ftp.debian.org/debian/".to_string();
                 if self.snapshot.is_none() {
-                    source.snapshots = Some(
+                    archive.snapshots = Some(
                         "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/".to_string(),
                     );
                 }
                 if self.components.is_empty() {
-                    source.components = vec!["main".to_string()];
+                    archive.components = vec!["main".to_string()];
                 }
                 if self.suites.len() < 2 {
                     let s = if self.suites.is_empty() {
@@ -759,35 +759,35 @@ impl Source {
                         self.suites[0].as_str()
                     };
                     if s != "sid" && s != "unstable" {
-                        source.suites = ["", "-updates", "-backports"]
+                        archive.suites = ["", "-updates", "-backports"]
                             .iter()
                             .map(|f| format!("{}{}", s, f))
                             .collect();
-                        security = Some(Source {
+                        security = Some(Archive {
                             url: "https://security.debian.org/debian-security/".to_string(),
                             suites: vec![format!("{}-security", s)],
                             snapshots: Some(
                                 "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
                                     .to_string(),
                             ),
-                            ..source.clone()
+                            ..archive.clone()
                         });
                     }
                 }
-                let mut sources = vec![source];
-                sources.extend(security);
-                Some((sources, vec![]))
+                let mut archives = vec![archive];
+                archives.extend(security);
+                Some((archives, vec![]))
             }
             "ubuntu" => {
                 const DEFAULT_SUITE: &str = "noble";
-                let mut source = self.clone();
-                source.url = "https://archive.ubuntu.com/ubuntu/".to_string();
+                let mut archive = self.clone();
+                archive.url = "https://archive.ubuntu.com/ubuntu/".to_string();
                 if self.snapshot.is_none() {
-                    source.snapshots =
+                    archive.snapshots =
                         Some("https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/".to_string());
                 }
                 if self.components.is_empty() {
-                    source.components = vec!["main".to_string(), "universe".to_string()];
+                    archive.components = vec!["main".to_string(), "universe".to_string()];
                 }
                 if self.suites.len() < 2 {
                     let s = if self.suites.is_empty() {
@@ -795,20 +795,20 @@ impl Source {
                     } else {
                         self.suites[0].as_str()
                     };
-                    source.suites = ["", "-updates", "-backports", "-security"]
+                    archive.suites = ["", "-updates", "-backports", "-security"]
                         .iter()
                         .map(|f| format!("{}{}", s, f))
                         .collect();
                 }
-                Some((vec![source], vec![]))
+                Some((vec![archive], vec![]))
             }
             "devuan" => {
                 const DEFAULT_SUITE: &str = "daedalus";
-                let mut source = self.clone();
-                source.url = "http://deb.devuan.org/merged/".to_string();
-                source.snapshots = None;
+                let mut archive = self.clone();
+                archive.url = "http://deb.devuan.org/merged/".to_string();
+                archive.snapshots = None;
                 if self.components.is_empty() {
-                    source.components = vec!["main".to_string()];
+                    archive.components = vec!["main".to_string()];
                 }
                 if self.suites.len() < 2 {
                     let s = if self.suites.is_empty() {
@@ -820,21 +820,21 @@ impl Source {
                         && s != "unstable"
                         && !s.chars().next().is_some_and(|c| c.is_ascii_digit())
                     {
-                        source.suites = ["", "-updates", "-backports", "-security"]
+                        archive.suites = ["", "-updates", "-backports", "-security"]
                             .iter()
                             .map(|f| format!("{}{}", s, f))
                             .collect();
                     }
                 }
-                Some((vec![source], vec!["devuan-keyring".to_string()]))
+                Some((vec![archive], vec!["devuan-keyring".to_string()]))
             }
             _ => None,
         }
     }
 }
 
-impl From<&Source> for MutableControlStanza {
-    fn from(src: &Source) -> Self {
+impl From<&Archive> for MutableControlStanza {
+    fn from(src: &Archive) -> Self {
         let mut cs = MutableControlStanza::parse("Types: deb\n").unwrap();
         cs.set("URIs", src.url.clone());
         cs.set("Suites", src.suites.join(" "));

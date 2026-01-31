@@ -4,7 +4,7 @@ use {
         hash::Hash,
         kvlist::KVList,
         version::{Constraint, Dependency},
-        RepositoryFile, Source,
+        RepositoryFile, Archive,
     },
     futures::{
         stream::{self, LocalBoxStream},
@@ -66,79 +66,79 @@ pub struct LockedSuite {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct LockedSource {
+pub struct LockedArchive {
     pub suites: Vec<LockedSuite>,
 }
 
-impl LockedSource {
+impl LockedArchive {
     pub fn fetch_or_refresh<'a, C: ContentProvider>(
         locked: &'a mut Option<Self>,
-        source: &'a Source,
+        archive: &'a Archive,
         arch: &'a str,
         force: bool,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         match locked {
-            Some(locked) => locked.refresh(source, arch, force, cache),
+            Some(locked) => locked.refresh(archive, arch, force, cache),
             None => {
-                *locked = Some(LockedSource {
-                    suites: vec![LockedSuite::default(); source.suites.len()],
+                *locked = Some(LockedArchive {
+                    suites: vec![LockedSuite::default(); archive.suites.len()],
                 });
-                locked.as_mut().unwrap().refresh(source, arch, true, cache)
+                locked.as_mut().unwrap().refresh(archive, arch, true, cache)
             }
         }
     }
     fn refresh<'a, C: ContentProvider>(
         &'a mut self,
-        source: &'a Source,
+        archive: &'a Archive,
         arch: &'a str,
         force: bool,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         tracing::debug!(
-            "Refreshing locked source for {} {}",
-            source.url,
-            source.suites.iter().join(" "),
+            "Refreshing locked archive for {} {}",
+            archive.url,
+            archive.suites.iter().join(" "),
         );
-        stream::iter(source.suites.iter().zip(self.suites.iter_mut()))
+        stream::iter(archive.suites.iter().zip(self.suites.iter_mut()))
             .then(move |(suite, locked)| {
-                tracing::debug!("Refreshing locked source for {} {}", source.url, suite);
+                tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
                 async move {
-                    tracing::debug!("Checking locked source for {} {}", source.url, suite,);
-                    let path = source.release_path(suite);
+                    tracing::debug!("Checking locked archive for {} {}", archive.url, suite,);
+                    let path = archive.release_path(suite);
                     if !locked.release.path.is_empty() && !force {
                         let rel = cache
                             .fetch_index_file(
                                 locked.release.hash.clone(),
                                 locked.release.size,
-                                &source.file_url(&path),
+                                &archive.file_url(&path),
                             )
                             .await?;
-                        let rel = source.release_from_file(rel).await;
+                        let rel = archive.release_from_file(rel).await;
                         if rel.is_ok() {
                             return Ok::<_, io::Error>(false);
                         }
                     }
-                    tracing::debug!("forced load locked source for {} {}", source.url, suite,);
+                    tracing::debug!("forced load locked archive for {} {}", archive.url, suite,);
                     let (rel, hash, size) = cache
-                        .ensure_index_file::<blake3::Hasher>(&source.file_url(&path))
+                        .ensure_index_file::<blake3::Hasher>(&archive.file_url(&path))
                         .and_then(|(rel, hash, size)| async move {
-                            let rel = source.release_from_file(rel).await?;
+                            let rel = archive.release_from_file(rel).await?;
                             Ok((rel, hash, size))
                         })
                         .await?;
                     if hash == locked.release.hash && size == locked.release.size {
                         return Ok(false);
                     }
-                    let (packages, sources) = source.release_files(&rel, suite, arch)?;
+                    let (packages, sources) = archive.release_files(&rel, suite, arch)?;
                     *locked = LockedSuite {
                         release: RepositoryFile { path, hash, size },
                         packages,
                         sources,
                     };
                     tracing::debug!(
-                        "Refreshed locked source for {} {}: {}",
-                        source.url,
+                        "Refreshed locked archive for {} {}: {}",
+                        archive.url,
                         suite,
                         locked.packages.iter().map(|f| f.path.as_str()).join(" "),
                     );

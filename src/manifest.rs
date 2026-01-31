@@ -6,8 +6,8 @@ use {
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
         packages::Package,
-        source::{RepositoryFile, SnapshotId, Source},
-        spec::{LockedPackage, LockedSource, LockedSpec},
+        archive::{RepositoryFile, SnapshotId, Archive},
+        spec::{LockedPackage, LockedArchive, LockedSpec},
         staging::StagingFileSystem,
         universe::Universe,
         version::{IntoConstraint, IntoDependency},
@@ -57,18 +57,18 @@ impl Manifest {
             universe: None,
         }
     }
-    pub fn from_sources<A, I, S>(arch: A, sources: I, comment: Option<&str>) -> Self
+    pub fn from_archives<A, I, S>(arch: A, archives: I, comment: Option<&str>) -> Self
     where
         A: ToString,
         I: IntoIterator<Item = S>,
-        S: Into<Source>,
+        S: Into<Archive>,
     {
-        let sources: Vec<Source> = sources.into_iter().map(|s| s.into()).collect();
+        let archives: Vec<Archive> = archives.into_iter().map(|s| s.into()).collect();
         Manifest {
             arch: arch.to_string(),
             hash: None,
-            lock: LockFile::new_with_sources(sources.len()),
-            file: ManifestFile::new_with_sources(sources, comment),
+            lock: LockFile::new_with_archives(archives.len()),
+            file: ManifestFile::new_with_archives(archives, comment),
             lock_updated: false,
             universe: None,
         }
@@ -144,14 +144,14 @@ impl Manifest {
         self.mark_lock_updated();
         Ok(())
     }
-    pub fn add_source(&mut self, source: Source, comment: Option<&str>) -> io::Result<()> {
-        match self.file.add_source(source, comment) {
+    pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> io::Result<()> {
+        match self.file.add_archive(archive, comment) {
             UpdateResult::None => return Ok(()),
             UpdateResult::Added => {
-                self.lock.push_source(None);
+                self.lock.push_archive(None);
             }
             UpdateResult::Updated(i) => {
-                self.lock.invalidate_source(i);
+                self.lock.invalidate_archive(i);
             }
         }
         self.mark_file_updated();
@@ -161,26 +161,26 @@ impl Manifest {
         self.mark_lock_updated();
         Ok(())
     }
-    pub fn drop_source<S: AsRef<str>>(&mut self, source_uri: S) -> io::Result<()> {
+    pub fn drop_archive<S: AsRef<str>>(&mut self, archive_uri: S) -> io::Result<()> {
         let pos = self
             .file
-            .sources()
+            .archives()
             .iter()
-            .find_position(|s| s.url == source_uri.as_ref());
+            .find_position(|s| s.url == archive_uri.as_ref());
         match pos {
             Some((i, _)) => {
-                self.file.remove_source(i);
+                self.file.remove_archive(i);
                 self.lock
                     .specs_mut()
                     .for_each(|(_, r)| r.invalidate_solution());
                 self.mark_file_updated();
-                self.lock.remove_source(i);
+                self.lock.remove_archive(i);
                 self.lock_updated = true;
                 Ok(())
             }
             None => Err(io::Error::new(
                 io::ErrorKind::NotFound,
-                format!("source {} not found", source_uri.as_ref()),
+                format!("archive {} not found", archive_uri.as_ref()),
             )),
         }
     }
@@ -188,7 +188,7 @@ impl Manifest {
         &'a self,
         name: Option<&'a str>,
     ) -> io::Result<
-        impl Iterator<Item = io::Result<(Option<&'a Source>, usize, &'a RepositoryFile)>> + 'a,
+        impl Iterator<Item = io::Result<(Option<&'a Archive>, usize, &'a RepositoryFile)>> + 'a,
     > {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
         Ok(self
@@ -198,11 +198,11 @@ impl Manifest {
                 let src = p
                     .src
                     .map(|id| {
-                        self.file.get_source(id as usize).ok_or_else(|| {
+                        self.file.get_archive(id as usize).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "invalid source index {} in spec {}",
+                                    "invalid archive index {} in spec {}",
                                     id,
                                     spec_display_name(spec_name)
                                 ),
@@ -368,8 +368,8 @@ impl Manifest {
         }
         Ok(())
     }
-    fn sources(&self) -> UniverseFiles<'_> {
-        UniverseFiles::new(self.file.sources(), self.lock.sources())
+    fn archives(&self) -> UniverseFiles<'_> {
+        UniverseFiles::new(self.file.archives(), self.lock.archives())
     }
     async fn make_universe<C: ContentProvider>(
         &mut self,
@@ -377,7 +377,7 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        let mut packages = cache.fetch_universe(self.sources(), concurrency).await?;
+        let mut packages = cache.fetch_universe(self.archives(), concurrency).await?;
         if let Some(pkgs) = self.lock.local_pkgs() {
             // local packages have highest priority
             packages.push(pkgs.clone().with_prio(0))
@@ -389,9 +389,9 @@ impl Manifest {
         tracing::debug!("setting snapshot to {}", stamp);
         let updated = self
             .file
-            .update_source_snapshots(stamp)
+            .update_archive_snapshots(stamp)
             .fold(false, |_, i| {
-                self.lock.invalidate_source(i);
+                self.lock.invalidate_archive(i);
                 true
             });
         if updated {
@@ -401,17 +401,17 @@ impl Manifest {
             self.mark_lock_updated();
         }
     }
-    async fn update_locked_sources<C: ContentProvider>(
+    async fn update_locked_archives<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
-        force_sources: bool,
+        force_archives: bool,
         force_locals: bool,
         cache: &C,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
-        let updated = stream::iter(self.file.sources().iter().zip(self.lock.sources_mut()).map(
-            move |(source, locked)| {
-                LockedSource::fetch_or_refresh(locked, source, arch, force_sources, cache)
+        let updated = stream::iter(self.file.archives().iter().zip(self.lock.archives_mut()).map(
+            move |(archive, locked)| {
+                LockedArchive::fetch_or_refresh(locked, archive, arch, force_archives, cache)
             },
         ))
         .flatten_unordered(concurrency.get())
@@ -477,22 +477,22 @@ impl Manifest {
     }
     pub async fn update<C: ContentProvider>(
         &mut self,
-        force_sources: bool,
+        force_archives: bool,
         force_locals: bool,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
-        tracing::debug!("updating locked sources");
+        tracing::debug!("updating locked archive");
         let updated = self
-            .update_locked_sources(concurrency, force_sources, force_locals, cache)
+            .update_locked_archives(concurrency, force_archives, force_locals, cache)
             .await?;
         if updated {
-            tracing::debug!("sources updated, invalidating locked specs");
+            tracing::debug!("archives updated, invalidating locked specs");
             self.lock.invalidate_specs();
             self.drop_universe().await;
             self.mark_lock_updated();
         } else if self.lock.specs().all(|(_, l)| l.is_locked()) {
-            tracing::debug!("sources up-to-date, all specs locked, skipping resolve");
+            tracing::debug!("archives up-to-date, all specs locked, skipping resolve");
             return Ok(());
         }
         self.resolve(concurrency, cache).await
@@ -515,8 +515,8 @@ impl Manifest {
         let mut updated = false;
         self.load_universe(concurrency, cache).await?;
         let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
-        let sources = self.file.sources();
-        let pkgs_idx = self.file.sources_pkgs();
+        let archives = self.file.archives();
+        let pkgs_idx = self.file.archives_pkgs();
         let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
@@ -565,10 +565,10 @@ impl Manifest {
                         let src = pkgs_idx.get(pkgs as usize);
                         let name = pkg.name().to_string();
                         let hash_kind = src.map_or(Ok("SHA256"), |src| {
-                            sources.get(*src).map_or_else(
+                            archives.get(*src).map_or_else(
                                 || {
                                     Err(io::Error::other(format!(
-                                        "invalid source index {} in spec {}",
+                                        "invalid archive index {} in spec {}",
                                         src,
                                         spec_display_name(spec_name)
                                     )))
@@ -651,16 +651,16 @@ impl Manifest {
             })
             .cloned()
     }
-    fn staging_sources(&self) -> io::Result<Vec<(&Source, &LockedSource)>> {
+    fn staging_archives(&self) -> io::Result<Vec<(&Archive, &LockedArchive)>> {
         self.file
-            .sources()
+            .archives()
             .iter()
-            .zip(self.lock.sources().iter())
+            .zip(self.lock.archives().iter())
             .map(|(s, l)| {
                 l.as_ref().map_or_else(
                     || {
                         Err(io::Error::other(format!(
-                            "source {} is not locked, run lock",
+                            "archive {} is not locked, run lock",
                             s.url
                         )))
                     },
@@ -693,7 +693,7 @@ impl Manifest {
         spec_name: &str,
         spec_index: usize,
     ) -> io::Result<(
-        Vec<(Option<&'a Source>, &'a RepositoryFile)>,
+        Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
         Vec<String>,
         Vec<Vec<String>>,
     )> {
@@ -706,11 +706,11 @@ impl Manifest {
                 let src = p
                     .src
                     .map(|id| {
-                        self.file.get_source(id as usize).ok_or_else(|| {
+                        self.file.get_archive(id as usize).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "invalid source index {} in spec {}",
+                                    "invalid archive index {} in spec {}",
                                     id,
                                     spec_display_name(spec_name)
                                 ),
@@ -738,9 +738,9 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        Vec<(&'a Source, &'a LockedSource)>,           // sources
+        Vec<(&'a Archive, &'a LockedArchive)>,         // archives 
         Vec<&'a Artifact>,                             // artifacts
-        Vec<(Option<&'a Source>, &'a RepositoryFile)>, // installables
+        Vec<(Option<&'a Archive>, &'a RepositoryFile)>, // installables
         Vec<String>,                                   // essentials
         Vec<Vec<String>>,                              // prioritized packages
         Vec<String>,                                   // scripts
@@ -750,7 +750,7 @@ impl Manifest {
         P: FnOnce(u64) -> ProgressBar,
     {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        let sources = self.staging_sources()?;
+        let archives = self.staging_archives()?;
         let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
         let artifacts = self.staging_artifacts(spec_name, spec_index)?;
         let scripts = self
@@ -764,7 +764,7 @@ impl Manifest {
             f(installables_size + artifacts_size)
         });
         Ok((
-            sources,
+            archives,
             artifacts,
             installables,
             essentials,
@@ -786,14 +786,14 @@ impl Manifest {
         P: FnOnce(u64) -> ProgressBar,
         C: ContentProvider<Target = FS>,
     {
-        let (sources, artifacts, installables, essentials, other, scripts, pb) =
+        let (archives, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
         crate::stage::stage_local(installables, artifacts, fs, concurrency, cache, pb.clone())
             .await?;
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, cache).await?;
+        crate::stage::stage_archives(archives.as_slice(), fs, concurrency, cache).await?;
         Ok((essentials, other, scripts))
     }
     pub async fn stage<FS, P, C>(
@@ -810,13 +810,13 @@ impl Manifest {
         C: ContentProvider<Target = FS>,
     {
         tracing::debug!("running stage_");
-        let (sources, artifacts, installables, essentials, other, scripts, pb) =
+        let (archives, artifacts, installables, essentials, other, scripts, pb) =
             self.stage_prepare(name, pb)?;
         crate::stage::stage(installables, artifacts, fs, concurrency, cache, pb.clone()).await?;
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_sources(sources.as_slice(), fs, concurrency, cache).await?;
+        crate::stage::stage_archives(archives.as_slice(), fs, concurrency, cache).await?;
         Ok((essentials, other, scripts))
     }
 }

@@ -1,9 +1,9 @@
 # rdebootstrap
 
-`rdebootstrap` is a manifest-driven Debian/Ubuntu bootstrapper written in Rust. It resolves packages from user-defined APT sources, locks the full dependency graph, stages arbitrary artifacts, and builds a root filesystem tree inside a sandbox so maintainer scripts run in a controlled environment. The same engine is exposed as the `debrepo` library for embedding in other tooling.
+`rdebootstrap` is a manifest-driven Debian/Ubuntu bootstrapper written in Rust. It resolves packages from user-defined APT archives, locks the full dependency graph, stages arbitrary artifacts, and builds a root filesystem tree inside a sandbox so maintainer scripts run in a controlled environment. The same engine is exposed as the `debrepo` library for embedding in other tooling.
 
 ## Highlights
-- **Declarative input** – `Manifest.toml` lists sources, specs, staged files, local `.deb`s, and metadata while `Manifest.<arch>.lock` captures the fully resolved set for reproducible builds.
+- **Declarative input** – `Manifest.toml` lists archives, specs, staged files, local `.deb`s, and metadata while `Manifest.<arch>.lock` captures the fully resolved set for reproducible builds.
 - **Deterministic resolution** – Release and Packages files are fetched with GPG verification, optional snapshot pinning, and a solver that locks each spec before anything is installed.
 - **Sandboxed builds** – `build` expands packages inside an isolated helper namespace; run as root for production ownership or unprivileged while iterating.
 - **Rich spec tooling** – add/drop requirements and constraints per spec, stage local files or HTTP artifacts, and include local packages that ship alongside the manifest.
@@ -47,7 +47,7 @@ The resulting binary lives at `target/release/rdebootstrap` (or in `~/.cargo/bin
 `Manifest.toml` sits at the project root unless `--manifest <path>` is supplied. A small example:
 
 ```toml
-[[source]]
+[[archive]]
 url = "https://ftp.debian.org/debian/"
 suites = ["trixie"]
 components = ["main"]
@@ -63,7 +63,7 @@ hash = "sha256-..."
 ```
 
 Key sections:
-- `[[source]]` — APT repositories with suites, components, optional snapshot templates, trusted keys, and priorities.
+- `[[archive]]` — APT repositories with suites, components, optional snapshot templates, trusted keys, and priorities.
 - `[[local]]` — Local `.deb` files copied into the cache and treated like repo packages.
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
 - `[spec]` and `[spec.<name>]` — Package requirements/constraints, staged artifacts, and metadata per spec. Specs can inherit from each other via `extends`.
@@ -77,8 +77,8 @@ Key sections:
 - Content integrity is enforced via the hashes recorded in the lock file; disabling cache does not bypass verification.
 
 ## CLI Tour
-- `init` – bootstrap a manifest from vendor presets or explicit sources.
-- `add source`, `add local` – append repositories or register a local `.deb`.
+- `init` – bootstrap a manifest from vendor presets or explicit archives.
+- `add archive`, `add local` – append repositories or register a local `.deb`.
 - `include` / `exclude` – add requirements or version constraints to a spec.
 - `drop` – remove requirements or constraints.
 - `stage` / `unstage` – add or remove artifacts (local files or URLs).
@@ -87,7 +87,7 @@ Key sections:
 - `build` – expand a spec into a directory, running maintainer scripts within the sandbox helper.
 
 ## Authentication
-- `-a/--auth` selects the source: omit for optional `auth.toml` in the same directory where Manifest is located, 
+- `-a/--auth` selects the archive: omit for optional `auth.toml` in the same directory where Manifest is located, 
 use `file:/path/to/auth.toml` (or just a path), or `vault:<prefix>` to read secrets from Vault.
 
 - Auth file (`auth.toml`) supports per-host entries:

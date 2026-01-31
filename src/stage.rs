@@ -4,8 +4,8 @@ use {
         comp::strip_comp_ext,
         content::{ContentProvider, DebLocation},
         control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
-        source::{RepositoryFile, Source},
-        spec::LockedSource,
+        archive::{RepositoryFile, Archive},
+        spec::LockedArchive,
         staging::{StagingFile, StagingFileSystem},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
@@ -16,8 +16,8 @@ use {
 
 // COMMON
 
-pub async fn stage_sources<'a, FS, C>(
-    sources: &[(&'a Source, &'a LockedSource)],
+pub async fn stage_archives<'a, FS, C>(
+    archives: &[(&'a Archive, &'a LockedArchive)],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -32,7 +32,7 @@ where
         .await?;
     let mut sources_file = MutableControlFile::new();
     stream::iter(
-        sources
+        archives
             .iter()
             .flat_map(|(src, locked)| {
                 sources_file.add(Into::<MutableControlStanza>::into(*src));
@@ -75,7 +75,7 @@ where
 // LOCAL
 
 pub async fn stage_local<'a, FS, C>(
-    installables: Vec<(Option<&'a Source>, &'a RepositoryFile)>,
+    installables: Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
@@ -128,7 +128,7 @@ where
 
 async fn stage_debs_local<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(Option<&'a Source>, &'a RepositoryFile)],
+    packages: &'a [(Option<&'a Archive>, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -216,7 +216,7 @@ where
 // THREAD SAFE
 //
 pub async fn stage<'a, FS, C>(
-    installables: Vec<(Option<&'a Source>, &'a RepositoryFile)>,
+    installables: Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
     artifacts: Vec<&'a Artifact>,
     fs: &FS,
     concurrency: NonZero<usize>,
@@ -270,7 +270,7 @@ where
 
 async fn stage_debs<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(Option<&'a Source>, &'a RepositoryFile)],
+    packages: &'a [(Option<&'a Archive>, &'a RepositoryFile)],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,

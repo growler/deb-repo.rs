@@ -2,7 +2,7 @@ use {
     crate::{
         content::ContentProvider,
         packages::{InstallPriority, Package},
-        source::{SnapshotId, SnapshotIdArgParser, Source},
+        archive::{SnapshotId, SnapshotIdArgParser, Archive},
         version::{Constraint, Dependency, Version},
         StagingFileSystem,
     },
@@ -48,8 +48,8 @@ pub mod cmd {
     #[derive(Parser)]
     #[command(
         about = "Create a new manifest file",
-        long_about = "Create a new manifest file from a source definition.
-If a vendor name is provided as source URL, default sources and packages are derived from it.
+        long_about = "Create a new manifest file from an archive definition.
+If a vendor name is provided as archive URL, default archives and packages are derived from it.
 Examples:  
     debrepo init --package mc --package libcom-err2 --url debian"
     )]
@@ -66,34 +66,34 @@ Examples:
         #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
         requirements: Vec<String>,
 
-        /// Source definition (i.e. --url <URL> ...).
+        /// Archive definition (i.e. --url <URL> ...).
         /// URL might be a vendor name (debian, ubuntu, devuan).
         #[command(flatten)]
-        source: Source,
+        archive: Archive,
     }
 
     impl<C: Config> Command<C> for Init {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (sources, packages, comment) =
-                    if let Some((sources, mut packages)) = self.source.as_vendor() {
+                let (archives, packages, comment) =
+                    if let Some((archives, mut packages)) = self.archive.as_vendor() {
                         if !self.requirements.is_empty() {
                             packages.extend(self.requirements.iter().cloned());
                             packages = packages.into_iter().unique().collect();
                         }
                         (
-                            sources,
+                            archives,
                             packages,
-                            Some(format!("default manifest file for {}", &self.source.url)),
+                            Some(format!("default manifest file for {}", &self.archive.url)),
                         )
                     } else {
-                        (vec![self.source.clone()], self.requirements.clone(), None)
+                        (vec![self.archive.clone()], self.requirements.clone(), None)
                     };
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let mut mf = Manifest::from_sources(
+                let mut mf = Manifest::from_archives(
                     conf.arch(),
-                    sources.iter().cloned(),
+                    archives.iter().cloned(),
                     self.comment.as_deref().or(comment.as_deref()),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
@@ -108,22 +108,22 @@ Examples:
 
     #[derive(Parser)]
     #[command(
-        about = "Adds a source",
-        long_about = "Add a source to the manifest file."
+        about = "Adds an archive",
+        long_about = "Add an archive definition to the manifest file."
     )]
-    pub struct AddSource {
+    pub struct AddArchive {
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
         #[command(flatten)]
-        source: Source,
+        archive: Archive,
     }
-    impl<C: Config> Command<C> for AddSource {
+    impl<C: Config> Command<C> for AddArchive {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                mf.add_source(self.source.clone(), self.comment.as_deref())?;
+                mf.add_archive(self.archive.clone(), self.comment.as_deref())?;
                 mf.update(false, false, conf.concurrency(), fetcher).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
@@ -170,12 +170,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[allow(clippy::large_enum_variant)]
     #[derive(Parser)]
     pub enum AddCommands {
-        Source(AddSource),
+        Archive(AddArchive),
         Local(AddLocalPackage),
     }
 
     #[derive(Parser)]
-    #[command(about = "Adds a source or a local package")]
+    #[command(about = "Adds an archive or a local package")]
     pub struct Add {
         #[command(subcommand)]
         cmd: AddCommands,
@@ -183,7 +183,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Add {
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
-                AddCommands::Source(cmd) => cmd.exec(conf),
+                AddCommands::Archive(cmd) => cmd.exec(conf),
                 AddCommands::Local(cmd) => cmd.exec(conf),
             }
         }
@@ -191,14 +191,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."
 
     #[derive(Parser)]
     #[command(
-        about = "Remove a source",
-        long_about = "Remove a source from the manifest file."
+        about = "Remove an archive",
+        long_about = "Remove an archive reference from the manifest file."
     )]
-    pub struct RemoveSource {
+    pub struct RemoveArchive {
         #[command(flatten)]
-        source: Source,
+        archive: Archive,
     }
-    impl<C: Config> Command<C> for RemoveSource {
+    impl<C: Config> Command<C> for RemoveArchive {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -239,8 +239,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."
 
     #[derive(Parser)]
     pub enum RemoveCommands {
-        Source(AddSource),
-        Local(AddLocalPackage),
+        Archive(RemoveArchive),
+        Local(RemoveLocalPackage),
     }
 
     #[derive(Parser)]
@@ -256,7 +256,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Remove {
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
-                RemoveCommands::Source(cmd) => cmd.exec(conf),
+                RemoveCommands::Archive(cmd) => cmd.exec(conf),
                 RemoveCommands::Local(cmd) => cmd.exec(conf),
             }
         }
@@ -462,17 +462,17 @@ Use --requirements-only or --constraints-only to limit the operation scope."
 
     #[derive(Parser)]
     #[command(
-        about = "Update sources and snapshot/lock state",
+        about = "Update archives and snapshot/lock state",
         long_about = "Fetch or retrieve from cache package indexes, solve the specs and update lock file. Optionally set a snapshot before updating."
     )]
     pub struct Update {
-        /// Re-fetch sources even if they appear up to date. Do not use cache.
+        /// Re-fetch archives even if they appear up to date. Do not use cache.
         #[arg(short = 'f', long = "force", action)]
         force: bool,
         /// Force update only local packages
         #[arg(short = 'l', long = "only-locals", requires = "force", action)]
         only_locals: bool,
-        /// Snapshot to use for all sources that support it and have snapshotting enabled
+        /// Snapshot to use for all archives that support it and have snapshotting enabled
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
     }
@@ -502,7 +502,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
 
     #[derive(Parser)]
     #[command(
-        about = "Search packages in sources",
+        about = "Search packages in archives",
         long_about = "Search for packages matching the given regex pattern(s)."
     )]
     pub struct Search {
@@ -561,7 +561,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     }
 
     #[derive(Parser)]
-    #[command(about = "Adds a source or a local package")]
+    #[command(about = "Show a package or a spec hash")]
     pub struct Show {
         #[command(subcommand)]
         cmd: ShowCommands,
