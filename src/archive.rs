@@ -580,7 +580,7 @@ pub struct Archive {
     #[serde(skip)]
     real_url: Option<String>,
 
-    /// Only include listed architecture
+    /// Only include the listed architectures
     #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
@@ -602,7 +602,15 @@ pub struct Archive {
 
     /// Snapshot ID to use.
     ///
-    /// Snapshot ID format is a timestamp in UTC timezone in one of the following formats:
+    /// Snapshot ID format is a timestamp in UTC (or with an explicit offset) accepted in any of
+    /// these forms:
+    ///   %Y%m%dT%H%M%SZ
+    ///   %Y%m%dT%H%M%S%z
+    ///   %Y-%m-%d
+    ///   %Y-%m-%dT%H:%M:%S%z
+    ///   %Y-%m-%dT%H:%M:%S
+    ///   %Y%m%d
+    ///   %Y%m%dT%H%M%S
     #[arg(long = "snapshot", value_name = "SNAPSHOT", value_parser = ClapSnapshotParser)]
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
@@ -611,12 +619,12 @@ pub struct Archive {
     #[arg(short = 's', long = "suite", value_name = "SUITE", num_args = 1, action = clap::ArgAction::Set)]
     pub suites: Vec<String>,
 
-    /// Space separated list of components (i.e. "main", "contrib", "non-free", etc.)
+    /// Space-separated list of components (i.e. "main", "contrib", "non-free", etc.)
     #[arg(short = 'C', long = "components", value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 
-    /// Hash type for veryfing repository files
+    /// Hash type for verifying repository files
     #[arg(
         hide = true,
         long = "hash",

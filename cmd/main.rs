@@ -27,9 +27,12 @@ This tool resolves packages from configured repositories, locks and updates
 a snapshot, stages artifacts, and builds a rootfs-like directory tree.
 Typical workflow:  
     1) init             - create a manifest with sources and initial packages
-    2) include/exclude  - add packages requirements and constraints 
+    2) include/exclude  - add package requirements and constraints
     3) update           - refresh lock/snapshot and metadata
     4) build            - extract and configure packages into a target directory
+Notes:
+    -k/--insecure disables TLS verification for archive downloads.
+    -K/--no-verify skips Release file signature verification.
 "
 )]
 pub struct App {

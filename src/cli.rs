@@ -51,7 +51,7 @@ pub mod cmd {
         long_about = "Create a new manifest file from an archive definition.
 If a vendor name is provided as archive URL, default archives and packages are derived from it.
 Examples:  
-    debrepo init --package mc --package libcom-err2 --url debian"
+    rdebootstrap init --package mc --package libcom-err2 --url debian"
     )]
     pub struct Init {
         /// Overwrite existing manifest if present
@@ -112,6 +112,7 @@ Examples:
         long_about = "Add an archive definition to the manifest file."
     )]
     pub struct AddArchive {
+        /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
         #[command(flatten)]
@@ -136,13 +137,14 @@ Examples:
 
     #[derive(Parser)]
     #[command(
-        about = "Remove requirements or constraints from a spec",
-        long_about = "Remove requirements and/or constraints from a spec
-Use --requirements-only or --constraints-only to limit the operation scope."
+        about = "Add a local package",
+        long_about = "Add a local .deb package to the manifest file so it can be staged alongside archives."
     )]
     pub struct AddLocalPackage {
+        /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
+        /// Path to a local .deb file
         #[arg(value_name = "PATH")]
         path: PathBuf,
     }
@@ -290,7 +292,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         spec: Option<String>,
 
         /// Package name or package version set
-        #[arg(value_name = "CONSTRAINT")]
+        #[arg(value_name = "PACKAGE_OR_SET")]
         cons: Vec<String>,
     }
     impl<C: Config> Command<C> for Drop {
@@ -435,7 +437,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
-        /// Requirement(s) to include (repeatable)
+        /// Constraint(s) to apply (repeatable)
         #[arg(value_name = "CONSTRAINT", value_parser = ConstraintParser)]
         reqs: Vec<Constraint<String>>,
     }
@@ -578,13 +580,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     #[command(
         name = "spec-hash",
-        about = "Show a package's control record",
-        long_about = "Print the raw control record for the given package."
+        about = "Show a spec hash",
+        long_about = "Print the hash of a spec definition. By default the hash is printed as a hexadecimal string; use --sri to emit Subresource Integrity format."
     )]
     pub struct ShowSpecHash {
         /// Use SRI format for the hash output
         ///
-        /// Outpus the hash as SRI (Subresource Integrity) format, e.g.
+        /// Outputs the hash as SRI (Subresource Integrity) format, e.g.
         /// sha256-<base64-encoded-hash>. If not specified, the hash is printed
         /// as a hexadecimal string.
         #[arg(long = "sri", action)]
@@ -645,6 +647,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
         #[arg(short = 'e', long = "only-essential", hide = true)]
         only_essential: bool,
         //
+        /// List available spec names instead of package contents
         #[arg(long = "specs", conflicts_with = "spec", action)]
         list_specs: bool,
         /// List packages for the target spec (omit to use the default spec)

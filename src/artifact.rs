@@ -31,7 +31,7 @@ pub struct ArtifactArg {
     pub mode: Option<NonZero<u32>>,
     /// Do not unpack (disables auto-unpacking of tar archives and compressed files)
     #[arg(long = "no-unpack", action)]
-    pub do_not_unpack: Option<bool>,
+    pub do_not_unpack: bool,
     /// A target architecture for the artifact
     #[arg(long = "only-arch", value_name = "ARCH")]
     pub target_arch: Option<String>,
@@ -116,7 +116,11 @@ impl Artifact {
     {
         let uri = artifact.url.clone();
         let target = artifact.target.clone();
-        let unpack = artifact.do_not_unpack.map(|b| !b);
+        let unpack = if artifact.do_not_unpack {
+            Some(false)
+        } else {
+            None
+        };
         let arch = artifact.target_arch.clone();
         if is_url(&uri) {
             let mut artifact = if unpack.unwrap_or(true) && is_tar_ext(uri.as_bytes()) {
