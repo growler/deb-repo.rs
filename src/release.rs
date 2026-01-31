@@ -23,10 +23,25 @@ use {
     itertools::Itertools,
     ouroboros::self_referencing,
     smallvec::SmallVec,
+    std::{fmt, iter},
 };
 
 pub struct Release {
     inner: ReleaseInner,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum ReleaseFileArch<'a> {
+    Source,
+    Binary(&'a str),
+}
+impl fmt::Display for ReleaseFileArch<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ReleaseFileArch::Source => write!(f, "source"),
+            ReleaseFileArch::Binary(arch) => write!(f, "binary-{}", arch),
+        }
+    }
 }
 
 impl Release {
@@ -43,8 +58,11 @@ impl Release {
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
-        arch: &'a str,
-    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
+        arch: &'a[&'a str],
+    ) -> Result<
+        impl Iterator<Item = Result<(&'a str, Hash, u64, ReleaseFileArch<'a>), ParseError>>,
+        ParseError,
+    > {
         let release_components = self.field("Components").unwrap_or("");
         if components.iter().any(|c| {
             !release_components.split_ascii_whitespace().any(|rc| {
@@ -85,31 +103,64 @@ impl Release {
                 }
             })
             .try_fold(
-                components
-                    .iter()
-                    .map(|c| (c.as_ref(), None::<(&str, Hash, u64)>))
+                iter::once(ReleaseFileArch::Source)
+                    .chain(arch.iter().map(|a| ReleaseFileArch::Binary(a)))
+                    .flat_map(|arch| {
+                        components
+                            .iter()
+                            .map(move |c| (c.as_ref(), arch, None::<(&str, Hash, u64)>))
+                    })
                     .collect::<Vec<_>>(),
                 move |mut files, file| {
                     let (path, digest, size) = file?;
-                    for (comp, entry) in files.iter_mut() {
+                    for (comp, arch, entry) in files.iter_mut() {
                         if let Some(rest) = path.strip_prefix(*comp) {
-                            if let Some(rest) = rest.strip_prefix("/binary-") {
-                                if let Some(rest) = rest.strip_prefix(arch) {
-                                    if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
-                                        rest.strip_prefix("/Packages")
-                                    {
-                                        if size
-                                            < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size)
+                            match arch {
+                                ReleaseFileArch::Binary(arch) => {
+                                    if let Some(rest) = rest.strip_prefix("/binary-") {
+                                        if let Some(rest) = rest.strip_prefix(*arch) {
+                                            if let Some(
+                                                "" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd",
+                                            ) = rest.strip_prefix("/Packages")
+                                            {
+                                                if size
+                                                    < entry
+                                                        .as_ref()
+                                                        .map_or(u64::MAX, |(_, _, size)| *size)
+                                                {
+                                                    let hash = Hash::from_hex(hash_name, digest)
+                                                        .map_err(|err| {
+                                                            ParseError::from(format!(
+                                                                "invalid hash: {} {}",
+                                                                digest, err
+                                                            ))
+                                                        })?;
+                                                    *entry = Some((path, hash, size));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                                ReleaseFileArch::Source => {
+                                    if let Some(rest) = rest.strip_prefix("/source") {
+                                        if let Some(
+                                            "" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd",
+                                        ) = rest.strip_prefix("/Sources")
                                         {
-                                            let hash = Hash::from_hex(hash_name, digest).map_err(
-                                                |err| {
-                                                    ParseError::from(format!(
-                                                        "invalid hash: {} {}",
-                                                        digest, err
-                                                    ))
-                                                },
-                                            )?;
-                                            *entry = Some((path, hash, size));
+                                            if size
+                                                < entry
+                                                    .as_ref()
+                                                    .map_or(u64::MAX, |(_, _, size)| *size)
+                                            {
+                                                let hash = Hash::from_hex(hash_name, digest)
+                                                    .map_err(|err| {
+                                                        ParseError::from(format!(
+                                                            "invalid hash: {} {}",
+                                                            digest, err
+                                                        ))
+                                                    })?;
+                                                *entry = Some((path, hash, size));
+                                            }
                                         }
                                     }
                                 }
@@ -119,14 +170,21 @@ impl Release {
                     Ok::<_, ParseError>(files)
                 },
             )?;
-        Ok(files.into_iter().map(|(comp, entry)| {
-            if let Some(entry) = entry {
-                Ok(entry)
+        Ok(files.into_iter().filter_map(|(comp, arch, entry)| {
+            if let Some((path, hash, size)) = entry {
+                // if entry size is zero (empty Packages file), skip it
+                if size == 0 {
+                    None
+                } else {
+                    Some(Ok((path, hash, size, arch)))
+                }
+            } else if matches!(arch, ReleaseFileArch::Binary(_)) {
+                Some(Err(ParseError::from(format!(
+                    "no Packages file found for component {} {}",
+                    comp, arch,
+                ))))
             } else {
-                Err(ParseError::from(format!(
-                    "no Packages file found for component {}",
-                    comp
-                )))
+                None
             }
         }))
     }

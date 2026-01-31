@@ -536,17 +536,19 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 let mut pkgs = mf
                     .packages()?
                     .filter(|p| {
-                        res.iter().any(|re| {
-                            re.is_match(p.name())
-                                || (!self.names_only
-                                    && re.is_match(p.field("Description").unwrap_or("")))
-                        })
+                        res.is_empty()
+                            || res.iter().any(|re| {
+                                re.is_match(p.name())
+                                    || (!self.names_only
+                                        && re.is_match(p.field("Description").unwrap_or("")))
+                            })
                     })
                     .collect::<Vec<_>>();
                 pkgs.sort_by_key(|&pkg| pkg.name());
                 let mut out = std::io::stdout().lock();
                 let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
                 pretty_print_packages(&mut out, pkgs, false).await?;
+                out.flush().await?;
                 Ok(())
             })
         }

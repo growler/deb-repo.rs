@@ -61,6 +61,7 @@ impl Spec {
 pub struct LockedSuite {
     pub release: RepositoryFile,
     pub packages: Vec<RepositoryFile>,
+    pub sources: Vec<RepositoryFile>,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -129,10 +130,11 @@ impl LockedSource {
                     if hash == locked.release.hash && size == locked.release.size {
                         return Ok(false);
                     }
-                    let files = source.release_files(&rel, suite, arch)?;
+                    let (packages, sources) = source.release_files(&rel, suite, arch)?;
                     *locked = LockedSuite {
                         release: RepositoryFile { path, hash, size },
-                        packages: files,
+                        packages,
+                        sources,
                     };
                     tracing::debug!(
                         "Refreshed locked source for {} {}: {}",
