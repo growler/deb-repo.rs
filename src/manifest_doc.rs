@@ -56,10 +56,6 @@ pub struct ManifestFile {
     #[serde(default, rename = "local", skip_serializing_if = "Vec::is_empty")]
     local_pkgs: Vec<RepositoryFile>,
 
-    // an index mapping packages files to their origins in `archives`
-    #[serde(default, skip)]
-    archives_pkgs: Vec<usize>,
-
     #[serde(
         default,
         rename = "artifact",
@@ -92,15 +88,6 @@ pub enum UpdateResult {
     Updated(usize),
 }
 
-fn archives_pkgs(archives: &[Archive]) -> Vec<usize> {
-    archives
-        .iter()
-        .enumerate()
-        .flat_map(|(i, s)| s.suites.iter().map(move |_| (i, s)))
-        .flat_map(|(i, s)| s.components.iter().map(move |_| i))
-        .collect()
-}
-
 impl ManifestFile {
     pub const MAX_SIZE: u64 = 1024 * 1024; // 1 MiB
 
@@ -109,7 +96,6 @@ impl ManifestFile {
         ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
             archives: Vec::new(),
-            archives_pkgs: Vec::new(),
             local_pkgs: Vec::new(),
             artifacts: Vec::new(),
             specs: KVList::new(),
@@ -123,7 +109,6 @@ impl ManifestFile {
         archives.iter_mut().for_each(|s| s.set_base());
         ManifestFile {
             doc,
-            archives_pkgs: archives_pkgs(&archives),
             archives,
             local_pkgs: Vec::new(),
             artifacts: Vec::new(),
@@ -161,7 +146,6 @@ impl ManifestFile {
             .init_manifest(None);
         manifest.doc = doc;
         manifest.archives.iter_mut().for_each(|s| s.set_base());
-        manifest.archives_pkgs = archives_pkgs(&manifest.archives);
         Ok((manifest, hash))
     }
 
@@ -409,9 +393,6 @@ impl ManifestFile {
     pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
         &self.local_pkgs
     }
-    pub fn archives_pkgs(&self) -> &'_ [usize] {
-        &self.archives_pkgs
-    }
     pub(crate) fn update_local_pkgs<I: IntoIterator<Item = Option<RepositoryFile>>>(
         &mut self,
         it: I,
@@ -459,19 +440,16 @@ impl ManifestFile {
             }
             self.doc.update_archives(i, &archive, comment);
             *src = archive;
-            self.archives_pkgs = archives_pkgs(&self.archives);
             UpdateResult::Updated(i)
         } else {
             self.doc.push_archives(std::iter::once(&archive), comment);
             self.archives.push(archive);
-            self.archives_pkgs = archives_pkgs(&self.archives);
             UpdateResult::Added
         }
     }
     pub fn remove_archive(&mut self, index: usize) -> Archive {
         self.doc.drop_archive(index);
         let archive = self.archives.remove(index);
-        self.archives_pkgs = archives_pkgs(&self.archives);
         archive
     }
     pub fn get_archive(&self, index: usize) -> Option<&'_ Archive> {
@@ -866,6 +844,18 @@ impl LockFile {
     pub fn is_uptodate(&self) -> bool {
         self.archives.iter().all(|s| s.is_some())
             && self.specs.iter_values().all(|spec| spec.is_locked())
+    }
+    pub(crate) fn pkgs_idx(&self) -> Option<Vec<usize>> {
+        let mut idx = Vec::new();
+        for (i, archive) in self.archives.iter().enumerate() {
+            let archive = archive.as_ref()?;
+            for suite in archive.suites.iter() {
+                for _ in suite.packages.iter() {
+                    idx.push(i);
+                }
+            }
+        }
+        Some(idx)
     }
 }
 

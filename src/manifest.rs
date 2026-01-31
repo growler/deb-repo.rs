@@ -196,7 +196,7 @@ impl Manifest {
             .installables()
             .map(move |p| {
                 let src = p
-                    .src
+                    .orig
                     .map(|id| {
                         self.file.get_archive(id as usize).ok_or_else(|| {
                             io::Error::new(
@@ -516,7 +516,9 @@ impl Manifest {
         self.load_universe(concurrency, cache).await?;
         let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
         let archives = self.file.archives();
-        let pkgs_idx = self.file.archives_pkgs();
+        let pkgs_idx = self.lock.pkgs_idx().ok_or_else(|| io::Error::other(
+            "cannot resolve specs with unlocked archives, update manifest lock",
+        ))?;
         let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
@@ -562,9 +564,9 @@ impl Manifest {
                     })
                     .map(|(order, solvable)| {
                         let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
-                        let src = pkgs_idx.get(pkgs as usize);
+                        let archive = pkgs_idx.get(pkgs as usize);
                         let name = pkg.name().to_string();
-                        let hash_kind = src.map_or(Ok("SHA256"), |src| {
+                        let hash_kind = archive.map_or(Ok("SHA256"), |src| {
                             archives.get(*src).map_or_else(
                                 || {
                                     Err(io::Error::other(format!(
@@ -593,7 +595,7 @@ impl Manifest {
                             },
                             idx: solvable.into(),
                             order: order as u32,
-                            src: src.map(|s| *s as u32),
+                            orig: archive.map(|s| *s as u32),
                             name,
                         })
                     })
@@ -704,7 +706,7 @@ impl Manifest {
             .installables()
             .map(|p| {
                 let src = p
-                    .src
+                    .orig
                     .map(|id| {
                         self.file.get_archive(id as usize).ok_or_else(|| {
                             io::Error::new(
