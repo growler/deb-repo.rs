@@ -698,7 +698,12 @@ impl<'a> ControlParser<'a> {
             }
         }
         // let start = inp;
-        let mut pos = memchr::memchr(b'\n', inp).map_or_else(|| inp.len(), |p| p + 1);
+        let mut pos = match memchr::memchr(b'\n', inp) {
+            Some(p) => p + 1,
+            None => {
+                return Ok(self.advance(inp.len(), 0));
+            }
+        };
         inp = &inp[pos..];
         // rest
         loop {
@@ -717,8 +722,8 @@ impl<'a> ControlParser<'a> {
             pos += ws;
             match memchr::memchr(b'\n', inp) {
                 None => {
-                    pos += inp.len();
-                    break;
+                    // end of input
+                    return Ok(self.advance(pos + inp.len(), 0));
                 }
                 Some(n) => {
                     pos += n + 1;
@@ -806,6 +811,34 @@ Multi-Line:
                     stanzas[1].field("multi-line").unwrap(),
                     "\n Line one\n .\n Line two"
                 );
+            }
+            Err(err) => panic!("Failed to parse control file {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_multiline_eof() {
+        let data = "Base:\n Value1\n Value2\nField:\n Value";
+        match ControlFile::parse(data) {
+            Ok(file) => {
+                let stanzas: Vec<&ControlStanza> = file.stanzas.iter().collect();
+                assert_eq!(file.stanzas.len(), 1);
+                assert_eq!(stanzas[0].fields.len(), 2);
+                assert_eq!(stanzas[0].field("Field").unwrap(), "\n Value");
+            }
+            Err(err) => panic!("Failed to parse control file {:?}", err),
+        }
+    }
+
+    #[test]
+    fn test_single_eof() {
+        let data = "Base:\n Value1\n Value2\nField: Value";
+        match ControlFile::parse(data) {
+            Ok(file) => {
+                let stanzas: Vec<&ControlStanza> = file.stanzas.iter().collect();
+                assert_eq!(file.stanzas.len(), 1);
+                assert_eq!(stanzas[0].fields.len(), 2);
+                assert_eq!(stanzas[0].field("Field").unwrap(), "Value");
             }
             Err(err) => panic!("Failed to parse control file {:?}", err),
         }

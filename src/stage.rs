@@ -281,9 +281,9 @@ where
     C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
-        .map(|(source, file)| {
+        .map(|(archive, file)| {
             let pb = pb.clone();
-            let url = if let Some(source) = source {
+            let url = if let Some(source) = archive {
                 DebLocation::Repository {
                     url: source.base(),
                     path: file.path(),

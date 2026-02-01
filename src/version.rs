@@ -1408,6 +1408,31 @@ impl<'a> ProvidedName<&'a str> {
             Version { inner: version },
         ))
     }
+    fn parse_display(inp: &mut Parser<'a>) -> Result<ProvidedName<&'a str>, ParseError> {
+        if inp.is_empty() {
+            return Err("provided version".into());
+        }
+        let package_name = inp.parse_string_of(2, package_char, "package name")?;
+        if inp.matches(b'=').is_none() {
+            return Ok(ProvidedName::Any(package_name));
+        }
+        let version = inp.parse_string_of(1, version_char, "version number")?;
+        Ok(ProvidedName::Exact(
+            package_name,
+            Version { inner: version },
+        ))
+    }
+    pub fn try_parse_display(s: &'a str) -> Result<ProvidedName<&'a str>, ParseError> {
+        let mut parser = Parser {
+            inp: s.as_bytes(),
+        };
+        let pv = ProvidedName::parse_display(&mut parser)?;
+        if parser.is_empty() {
+            Ok(pv)
+        } else {
+            Err("unexpected remaining input".into())
+        }
+    }
 }
 
 impl<'a> Constraint<&'a str> {

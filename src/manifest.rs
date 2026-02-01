@@ -1,16 +1,17 @@
 use {
     crate::{
+        archive::{Archive, RepositoryFile, SnapshotId},
         artifact::{Artifact, ArtifactArg},
         content::{ContentProvider, UniverseFiles},
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
         packages::Package,
-        archive::{RepositoryFile, SnapshotId, Archive},
-        spec::{LockedPackage, LockedArchive, LockedSpec},
+        spec::{LockedArchive, LockedPackage, LockedSpec},
         staging::StagingFileSystem,
         universe::Universe,
-        version::{IntoConstraint, IntoDependency},
+        version::{IntoConstraint, IntoDependency, ProvidedName},
+        Source, SourceUniverse,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
@@ -26,6 +27,7 @@ pub struct Manifest {
     lock: LockFile,
     lock_updated: bool,
     universe: Option<Box<Universe>>,
+    source_universe: Option<SourceUniverse>,
 }
 
 ///
@@ -55,6 +57,7 @@ impl Manifest {
             lock: LockFile::new(),
             lock_updated: false,
             universe: None,
+            source_universe: None,
         }
     }
     pub fn from_archives<A, I, S>(arch: A, archives: I, comment: Option<&str>) -> Self
@@ -71,6 +74,7 @@ impl Manifest {
             file: ManifestFile::new_with_archives(archives, comment),
             lock_updated: false,
             universe: None,
+            source_universe: None,
         }
     }
     pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<Self> {
@@ -87,6 +91,7 @@ impl Manifest {
             lock,
             lock_updated: false,
             universe: None,
+            source_universe: None,
         })
     }
     fn mark_file_updated(&mut self) {
@@ -385,6 +390,55 @@ impl Manifest {
         self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
         Ok(())
     }
+    pub async fn load_source_universe<C: ContentProvider>(
+        &mut self,
+        concurrency: NonZero<usize>,
+        cache: &C,
+    ) -> io::Result<()> {
+        if self.source_universe.is_none() {
+            self.make_source_universe(concurrency, cache).await?;
+        }
+        Ok(())
+    }
+    pub fn find_source<R>(&self, name: &ProvidedName<R>) -> io::Result<Vec<Source<'_>>>
+    where
+        R: AsRef<str> + std::fmt::Display,
+    {
+        let source_universe = self
+            .source_universe
+            .as_ref()
+            .ok_or_else(|| io::Error::other("call load_source_universe first"))?;
+        let found = source_universe.find(name)?;
+        found
+            .into_iter()
+            .map(|(src, archive_id)| {
+                let archive = self.file.get_archive(archive_id).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "invalid archive index {} for source {}",
+                        archive_id, name
+                    ))
+                })?;
+                src.clone_with_files(|s| archive.file_url(s)).map_err(|e| {
+                    io::Error::other(format!(
+                        "failed to build source {} from archive {}: {}",
+                        name, archive.url, e,
+                    ))
+                })
+            })
+            .collect()
+    }
+    async fn make_source_universe<C: ContentProvider>(
+        &mut self,
+        concurrency: NonZero<usize>,
+        cache: &C,
+    ) -> io::Result<()> {
+        tracing::debug!("building source package universe");
+        let sources = cache
+            .fetch_source_universe(self.archives(), concurrency)
+            .await?;
+        self.source_universe = Some(SourceUniverse::from_sources(sources));
+        Ok(())
+    }
     pub async fn set_snapshot(&mut self, stamp: SnapshotId) {
         tracing::debug!("setting snapshot to {}", stamp);
         let updated = self
@@ -409,11 +463,15 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
-        let updated = stream::iter(self.file.archives().iter().zip(self.lock.archives_mut()).map(
-            move |(archive, locked)| {
-                LockedArchive::fetch_or_refresh(locked, archive, arch, force_archives, cache)
-            },
-        ))
+        let updated = stream::iter(
+            self.file
+                .archives()
+                .iter()
+                .zip(self.lock.archives_mut())
+                .map(move |(archive, locked)| {
+                    LockedArchive::fetch_or_refresh(locked, archive, arch, force_archives, cache)
+                }),
+        )
         .flatten_unordered(concurrency.get())
         .try_fold(false, |a, r| async move { Ok(a || r) })
         .await?;
@@ -516,9 +574,9 @@ impl Manifest {
         self.load_universe(concurrency, cache).await?;
         let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
         let archives = self.file.archives();
-        let pkgs_idx = self.lock.pkgs_idx().ok_or_else(|| io::Error::other(
-            "cannot resolve specs with unlocked archives, update manifest lock",
-        ))?;
+        let pkgs_idx = self.lock.pkgs_idx().ok_or_else(|| {
+            io::Error::other("cannot resolve specs with unlocked archives, update manifest lock")
+        })?;
         let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
@@ -616,6 +674,7 @@ impl Manifest {
     }
     async fn drop_universe(&mut self) {
         self.universe.take();
+        self.source_universe.take();
     }
     pub fn packages(&self) -> io::Result<impl Iterator<Item = &'_ Package<'_>>> {
         self.universe
@@ -740,12 +799,12 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        Vec<(&'a Archive, &'a LockedArchive)>,         // archives 
-        Vec<&'a Artifact>,                             // artifacts
+        Vec<(&'a Archive, &'a LockedArchive)>,          // archives
+        Vec<&'a Artifact>,                              // artifacts
         Vec<(Option<&'a Archive>, &'a RepositoryFile)>, // installables
-        Vec<String>,                                   // essentials
-        Vec<Vec<String>>,                              // prioritized packages
-        Vec<String>,                                   // scripts
+        Vec<String>,                                    // essentials
+        Vec<Vec<String>>,                               // prioritized packages
+        Vec<String>,                                    // scripts
         Option<ProgressBar>,
     )>
     where

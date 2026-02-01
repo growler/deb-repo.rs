@@ -19,6 +19,7 @@ mod kvlist;
 mod manifest;
 mod manifest_doc;
 mod packages;
+mod sources;
 mod release;
 pub mod sandbox;
 mod archive;
@@ -36,6 +37,7 @@ pub use {
     builder::{BuildJob, Executor},
     manifest::Manifest,
     packages::{Package, Packages},
+    sources::{Source, Sources, SourceUniverse},
     release::Release,
     archive::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Archive},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},

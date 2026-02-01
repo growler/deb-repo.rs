@@ -1,16 +1,16 @@
 use crate::{
+    archive::SnapshotId,
     control::{MutableControlFile, MutableControlStanza},
     hash::HashAlgo,
-    archive::SnapshotId,
 };
 
 use {
     crate::{
+        archive::{Archive, RepositoryFile, Snapshot},
         artifact::Artifact,
         hash::Hash,
         kvlist::{KVList, KVListSet},
         packages::Packages,
-        archive::{RepositoryFile, Snapshot, Archive},
         spec::*,
         version::{Constraint, Dependency},
     },
@@ -102,7 +102,7 @@ impl ManifestFile {
         }
     }
 
-    // A new manifest with archives 
+    // A new manifest with archives
     pub fn new_with_archives(mut archives: Vec<Archive>, comment: Option<&str>) -> Self {
         let mut doc = toml_edit::DocumentMut::new().init_manifest(comment);
         doc.push_archives(archives.iter(), None);
@@ -160,7 +160,7 @@ impl ManifestFile {
     pub fn unlocked_lock_file(&self) -> LockFile {
         LockFile {
             archives: self.archives().iter().map(|_| None).collect(),
-            local_pkgs: None,
+            local_pkgs: Packages::default(),
             specs: self
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
@@ -449,8 +449,7 @@ impl ManifestFile {
     }
     pub fn remove_archive(&mut self, index: usize) -> Archive {
         self.doc.drop_archive(index);
-        let archive = self.archives.remove(index);
-        archive
+        self.archives.remove(index)
     }
     pub fn get_archive(&self, index: usize) -> Option<&'_ Archive> {
         self.archives.get(index)
@@ -650,8 +649,8 @@ fn universe_hash<'a, I: Iterator<Item = &'a LockedArchive> + 'a>(
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
     archives: Vec<Option<LockedArchive>>,
-    #[serde(rename = "locals", skip_serializing_if = "Option::is_none", default)]
-    local_pkgs: Option<Packages>,
+    #[serde(rename = "locals", skip_serializing_if = "Packages::is_empty", default)]
+    local_pkgs: Packages,
     specs: KVList<LockedSpec>,
     #[serde(skip, default)]
     universe_hash: Option<Hash>,
@@ -663,7 +662,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             archives: Vec::new(),
-            local_pkgs: None,
+            local_pkgs: Packages::default(),
             specs: KVList::new(),
         }
     }
@@ -671,7 +670,7 @@ impl LockFile {
         LockFile {
             universe_hash: None,
             archives: vec![None; archives],
-            local_pkgs: None,
+            local_pkgs: Packages::default(),
             specs: KVList::new(),
         }
     }
@@ -707,7 +706,7 @@ impl LockFile {
                     hash: Hash,
                     archives: Vec<LockedArchive>,
                     #[serde(default)]
-                    locals: Option<Packages>,
+                    locals: Packages,
                     specs: KVList<LockedSpec>,
                 }
                 r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
@@ -723,7 +722,7 @@ impl LockFile {
                             Some(LockFile {
                                 universe_hash: Some(universe_hash(
                                     lock.archives.iter(),
-                                    lock.locals.as_ref(),
+                                    (!lock.locals.is_empty()).then_some(&lock.locals),
                                 )),
                                 archives: lock.archives.into_iter().map(Some).collect(),
                                 local_pkgs: lock.locals,
@@ -771,32 +770,26 @@ impl LockFile {
         &self.archives
     }
     pub fn local_pkgs(&self) -> Option<&'_ Packages> {
-        self.local_pkgs.as_ref()
+        (!self.local_pkgs.is_empty()).then_some(&self.local_pkgs)
     }
     pub fn archives_mut(&mut self) -> &'_ mut [Option<LockedArchive>] {
         &mut self.archives
     }
     pub fn set_local_packages(&mut self, pkgs: Packages) {
-        self.local_pkgs.replace(pkgs);
+        self.local_pkgs = pkgs;
         self.universe_hash.take();
     }
     pub fn push_local_package(&mut self, pkg: MutableControlStanza) -> io::Result<()> {
-        let mut pkgs: MutableControlFile = self
-            .local_pkgs
-            .as_ref()
-            .map_or_else(MutableControlFile::new, MutableControlFile::from);
+        let mut pkgs = MutableControlFile::from(&self.local_pkgs);
         pkgs.add(pkg);
-        self.local_pkgs.replace(pkgs.try_into()?);
+        self.local_pkgs = pkgs.try_into()?;
         self.universe_hash.take();
         Ok(())
     }
     pub fn update_local_package(&mut self, id: usize, pkg: MutableControlStanza) -> io::Result<()> {
-        let mut pkgs: MutableControlFile = self
-            .local_pkgs
-            .as_ref()
-            .map_or_else(MutableControlFile::new, MutableControlFile::from);
+        let mut pkgs = MutableControlFile::from(&self.local_pkgs);
         pkgs.set_at(id, pkg);
-        self.local_pkgs.replace(pkgs.try_into()?);
+        self.local_pkgs = pkgs.try_into()?;
         self.universe_hash.take();
         Ok(())
     }
@@ -815,7 +808,7 @@ impl LockFile {
     pub(crate) fn update_universe_hash(&mut self) {
         self.universe_hash = Some(universe_hash(
             self.archives.iter().map(|s| s.as_ref().unwrap()),
-            self.local_pkgs.as_ref(),
+            (!self.local_pkgs.is_empty()).then_some(&self.local_pkgs),
         ));
     }
     pub fn specs_len(&self) -> usize {

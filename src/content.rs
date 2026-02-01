@@ -1,6 +1,7 @@
 pub use crate::indexfile::IndexFile;
 use {
     crate::{
+        archive::{Archive, RepositoryFile},
         artifact::Artifact,
         comp::{comp_reader, strip_comp_ext},
         control::{MutableControlFile, MutableControlStanza},
@@ -8,7 +9,7 @@ use {
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
         packages::Packages,
-        archive::{RepositoryFile, Archive},
+        sources::Sources,
         spec::LockedArchive,
         staging::Stage,
         staging::{HostFileSystem, StagingFile, StagingFileSystem},
@@ -98,6 +99,11 @@ pub trait ContentProvider {
     ) -> impl Future<
         Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
     >;
+    fn fetch_source_universe(
+        &self,
+        archives: UniverseFiles<'_>,
+        concurrency: NonZero<usize>,
+    ) -> impl Future<Output = io::Result<Vec<Sources>>>;
     fn transport(&self) -> &impl TransportProvider;
     fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
 }
@@ -110,7 +116,9 @@ impl<'a> UniverseFiles<'a> {
     pub(crate) fn new(archives: &'a [Archive], locked: &'a [Option<LockedArchive>]) -> Self {
         UniverseFiles { archives, locked }
     }
-    pub fn files(&self) -> impl Iterator<Item = io::Result<(&'a Archive, &'a RepositoryFile)>> + '_ {
+    pub fn files(
+        &self,
+    ) -> impl Iterator<Item = io::Result<(&'a Archive, &'a RepositoryFile)>> + '_ {
         self.archives
             .iter()
             .zip(self.locked.iter())
@@ -128,6 +136,30 @@ impl<'a> UniverseFiles<'a> {
                     std::iter::once((src, &suite.release))
                         .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
                 })
+            })
+            .flatten_ok()
+    }
+    pub fn source_files(
+        &self,
+    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
+        self.archives
+            .iter()
+            .enumerate()
+            .zip(self.locked.iter())
+            .map(|((id, archive), locked)| {
+                if let Some(locked) = locked.as_ref() {
+                    Ok((id, archive, locked))
+                } else {
+                    Err(std::io::Error::other(
+                        "lock file is missed or outdated, run update",
+                    ))
+                }
+            })
+            .map_ok(|(id, archive, locked)| {
+                locked
+                    .suites
+                    .iter()
+                    .flat_map(move |suite| suite.sources.iter().map(move |pkg| (id as u32, archive, pkg)))
             })
             .flatten_ok()
     }
@@ -417,12 +449,12 @@ impl ContentProvider for HostCache {
                 .files()
                 .filter_ok(|(_, file)| !file.path.ends_with("Release")),
         )
-        .map_ok(|(src, file)| async move {
-            let prio = src.priority;
-            let url = src.file_url(file.path());
-            tracing::debug!("Fetching Packages file from {}", &url);
+        .map_ok(|(archive, file)| async move {
+            let prio = archive.priority;
+            let url = archive.file_url(file.path());
+            tracing::debug!("Fetching Package file from {}", &url);
             let file = self
-                .fetch_index_file(file.hash.clone(), file.size, &src.file_url(file.path()))
+                .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
                 .await?;
             let pkg = blocking::unblock(move || {
                 Packages::new(file, prio).map_err(|e| {
@@ -532,6 +564,33 @@ impl ContentProvider for HostCache {
             let (hash, size) = input.into_hash_and_size();
             Ok((file, hash, size))
         }
+    }
+    async fn fetch_source_universe(
+        &self,
+        archives: UniverseFiles<'_>,
+        concurrency: NonZero<usize>,
+    ) -> io::Result<Vec<Sources>> {
+        stream::iter(archives.source_files())
+            .map_ok(|(id, archive, file)| async move {
+                let url = archive.file_url(file.path());
+                tracing::debug!("Fetching Sources file from {}", &url);
+                let file = self
+                    .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
+                    .await?;
+                let srcs = blocking::unblock(move || {
+                    Sources::new(file, id).map_err(|e| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("failed to parse Sources file {}: {}", &url, e),
+                        )
+                    })
+                })
+                .await?;
+                Ok(srcs)
+            })
+            .try_buffered(concurrency.get())
+            .try_collect::<Vec<_>>()
+            .await
     }
     fn transport(&self) -> &impl TransportProvider {
         &self.transport

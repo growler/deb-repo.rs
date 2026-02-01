@@ -58,7 +58,7 @@ impl Release {
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
-        arch: &'a[&'a str],
+        arch: &'a [&'a str],
     ) -> Result<
         impl Iterator<Item = Result<(&'a str, Hash, u64, ReleaseFileArch<'a>), ParseError>>,
         ParseError,

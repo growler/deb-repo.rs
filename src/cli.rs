@@ -1,8 +1,8 @@
 use {
     crate::{
+        archive::{Archive, SnapshotId, SnapshotIdArgParser},
         content::ContentProvider,
         packages::{InstallPriority, Package},
-        archive::{SnapshotId, SnapshotIdArgParser, Archive},
         version::{Constraint, Dependency, Version},
         StagingFileSystem,
     },
@@ -32,10 +32,12 @@ pub mod cmd {
         crate::{
             artifact::ArtifactArg,
             builder::Executor,
+            comp::is_comp_ext,
             content::{ContentProviderGuard, HostCache},
             manifest::Manifest,
             sandbox::HostSandboxExecutor,
             staging::HostFileSystem,
+            version::ProvidedName,
         },
         anyhow::{anyhow, Result},
         clap::Parser,
@@ -559,6 +561,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     pub enum ShowCommands {
         Package(ShowPackage),
+        Source(ShowSource),
         SpecHash(ShowSpecHash),
     }
 
@@ -571,6 +574,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     impl<C: Config> Command<C> for Show {
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
+                ShowCommands::Source(cmd) => cmd.exec(conf),
                 ShowCommands::Package(cmd) => cmd.exec(conf),
                 ShowCommands::SpecHash(cmd) => cmd.exec(conf),
             }
@@ -637,6 +641,87 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                 } else {
                     Err(anyhow!("package {} not found", &self.package))
                 }
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        name = "source",
+        about = "Show a package's source control record",
+        long_about = "Print the raw control record for the given package's source."
+    )]
+    pub struct ShowSource {
+        /// Find and print source files as artifacts to stage in path.
+        /// Fails if there are multiple source packages matching the name.
+        #[arg(long = "stage-to", value_name = "PATH")]
+        stage_to: Option<String>,
+        /// Package or source package name. May include version (pkg=version)
+        #[arg(value_name = "PACKAGE")]
+        package: String,
+    }
+
+    impl<C: Config> Command<C> for ShowSource {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let name = ProvidedName::try_parse_display(&self.package).map_err(|err| {
+                    anyhow!("invalid package/source name '{}': {}", &self.package, err)
+                })?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let mut mf = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.load_source_universe(conf.concurrency(), fetcher).await?;
+                guard.commit().await?;
+                let found = mf.find_source(&name)?;
+                if found.is_empty() {
+                    return Err(anyhow!("package/source {} not found", &self.package));
+                }
+                let mut out = async_io::Async::new(std::io::stdout().lock())?;
+                if let Some(target) = self.stage_to.as_deref() {
+                    if found.len() > 1 {
+                        return Err(anyhow!(
+                            "multiple source packages found for {}, cannot show as artifacts",
+                            &self.package
+                        ));
+                    }
+                    let src = found.first().unwrap();
+                    let mut first = true;
+                    let mut staged = vec![];
+                    for artifact in src.files() {
+                        if first {
+                            first = false;
+                        } else {
+                            out.write_all(b"\n").await?;
+                        }
+                        let file_name = match artifact.path.rsplit('/').next() {
+                            Some(name) => name,
+                            None => &artifact.path,
+                        };
+                        out.write_all(format!("[artifact.\"{}\"]\ntype = \"file\"\ntarget = \"{}/{}\"\nsize = \"{}\"\nhash = \"{}\"\n", 
+                            &artifact.path,
+                            target.trim_end_matches('/'), file_name,
+                            artifact.size,
+                            artifact.hash.to_sri(),
+                        ).as_bytes()).await?;
+                        if is_comp_ext(&artifact.path) {
+                            out.write_all(b"unpack = false\n").await?;
+                        }
+                        staged.push(&artifact.path);
+                    }
+                    out.write_all(b"\nstage = [\n").await?;
+                    for staged in staged {
+                        out.write_all(format!("  \"{}\",\n", staged).as_bytes())
+                            .await?;
+                    }
+                    out.write_all(b"]\n").await?;
+                } else {
+                    for src in found.iter() {
+                        out.write_all(src.as_ref().as_bytes()).await?;
+                        out.write_all(b"\n").await?;
+                    }
+                }
+                out.flush().await?;
+                Ok(())
             })
         }
     }

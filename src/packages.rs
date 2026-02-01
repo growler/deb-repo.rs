@@ -445,6 +445,23 @@ pub struct Packages {
     inner: Arc<PackagesInner>,
 }
 
+impl Default for Packages {
+    fn default() -> Self {
+        Packages {
+            prio: 500,
+            inner: Arc::new(
+                PackagesInnerTryBuilder {
+                    data: IndexFile::from(""),
+                    packages_builder:
+                        |_: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> { Ok(vec![]) },
+                }
+                .try_build()
+                .unwrap(),
+            ),
+        }
+    }
+}
+
 impl Clone for Packages {
     fn clone(&self) -> Self {
         Packages {
