@@ -574,9 +574,6 @@ impl Manifest {
         self.load_universe(concurrency, cache).await?;
         let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
         let archives = self.file.archives();
-        let pkgs_idx = self.lock.pkgs_idx().ok_or_else(|| {
-            io::Error::other("cannot resolve specs with unlocked archives, update manifest lock")
-        })?;
         let artifacts = self.file.artifacts();
         std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
             .filter_map(|((id, (ns, s)), (nl, l))| {
@@ -621,21 +618,22 @@ impl Manifest {
                         solvables.into_iter().map(move |solvable| (order, solvable))
                     })
                     .map(|(order, solvable)| {
-                        let (pkgs, pkg) = universe.package_with_idx(solvable).unwrap();
-                        let archive = pkgs_idx.get(pkgs as usize);
-                        let name = pkg.name().to_string();
-                        let hash_kind = archive.map_or(Ok("SHA256"), |src| {
-                            archives.get(*src).map_or_else(
-                                || {
-                                    Err(io::Error::other(format!(
-                                        "invalid archive index {} in spec {}",
-                                        src,
+                        let (pkgs, pkg) = universe.package_with_pkgs(solvable).unwrap();
+                        let archive = pkgs
+                            .archive_id()
+                            .map(|id| {
+                                archives.get(id).ok_or_else(|| {
+                                    io::Error::other(format!(
+                                        "invalid archive index {} for package {} in spec {}",
+                                        id,
+                                        pkg.name(),
                                         spec_display_name(spec_name)
-                                    )))
-                                },
-                                |src| Ok(src.hash.name()),
-                            )
-                        })?;
+                                    ))
+                                })
+                            })
+                            .transpose()?;
+                        let name = pkg.name().to_string();
+                        let hash_kind = archive.map_or("SHA256", |archive| archive.hash.name());
                         let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
                             io::Error::other(format!(
                                 "failed to parse package {} record while processing spec {}: {}",
@@ -653,7 +651,7 @@ impl Manifest {
                             },
                             idx: solvable.into(),
                             order: order as u32,
-                            orig: archive.map(|s| *s as u32),
+                            orig: pkgs.archive_id().map(|id| id as u32),
                             name,
                         })
                     })
@@ -711,24 +709,6 @@ impl Manifest {
                 ))
             })
             .cloned()
-    }
-    fn staging_archives(&self) -> io::Result<Vec<(&Archive, &LockedArchive)>> {
-        self.file
-            .archives()
-            .iter()
-            .zip(self.lock.archives().iter())
-            .map(|(s, l)| {
-                l.as_ref().map_or_else(
-                    || {
-                        Err(io::Error::other(format!(
-                            "archive {} is not locked, run lock",
-                            s.url
-                        )))
-                    },
-                    |l| Ok((s, l)),
-                )
-            })
-            .collect::<io::Result<Vec<_>>>()
     }
     fn staging_artifacts<'a>(
         &'a self,
@@ -799,7 +779,7 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        Vec<(&'a Archive, &'a LockedArchive)>,          // archives
+        UniverseFiles<'a>,                              // archives
         Vec<&'a Artifact>,                              // artifacts
         Vec<(Option<&'a Archive>, &'a RepositoryFile)>, // installables
         Vec<String>,                                    // essentials
@@ -811,7 +791,7 @@ impl Manifest {
         P: FnOnce(u64) -> ProgressBar,
     {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        let archives = self.staging_archives()?;
+        let archives = self.archives();
         let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
         let artifacts = self.staging_artifacts(spec_name, spec_index)?;
         let scripts = self
@@ -854,7 +834,8 @@ impl Manifest {
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_archives(archives.as_slice(), fs, concurrency, cache).await?;
+        let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
+        fs.stage(universe_stage).await?;
         Ok((essentials, other, scripts))
     }
     pub async fn stage<FS, P, C>(
@@ -877,7 +858,8 @@ impl Manifest {
         if let Some(pb) = pb {
             pb.finish_using_style();
         }
-        crate::stage::stage_archives(archives.as_slice(), fs, concurrency, cache).await?;
+        let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
+        fs.stage(universe_stage).await?;
         Ok((essentials, other, scripts))
     }
 }

@@ -536,7 +536,7 @@ impl MutableControlFile {
 impl TryFrom<MutableControlFile> for Packages {
     type Error = ParseError;
     fn try_from(cf: MutableControlFile) -> std::result::Result<Self, ParseError> {
-        Packages::new(cf.to_string().into(), None)
+        Packages::new(cf.to_string().into(), None, None)
     }
 }
 

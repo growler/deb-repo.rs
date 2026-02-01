@@ -1,11 +1,9 @@
 use {
     crate::{
+        archive::{Archive, RepositoryFile},
         artifact::Artifact,
-        comp::strip_comp_ext,
         content::{ContentProvider, DebLocation},
-        control::{ControlFile, ControlStanza, MutableControlFile, MutableControlStanza},
-        archive::{RepositoryFile, Archive},
-        spec::LockedArchive,
+        control::{ControlFile, ControlStanza, MutableControlStanza},
         staging::{StagingFile, StagingFileSystem},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
@@ -13,64 +11,6 @@ use {
     smol::io,
     std::num::NonZero,
 };
-
-// COMMON
-
-pub async fn stage_archives<'a, FS, C>(
-    archives: &[(&'a Archive, &'a LockedArchive)],
-    fs: &FS,
-    concurrency: NonZero<usize>,
-    cache: &C,
-) -> io::Result<()>
-where
-    FS: StagingFileSystem,
-    C: ContentProvider,
-{
-    fs.create_dir_all("./etc/apt/sources.list.d", 0, 0, 0o755)
-        .await?;
-    fs.create_dir_all("./var/lib/apt/lists", 0, 0, 0o755)
-        .await?;
-    let mut sources_file = MutableControlFile::new();
-    stream::iter(
-        archives
-            .iter()
-            .flat_map(|(src, locked)| {
-                sources_file.add(Into::<MutableControlStanza>::into(*src));
-                locked.suites.iter().flat_map(move |suite| {
-                    std::iter::once((*src, &suite.release))
-                        .chain(suite.packages.iter().map(|pkg| (*src, pkg)))
-                })
-            })
-            .map(Ok),
-    )
-    .try_for_each_concurrent(Some(concurrency.into()), |(source, file)| {
-        let target = format!(
-            "./var/lib/apt/lists/{}",
-            strip_comp_ext(
-                &crate::strip_url_scheme(&source.file_url(file.path())).replace('/', "_")
-            )
-        );
-        async move {
-            let file = cache
-                .fetch_index_file(
-                    file.hash().clone(),
-                    file.size(),
-                    &source.file_url(file.path()),
-                )
-                .await?;
-            fs.create_file_from_bytes(file.as_bytes(), 0, 0, 0o644)
-                .await?
-                .persist(target)
-                .await
-        }
-    })
-    .await?;
-    let sources_file = sources_file.to_string();
-    fs.create_file_from_bytes(sources_file.as_bytes(), 0, 0, 0o644)
-        .await?
-        .persist("./etc/apt/sources.list.d/manifest.sources")
-        .await
-}
 
 // LOCAL
 

@@ -838,18 +838,6 @@ impl LockFile {
         self.archives.iter().all(|s| s.is_some())
             && self.specs.iter_values().all(|spec| spec.is_locked())
     }
-    pub(crate) fn pkgs_idx(&self) -> Option<Vec<usize>> {
-        let mut idx = Vec::new();
-        for (i, archive) in self.archives.iter().enumerate() {
-            let archive = archive.as_ref()?;
-            for suite in archive.suites.iter() {
-                for _ in suite.packages.iter() {
-                    idx.push(i);
-                }
-            }
-        }
-        Some(idx)
-    }
 }
 
 fn serialize_spec_list<S>(list: &KVList<Spec>, serializer: S) -> Result<S::Ok, S::Error>

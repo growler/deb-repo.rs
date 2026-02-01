@@ -118,23 +118,24 @@ impl<'a> UniverseFiles<'a> {
     }
     pub fn files(
         &self,
-    ) -> impl Iterator<Item = io::Result<(&'a Archive, &'a RepositoryFile)>> + '_ {
+    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
         self.archives
             .iter()
+            .enumerate()
             .zip(self.locked.iter())
-            .map(|(archive, locked)| {
+            .map(|((id, archive), locked)| {
                 if let Some(locked) = locked.as_ref() {
-                    Ok((archive, locked))
+                    Ok((id as u32, archive, locked))
                 } else {
                     Err(std::io::Error::other(
                         "lock file is missed or outdated, run update",
                     ))
                 }
             })
-            .map_ok(|(src, locked)| {
+            .map_ok(|(id, archive, locked)| {
                 locked.suites.iter().flat_map(move |suite| {
-                    std::iter::once((src, &suite.release))
-                        .chain(suite.packages.iter().map(move |pkg| (src, pkg)))
+                    std::iter::once((id, archive, &suite.release))
+                        .chain(suite.packages.iter().map(move |pkg| (id, archive, pkg)))
                 })
             })
             .flatten_ok()
@@ -447,9 +448,9 @@ impl ContentProvider for HostCache {
         stream::iter(
             archives
                 .files()
-                .filter_ok(|(_, file)| !file.path.ends_with("Release")),
+                .filter_ok(|(_, _, file)| !file.path.ends_with("Release")),
         )
-        .map_ok(|(archive, file)| async move {
+        .map_ok(|(id, archive, file)| async move {
             let prio = archive.priority;
             let url = archive.file_url(file.path());
             tracing::debug!("Fetching Package file from {}", &url);
@@ -457,7 +458,7 @@ impl ContentProvider for HostCache {
                 .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
                 .await?;
             let pkg = blocking::unblock(move || {
-                Packages::new(file, prio).map_err(|e| {
+                Packages::new(file, Some(id), prio).map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("failed to parse Packages file {}: {}", &url, e),
@@ -478,12 +479,13 @@ impl ContentProvider for HostCache {
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = archives.apt_sources();
         let files = stream::iter(archives.files())
-            .map_ok(|(src, file)| async move {
+            .map_ok(|(_, src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
                     .fetch_index_file(file.hash.clone(), file.size, &url)
                     .await?;
                 let name = crate::strip_url_scheme(strip_comp_ext(&url)).replace('/', "_");
+                tracing::debug!("staging index file from {} as {}", &url, &name);
                 Ok((name, file))
             })
             .try_buffered(concurrency.get())

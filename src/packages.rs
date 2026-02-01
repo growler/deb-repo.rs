@@ -128,6 +128,7 @@ impl MemoryMappedUniverseFile {
             files.push(
                 Packages::new(
                     IndexFile::mmap_region(Arc::clone(&mmap), begin, end)?,
+                    None,
                     Some(prio),
                 )
                 .map_err(io::Error::other)?,
@@ -442,18 +443,21 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 
 pub struct Packages {
     prio: u32,
+    archive_id: Option<u32>,
     inner: Arc<PackagesInner>,
 }
 
 impl Default for Packages {
     fn default() -> Self {
         Packages {
+            archive_id: None,
             prio: 500,
             inner: Arc::new(
                 PackagesInnerTryBuilder {
                     data: IndexFile::from(""),
-                    packages_builder:
-                        |_: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> { Ok(vec![]) },
+                    packages_builder: |_: &'_ IndexFile| -> Result<Vec<Package<'_>>, ParseError> {
+                        Ok(vec![])
+                    },
                 }
                 .try_build()
                 .unwrap(),
@@ -465,6 +469,7 @@ impl Default for Packages {
 impl Clone for Packages {
     fn clone(&self) -> Self {
         Packages {
+            archive_id: self.archive_id,
             prio: self.prio,
             inner: Arc::clone(&self.inner),
         }
@@ -511,11 +516,23 @@ impl Packages {
     pub fn with_prio(self, prio: u32) -> Self {
         Self {
             prio,
+            archive_id: self.archive_id,
             inner: self.inner,
         }
     }
-    pub fn new(data: IndexFile, prio: Option<u32>) -> Result<Self, ParseError> {
+    pub fn archive_id(&self) -> Option<usize> {
+        self.archive_id.map(|id| id as usize)
+    } 
+    pub fn with_archive_id(self, archive_id: u32) -> Self {
+        Self {
+            archive_id: Some(archive_id),
+            prio: self.prio,
+            inner: self.inner,
+        }
+    }
+    pub fn new(data: IndexFile, archive_id: Option<u32>, prio: Option<u32>) -> Result<Self, ParseError> {
         Ok(Packages {
+            archive_id,
             prio: prio.unwrap_or(500),
             inner: Arc::new(
                 PackagesInnerTryBuilder {
@@ -577,14 +594,14 @@ impl<'de> Deserialize<'de> for Packages {
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(inp.to_owned().into(), None)
+        Self::new(inp.to_owned().into(), None, None)
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(inp.into(), None)
+        Self::new(inp.into(), None, None)
     }
 }
 
@@ -595,6 +612,7 @@ impl TryFrom<Vec<u8>> for Packages {
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into(),
+            None,
             None,
         )
     }

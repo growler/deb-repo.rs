@@ -477,6 +477,15 @@ impl Universe {
                 .map(|s| s.package)
         })
     }
+    pub fn package_with_pkgs<Id>(&self, solvable: Id) -> Option<(&Packages, &Package<'_>)>
+    where
+        Id: IntoId<PackageId>,
+    {
+        let (pkgs_idx, pkg) = self.package_with_idx(solvable)?;
+        self.inner.provider().with_packages(|pkgs| {
+            Some((pkgs.get(pkgs_idx as usize)?, pkg))
+        })
+    }
     pub fn package_with_idx<Id>(&self, solvable: Id) -> Option<(u32, &Package<'_>)>
     where
         Id: IntoId<PackageId>,
@@ -916,7 +925,7 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src.to_string().into(), None)
+                    vec![Packages::new($src.to_string().into(), None, None)
                         .expect("failed to parse test source")]
                     .into_iter(),
                 )

@@ -50,7 +50,7 @@ pub fn parse_benchmark(c: &mut Criterion) {
     g.bench_function("find solution", |b| {
         b.iter(|| {
             let packages =
-                Some(Packages::new(data.clone(), None).expect("failed to parse packages"));
+                Some(Packages::new(data.clone(), None, None).expect("failed to parse packages"));
             let mut uni = Universe::new("amd64", packages).expect("universe");
             let _ = match uni.solve(
                 vec!["task-gnome-desktop | task-kde-desktop"
