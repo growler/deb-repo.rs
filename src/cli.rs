@@ -697,7 +697,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                             Some(name) => name,
                             None => &artifact.path,
                         };
-                        out.write_all(format!("[artifact.\"{}\"]\ntype = \"file\"\ntarget = \"{}/{}\"\nsize = \"{}\"\nhash = \"{}\"\n", 
+                        out.write_all(format!("[artifact.\"{}\"]\ntype = \"file\"\ntarget = \"{}/{}\"\nsize = \"{}\"\nhash = {}\n", 
                             &artifact.path,
                             target.trim_end_matches('/'), file_name,
                             artifact.size,
