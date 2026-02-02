@@ -697,12 +697,23 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                             Some(name) => name,
                             None => &artifact.path,
                         };
-                        out.write_all(format!("[artifact.\"{}\"]\ntype = \"file\"\ntarget = \"{}/{}\"\nsize = \"{}\"\nhash = {}\n", 
-                            &artifact.path,
-                            target.trim_end_matches('/'), file_name,
-                            artifact.size,
-                            artifact.hash.to_sri(),
-                        ).as_bytes()).await?;
+                        out.write_all(
+                            format!(
+                                "[artifact.\"{}\"]
+type = \"file\"
+target = \"{}/{}\"
+size = {}
+hash = \"{}\"
+",
+                                &artifact.path,
+                                target.trim_end_matches('/'),
+                                file_name,
+                                artifact.size,
+                                artifact.hash.to_sri(),
+                            )
+                            .as_bytes(),
+                        )
+                        .await?;
                         if is_comp_ext(&artifact.path) {
                             out.write_all(b"unpack = false\n").await?;
                         }
@@ -710,7 +721,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."
                     }
                     out.write_all(b"\nstage = [\n").await?;
                     for staged in staged {
-                        out.write_all(format!("  \"{}\",\n", staged).as_bytes())
+                        out.write_all(format!("    \"{}\",\n", staged).as_bytes())
                             .await?;
                     }
                     out.write_all(b"]\n").await?;

@@ -327,7 +327,6 @@ macro_rules! __commands_collect {
 macro_rules! __commands_expand {
     (@vis ($v:vis) @enum $E:ident @conf $C:ident @items ( $( ( [$($attrs:tt)*] $V:ident $T:path ) )* ) ) => {
         #[derive(::clap::Subcommand)]
-        #[command(arg_required_else_help = true)]
         $v enum $E {
             $( $($attrs)* $V($T), )*
         }
