@@ -6,7 +6,7 @@ use std::{
 
 use anyhow::Result;
 use debrepo::tar::{
-    TarDevice, TarDirectory, TarEntry, TarReader, TarRegularFile, TarSymlink, TarWriter,
+    AttrList, TarDevice, TarDirectory, TarEntry, TarReader, TarRegularFile, TarSymlink, TarWriter,
 };
 use futures::SinkExt;
 use futures_lite::{
@@ -306,6 +306,29 @@ fn tar_writer_round_trip_long_names() -> Result<()> {
             other => panic!("expected symlink entry, got {:?}", other),
         }
         assert!(stream.next().await.is_none());
+        Ok(())
+    })
+}
+
+#[test]
+fn tar_writer_writes_xattrs() -> Result<()> {
+    smol::block_on(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        let attrs = AttrList::new().with("user.comment", b"hello".as_slice());
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("file.txt", 0, 0, 0, 0o644, 1, Cursor::new(&[][..]))
+                    .with_attrs(attrs),
+            ))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap();
+        let needle = b"SCHILY.xattr.user.comment=hello";
+        assert!(buffer
+            .windows(needle.len())
+            .any(|window| window == needle));
         Ok(())
     })
 }

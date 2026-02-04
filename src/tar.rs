@@ -726,6 +726,7 @@ impl TarLink {
             0,    // gid
             0,    // mtime
             None, // device
+            &AttrList::default(),
         )
     }
 }
@@ -835,6 +836,7 @@ impl TarDevice {
             self.gid,
             self.mtime,
             Some((self.major, self.minor)),
+            &AttrList::default(),
         )
     }
 }
@@ -896,6 +898,7 @@ impl TarFifo {
             self.gid,
             self.mtime,
             None, // device
+            &AttrList::default(),
         )
     }
 }
@@ -963,6 +966,7 @@ impl TarSymlink {
             self.gid,
             self.mtime,
             None, // device
+            &AttrList::default(),
         )
     }
 }
@@ -1029,7 +1033,55 @@ impl TarDirectory {
             self.gid,
             self.mtime,
             None, // device
+            &AttrList::default(),
         )
+    }
+}
+
+/// Extended attribute list stored in PAX headers.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AttrList {
+    inner: Vec<(Box<str>, Box<[u8]>)>,
+}
+
+impl AttrList {
+    /// Create an empty attribute list.
+    pub fn new() -> Self {
+        Self { inner: Vec::new() }
+    }
+
+    /// Returns the number of attributes stored.
+    pub fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    /// Returns true if the list is empty.
+    pub fn is_empty(&self) -> bool {
+        self.inner.is_empty()
+    }
+
+    /// Append an attribute name/value pair.
+    pub fn push<N: Into<Box<str>>, V: Into<Box<[u8]>>>(&mut self, name: N, value: V) {
+        self.inner.push((name.into(), value.into()));
+    }
+
+    /// Append an attribute pair and return the list.
+    pub fn with<N: Into<Box<str>>, V: Into<Box<[u8]>>>(mut self, name: N, value: V) -> Self {
+        self.push(name, value);
+        self
+    }
+
+    /// Iterate over stored attributes.
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &[u8])> {
+        self.inner
+            .iter()
+            .map(|(name, value)| (name.as_ref(), value.as_ref()))
+    }
+}
+
+impl From<Vec<(Box<str>, Box<[u8]>)>> for AttrList {
+    fn from(inner: Vec<(Box<str>, Box<[u8]>)>) -> Self {
+        Self { inner }
     }
 }
 
@@ -1042,6 +1094,7 @@ pin_project! {
         mtime: u32,
         uid: u32,
         gid: u32,
+        attrs: AttrList,
         #[pin]
         inner: R,
         marker: std::marker::PhantomData<&'a ()>,
@@ -1065,6 +1118,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
             mtime,
             uid,
             gid,
+            attrs: AttrList::default(),
             inner,
             marker: std::marker::PhantomData,
         }
@@ -1087,6 +1141,16 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
     pub fn gid(&self) -> u32 {
         self.gid
     }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
+    }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
             buffer,
@@ -1099,6 +1163,7 @@ impl<'a, R: AsyncRead + 'a> TarRegularFile<'a, R> {
             self.gid,
             self.mtime,
             None, // device
+            &self.attrs,
         )
     }
 }
@@ -1141,6 +1206,7 @@ impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &file.mtime)
                 .field("uid", &file.uid)
                 .field("gid", &file.gid)
+                .field("attrs", &file.attrs.len())
                 .finish(),
             Self::Device(device) => f
                 .debug_struct("TarEntry::Device")
@@ -1628,6 +1694,7 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
                 mtime,
                 uid,
                 gid,
+                attrs: AttrList::default(),
                 inner: TarRegularFileReader {
                     eof,
                     inner: Arc::clone(&this.inner),
@@ -1734,9 +1801,10 @@ const fn padded_size(n: u64) -> u64 {
 /// Write a single header (plus optional PAX prefix) into `buffer`.
 ///
 /// The function encodes metadata using the ustar layout and, if either the path
-/// or link name is too long, prepends a minimal PAX header that stores the full
-/// value before duplicating the original header so downstream tools can still
-/// read the entry.
+/// or link name is too long, or if PAX attributes are supplied (for example
+/// extended attributes), prepends a PAX header that stores the full values
+/// before duplicating the original header so downstream tools can still read
+/// the entry.
 fn write_header(
     buffer: &mut [u8],
     name: &str,
@@ -1748,6 +1816,7 @@ fn write_header(
     gid: u32,
     mtime: u32,
     device: Option<(u32, u32)>,
+    attrs: &AttrList,
 ) -> std::io::Result<usize> {
     if buffer.len() < BLOCK_SIZE {
         return Err(std::io::Error::other("buffer too small for tar header"));
@@ -1772,7 +1841,8 @@ fn write_header(
         .as_ref()
         .is_some_and(|link_name| link_name.len() > NAME_LEN);
 
-    if !path_truncated && !link_path_truncated {
+    let attrs_present = !attrs.is_empty();
+    if !path_truncated && !link_path_truncated && !attrs_present {
         header.set_uid(uid)?;
         header.set_gid(gid)?;
         header.set_mode(mode)?;
@@ -1789,40 +1859,45 @@ fn write_header(
         header.set_typeflag(kind);
         header.finalize()?;
     } else {
-        use std::io::Write;
         header.set_typeflag(Kind::PAXLocal);
         header.set_path("././@PaxHeader", None);
         header.set_uid(0)?;
         header.set_gid(0)?;
         header.set_mode(0)?;
         header.set_mtime(0)?;
-        let mut ext_size = 0;
+        let mut records = Vec::new();
         if path_truncated {
-            let rec_len = pax_record_len("path", name.len());
-            if data_buf.len() < rec_len {
-                return Err(std::io::Error::other("buffer too small for pax header"));
-            }
-            writeln!(
-                &mut data_buf[ext_size..rec_len],
-                "{} path={}",
-                rec_len,
-                name
-            )?;
-            ext_size += rec_len;
+            records.push(PaxRecord::new("path", name.as_bytes()));
         }
         if link_path_truncated {
             let name = link_name.unwrap();
-            let rec_len = pax_record_len("linkpath", name.len());
-            if data_buf.len() < ext_size + rec_len {
+            records.push(PaxRecord::new("linkpath", name.as_bytes()));
+        }
+        if attrs_present {
+            for (name, value) in attrs.iter() {
+                records.push(pax_xattr_record(name, value)?);
+            }
+        }
+        let mut ext_size = 0;
+        for record in &records {
+            ext_size += pax_record_len(&record.key, record.value.len());
+        }
+        if data_buf.len() < ext_size {
+            return Err(std::io::Error::other("buffer too small for pax header"));
+        }
+        let mut offset = 0;
+        for record in records {
+            let rec_len = pax_record_len(&record.key, record.value.len());
+            if data_buf.len() < offset + rec_len {
                 return Err(std::io::Error::other("buffer too small for pax header"));
             }
-            writeln!(
-                &mut data_buf[ext_size..ext_size + rec_len],
-                "{} linkpath={}",
+            write_pax_record(
+                &mut data_buf[offset..offset + rec_len],
+                &record.key,
+                &record.value,
                 rec_len,
-                name
             )?;
-            ext_size += rec_len;
+            offset += rec_len;
         }
         header.set_size(ext_size as u64)?;
         header.finalize()?;
@@ -1881,6 +1956,66 @@ fn num_decimal_digits(mut n: usize) -> usize {
         c += 1;
     }
     c
+}
+
+fn write_pax_record(
+    buf: &mut [u8],
+    key: &str,
+    value: &[u8],
+    rec_len: usize,
+) -> std::io::Result<()> {
+    if buf.len() < rec_len {
+        return Err(std::io::Error::other("buffer too small for pax record"));
+    }
+    let len_str = rec_len.to_string();
+    let expected = len_str.len() + 1 + key.len() + 1 + value.len() + 1;
+    if expected != rec_len {
+        return Err(std::io::Error::other("pax record length mismatch"));
+    }
+    let mut offset = 0;
+    buf[..len_str.len()].copy_from_slice(len_str.as_bytes());
+    offset += len_str.len();
+    buf[offset] = b' ';
+    offset += 1;
+    buf[offset..offset + key.len()].copy_from_slice(key.as_bytes());
+    offset += key.len();
+    buf[offset] = b'=';
+    offset += 1;
+    buf[offset..offset + value.len()].copy_from_slice(value);
+    offset += value.len();
+    buf[offset] = b'\n';
+    Ok(())
+}
+
+struct PaxRecord {
+    key: String,
+    value: Vec<u8>,
+}
+
+impl PaxRecord {
+    fn new(key: &str, value: &[u8]) -> Self {
+        Self {
+            key: key.to_string(),
+            value: value.to_vec(),
+        }
+    }
+}
+
+fn pax_xattr_record(name: &str, value: &[u8]) -> std::io::Result<PaxRecord> {
+    if !xattr_name_is_pax_safe(name) {
+        return Err(std::io::Error::other(
+            "xattr name contains non-portable characters",
+        ));
+    }
+    Ok(PaxRecord::new(
+        &format!("SCHILY.xattr.{name}"),
+        value,
+    ))
+}
+
+fn xattr_name_is_pax_safe(name: &str) -> bool {
+    name.bytes()
+        .all(|b| b.is_ascii_graphic() && b != b'=')
 }
 
 fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {

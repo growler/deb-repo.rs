@@ -39,6 +39,10 @@ path = "cmd/main.rs"
 name = "tar-test"
 path = "cmd/tar.rs"
 
+[[bin]]
+name = "tar-xattr"
+path = "cmd/tar_xattr.rs"
+
 [dependencies]
 anyhow = "1.0.99"
 async-channel = "2.5.0"
