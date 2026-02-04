@@ -454,6 +454,7 @@ enum Entry {
         mtime: u32,
         uid: u32,
         gid: u32,
+        attrs: AttrList,
     },
     Link(TarLink),
     Symlink(TarSymlink),
@@ -694,6 +695,7 @@ impl<'a, R: AsyncRead + 'a> TarReader<'a, R> {
 pub struct TarLink {
     path_name: Box<str>,
     link_name: Box<str>,
+    attrs: AttrList,
 }
 impl<R: AsyncRead> From<TarLink> for TarEntry<'_, R> {
     fn from(link: TarLink) -> Self {
@@ -706,6 +708,7 @@ impl TarLink {
         TarLink {
             path_name: path_name.into(),
             link_name: link_name.into(),
+            attrs: AttrList::default(),
         }
     }
     pub fn path(&'_ self) -> &'_ str {
@@ -713,6 +716,16 @@ impl TarLink {
     }
     pub fn link(&'_ self) -> &'_ str {
         &self.link_name
+    }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
     }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
@@ -726,7 +739,7 @@ impl TarLink {
             0,    // gid
             0,    // mtime
             None, // device
-            &AttrList::default(),
+            &self.attrs,
         )
     }
 }
@@ -745,6 +758,7 @@ pub struct TarDevice {
     kind: DeviceKind,
     major: u32,
     minor: u32,
+    attrs: AttrList,
 }
 impl<R: AsyncRead> From<TarDevice> for TarEntry<'_, R> {
     fn from(device: TarDevice) -> Self {
@@ -771,6 +785,7 @@ impl TarDevice {
             major,
             minor,
             kind: DeviceKind::Char,
+            attrs: AttrList::default(),
         }
     }
     /// Create a block device entry.
@@ -792,6 +807,7 @@ impl TarDevice {
             major,
             minor,
             kind: DeviceKind::Block,
+            attrs: AttrList::default(),
         }
     }
     pub fn path(&'_ self) -> &'_ str {
@@ -821,6 +837,16 @@ impl TarDevice {
     pub fn minor(&self) -> u32 {
         self.minor
     }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
+    }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
             buffer,
@@ -836,7 +862,7 @@ impl TarDevice {
             self.gid,
             self.mtime,
             Some((self.major, self.minor)),
-            &AttrList::default(),
+            &self.attrs,
         )
     }
 }
@@ -848,6 +874,7 @@ pub struct TarFifo {
     mtime: u32,
     uid: u32,
     gid: u32,
+    attrs: AttrList,
 }
 impl<R: AsyncRead> From<TarFifo> for TarEntry<'_, R> {
     fn from(fifo: TarFifo) -> Self {
@@ -869,6 +896,7 @@ impl TarFifo {
             mtime,
             uid,
             gid,
+            attrs: AttrList::default(),
         }
     }
     pub fn path(&'_ self) -> &'_ str {
@@ -886,6 +914,16 @@ impl TarFifo {
     pub fn gid(&self) -> u32 {
         self.gid
     }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
+    }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
             buffer,
@@ -898,7 +936,7 @@ impl TarFifo {
             self.gid,
             self.mtime,
             None, // device
-            &AttrList::default(),
+            &self.attrs,
         )
     }
 }
@@ -911,6 +949,7 @@ pub struct TarSymlink {
     mtime: u32,
     uid: u32,
     gid: u32,
+    attrs: AttrList,
 }
 impl<R: AsyncRead> From<TarSymlink> for TarEntry<'_, R> {
     fn from(symlink: TarSymlink) -> Self {
@@ -934,6 +973,7 @@ impl TarSymlink {
             mtime,
             uid,
             gid,
+            attrs: AttrList::default(),
         }
     }
     pub fn path(&'_ self) -> &'_ str {
@@ -954,6 +994,16 @@ impl TarSymlink {
     pub fn gid(&self) -> u32 {
         self.gid
     }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
+    }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
             buffer,
@@ -966,7 +1016,7 @@ impl TarSymlink {
             self.gid,
             self.mtime,
             None, // device
-            &AttrList::default(),
+            &self.attrs,
         )
     }
 }
@@ -979,6 +1029,7 @@ pub struct TarDirectory {
     uid: u32,
     gid: u32,
     size: u64,
+    attrs: AttrList,
 }
 impl<R: AsyncRead> From<TarDirectory> for TarEntry<'_, R> {
     fn from(dir: TarDirectory) -> Self {
@@ -1001,6 +1052,7 @@ impl TarDirectory {
             mtime,
             uid,
             gid,
+            attrs: AttrList::default(),
         }
     }
     pub fn path(&'_ self) -> &'_ str {
@@ -1021,6 +1073,16 @@ impl TarDirectory {
     pub fn gid(&self) -> u32 {
         self.gid
     }
+    pub fn attrs(&self) -> &AttrList {
+        &self.attrs
+    }
+    pub fn attrs_mut(&mut self) -> &mut AttrList {
+        &mut self.attrs
+    }
+    pub fn with_attrs(mut self, attrs: AttrList) -> Self {
+        self.attrs = attrs;
+        self
+    }
     fn write_header(&self, buffer: &mut [u8]) -> std::io::Result<usize> {
         write_header(
             buffer,
@@ -1033,7 +1095,7 @@ impl TarDirectory {
             self.gid,
             self.mtime,
             None, // device
-            &AttrList::default(),
+            &self.attrs,
         )
     }
 }
@@ -1215,6 +1277,7 @@ impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &device.mtime)
                 .field("uid", &device.uid)
                 .field("gid", &device.gid)
+                .field("attrs", &device.attrs.len())
                 .field(
                     "kind",
                     match device.kind {
@@ -1232,11 +1295,13 @@ impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &fifo.mtime)
                 .field("uid", &fifo.uid)
                 .field("gid", &fifo.gid)
+                .field("attrs", &fifo.attrs.len())
                 .finish(),
             Self::Link(link) => f
                 .debug_struct("TarEntry::Link")
                 .field("path_name", &link.path_name)
                 .field("link_name", &link.link_name)
+                .field("attrs", &link.attrs.len())
                 .finish(),
             Self::Symlink(symlink) => f
                 .debug_struct("TarEntry::Symlink")
@@ -1246,6 +1311,7 @@ impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &symlink.mtime)
                 .field("uid", &symlink.uid)
                 .field("gid", &symlink.gid)
+                .field("attrs", &symlink.attrs.len())
                 .finish(),
             Self::Directory(dir) => f
                 .debug_struct("TarEntry::Directory")
@@ -1255,59 +1321,45 @@ impl<'a, R: AsyncRead + 'a> std::fmt::Debug for TarEntry<'a, R> {
                 .field("mtime", &dir.mtime)
                 .field("uid", &dir.uid)
                 .field("gid", &dir.gid)
+                .field("attrs", &dir.attrs.len())
                 .finish(),
         }
     }
 }
 
-fn entry_name(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<Box<str>> {
-    let long_path = exts.drain(..).fold(None, |p, e| match e {
-        ExtensionHeader::LongName(name) => Some(name),
-        ExtensionHeader::PosixExtension(ext) => {
-            for (key, val) in ext.iter() {
-                tracing::trace!(target: "tar", "PAX ext key={} val={}", key, val);
-                if key == "path" {
-                    return Some(val.to_string().into_boxed_str());
-                }
-            }
-            p
-        }
-        _ => p,
-    });
-    tracing::trace!(target: "tar", "long_path={:?}", long_path);
+struct PaxInfo {
+    path: Option<Box<str>>,
+    linkpath: Option<Box<str>>,
+    attrs: AttrList,
+}
+
+fn entry_path(hdr: &Header, path: Option<Box<str>>) -> Result<Box<str>> {
+    tracing::trace!(target: "tar", "pax_path={:?}", path);
     match hdr.kind() {
-        HeaderKind::Gnu(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
-        HeaderKind::Ustar(hdr) => Ok(long_path.map_or_else(|| hdr.path_name(), Ok)?),
-        HeaderKind::Old(hdr) => hdr.path_name(),
+        HeaderKind::Gnu(hdr) => Ok(path.map_or_else(|| hdr.path_name(), Ok)?),
+        HeaderKind::Ustar(hdr) => Ok(path.map_or_else(|| hdr.path_name(), Ok)?),
+        HeaderKind::Old(hdr) => path.map_or_else(|| hdr.path_name(), Ok),
     }
 }
-fn entry_name_link(hdr: &Header, exts: &mut Vec<ExtensionHeader>) -> Result<(Box<str>, Box<str>)> {
-    let (long_path, long_link) = exts.drain(..).fold((None, None), |(p, l), e| match e {
-        ExtensionHeader::LongName(name) => (Some(name), l),
-        ExtensionHeader::LongLink(name) => (p, Some(name)),
-        ExtensionHeader::PosixExtension(ext) => {
-            let mut np = p;
-            let mut nl = l;
-            for (key, val) in ext.iter() {
-                if key == "path" {
-                    np = Some(val.to_string().into_boxed_str());
-                } else if key == "linkpath" {
-                    nl = Some(val.to_string().into_boxed_str());
-                }
-            }
-            (np, nl)
-        }
-    });
+
+fn entry_path_link(
+    hdr: &Header,
+    path: Option<Box<str>>,
+    link: Option<Box<str>>,
+) -> Result<(Box<str>, Box<str>)> {
     match hdr.kind() {
         HeaderKind::Gnu(hdr) => Ok((
-            long_path.map_or_else(|| hdr.path_name(), Ok)?,
-            long_link.map_or_else(|| hdr.link_name(), Ok)?,
+            path.map_or_else(|| hdr.path_name(), Ok)?,
+            link.map_or_else(|| hdr.link_name(), Ok)?,
         )),
         HeaderKind::Ustar(hdr) => Ok((
-            long_path.map_or_else(|| hdr.path_name(), Ok)?,
-            long_link.map_or_else(|| hdr.link_name(), Ok)?,
+            path.map_or_else(|| hdr.path_name(), Ok)?,
+            link.map_or_else(|| hdr.link_name(), Ok)?,
         )),
-        HeaderKind::Old(hdr) => Ok((hdr.path_name()?, hdr.link_name()?)),
+        HeaderKind::Old(hdr) => Ok((
+            path.map_or_else(|| hdr.path_name(), Ok)?,
+            link.map_or_else(|| hdr.link_name(), Ok)?,
+        )),
     }
 }
 
@@ -1325,6 +1377,52 @@ fn ext_as_str(hdr: &Header, size: usize, ext: &Option<ExtensionBuffer>) -> Resul
         ext.as_ref().unwrap().as_str(..size)
     }
     .map(|p| p.to_string().into_boxed_str())
+}
+
+fn take_pax_info(exts: &mut Vec<ExtensionHeader>, globs: &[PosixExtension]) -> PaxInfo {
+    let mut info = PaxInfo {
+        path: None,
+        linkpath: None,
+        attrs: AttrList::default(),
+    };
+    for glob in globs {
+        apply_pax_extension(glob, &mut info);
+    }
+    for ext in exts.drain(..) {
+        match ext {
+            ExtensionHeader::LongName(name) => info.path = Some(name),
+            ExtensionHeader::LongLink(name) => info.linkpath = Some(name),
+            ExtensionHeader::PosixExtension(ext) => apply_pax_extension(&ext, &mut info),
+        }
+    }
+    info
+}
+
+fn apply_pax_extension(ext: &PosixExtension, info: &mut PaxInfo) {
+    for (key, val) in ext.iter() {
+        tracing::trace!(target: "tar", "PAX ext key={} val={}", key, val);
+        if key == "path" {
+            info.path = Some(val.to_string().into_boxed_str());
+        } else if key == "linkpath" {
+            info.linkpath = Some(val.to_string().into_boxed_str());
+        } else if let Some(name) = key.strip_prefix("SCHILY.xattr.") {
+            attr_set(&mut info.attrs, name, val.as_bytes());
+        }
+    }
+}
+
+fn attr_set(attrs: &mut AttrList, name: &str, value: &[u8]) {
+    if let Some(pos) = attrs
+        .inner
+        .iter()
+        .position(|(existing, _)| existing.as_ref() == name)
+    {
+        attrs.inner.remove(pos);
+    }
+    attrs.inner.push((
+        name.to_string().into_boxed_str(),
+        value.to_vec().into_boxed_slice(),
+    ));
 }
 
 impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
@@ -1386,9 +1484,15 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                     })?;
                     return Poll::Ready(Some(match kind {
                         Kind::File | Kind::File0 | Kind::Continous => {
+                            let PaxInfo {
+                                path,
+                                linkpath: _,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             let size = this.header.size()?;
-                            let path_name = entry_name(this.header, this.exts)?;
+                            let path_name = entry_path(this.header, path)?;
                             Ok(if path_name.ends_with('/') && this.header.is_old() {
+                                let _ = attrs;
                                 *this.nxt += BLOCK_SIZE as u64;
                                 *this.state = Header;
                                 Entry::Directory(TarDirectory {
@@ -1398,6 +1502,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                     uid: this.header.uid()?,
                                     gid: this.header.gid()?,
                                     path_name,
+                                    attrs,
                                 })
                             } else {
                                 *this.nxt += size;
@@ -1410,14 +1515,20 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                     gid: this.header.gid()?,
                                     eof: *this.nxt,
                                     path_name,
+                                    attrs,
                                 }
                             })
                         }
                         Kind::Directory => {
+                            let PaxInfo {
+                                path,
+                                linkpath: _,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             let size = this.header.size()?;
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
-                            let path_name = entry_name(this.header, this.exts)?;
+                            let path_name = entry_path(this.header, path)?;
                             Ok(Entry::Directory(TarDirectory {
                                 size,
                                 mode: this.header.mode()?,
@@ -1425,24 +1536,36 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 uid: this.header.uid()?,
                                 gid: this.header.gid()?,
                                 path_name,
+                                attrs,
                             }))
                         }
                         Kind::Fifo => {
+                            let PaxInfo {
+                                path,
+                                linkpath: _,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
-                            let path_name = entry_name(this.header, this.exts)?;
+                            let path_name = entry_path(this.header, path)?;
                             Ok(Entry::Fifo(TarFifo {
                                 path_name,
                                 mode: this.header.mode()?,
                                 mtime: this.header.mtime()?,
                                 uid: this.header.uid()?,
                                 gid: this.header.gid()?,
+                                attrs,
                             }))
                         }
                         Kind::CharDevice | Kind::BlockDevice => {
+                            let PaxInfo {
+                                path,
+                                linkpath: _,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
-                            let path_name = entry_name(this.header, this.exts)?;
+                            let path_name = entry_path(this.header, path)?;
                             Ok(Entry::Device(TarDevice {
                                 path_name,
                                 mode: this.header.mode()?,
@@ -1456,21 +1579,35 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 },
                                 major: this.header.dev_major()?,
                                 minor: this.header.dev_minor()?,
+                                attrs,
                             }))
                         }
                         Kind::Link => {
+                            let PaxInfo {
+                                path,
+                                linkpath,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
-                            let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
+                            let (path_name, link_name) =
+                                entry_path_link(this.header, path, linkpath)?;
                             Ok(Entry::Link(TarLink {
                                 path_name,
                                 link_name,
+                                attrs,
                             }))
                         }
                         Kind::Symlink => {
+                            let PaxInfo {
+                                path,
+                                linkpath,
+                                attrs,
+                            } = take_pax_info(this.exts, this.globs);
                             *this.nxt += BLOCK_SIZE as u64;
                             *this.state = Header;
-                            let (path_name, link_name) = entry_name_link(this.header, this.exts)?;
+                            let (path_name, link_name) =
+                                entry_path_link(this.header, path, linkpath)?;
                             Ok(Entry::Symlink(TarSymlink {
                                 mode: this.header.mode()?,
                                 mtime: this.header.mtime()?,
@@ -1478,6 +1615,7 @@ impl<'a, R: AsyncRead + 'a> TarReaderInner<'a, R> {
                                 gid: this.header.gid()?,
                                 path_name,
                                 link_name,
+                                attrs,
                             }))
                         }
                         Kind::PAXLocal | Kind::PAXGlobal if this.header.is_ustar() => {
@@ -1687,6 +1825,7 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
                 gid,
                 eof,
                 path_name,
+                attrs,
             } => TarEntry::File(TarRegularFile {
                 path_name,
                 size,
@@ -1694,7 +1833,7 @@ impl<'a, R: AsyncRead + 'a> Stream for TarReader<'a, R> {
                 mtime,
                 uid,
                 gid,
-                attrs: AttrList::default(),
+                attrs,
                 inner: TarRegularFileReader {
                     eof,
                     inner: Arc::clone(&this.inner),
@@ -2007,15 +2146,11 @@ fn pax_xattr_record(name: &str, value: &[u8]) -> std::io::Result<PaxRecord> {
             "xattr name contains non-portable characters",
         ));
     }
-    Ok(PaxRecord::new(
-        &format!("SCHILY.xattr.{name}"),
-        value,
-    ))
+    Ok(PaxRecord::new(&format!("SCHILY.xattr.{name}"), value))
 }
 
 fn xattr_name_is_pax_safe(name: &str) -> bool {
-    name.bytes()
-        .all(|b| b.is_ascii_graphic() && b != b'=')
+    name.bytes().all(|b| b.is_ascii_graphic() && b != b'=')
 }
 
 fn format_octal(val: u64, field: &mut [u8]) -> std::io::Result<()> {

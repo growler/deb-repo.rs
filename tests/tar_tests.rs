@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::Result;
 use debrepo::tar::{
-    AttrList, TarDevice, TarDirectory, TarEntry, TarReader, TarRegularFile, TarSymlink, TarWriter,
+    AttrList, TarDevice, TarDirectory, TarEntry, TarFifo, TarLink, TarReader, TarRegularFile,
+    TarSymlink, TarWriter,
 };
 use futures::SinkExt;
 use futures_lite::{
@@ -18,6 +19,17 @@ fn fixture(name: &str) -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("tests/data")
         .join(name)
+}
+
+fn assert_attrs_eq(attrs: &AttrList, expected: &[(&str, &[u8])]) {
+    assert_eq!(attrs.len(), expected.len());
+    for (name, value) in expected {
+        assert!(
+            attrs.iter().any(|(n, v)| n == *name && v == *value),
+            "missing attr {}",
+            name
+        );
+    }
 }
 
 #[test]
@@ -326,9 +338,154 @@ fn tar_writer_writes_xattrs() -> Result<()> {
 
         let buffer = shared.lock().unwrap();
         let needle = b"SCHILY.xattr.user.comment=hello";
-        assert!(buffer
-            .windows(needle.len())
-            .any(|window| window == needle));
+        assert!(buffer.windows(needle.len()).any(|window| window == needle));
+        Ok(())
+    })
+}
+
+#[test]
+fn tar_reader_reads_xattrs() -> Result<()> {
+    smol::block_on(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        let attrs = AttrList::new().with("user.comment", b"hello".as_slice());
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new("file.txt", 0, 0, 0, 0o644, 1, Cursor::new(&[][..]))
+                    .with_attrs(attrs),
+            ))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let cursor = Cursor::new(buffer);
+        let reader = TarReader::new(cursor);
+        let mut stream = Box::pin(reader);
+        match stream.next().await.unwrap()? {
+            TarEntry::File(file) => {
+                let attrs = file.attrs();
+                assert_eq!(attrs.len(), 1);
+                let mut iter = attrs.iter();
+                let (name, value) = iter.next().unwrap();
+                assert_eq!(name, "user.comment");
+                assert_eq!(value, b"hello");
+            }
+            other => panic!("expected file entry, got {:?}", other),
+        }
+        Ok(())
+    })
+}
+
+#[test]
+fn tar_round_trip_xattrs_all_kinds() -> Result<()> {
+    smol::block_on(async {
+        let (writer_sink, shared) = VecAsyncWriter::new();
+        let mut writer = TarWriter::<'static, 'static, _, Cursor<&'static [u8]>>::new(writer_sink);
+        const DATA: &[u8] = b"round trip xattrs";
+
+        writer
+            .send(TarEntry::Directory(
+                TarDirectory::new("dir/", 0, 0, 0o755, 1).with_attrs(
+                    AttrList::new()
+                        .with("user.dir", b"dir".as_slice())
+                        .with("user.dir2", b"dir2".as_slice()),
+                ),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::File(
+                TarRegularFile::new(
+                    "dir/file.txt",
+                    DATA.len() as u64,
+                    0,
+                    0,
+                    0o644,
+                    2,
+                    Cursor::new(DATA),
+                )
+                .with_attrs(
+                    AttrList::new()
+                        .with("user.file", b"file".as_slice())
+                        .with("user.file2", b"file2".as_slice()),
+                ),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::Symlink(
+                TarSymlink::new("dir/link", "file.txt", 0, 0, 0o777, 3)
+                    .with_attrs(AttrList::new().with("user.symlink", b"link".as_slice())),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::Link(
+                TarLink::new("dir/hard", "dir/file.txt")
+                    .with_attrs(AttrList::new().with("user.hard", b"hard".as_slice())),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::Fifo(
+                TarFifo::new("dir/fifo", 0, 0, 0o644, 4)
+                    .with_attrs(AttrList::new().with("user.fifo", b"fifo".as_slice())),
+            ))
+            .await?;
+        writer
+            .send(TarEntry::Device(
+                TarDevice::new_char("dir/dev", 1, 3, 0, 0, 0o600, 5)
+                    .with_attrs(AttrList::new().with("user.dev", b"dev".as_slice())),
+            ))
+            .await?;
+        writer.close().await?;
+
+        let buffer = shared.lock().unwrap().clone();
+        let cursor = Cursor::new(buffer);
+        let reader = TarReader::new(cursor);
+        let mut stream = Box::pin(reader);
+        let mut seen = Vec::new();
+        while let Some(entry) = stream.next().await {
+            match entry? {
+                TarEntry::Directory(dir) => {
+                    assert_attrs_eq(dir.attrs(), &[("user.dir", b"dir"), ("user.dir2", b"dir2")]);
+                    seen.push(dir.path().to_string());
+                }
+                TarEntry::File(mut file) => {
+                    let mut buf = Vec::new();
+                    file.read_to_end(&mut buf).await?;
+                    assert_eq!(buf, DATA);
+                    assert_attrs_eq(
+                        file.attrs(),
+                        &[("user.file", b"file"), ("user.file2", b"file2")],
+                    );
+                    seen.push(file.path().to_string());
+                }
+                TarEntry::Symlink(link) => {
+                    assert_attrs_eq(link.attrs(), &[("user.symlink", b"link")]);
+                    seen.push(link.path().to_string());
+                }
+                TarEntry::Link(link) => {
+                    assert_attrs_eq(link.attrs(), &[("user.hard", b"hard")]);
+                    seen.push(link.path().to_string());
+                }
+                TarEntry::Fifo(fifo) => {
+                    assert_attrs_eq(fifo.attrs(), &[("user.fifo", b"fifo")]);
+                    seen.push(fifo.path().to_string());
+                }
+                TarEntry::Device(device) => {
+                    assert_attrs_eq(device.attrs(), &[("user.dev", b"dev")]);
+                    seen.push(device.path().to_string());
+                }
+            }
+        }
+        assert_eq!(
+            seen,
+            vec![
+                "dir/".to_string(),
+                "dir/file.txt".to_string(),
+                "dir/link".to_string(),
+                "dir/hard".to_string(),
+                "dir/fifo".to_string(),
+                "dir/dev".to_string()
+            ]
+        );
         Ok(())
     })
 }
