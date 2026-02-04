@@ -1423,9 +1423,7 @@ impl<'a> ProvidedName<&'a str> {
         ))
     }
     pub fn try_parse_display(s: &'a str) -> Result<ProvidedName<&'a str>, ParseError> {
-        let mut parser = Parser {
-            inp: s.as_bytes(),
-        };
+        let mut parser = Parser { inp: s.as_bytes() };
         let pv = ProvidedName::parse_display(&mut parser)?;
         if parser.is_empty() {
             Ok(pv)

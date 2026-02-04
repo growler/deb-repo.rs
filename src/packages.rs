@@ -522,7 +522,7 @@ impl Packages {
     }
     pub fn archive_id(&self) -> Option<usize> {
         self.archive_id.map(|id| id as usize)
-    } 
+    }
     pub fn with_archive_id(self, archive_id: u32) -> Self {
         Self {
             archive_id: Some(archive_id),
@@ -530,7 +530,11 @@ impl Packages {
             inner: self.inner,
         }
     }
-    pub fn new(data: IndexFile, archive_id: Option<u32>, prio: Option<u32>) -> Result<Self, ParseError> {
+    pub fn new(
+        data: IndexFile,
+        archive_id: Option<u32>,
+        prio: Option<u32>,
+    ) -> Result<Self, ParseError> {
         Ok(Packages {
             archive_id,
             prio: prio.unwrap_or(500),

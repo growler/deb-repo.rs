@@ -95,9 +95,10 @@ impl TransportProvider for HttpTransport {
                     StatusCode::OK => {
                         Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send>>)
                     }
-                    StatusCode::NOT_FOUND => {
-                        Err(io::Error::new(io::ErrorKind::NotFound, format!("not found: {url}")))
-                    }
+                    StatusCode::NOT_FOUND => Err(io::Error::new(
+                        io::ErrorKind::NotFound,
+                        format!("not found: {url}"),
+                    )),
                     code => Err(io::Error::other(format!(
                         "unexpected HTTP response {code}: {url} ",
                     ))),

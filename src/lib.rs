@@ -1,6 +1,7 @@
 //! A Debian repository client library
 
 mod arch;
+mod archive;
 pub mod artifact;
 pub mod auth;
 mod auth_vault;
@@ -19,10 +20,9 @@ mod kvlist;
 mod manifest;
 mod manifest_doc;
 mod packages;
-mod sources;
 mod release;
 pub mod sandbox;
-mod archive;
+mod sources;
 mod spec;
 mod stage;
 mod staging;
@@ -33,13 +33,13 @@ mod version;
 
 pub use {
     arch::DEFAULT_ARCH,
+    archive::{Archive, RepositoryFile, SignedBy, Snapshot, SnapshotId},
     async_compression::Level as CompressionLevel,
     builder::{BuildJob, Executor},
     manifest::Manifest,
     packages::{Package, Packages},
-    sources::{Source, Sources, SourceUniverse},
     release::Release,
-    archive::{RepositoryFile, SignedBy, Snapshot, SnapshotId, Archive},
+    sources::{Source, SourceUniverse, Sources},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
     transport::{HttpTransport, TransportProvider},
     version::{Constraint, Dependency, Version, VersionSet},

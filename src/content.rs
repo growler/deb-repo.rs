@@ -157,10 +157,12 @@ impl<'a> UniverseFiles<'a> {
                 }
             })
             .map_ok(|(id, archive, locked)| {
-                locked
-                    .suites
-                    .iter()
-                    .flat_map(move |suite| suite.sources.iter().map(move |pkg| (id as u32, archive, pkg)))
+                locked.suites.iter().flat_map(move |suite| {
+                    suite
+                        .sources
+                        .iter()
+                        .map(move |pkg| (id as u32, archive, pkg))
+                })
             })
             .flatten_ok()
     }
