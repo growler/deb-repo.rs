@@ -27,6 +27,39 @@ pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
         Self::hash(self.finalize_fixed_reset())
     }
 }
+pub trait Hashable<H: HashAlgo> {
+    fn hash_into(self, hasher: &mut H); 
+}
+impl<H: HashAlgo> Hashable<H> for &[u8] {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(self);
+    }
+}
+impl<H: HashAlgo> Hashable<H> for &str {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(self.as_bytes());
+    }
+}
+impl<H: HashAlgo> Hashable<H> for usize {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(&self.to_le_bytes());
+    }
+}
+impl<H: HashAlgo> Hashable<H> for u64 {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(&self.to_le_bytes());
+    }
+}
+impl<H: HashAlgo> Hashable<H> for u32 {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(&self.to_le_bytes());
+    }
+}
+impl<H: HashAlgo> Hashable<H> for bool {
+    fn hash_into(self, hasher: &mut H) {
+        hasher.update(&[u8::from(self)]);
+    }
+}
 
 impl HashAlgo for sha1::Sha1 {
     const NAME: &'static str = "SHA1";
@@ -102,10 +135,10 @@ impl<D: HashAlgo> InnerHash<D> {
     fn hash_size() -> usize {
         <D as OutputSizeUser>::output_size()
     }
-    fn as_bytes(&self) -> &[u8] {
+    pub fn as_bytes(&self) -> &[u8] {
         &self.inner
     }
-    fn hash(&self) -> Hash {
+    pub fn hash(&self) -> Hash {
         D::hash(self.inner.clone())
     }
     fn reader<'b, R: AsyncRead + Send + 'b>(

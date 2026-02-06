@@ -219,24 +219,31 @@ impl Manifest {
             }))
     }
     fn scripts_for(&self, id: usize) -> io::Result<Vec<&str>> {
-        let mut scripts = self
-            .file
+        Self::scripts_for_spec(&self.file, id)
+    }
+    fn artifacts_for(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Artifact>> + '_ {
+        Self::artifacts_for_spec(&self.file, self.arch.as_str(), id)
+    }
+    fn scripts_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<&str>> {
+        let mut scripts = file
             .ancestors(id)
             .filter_map_ok(|spec| spec.run.as_deref())
             .collect::<io::Result<Vec<_>>>()?;
         scripts.reverse();
         Ok(scripts)
     }
-    fn artifacts_for(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Artifact>> + '_ {
-        let arch = self.arch.as_str();
-        self.file
-            .ancestors(id)
+    fn artifacts_for_spec<'a>(
+        file: &'a ManifestFile,
+        arch: &'a str,
+        id: usize,
+    ) -> impl Iterator<Item = io::Result<&'a Artifact>> + 'a {
+        file.ancestors(id)
             .map_ok(|spec| spec.stage.iter().map(String::as_str))
             .flatten_ok()
             .filter_map(move |artifact| {
                 artifact
                     .and_then(|artifact| {
-                        let artifact = self.file.artifact(artifact).ok_or_else(|| {
+                        let artifact = file.artifact(artifact).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!("missing artifact '{}' in spec stage list", artifact),
@@ -256,6 +263,42 @@ impl Manifest {
                     .transpose()
             })
     }
+    fn spec_hasher(
+        file: &ManifestFile,
+        arch: &str,
+        spec_index: usize,
+    ) -> io::Result<blake3::Hasher> {
+        use digest::FixedOutput;
+        let mut hasher = blake3::Hasher::default();
+        let scripts = Self::scripts_for_spec(file, spec_index)?;
+        for script in scripts {
+            let mut h = blake3::Hasher::default();
+            h.update(script.as_bytes());
+            hasher.update(&h.finalize_fixed());
+        }
+        let artifacts =
+            Self::artifacts_for_spec(file, arch, spec_index).collect::<io::Result<Vec<_>>>()?;
+        for artifact in artifacts {
+            artifact.update_spec_hash(&mut hasher);
+        }
+        Ok(hasher)
+    }
+    fn refresh_spec_hashes(&mut self, spec_index: usize) -> io::Result<()> {
+        let file = &self.file;
+        let arch = self.arch.as_str();
+        for idx in file.descendants(spec_index).into_iter() {
+            let lock = self.lock.get_spec_mut(idx);
+            if !lock.is_locked() {
+                continue;
+            }
+            let mut hasher = Self::spec_hasher(file, arch, idx)?;
+            for pkg in lock.installables() {
+                hasher.update(pkg.file.hash.as_ref());
+            }
+            lock.hash = Some(hasher.into_hash());
+        }
+        Ok(())
+    }
     fn invalidate_locked_specs(&mut self, spec: usize) {
         for spec_index in self.file.descendants(spec).into_iter() {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
@@ -271,9 +314,12 @@ impl Manifest {
     where
         C: ContentProvider,
     {
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         let staged = Artifact::new(artifact, cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
         Ok(())
     }
     pub fn remove_artifact<S: AsRef<str>>(
@@ -281,8 +327,11 @@ impl Manifest {
         spec_name: Option<&str>,
         artifact: S,
     ) -> io::Result<()> {
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.remove_artifact(spec_name, artifact.as_ref())?;
         self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
         Ok(())
     }
     pub fn add_requirements<S, I>(
@@ -570,101 +619,86 @@ impl Manifest {
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
-        let mut updated = false;
         self.load_universe(concurrency, cache).await?;
-        let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
-        let archives = self.file.archives();
-        let artifacts = self.file.artifacts();
-        std::iter::zip(self.file.specs().enumerate(), self.lock.specs_mut())
-            .filter_map(|((id, (ns, s)), (nl, l))| {
-                debug_assert_eq!(ns, nl);
-                (!l.is_locked()).then_some((id, ns, s, l))
-            })
-            .try_for_each(|(spec_index, spec_name, spec, lock)| {
-                tracing::debug!("resolving spec {}", spec_display_name(spec_name));
-                use digest::FixedOutput;
-                let mut hasher = blake3::Hasher::default();
-                let (reqs, cons) = self.file.requirements_for(spec_index)?;
-                let solvables = universe.solve(reqs, cons).map_err(|conflict| {
-                    io::Error::other(format!(
-                        "failed to solve spec {}:\n{}",
-                        spec_display_name(spec_name),
-                        universe.display_conflict(conflict)
-                    ))
-                })?;
-                if let Some(script) = spec.run.as_deref() {
-                    let mut h = blake3::Hasher::default();
-                    h.update(script.as_bytes());
-                    hasher.update(&h.finalize_fixed());
-                }
-                for aritfact_id in &spec.stage {
-                    let aritfact = artifacts
-                        .iter()
-                        .find(|a| a.uri() == aritfact_id)
-                        .ok_or_else(|| {
-                            io::Error::other(format!(
-                                "missing artifact '{}' to stage in spec {}",
-                                aritfact_id,
-                                spec_display_name(spec_name)
-                            ))
-                        })?;
-                    hasher.update(aritfact.hash().as_ref());
-                }
-                let sorted = universe.installation_order(&solvables);
-                let installables = sorted
-                    .into_iter()
-                    .enumerate()
-                    .flat_map(|(order, solvables)| {
-                        solvables.into_iter().map(move |solvable| (order, solvable))
-                    })
-                    .map(|(order, solvable)| {
-                        let (pkgs, pkg) = universe.package_with_pkgs(solvable).unwrap();
-                        let archive = pkgs
-                            .archive_id()
-                            .map(|id| {
-                                archives.get(id).ok_or_else(|| {
-                                    io::Error::other(format!(
-                                        "invalid archive index {} for package {} in spec {}",
-                                        id,
-                                        pkg.name(),
-                                        spec_display_name(spec_name)
-                                    ))
-                                })
-                            })
-                            .transpose()?;
-                        let name = pkg.name().to_string();
-                        let hash_kind = archive.map_or("SHA256", |archive| archive.hash.name());
-                        let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
-                            io::Error::other(format!(
-                                "failed to parse package {} record while processing spec {}: {}",
-                                pkg.name(),
-                                spec_display_name(spec_name),
-                                err
-                            ))
-                        })?;
-                        hasher.update(hash.as_ref());
-                        Ok(LockedPackage {
-                            file: RepositoryFile {
-                                path: path.to_string(),
-                                size,
-                                hash,
-                            },
-                            idx: solvable.into(),
-                            order: order as u32,
-                            orig: pkgs.archive_id().map(|id| id as u32),
-                            name,
+        let updated = {
+            let file = &self.file;
+            let arch = self.arch.as_str();
+            let archives = file.archives();
+            let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
+            let mut updated = false;
+            std::iter::zip(file.specs().enumerate(), self.lock.specs_mut())
+                .filter_map(|((id, (ns, s)), (nl, l))| {
+                    debug_assert_eq!(ns, nl);
+                    (!l.is_locked()).then_some((id, ns, s, l))
+                })
+                .try_for_each(|(spec_index, spec_name, _spec, lock)| {
+                    tracing::debug!("resolving spec {}", spec_display_name(spec_name));
+                    let (reqs, cons) = file.requirements_for(spec_index)?;
+                    let mut hasher = Self::spec_hasher(file, arch, spec_index)?;
+                    let solvables = universe.solve(reqs, cons).map_err(|conflict| {
+                        io::Error::other(format!(
+                            "failed to solve spec {}:\n{}",
+                            spec_display_name(spec_name),
+                            universe.display_conflict(conflict)
+                        ))
+                    })?;
+                    let sorted = universe.installation_order(&solvables);
+                    let installables = sorted
+                        .into_iter()
+                        .enumerate()
+                        .flat_map(|(order, solvables)| {
+                            solvables.into_iter().map(move |solvable| (order, solvable))
                         })
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                *lock = LockedSpec {
-                    installables: Some(installables),
-                    hash: Some(hasher.into_hash()),
-                };
-                if !updated {
-                    updated = true;
-                }
-                Ok::<(), io::Error>(())
-            })?;
+                        .map(|(order, solvable)| {
+                            let (pkgs, pkg) = universe.package_with_pkgs(solvable).unwrap();
+                            let archive = pkgs
+                                .archive_id()
+                                .map(|id| {
+                                    archives.get(id).ok_or_else(|| {
+                                        io::Error::other(format!(
+                                            "invalid archive index {} for package {} in spec {}",
+                                            id,
+                                            pkg.name(),
+                                            spec_display_name(spec_name)
+                                        ))
+                                    })
+                                })
+                                .transpose()?;
+                            let name = pkg.name().to_string();
+                            let hash_kind = archive.map_or("SHA256", |archive| archive.hash.name());
+                            let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
+                                io::Error::other(format!(
+                                    "failed to parse package {} record while processing spec {}: {}",
+                                    pkg.name(),
+                                    spec_display_name(spec_name),
+                                    err
+                                ))
+                            })?;
+                            hasher.update(hash.as_ref());
+                            Ok(LockedPackage {
+                                file: RepositoryFile {
+                                    path: path.to_string(),
+                                    size,
+                                    hash,
+                                },
+                                idx: solvable.into(),
+                                order: order as u32,
+                                orig: pkgs.archive_id().map(|id| id as u32),
+                                name,
+                            })
+                        })
+                        .collect::<io::Result<Vec<_>>>()?;
+                    *lock = LockedSpec {
+                        installables: Some(installables),
+                        hash: Some(hasher.into_hash()),
+                    };
+                    if !updated {
+                        updated = true;
+                    }
+                    Ok::<(), io::Error>(())
+                })?;
+            updated
+        };
         if updated {
             self.mark_lock_updated();
         }

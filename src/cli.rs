@@ -30,10 +30,11 @@ pub mod cmd {
     use {
         super::*,
         crate::{
-            artifact::ArtifactArg,
+            artifact::{hash_directory, ArtifactArg},
             builder::Executor,
             comp::is_comp_ext,
             content::{ContentProviderGuard, HostCache},
+            hash::{Hash, HashAlgo, HashingReader},
             manifest::Manifest,
             sandbox::HostSandboxExecutor,
             staging::HostFileSystem,
@@ -44,7 +45,7 @@ pub mod cmd {
         indicatif::ProgressBar,
         itertools::Itertools,
         rustix::path::Arg,
-        smol::io::AsyncWriteExt,
+        smol::io::{AsyncReadExt, AsyncWriteExt},
         std::path::PathBuf,
     };
     #[derive(Parser)]
@@ -732,6 +733,177 @@ hash = \"{}\"
                     }
                 }
                 out.flush().await?;
+                Ok(())
+            })
+        }
+    }
+
+    fn normalize_hash_name(name: &str) -> Result<&'static str> {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(anyhow!("hash name cannot be empty"));
+        }
+        match name.to_ascii_lowercase().as_str() {
+            "md5" | "md5sum" => Ok("md"),
+            "sha1" => Ok("sha1"),
+            "sha256" => Ok("sha256"),
+            "sha512" => Ok("sha512"),
+            "blake3" => Ok("blake3"),
+            _ => Err(anyhow!(
+                "unsupported hash {}, expected one of: md5, sha1, sha256, sha512, blake3",
+                name
+            )),
+        }
+    }
+
+    async fn hash_stream<D: HashAlgo, R: smol::io::AsyncRead + Send + Unpin>(
+        reader: R,
+    ) -> Result<Hash> {
+        let mut reader = HashingReader::<D, _>::new(reader);
+        let mut buf = [0u8; 32 * 1024];
+        loop {
+            let read = reader.read(&mut buf).await?;
+            if read == 0 {
+                break;
+            }
+        }
+        Ok(reader.into_hash())
+    }
+
+    async fn hash_stream_for<R: smol::io::AsyncRead + Send + Unpin>(
+        hash_name: &str,
+        reader: R,
+    ) -> Result<Hash> {
+        let mut reader = Some(reader);
+        match hash_name {
+            md5::Md5::SRI_NAME => hash_stream::<md5::Md5, _>(reader.take().unwrap()).await,
+            sha1::Sha1::SRI_NAME => hash_stream::<sha1::Sha1, _>(reader.take().unwrap()).await,
+            sha2::Sha256::SRI_NAME => hash_stream::<sha2::Sha256, _>(reader.take().unwrap()).await,
+            sha2::Sha512::SRI_NAME => hash_stream::<sha2::Sha512, _>(reader.take().unwrap()).await,
+            blake3::Hasher::SRI_NAME => hash_stream::<blake3::Hasher, _>(reader.take().unwrap()).await,
+            other => Err(anyhow!("hash {} not supported", other)),
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum ToolCommands {
+        HexToSri(ToolHexToSri),
+        SriToHex(ToolSriToHex),
+        Hash(ToolHash),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Internal tooling helpers", hide = true)]
+    pub struct Tool {
+        #[command(subcommand)]
+        cmd: ToolCommands,
+    }
+
+    impl<C: Config> Command<C> for Tool {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                ToolCommands::HexToSri(cmd) => cmd.exec(conf),
+                ToolCommands::SriToHex(cmd) => cmd.exec(conf),
+                ToolCommands::Hash(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        name = "hex-to-sri",
+        about = "Convert a hex digest to SRI format",
+        long_about = "Convert a hex digest and hash name to SRI (Subresource Integrity) format."
+    )]
+    pub struct ToolHexToSri {
+        #[arg(value_name = "HASH_NAME")]
+        hash: String,
+        #[arg(value_name = "HEX_DIGEST")]
+        digest: String,
+    }
+
+    impl<C: Config> Command<C> for ToolHexToSri {
+        fn exec(&self, _conf: &C) -> Result<()> {
+            let name = normalize_hash_name(&self.hash)?;
+            let hash = Hash::from_hex(name, &self.digest)
+                .map_err(|err| anyhow!("error decoding hex digest: {}", err))?;
+            println!("{}", hash.to_sri());
+            Ok(())
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        name = "sri-to-hex",
+        about = "Convert an SRI digest to hex",
+        long_about = "Convert an SRI (Subresource Integrity) digest to hexadecimal."
+    )]
+    pub struct ToolSriToHex {
+        #[arg(value_name = "SRI_DIGEST")]
+        digest: String,
+    }
+
+    impl<C: Config> Command<C> for ToolSriToHex {
+        fn exec(&self, _conf: &C) -> Result<()> {
+            let hash = Hash::from_sri(&self.digest)
+                .map_err(|err| anyhow!("error decoding SRI digest: {}", err))?;
+            println!("{}", hash.to_hex());
+            Ok(())
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        name = "hash",
+        about = "Hash a file, directory, or stdin",
+        long_about = "Hash a file, directory, or stdin. For directories the artifact tree hash (blake3) is used."
+    )]
+    pub struct ToolHash {
+        #[arg(value_name = "HASH_NAME")]
+        hash: String,
+        /// Output in SRI format instead of hex
+        #[arg(long = "sri", conflicts_with = "hex", action)]
+        sri: bool,
+        /// Output in hex (default)
+        #[arg(long = "hex", conflicts_with = "sri", action)]
+        hex: bool,
+        /// File or directory to hash (stdin if omitted)
+        #[arg(value_name = "PATH")]
+        path: Option<PathBuf>,
+    }
+
+    impl<C: Config> Command<C> for ToolHash {
+        fn exec(&self, _conf: &C) -> Result<()> {
+            let name = normalize_hash_name(&self.hash)?;
+            let use_sri = self.sri;
+            smol::block_on(async move {
+                let hash = if let Some(path) = self.path.as_ref() {
+                    let meta = smol::fs::symlink_metadata(path)
+                        .await
+                        .map_err(|err| {
+                            anyhow!("failed to stat {}: {}", path.display(), err)
+                        })?;
+                    if meta.is_dir() {
+                        let (hash, _) = hash_directory(path, name).await.map_err(|err| {
+                            anyhow!("failed to hash directory {}: {}", path.display(), err)
+                        })?;
+                        hash
+                    } else {
+                        let file = smol::fs::File::open(path).await.map_err(|err| {
+                            anyhow!("failed to open {}: {}", path.display(), err)
+                        })?;
+                        hash_stream_for(name, file).await?
+                    }
+                } else {
+                    let stdin = async_io::Async::new(std::io::stdin())
+                        .map_err(|err| anyhow!("failed to read stdin: {}", err))?;
+                    hash_stream_for(name, stdin).await?
+                };
+                if use_sri {
+                    println!("{}", hash.to_sri());
+                } else {
+                    println!("{}", hash.to_hex());
+                }
                 Ok(())
             })
         }

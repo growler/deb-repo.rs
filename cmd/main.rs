@@ -180,6 +180,8 @@ debrepo::cli_commands! {
         List(cli::cmd::List),
         Search(cli::cmd::Search),
         Show(cli::cmd::Show),
+        #[command(hide = true)]
+        Tool(cli::cmd::Tool),
     }
 }
 

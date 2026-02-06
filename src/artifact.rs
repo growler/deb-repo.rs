@@ -2,7 +2,7 @@ use {
     crate::{
         comp::{comp_reader, is_comp_ext, is_tar_ext, tar_reader},
         content::ContentProvider,
-        hash::{AsyncHashingRead, Hash, HashAlgo, HashingReader},
+        hash::{AsyncHashingRead, Hash, HashAlgo, Hashable, HashingReader},
         is_url,
         staging::{FileList, Stage, StagingFile, StagingFileSystem},
         tar,
@@ -104,6 +104,8 @@ pub struct FileReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
     target: String,
     inner: R,
     mode: Option<NonZero<u32>>,
+    uri: String,
+    unpack: bool,
     size: Option<NonZero<usize>>,
     _marker: std::marker::PhantomData<&'a ()>,
     _marker_fs: std::marker::PhantomData<fn(&FS)>,
@@ -293,6 +295,13 @@ impl Artifact {
             Artifact::File(inner) => Some(&inner.target),
         }
     }
+    pub fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
+        match self {
+            Artifact::Tar(inner) => inner.update_spec_hash(hasher),
+            Artifact::Dir(inner) => inner.update_spec_hash(hasher),
+            Artifact::File(inner) => inner.update_spec_hash(hasher),
+        }
+    }
     pub fn arch(&self) -> Option<&str> {
         match self {
             Artifact::Tar(inner) => inner.arch.as_deref(),
@@ -325,6 +334,23 @@ impl Artifact {
 }
 
 impl Tar {
+    fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
+        "tar".hash_into(hasher);
+        if let Some(arch) = self.arch.as_deref() {
+            true.hash_into(hasher);
+            arch.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.uri.hash_into(hasher);
+        if let Some(target) = self.target.as_deref() {
+            true.hash_into(hasher);
+            target.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.hash.as_bytes().hash_into(hasher);
+    }
     pub async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
         path: P,
@@ -521,6 +547,23 @@ where
 }
 
 impl Tree {
+    fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
+        "dir".hash_into(hasher);
+        if let Some(arch) = self.arch.as_deref() {
+            true.hash_into(hasher);
+            arch.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.path.hash_into(hasher);
+        if let Some(target) = self.target.as_deref() {
+            true.hash_into(hasher);
+            target.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.hash.as_bytes().hash_into(hasher);
+    }
     async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
         &mut self,
         path: P,
@@ -539,7 +582,9 @@ impl Tree {
                 err
             ))
         })?;
-        tree::copy_hash_dir(&fd, fs, self.target.as_deref()).await
+        tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, self.target.as_deref())
+            .await
+            .map(|(hash, size)| (hash.hash(), size))
     }
     async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
         let fd = openat(
@@ -548,10 +593,9 @@ impl Tree {
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )?;
-        let (merkle, size) = tree::hash_dir(fd).await?;
-        self.hash = merkle.clone();
-        self.size = size;
-        Ok((merkle, size))
+        tree::hash_dir_inner::<blake3::Hasher>(fd)
+            .await
+            .map(|(hash, size)| (hash.hash(), size))
     }
     async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
@@ -573,6 +617,23 @@ impl Tree {
     }
 }
 
+pub(crate) async fn hash_directory<P: AsRef<Path>>(path: P, hash: &str) -> io::Result<(Hash, u64)> {
+    let fd = openat(
+        CWD,
+        path.as_ref(),
+        OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    )
+    .map_err(|err| {
+        io::Error::other(format!(
+            "failed to open directory {}: {}",
+            path.as_ref().display(),
+            err
+        ))
+    })?;
+    tree::hash_dir(fd, hash).await
+}
+
 impl<FS> Stage for TreeReader<FS>
 where
     FS: StagingFileSystem + ?Sized,
@@ -587,7 +648,9 @@ where
             if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
                 fs.create_dir_all(parent, 0, 0, 0o755).await?;
             }
-            let (hash, _) = tree::copy_hash_dir(&self.dir, fs, self.target.as_deref()).await?;
+            let (hash, _) =
+                tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.sri_name())
+                    .await?;
             if hash != self.hash {
                 Err(io::Error::other("hash mismatch after copying local tree"))
             } else {
@@ -598,6 +661,20 @@ where
 }
 
 impl File {
+    fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
+        "file".hash_into(hasher);
+        if let Some(arch) = self.arch.as_deref() {
+            true.hash_into(hasher);
+            arch.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.uri.hash_into(hasher);
+        self.target.hash_into(hasher);
+        let mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
+        mode.hash_into(hasher);
+        self.unpack.unwrap_or(true).hash_into(hasher);
+    }
     async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
         path: P,
@@ -613,6 +690,8 @@ impl File {
             inner: self.hash.reader(self.size, r),
             target: self.target.clone(),
             mode: self.mode,
+            uri: self.uri.clone(),
+            unpack: self.unpack.unwrap_or(true),
             size: Some(NonZero::new(self.size as usize).unwrap()),
             _marker: std::marker::PhantomData,
             _marker_fs: std::marker::PhantomData,
@@ -689,22 +768,8 @@ impl File {
         if self.mode.is_none() && st_mode != 0o644 {
             self.mode = Some(NonZero::new(st_mode as u32).unwrap());
         }
-        let (hash, size) = if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
-            let mut digester = blake3::Hasher::new();
-            digester.update(&u32::to_le_bytes(st_mode));
-            let mut reader = HashingReader::<blake3::Hasher, _>::new_with_digester(
-                digester,
-                smol::fs::File::from(fd),
-            );
-            smol::io::copy(comp_reader(&self.uri, &mut reader), smol::io::sink()).await?;
-            reader.into_hash_and_size()
-        } else if stat.st_size < 65_536 {
-            let mut digester = blake3::Hasher::new();
-            digester.update(&u32::to_le_bytes(st_mode));
-            let mut reader = HashingReader::<blake3::Hasher, _>::new_with_digester(
-                digester,
-                smol::fs::File::from(fd),
-            );
+        let (hash, size) = if stat.st_size < 65_536 {
+            let mut reader = HashingReader::<blake3::Hasher, _>::new(smol::fs::File::from(fd));
             smol::io::copy(&mut reader, smol::io::sink()).await?;
             reader.into_hash_and_size()
         } else {
@@ -712,7 +777,6 @@ impl File {
                 let map = unsafe { memmap2::Mmap::map(fd.as_raw_fd()) }?;
                 map.advise(memmap2::Advice::Sequential)?;
                 let mut hasher = blake3::Hasher::new();
-                hasher.update(&u32::to_le_bytes(st_mode));
                 hasher.update(&map[..]);
                 Ok::<_, io::Error>(hasher.into_hash())
             })
@@ -729,32 +793,15 @@ impl File {
         fs: &FS,
     ) -> io::Result<(Hash, u64)> {
         let st_mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
-        let mut digester = blake3::Hasher::new();
-        digester.update(&u32::to_le_bytes(st_mode));
-        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new_with_digester(
-            digester, r
-        ));
+        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
         if let Some(parent) = Path::new(&self.target).parent() {
             fs.create_dir_all(parent, 0, 0, 0o755).await?;
         }
         if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
-            fs.create_file(
-                comp_reader(&self.uri, &mut reader),
-                0,
-                0,
-                self.mode.map_or(0o644, |m| m.get() & 0o7777),
-                None,
-            )
-            .await?
+            fs.create_file(comp_reader(&self.uri, &mut reader), 0, 0, st_mode, None)
+                .await?
         } else {
-            fs.create_file(
-                &mut reader,
-                0,
-                0,
-                self.mode.map_or(0o644, |m| m.get() & 0o7777),
-                None,
-            )
-            .await?
+            fs.create_file(&mut reader, 0, 0, st_mode, None).await?
         }
         .persist(&self.target)
         .await?;
@@ -766,17 +813,8 @@ impl File {
         &mut self,
         r: R,
     ) -> io::Result<(Hash, u64)> {
-        let st_mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
-        let mut digester = blake3::Hasher::new();
-        digester.update(&u32::to_le_bytes(st_mode));
-        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new_with_digester(
-            digester, r
-        ));
-        if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
-            smol::io::copy(comp_reader(&self.uri, &mut reader), smol::io::sink()).await?;
-        } else {
-            smol::io::copy(&mut reader, smol::io::sink()).await?;
-        }
+        let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
+        smol::io::copy(&mut reader, smol::io::sink()).await?;
         self.size = reader.as_mut().size();
         self.hash = reader.as_mut().hash();
         Ok((self.hash.clone(), self.size))
@@ -789,6 +827,8 @@ impl File {
             inner: self.hash.reader(self.size, r),
             target: self.target.clone(),
             mode: self.mode,
+            uri: self.uri.clone(),
+            unpack: self.unpack.unwrap_or(true),
             size: Some(NonZero::new(self.size as usize).unwrap()),
             _marker: std::marker::PhantomData,
             _marker_fs: std::marker::PhantomData,
@@ -812,16 +852,29 @@ where
             if let Some(parent) = Path::new(&self.target).parent() {
                 fs.create_dir_all(parent, 0, 0, 0o755).await?;
             }
-            fs.create_file(
-                &mut self.inner,
-                0,
-                0,
-                self.mode.map_or(0o644, |m| m.get() & 0o7777),
-                self.size.map(|s| s.get()),
-            )
-            .await?
-            .persist(&self.target)
-            .await
+            if self.unpack && is_comp_ext(self.uri.as_bytes()) {
+                fs.create_file(
+                    comp_reader(&self.uri, &mut self.inner),
+                    0,
+                    0,
+                    self.mode.map_or(0o644, |m| m.get() & 0o7777),
+                    None,
+                )
+                .await?
+                .persist(&self.target)
+                .await
+            } else {
+                fs.create_file(
+                    &mut self.inner,
+                    0,
+                    0,
+                    self.mode.map_or(0o644, |m| m.get() & 0o7777),
+                    self.size.map(|s| s.get()),
+                )
+                .await?
+                .persist(&self.target)
+                .await
+            }
         })
     }
 }
@@ -836,11 +889,10 @@ mod tree {
     use {
         super::mode,
         crate::{
-            hash::{Hash, HashingReader},
+            hash::{Hash, HashAlgo, HashingReader, InnerHash},
             StagingFile, StagingFileSystem,
         },
         async_channel as chan,
-        digest::{FixedOutput, Output},
         futures::stream::{self, StreamExt, TryStreamExt},
         itertools::Itertools,
         rustix::{
@@ -910,14 +962,49 @@ mod tree {
         }
     }
 
-    type NodeHasher = blake3::Hasher;
-    type NodeHash = Output<NodeHasher>;
-
     pub(super) async fn copy_hash_dir<Fd: AsFd, FS: StagingFileSystem + ?Sized>(
         fd: Fd,
         fs: &FS,
         target_path: Option<&str>,
+        hash: &str,
     ) -> io::Result<(Hash, u64)> {
+        match hash {
+            md5::Md5::SRI_NAME => copy_hash_dir_inner::<md5::Md5, _, _>(fd, fs, target_path)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha1::Sha1::SRI_NAME => copy_hash_dir_inner::<sha1::Sha1, _, _>(fd, fs, target_path)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha2::Sha256::SRI_NAME => {
+                copy_hash_dir_inner::<sha2::Sha256, _, _>(fd, fs, target_path)
+                    .await
+                    .map(|(hash, size)| (hash.hash(), size))
+            }
+            sha2::Sha512::SRI_NAME => {
+                copy_hash_dir_inner::<sha2::Sha512, _, _>(fd, fs, target_path)
+                    .await
+                    .map(|(hash, size)| (hash.hash(), size))
+            }
+            blake3::Hasher::SRI_NAME => {
+                copy_hash_dir_inner::<blake3::Hasher, _, _>(fd, fs, target_path)
+                    .await
+                    .map(|(hash, size)| (hash.hash(), size))
+            }
+            _ => io::Result::Err(io::Error::other(format!(
+                "unsupported hash algorithm for directory artifact: {hash}"
+            ))),
+        }
+    }
+
+    pub(super) async fn copy_hash_dir_inner<
+        H: HashAlgo,
+        Fd: AsFd,
+        FS: StagingFileSystem + ?Sized,
+    >(
+        fd: Fd,
+        fs: &FS,
+        target_path: Option<&str>,
+    ) -> io::Result<(InnerHash<H>, u64)> {
         process(fd, &|obj| async {
             match obj {
                 Object::Symlink { path, target } => {
@@ -945,35 +1032,62 @@ mod tree {
                     } else {
                         path
                     };
-                    let mut rd = HashingReader::<blake3::Hasher, _>::new(smol::fs::File::from(fd));
+                    let mut rd = HashingReader::<H, _>::new(smol::fs::File::from(fd));
                     let file = fs
                         .create_file(&mut rd, 0, 0, stat.st_mode, Some(stat.st_size as usize))
                         .await?;
                     file.persist(path).await?;
-                    Ok(Some(rd.into_hash_output()))
+                    let hash: InnerHash<H> = rd.into_hash_output().into();
+                    Ok(Some(hash))
                 }
             }
         })
         .await
     }
 
-    pub(super) async fn hash_dir(fd: OwnedFd) -> io::Result<(Hash, u64)> {
+    pub(super) async fn hash_dir(fd: OwnedFd, hash: &str) -> io::Result<(Hash, u64)> {
+        match hash {
+            md5::Md5::SRI_NAME => hash_dir_inner::<md5::Md5>(fd)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha1::Sha1::SRI_NAME => hash_dir_inner::<sha1::Sha1>(fd)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha2::Sha256::SRI_NAME => hash_dir_inner::<sha2::Sha256>(fd)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha2::Sha512::SRI_NAME => hash_dir_inner::<sha2::Sha512>(fd)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            blake3::Hasher::SRI_NAME => hash_dir_inner::<blake3::Hasher>(fd)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            _ => io::Result::Err(io::Error::other(format!(
+                "unsupported hash algorithm for directory artifact: {hash}"
+            ))),
+        }
+    }
+
+    pub(super) async fn hash_dir_inner<H: HashAlgo + 'static>(
+        fd: OwnedFd,
+    ) -> io::Result<(InnerHash<H>, u64)> {
         let pool = SmallBlockingPool::new(num_cpus::get().saturating_mul(2), "hash-pool");
         process(fd, &|obj| async {
             match obj {
                 Object::Symlink { .. } => Ok(None),
                 Object::Directory { .. } => Ok(None),
                 Object::RegularFile { fd, stat, path } => {
-                    let mut hasher = NodeHasher::new();
                     let hash = if stat.st_size < 16 * 1024 {
-                        hasher.update_reader(std::fs::File::from(fd))?;
-                        Ok(hasher.finalize_fixed())
+                        let mut reader = HashingReader::<H, _>::new(smol::fs::File::from(fd));
+                        smol::io::copy(&mut reader, smol::io::sink()).await?;
+                        Ok(reader.into_hash_output().into())
                     } else {
+                        let mut hasher = H::default();
                         pool.spawn(move || {
                             let map = unsafe { memmap2::Mmap::map(fd.as_raw_fd()) }?;
                             map.advise(memmap2::Advice::Sequential)?;
                             hasher.update(&map[..]);
-                            Ok::<_, io::Error>(hasher.finalize_fixed())
+                            Ok::<_, io::Error>(hasher.finalize_fixed().into())
                         })
                         .await
                     }
@@ -987,31 +1101,32 @@ mod tree {
         .await
     }
 
-    async fn process<Fd, F, Fut>(fd: Fd, f: &F) -> io::Result<(Hash, u64)>
+    async fn process<H, Fd, F, Fut>(fd: Fd, f: &F) -> io::Result<(InnerHash<H>, u64)>
     where
+        H: HashAlgo,
         Fd: AsFd,
         F: Fn(Object) -> Fut,
-        Fut: std::future::Future<Output = io::Result<Option<NodeHash>>>,
+        Fut: std::future::Future<Output = io::Result<Option<InnerHash<H>>>>,
     {
-        let (hash, size) = process_fs_object(
+        process_fs_object(
             PathBuf::from_str("").unwrap().as_ref(),
             fd,
             OsStr::from_bytes(b".").to_owned(),
             f,
         )
-        .await?;
-        Ok((Hash::new_from_hash::<NodeHasher>(hash), size))
+        .await
     }
 
-    async fn process_fs_object<F, Fut>(
+    async fn process_fs_object<H, F, Fut>(
         parent: &Path,
         parent_dfd: impl AsFd,
         name: OsString,
         f: &F,
-    ) -> io::Result<(NodeHash, u64)>
+    ) -> io::Result<(InnerHash<H>, u64)>
     where
+        H: HashAlgo,
         F: Fn(Object) -> Fut,
-        Fut: std::future::Future<Output = io::Result<Option<NodeHash>>>,
+        Fut: std::future::Future<Output = io::Result<Option<InnerHash<H>>>>,
     {
         let fd = match openat2(
             parent_dfd.as_fd(),
@@ -1032,7 +1147,7 @@ mod tree {
         };
         let stat = fstat(&fd)?;
         let path = parent.join(&name);
-        let mut hasher = NodeHasher::new();
+        let mut hasher = H::default();
         hasher.update(&mode(stat.st_mode).to_le_bytes());
         hasher.update(name.as_encoded_bytes());
         match FileType::from_raw_mode(stat.st_mode) {
@@ -1040,20 +1155,20 @@ mod tree {
                 let file_hash = f(Object::RegularFile { path, stat, fd })
                     .await?
                     .expect("file hash");
-                hasher.update(&file_hash);
-                Ok((hasher.finalize_fixed(), stat.st_size as u64))
+                hasher.update(file_hash.as_bytes());
+                Ok((hasher.finalize_fixed().into(), stat.st_size as u64))
             }
             FileType::Symlink => {
                 let target = readlinkat(&fd, c"", [])?;
                 hasher.update(target.as_bytes());
                 f(Object::Symlink { path, target }).await?;
-                Ok((hasher.finalize_fixed(), 1))
+                Ok((hasher.finalize_fixed().into(), 1))
             }
             FileType::Directory => {
-                let (dir_hash, dir_size) = process_dir(path.clone(), fd, f).await?;
-                hasher.update(&dir_hash);
+                let (dir_hash, dir_size) = process_dir::<H, _, _>(path.clone(), fd, f).await?;
+                hasher.update(dir_hash.as_bytes());
                 f(Object::Directory { path, stat }).await?;
-                Ok((hasher.finalize_fixed(), dir_size))
+                Ok((hasher.finalize_fixed().into(), dir_size))
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -1062,10 +1177,15 @@ mod tree {
         }
     }
 
-    async fn process_dir<F, Fut>(path: PathBuf, fd: OwnedFd, f: &F) -> io::Result<(NodeHash, u64)>
+    async fn process_dir<H, F, Fut>(
+        path: PathBuf,
+        fd: OwnedFd,
+        f: &F,
+    ) -> io::Result<(InnerHash<H>, u64)>
     where
+        H: HashAlgo,
         F: Fn(Object) -> Fut,
-        Fut: std::future::Future<Output = io::Result<Option<NodeHash>>>,
+        Fut: std::future::Future<Output = io::Result<Option<InnerHash<H>>>>,
     {
         let dir = Dir::read_from(&fd)?;
         let mut entries = dir
@@ -1076,17 +1196,17 @@ mod tree {
         let (hasher, size) = stream::iter(
             entries
                 .into_iter()
-                .map(|entry| process_fs_object(&path, &fd, entry, f)),
+                .map(|entry| process_fs_object::<H, _, _>(&path, &fd, entry, f)),
         )
         .buffered(16)
         .try_fold(
-            (NodeHasher::new(), 0u64),
+            (H::default(), 0u64),
             |(mut hasher, size), (hash, s)| async move {
-                hasher.update(&hash);
+                hasher.update(hash.as_bytes());
                 Ok((hasher, size + s))
             },
         )
         .await?;
-        Ok((hasher.finalize_fixed(), size))
+        Ok((hasher.finalize_fixed().into(), size))
     }
 }
