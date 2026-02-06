@@ -181,6 +181,7 @@ impl ManifestFile {
             })?;
         Ok((spec_name, spec_index))
     }
+    #[allow(dead_code)]
     pub fn artifacts(&self) -> &'_ [Artifact] {
         &self.artifacts
     }

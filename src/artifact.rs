@@ -656,7 +656,7 @@ where
                 fs.create_dir_all(parent, 0, 0, 0o755).await?;
             }
             let (hash, _) =
-                tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.sri_name())
+                tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.name())
                     .await?;
             if hash != self.hash {
                 Err(io::Error::other("hash mismatch after copying local tree"))
@@ -976,23 +976,23 @@ mod tree {
         hash: &str,
     ) -> io::Result<(Hash, u64)> {
         match hash {
-            md5::Md5::SRI_NAME => copy_hash_dir_inner::<md5::Md5, _, _>(fd, fs, target_path)
+            md5::Md5::NAME => copy_hash_dir_inner::<md5::Md5, _, _>(fd, fs, target_path)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha1::Sha1::SRI_NAME => copy_hash_dir_inner::<sha1::Sha1, _, _>(fd, fs, target_path)
+            sha1::Sha1::NAME => copy_hash_dir_inner::<sha1::Sha1, _, _>(fd, fs, target_path)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha2::Sha256::SRI_NAME => {
+            sha2::Sha256::NAME => {
                 copy_hash_dir_inner::<sha2::Sha256, _, _>(fd, fs, target_path)
                     .await
                     .map(|(hash, size)| (hash.hash(), size))
             }
-            sha2::Sha512::SRI_NAME => {
+            sha2::Sha512::NAME => {
                 copy_hash_dir_inner::<sha2::Sha512, _, _>(fd, fs, target_path)
                     .await
                     .map(|(hash, size)| (hash.hash(), size))
             }
-            blake3::Hasher::SRI_NAME => {
+            blake3::Hasher::NAME => {
                 copy_hash_dir_inner::<blake3::Hasher, _, _>(fd, fs, target_path)
                     .await
                     .map(|(hash, size)| (hash.hash(), size))
@@ -1054,19 +1054,19 @@ mod tree {
 
     pub(super) async fn hash_dir(fd: OwnedFd, hash: &str) -> io::Result<(Hash, u64)> {
         match hash {
-            md5::Md5::SRI_NAME => hash_dir_inner::<md5::Md5>(fd)
+            md5::Md5::NAME => hash_dir_inner::<md5::Md5>(fd)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha1::Sha1::SRI_NAME => hash_dir_inner::<sha1::Sha1>(fd)
+            sha1::Sha1::NAME => hash_dir_inner::<sha1::Sha1>(fd)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha2::Sha256::SRI_NAME => hash_dir_inner::<sha2::Sha256>(fd)
+            sha2::Sha256::NAME => hash_dir_inner::<sha2::Sha256>(fd)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha2::Sha512::SRI_NAME => hash_dir_inner::<sha2::Sha512>(fd)
+            sha2::Sha512::NAME => hash_dir_inner::<sha2::Sha512>(fd)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            blake3::Hasher::SRI_NAME => hash_dir_inner::<blake3::Hasher>(fd)
+            blake3::Hasher::NAME => hash_dir_inner::<blake3::Hasher>(fd)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
             _ => io::Result::Err(io::Error::other(format!(

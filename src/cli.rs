@@ -34,7 +34,7 @@ pub mod cmd {
             builder::Executor,
             comp::is_comp_ext,
             content::{ContentProviderGuard, HostCache},
-            hash::{Hash, HashAlgo, HashingReader},
+            hash::{Hash, HashAlgo},
             manifest::Manifest,
             sandbox::HostSandboxExecutor,
             staging::HostFileSystem,
@@ -45,7 +45,7 @@ pub mod cmd {
         indicatif::ProgressBar,
         itertools::Itertools,
         rustix::path::Arg,
-        smol::io::{AsyncReadExt, AsyncWriteExt},
+        smol::io::AsyncWriteExt,
         std::path::PathBuf,
     };
     #[derive(Parser)]
@@ -744,46 +744,15 @@ hash = \"{}\"
             return Err(anyhow!("hash name cannot be empty"));
         }
         match name.to_ascii_lowercase().as_str() {
-            "md5" | "md5sum" => Ok("md"),
-            "sha1" => Ok("sha1"),
-            "sha256" => Ok("sha256"),
-            "sha512" => Ok("sha512"),
-            "blake3" => Ok("blake3"),
+            "md5" | "md5sum" => Ok(md5::Md5::NAME),
+            "sha1" => Ok(sha1::Sha1::NAME),
+            "sha256" => Ok(sha2::Sha256::NAME),
+            "sha512" => Ok(sha2::Sha512::NAME),
+            "blake3" => Ok(blake3::Hasher::NAME),
             _ => Err(anyhow!(
                 "unsupported hash {}, expected one of: md5, sha1, sha256, sha512, blake3",
                 name
             )),
-        }
-    }
-
-    async fn hash_stream<D: HashAlgo, R: smol::io::AsyncRead + Send + Unpin>(
-        reader: R,
-    ) -> Result<Hash> {
-        let mut reader = HashingReader::<D, _>::new(reader);
-        let mut buf = [0u8; 32 * 1024];
-        loop {
-            let read = reader.read(&mut buf).await?;
-            if read == 0 {
-                break;
-            }
-        }
-        Ok(reader.into_hash())
-    }
-
-    async fn hash_stream_for<R: smol::io::AsyncRead + Send + Unpin>(
-        hash_name: &str,
-        reader: R,
-    ) -> Result<Hash> {
-        let mut reader = Some(reader);
-        match hash_name {
-            md5::Md5::SRI_NAME => hash_stream::<md5::Md5, _>(reader.take().unwrap()).await,
-            sha1::Sha1::SRI_NAME => hash_stream::<sha1::Sha1, _>(reader.take().unwrap()).await,
-            sha2::Sha256::SRI_NAME => hash_stream::<sha2::Sha256, _>(reader.take().unwrap()).await,
-            sha2::Sha512::SRI_NAME => hash_stream::<sha2::Sha512, _>(reader.take().unwrap()).await,
-            blake3::Hasher::SRI_NAME => {
-                hash_stream::<blake3::Hasher, _>(reader.take().unwrap()).await
-            }
-            other => Err(anyhow!("hash {} not supported", other)),
         }
     }
 
@@ -880,7 +849,7 @@ hash = \"{}\"
             let use_sri = self.sri;
             smol::block_on(async move {
                 let hash = if let Some(path) = self.path.as_ref() {
-                    let meta = smol::fs::symlink_metadata(path)
+                    let meta = smol::fs::metadata(path)
                         .await
                         .map_err(|err| anyhow!("failed to stat {}: {}", path.display(), err))?;
                     if meta.is_dir() {
@@ -892,12 +861,20 @@ hash = \"{}\"
                         let file = smol::fs::File::open(path)
                             .await
                             .map_err(|err| anyhow!("failed to open {}: {}", path.display(), err))?;
-                        hash_stream_for(name, file).await?
+                        let mut hasher = Hash::hashing_reader_for(name, file)?;
+                        smol::io::copy(&mut hasher, &mut smol::io::sink())
+                            .await
+                            .map_err(|err| anyhow!("failed to read stdin: {}", err))?;
+                        hasher.as_mut().hash()
                     }
                 } else {
                     let stdin = async_io::Async::new(std::io::stdin())
                         .map_err(|err| anyhow!("failed to read stdin: {}", err))?;
-                    hash_stream_for(name, stdin).await?
+                    let mut hasher = Hash::hashing_reader_for(name, stdin)?;
+                    smol::io::copy(&mut hasher, &mut smol::io::sink())
+                        .await
+                        .map_err(|err| anyhow!("failed to read stdin: {}", err))?;
+                    hasher.as_mut().hash()
                 };
                 if use_sri {
                     println!("{}", hash.to_sri());
