@@ -780,7 +780,9 @@ hash = \"{}\"
             sha1::Sha1::SRI_NAME => hash_stream::<sha1::Sha1, _>(reader.take().unwrap()).await,
             sha2::Sha256::SRI_NAME => hash_stream::<sha2::Sha256, _>(reader.take().unwrap()).await,
             sha2::Sha512::SRI_NAME => hash_stream::<sha2::Sha512, _>(reader.take().unwrap()).await,
-            blake3::Hasher::SRI_NAME => hash_stream::<blake3::Hasher, _>(reader.take().unwrap()).await,
+            blake3::Hasher::SRI_NAME => {
+                hash_stream::<blake3::Hasher, _>(reader.take().unwrap()).await
+            }
             other => Err(anyhow!("hash {} not supported", other)),
         }
     }
@@ -880,18 +882,16 @@ hash = \"{}\"
                 let hash = if let Some(path) = self.path.as_ref() {
                     let meta = smol::fs::symlink_metadata(path)
                         .await
-                        .map_err(|err| {
-                            anyhow!("failed to stat {}: {}", path.display(), err)
-                        })?;
+                        .map_err(|err| anyhow!("failed to stat {}: {}", path.display(), err))?;
                     if meta.is_dir() {
                         let (hash, _) = hash_directory(path, name).await.map_err(|err| {
                             anyhow!("failed to hash directory {}: {}", path.display(), err)
                         })?;
                         hash
                     } else {
-                        let file = smol::fs::File::open(path).await.map_err(|err| {
-                            anyhow!("failed to open {}: {}", path.display(), err)
-                        })?;
+                        let file = smol::fs::File::open(path)
+                            .await
+                            .map_err(|err| anyhow!("failed to open {}: {}", path.display(), err))?;
                         hash_stream_for(name, file).await?
                     }
                 } else {

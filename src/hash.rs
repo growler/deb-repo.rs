@@ -28,7 +28,7 @@ pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
     }
 }
 pub trait Hashable<H: HashAlgo> {
-    fn hash_into(self, hasher: &mut H); 
+    fn hash_into(self, hasher: &mut H);
 }
 impl<H: HashAlgo> Hashable<H> for &[u8] {
     fn hash_into(self, hasher: &mut H) {

@@ -582,9 +582,13 @@ impl Tree {
                 err
             ))
         })?;
-        tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, self.target.as_deref())
-            .await
-            .map(|(hash, size)| (hash.hash(), size))
+        let (hash, size) =
+            tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, self.target.as_deref())
+                .await
+                .map(|(hash, size)| (hash.hash(), size))?;
+        self.hash = hash.clone();
+        self.size = size;
+        Ok((hash, size))
     }
     async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
         let fd = openat(
@@ -593,9 +597,12 @@ impl Tree {
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
         )?;
-        tree::hash_dir_inner::<blake3::Hasher>(fd)
+        let (hash, size) = tree::hash_dir_inner::<blake3::Hasher>(fd)
             .await
-            .map(|(hash, size)| (hash.hash(), size))
+            .map(|(hash, size)| (hash.hash(), size))?;
+        self.hash = hash.clone();
+        self.size = size;
+        Ok((hash, size))
     }
     async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
@@ -1165,9 +1172,13 @@ mod tree {
                 Ok((hasher.finalize_fixed().into(), 1))
             }
             FileType::Directory => {
-                let (dir_hash, dir_size) = process_dir::<H, _, _>(path.clone(), fd, f).await?;
+                f(Object::Directory {
+                    path: path.clone(),
+                    stat,
+                })
+                .await?;
+                let (dir_hash, dir_size) = process_dir::<H, _, _>(path, fd, f).await?;
                 hasher.update(dir_hash.as_bytes());
-                f(Object::Directory { path, stat }).await?;
                 Ok((hasher.finalize_fixed().into(), dir_size))
             }
             _ => Err(io::Error::new(
