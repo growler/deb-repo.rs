@@ -32,6 +32,9 @@ mod transport;
 pub mod universe;
 mod version;
 
+#[cfg(test)]
+mod manifest_doc_test;
+
 pub use {
     arch::DEFAULT_ARCH,
     archive::{Archive, RepositoryFile, SignedBy, Snapshot, SnapshotId},
