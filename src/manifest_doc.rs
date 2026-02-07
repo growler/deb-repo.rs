@@ -99,6 +99,12 @@ pub enum UpdateResult {
     Updated(usize),
 }
 
+#[derive(Default, Clone)]
+pub struct BuildEnvComments {
+    pub prefix: HashMap<String, String>,
+    pub inline: HashMap<String, String>,
+}
+
 impl ManifestFile {
     pub const MAX_SIZE: u64 = 1024 * 1024; // 1 MiB
 
@@ -322,6 +328,22 @@ impl ManifestFile {
         spec_name: Option<&str>,
         env: KVList<String>,
     ) -> io::Result<()> {
+        self.update_build_env(spec_name, env, None)
+    }
+    pub fn set_build_env_with_comments(
+        &mut self,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+        comments: &BuildEnvComments,
+    ) -> io::Result<()> {
+        self.update_build_env(spec_name, env, Some(comments))
+    }
+    fn update_build_env(
+        &mut self,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+        comments: Option<&BuildEnvComments>,
+    ) -> io::Result<()> {
         let (spec_name, spec_index) = self.spec_index_ensure(spec_name)?;
         self.specs.value_mut_at(spec_index).build_env = env.clone();
         if env.is_empty() {
@@ -331,16 +353,107 @@ impl ManifestFile {
         let entry = self
             .doc
             .get_spec_table_entry_mut(spec_name, "build-env", toml_edit::table);
-        let mut table = toml_edit::table();
-        {
-            let table = table.as_table_mut().expect("a table");
-            table.set_implicit(true);
-            for (key, value) in env.iter() {
-                table.insert(key, toml_edit::value(value));
+        let table = entry.as_table_mut().expect("a table");
+        table.set_implicit(true);
+
+        let keys: Vec<String> = table.iter().map(|(k, _)| k.to_string()).collect();
+        let mut existing = HashMap::with_capacity(keys.len());
+        for key in keys {
+            if let Some((key_entry, item)) = table.remove_entry(&key) {
+                existing.insert(key, (key_entry, item));
             }
         }
-        *entry = table;
+
+        for (key, value) in env.iter() {
+            let (mut key_entry, mut item) = existing
+                .remove(key)
+                .unwrap_or_else(|| (toml_edit::Key::new(key), toml_edit::value(value.as_str())));
+            let value_item = match item.as_value_mut() {
+                Some(existing_value) => {
+                    let decor = existing_value.decor().clone();
+                    *existing_value = toml_edit::Value::from(value.as_str());
+                    *existing_value.decor_mut() = decor;
+                    existing_value
+                }
+                None => {
+                    item = toml_edit::value(value.as_str());
+                    item.as_value_mut().expect("a value")
+                }
+            };
+            if let Some(comments) = comments {
+                let prefix = comments.prefix.get(key).map(String::as_str).unwrap_or("");
+                key_entry.leaf_decor_mut().set_prefix(prefix);
+                let inline = comments.inline.get(key).map(String::as_str).unwrap_or("");
+                if inline.trim().is_empty() {
+                    value_item.decor_mut().set_suffix("");
+                } else if inline
+                    .chars()
+                    .next()
+                    .map(|c| c.is_whitespace())
+                    == Some(true)
+                {
+                    value_item.decor_mut().set_suffix(inline.trim_end());
+                } else {
+                    value_item
+                        .decor_mut()
+                        .set_suffix(format!(" {}", inline.trim_end()));
+                }
+            }
+            table.insert_formatted(&key_entry, item);
+        }
         Ok(())
+    }
+    pub fn spec_build_env_comments(
+        &self,
+        spec_name: Option<&str>,
+    ) -> io::Result<BuildEnvComments> {
+        let (spec_name, _) = self.spec_index_ensure(spec_name)?;
+        let mut out = BuildEnvComments::default();
+        let spec_table = self
+            .doc
+            .get("spec")
+            .and_then(toml_edit::Item::as_table)
+            .ok_or_else(|| io::Error::other("spec table missing"))?;
+        let spec_table = if spec_name.is_empty() {
+            spec_table
+        } else {
+            spec_table
+                .get(spec_name)
+                .and_then(toml_edit::Item::as_table)
+                .ok_or_else(|| {
+                    io::Error::other(format!(
+                        "spec {} not found",
+                        spec_display_name(spec_name)
+                    ))
+                })?
+        };
+        let build_env = match spec_table
+            .get("build-env")
+            .and_then(toml_edit::Item::as_table)
+        {
+            Some(table) => table,
+            None => return Ok(out),
+        };
+        for (key, _) in build_env.iter() {
+            let prefix = build_env
+                .key(key)
+                .and_then(|k| k.leaf_decor().prefix())
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("");
+            if !prefix.is_empty() {
+                out.prefix.insert(key.to_string(), prefix.to_string());
+            }
+            let suffix = build_env
+                .get(key)
+                .and_then(toml_edit::Item::as_value)
+                .and_then(|value| value.decor().suffix())
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("");
+            if !suffix.is_empty() && suffix.contains('#') {
+                out.inline.insert(key.to_string(), suffix.to_string());
+            }
+        }
+        Ok(out)
     }
     pub fn set_build_script(
         &mut self,

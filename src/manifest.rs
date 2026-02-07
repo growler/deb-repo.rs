@@ -6,7 +6,7 @@ use {
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         kvlist::KVList,
-        manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
+        manifest_doc::{spec_display_name, BuildEnvComments, LockFile, ManifestFile, UpdateResult},
         packages::Package,
         spec::{LockedArchive, LockedPackage, LockedSpec},
         staging::StagingFileSystem,
@@ -457,6 +457,12 @@ impl Manifest {
     pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
         Ok(self.file.spec_build_env(spec_name)?.clone())
     }
+    pub fn spec_build_env_comments(
+        &self,
+        spec_name: Option<&str>,
+    ) -> io::Result<BuildEnvComments> {
+        self.file.spec_build_env_comments(spec_name)
+    }
     pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
         Ok(self
             .file
@@ -470,6 +476,20 @@ impl Manifest {
     ) -> io::Result<()> {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.set_build_env(spec_name, env)?;
+        self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
+        Ok(())
+    }
+    pub fn set_build_env_with_comments(
+        &mut self,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+        comments: BuildEnvComments,
+    ) -> io::Result<()> {
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        self.file
+            .set_build_env_with_comments(spec_name, env, &comments)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
         self.mark_lock_updated();
