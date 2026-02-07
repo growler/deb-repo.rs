@@ -58,6 +58,7 @@ pub(crate) fn setup_root(root: impl AsFd) -> io::Result<()> {
     mount_dev(root_dfd)?;
     mount_pts(root_dfd)?;
     mount_proc(root_dfd)?;
+    mount_sys(root_dfd)?;
     mount_run(root_dfd)?;
     pivot_root(".", ".")?;
     unmount(".", UnmountFlags::DETACH)?;
