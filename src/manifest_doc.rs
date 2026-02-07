@@ -309,6 +309,58 @@ impl ManifestFile {
     {
         self.remove_spec_list_item(spec_name, "exclude", reqs, |spec| &mut spec.exclude)
     }
+    pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<&KVList<String>> {
+        let (_, spec_index) = self.spec_index_ensure(spec_name)?;
+        Ok(&self.specs.value_at(spec_index).build_env)
+    }
+    pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<&str>> {
+        let (_, spec_index) = self.spec_index_ensure(spec_name)?;
+        Ok(self.specs.value_at(spec_index).build_script.as_deref())
+    }
+    pub fn set_build_env(
+        &mut self,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+    ) -> io::Result<()> {
+        let (spec_name, spec_index) = self.spec_index_ensure(spec_name)?;
+        self.specs.value_mut_at(spec_index).build_env = env.clone();
+        if env.is_empty() {
+            self.doc.remove_spec_table_entry(spec_name, "build-env");
+            return Ok(());
+        }
+        let entry = self
+            .doc
+            .get_spec_table_entry_mut(spec_name, "build-env", toml_edit::table);
+        let mut table = toml_edit::table();
+        {
+            let table = table.as_table_mut().expect("a table");
+            table.set_implicit(true);
+            for (key, value) in env.iter() {
+                table.insert(key, toml_edit::value(value));
+            }
+        }
+        *entry = table;
+        Ok(())
+    }
+    pub fn set_build_script(
+        &mut self,
+        spec_name: Option<&str>,
+        script: Option<String>,
+    ) -> io::Result<()> {
+        let (spec_name, spec_index) = self.spec_index_ensure(spec_name)?;
+        self.specs.value_mut_at(spec_index).build_script = script.clone();
+        if let Some(script) = script {
+            let entry = self.doc.get_spec_table_entry_mut(
+                spec_name,
+                "build-script",
+                || toml_edit::value(""),
+            );
+            *entry = toml_edit::value(script);
+        } else {
+            self.doc.remove_spec_table_entry(spec_name, "build-script");
+        }
+        Ok(())
+    }
     fn remove_spec_list_item<'a, 'b, I, T, F>(
         &'a mut self,
         spec_name: Option<&str>,

@@ -5,6 +5,7 @@ use {
         content::{ContentProvider, UniverseFiles},
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
+        kvlist::KVList,
         manifest_doc::{spec_display_name, LockFile, ManifestFile, UpdateResult},
         packages::Package,
         spec::{LockedArchive, LockedPackage, LockedSpec},
@@ -109,6 +110,11 @@ impl Manifest {
         if self.lock_updated || hash_update {
             self.lock.store(path.as_ref(), &self.arch, &hash).await?;
         }
+        Ok(())
+    }
+    pub async fn store_manifest_only<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        let hash = self.file.store(path.as_ref()).await?;
+        self.hash = Some(hash);
         Ok(())
     }
     pub fn spec_names(&self) -> impl Iterator<Item = &str> {
@@ -446,6 +452,39 @@ impl Manifest {
             self.mark_lock_updated();
             // TODO: drop empty leaf spec
         }
+        Ok(())
+    }
+    pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
+        Ok(self.file.spec_build_env(spec_name)?.clone())
+    }
+    pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
+        Ok(self
+            .file
+            .spec_build_script(spec_name)?
+            .map(|script| script.to_string()))
+    }
+    pub fn set_build_env(
+        &mut self,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+    ) -> io::Result<()> {
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        self.file.set_build_env(spec_name, env)?;
+        self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
+        Ok(())
+    }
+    pub fn set_build_script(
+        &mut self,
+        spec_name: Option<&str>,
+        script: Option<String>,
+    ) -> io::Result<()> {
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        self.file.set_build_script(spec_name, script)?;
+        self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
         Ok(())
     }
     fn archives(&self) -> UniverseFiles<'_> {

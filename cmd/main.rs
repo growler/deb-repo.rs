@@ -170,6 +170,7 @@ debrepo::cli_commands! {
     enum Commands<App> {
         Init(cli::cmd::Init),
         Update(cli::cmd::Update),
+        Edit(cli::cmd::Edit),
         Add(cli::cmd::Add),
         Include(cli::cmd::Include),
         Exclude(cli::cmd::Exclude),

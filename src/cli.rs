@@ -48,6 +48,7 @@ pub mod cmd {
         smol::io::AsyncWriteExt,
         std::path::PathBuf,
     };
+    pub use crate::cli_edit::Edit;
     #[derive(Parser)]
     #[command(
         about = "Create a new manifest file",

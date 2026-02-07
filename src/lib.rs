@@ -7,6 +7,7 @@ pub mod auth;
 mod auth_vault;
 mod builder;
 pub mod cli;
+mod cli_edit;
 pub mod comp;
 pub mod content;
 pub mod control;
