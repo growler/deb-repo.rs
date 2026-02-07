@@ -53,6 +53,7 @@ pub(crate) fn setup_root(root: impl AsFd) -> io::Result<()> {
     fchdir(root_dfd)?;
     mkdirat_if_not_exist(root_dfd, "dev", Mode::from_raw_mode(0o755))?;
     mkdirat_if_not_exist(root_dfd, "proc", Mode::from_raw_mode(0o755))?;
+    mkdirat_if_not_exist(root_dfd, "sys", Mode::from_raw_mode(0o755))?;
     mkdirat_if_not_exist(root_dfd, "run", Mode::from_raw_mode(0o755))?;
     mount_dev(root_dfd)?;
     mount_pts(root_dfd)?;
@@ -87,10 +88,11 @@ fn mount_dev(dfd: impl AsFd) -> io::Result<()> {
         Mode::empty(),
     )?;
     mkdirat(&dev_dfd, "pts", Mode::from_raw_mode(0o755))?;
-    static LINKS: [(&str, &str); 6] = [
+    static LINKS: [(&str, &str); 7] = [
         ("pts/ptmx", "ptmx"),
         ("pts/0", "console"),
         ("/proc/kcore", "core"),
+        ("/proc/self/fd", "fd"),
         ("/proc/self/fd/0", "stdin"),
         ("/proc/self/fd/1", "stdout"),
         ("/proc/self/fd/2", "stderr"),
@@ -161,6 +163,26 @@ fn mount_proc(dfd: impl AsFd) -> io::Result<()> {
         "",
         dfd.as_fd(),
         "proc",
+        MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
+    )?;
+    Ok(())
+}
+fn mount_sys(dfd: impl AsFd) -> io::Result<()> {
+    let fsfd = fsopen("sysfs", FsOpenFlags::FSOPEN_CLOEXEC)?;
+    fsconfig_create(&fsfd)?;
+    let mntfd = fsmount(
+        &fsfd,
+        FsMountFlags::empty(),
+        MountAttrFlags::MOUNT_ATTR_NODEV
+            | MountAttrFlags::MOUNT_ATTR_NOSUID
+            | MountAttrFlags::MOUNT_ATTR_NOEXEC
+            | MountAttrFlags::MOUNT_ATTR_RELATIME,
+    )?;
+    move_mount(
+        mntfd,
+        "",
+        dfd.as_fd(),
+        "sys",
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH,
     )?;
     Ok(())
