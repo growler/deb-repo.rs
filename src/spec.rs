@@ -30,8 +30,11 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage: Vec<String>,
 
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub run: Option<String>,
+    #[serde(default, rename = "build-env", skip_serializing_if = "KVList::is_empty")]
+    pub build_env: KVList<String>,
+
+    #[serde(default, rename = "build-script", skip_serializing_if = "Option::is_none")]
+    pub build_script: Option<String>,
 
     #[serde(default, skip_serializing_if = "KVList::is_empty")]
     pub meta: KVList<String>,
@@ -44,8 +47,9 @@ impl Spec {
             include: Vec::new(),
             exclude: Vec::new(),
             stage: Vec::new(),
+            build_env: KVList::new(),
             meta: KVList::new(),
-            run: None,
+            build_script: None,
         }
     }
     pub fn locked_spec(&self) -> LockedSpec {

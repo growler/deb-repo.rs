@@ -221,16 +221,34 @@ impl Manifest {
     fn scripts_for(&self, id: usize) -> io::Result<Vec<&str>> {
         Self::scripts_for_spec(&self.file, id)
     }
+    fn build_env_for(&self, id: usize) -> io::Result<Vec<(String, String)>> {
+        Self::build_env_for_spec(&self.file, id)
+    }
     fn artifacts_for(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Artifact>> + '_ {
         Self::artifacts_for_spec(&self.file, self.arch.as_str(), id)
     }
     fn scripts_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<&str>> {
         let mut scripts = file
             .ancestors(id)
-            .filter_map_ok(|spec| spec.run.as_deref())
+            .filter_map_ok(|spec| spec.build_script.as_deref())
             .collect::<io::Result<Vec<_>>>()?;
         scripts.reverse();
         Ok(scripts)
+    }
+    fn build_env_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(String, String)>> {
+        let mut env: Vec<(String, String)> = Vec::new();
+        let mut specs = file.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+        specs.reverse();
+        for spec in specs {
+            for (key, value) in spec.build_env.iter() {
+                if let Some((_, existing)) = env.iter_mut().find(|(k, _)| k == key) {
+                    *existing = value.clone();
+                } else {
+                    env.push((key.to_string(), value.clone()));
+                }
+            }
+        }
+        Ok(env)
     }
     fn artifacts_for_spec<'a>(
         file: &'a ManifestFile,
@@ -274,6 +292,14 @@ impl Manifest {
         for script in scripts {
             let mut h = blake3::Hasher::default();
             h.update(script.as_bytes());
+            hasher.update(&h.finalize_fixed());
+        }
+        let build_env = Self::build_env_for_spec(file, spec_index)?;
+        for (key, value) in build_env {
+            let mut h = blake3::Hasher::default();
+            h.update(key.as_bytes());
+            h.update(&[0]);
+            h.update(value.as_bytes());
             hasher.update(&h.finalize_fixed());
         }
         let artifacts =
@@ -819,6 +845,7 @@ impl Manifest {
         Vec<String>,                                    // essentials
         Vec<Vec<String>>,                               // prioritized packages
         Vec<String>,                                    // scripts
+        Vec<(String, String)>,                          // build env
         Option<ProgressBar>,
     )>
     where
@@ -833,6 +860,7 @@ impl Manifest {
             .into_iter()
             .map(String::from)
             .collect();
+        let build_env = self.build_env_for(spec_index)?;
         let pb = pb.map(|f| {
             let installables_size: u64 = installables.iter().map(|(_, file)| file.size).sum();
             let artifacts_size: u64 = artifacts.iter().map(|a| a.size()).sum();
@@ -845,6 +873,7 @@ impl Manifest {
             essentials,
             other,
             scripts,
+            build_env,
             pb,
         ))
     }
@@ -855,13 +884,13 @@ impl Manifest {
         concurrency: NonZero<usize>,
         cache: &C,
         pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
+    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>, Vec<(String, String)>)>
     where
         FS: StagingFileSystem,
         P: FnOnce(u64) -> ProgressBar,
         C: ContentProvider<Target = FS>,
     {
-        let (archives, artifacts, installables, essentials, other, scripts, pb) =
+        let (archives, artifacts, installables, essentials, other, scripts, build_env, pb) =
             self.stage_prepare(name, pb)?;
         crate::stage::stage_local(installables, artifacts, fs, concurrency, cache, pb.clone())
             .await?;
@@ -870,7 +899,7 @@ impl Manifest {
         }
         let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
         fs.stage(universe_stage).await?;
-        Ok((essentials, other, scripts))
+        Ok((essentials, other, scripts, build_env))
     }
     pub async fn stage<FS, P, C>(
         &self,
@@ -879,14 +908,14 @@ impl Manifest {
         concurrency: NonZero<usize>,
         cache: &C,
         pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>)>
+    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>, Vec<(String, String)>)>
     where
         FS: StagingFileSystem + Send + Clone + 'static,
         P: FnOnce(u64) -> ProgressBar,
         C: ContentProvider<Target = FS>,
     {
         tracing::debug!("running stage_");
-        let (archives, artifacts, installables, essentials, other, scripts, pb) =
+        let (archives, artifacts, installables, essentials, other, scripts, build_env, pb) =
             self.stage_prepare(name, pb)?;
         crate::stage::stage(installables, artifacts, fs, concurrency, cache, pb.clone()).await?;
         if let Some(pb) = pb {
@@ -894,6 +923,6 @@ impl Manifest {
         }
         let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
         fs.stage(universe_stage).await?;
-        Ok((essentials, other, scripts))
+        Ok((essentials, other, scripts, build_env))
     }
 }

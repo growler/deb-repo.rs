@@ -10,6 +10,7 @@ pub struct BuildJob<E: Executor> {
     essentials: Vec<String>,
     packages: Vec<Vec<String>>,
     scripts: Vec<String>,
+    build_env: Vec<(String, String)>,
     #[serde(skip)]
     _marker: std::marker::PhantomData<E>,
 }
@@ -19,11 +20,13 @@ impl<E: Executor> BuildJob<E> {
         essentials: Vec<String>,
         packages: Vec<Vec<String>>,
         scripts: Vec<String>,
+        build_env: Vec<(String, String)>,
     ) -> Self {
         Self {
             essentials,
             packages,
             scripts,
+            build_env,
             _marker: std::marker::PhantomData,
         }
     }
@@ -32,6 +35,7 @@ impl<E: Executor> BuildJob<E> {
             essentials: self.essentials,
             packages: self.packages,
             scripts: self.scripts,
+            build_env: self.build_env,
             _marker: std::marker::PhantomData,
         }
     }
@@ -40,6 +44,13 @@ impl<E: Executor> BuildJob<E> {
             ("DEBIAN_FRONTEND", "noninteractive"),
             ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
         ])?;
+        if !self.build_env.is_empty() {
+            executor.envs(
+                self.build_env
+                    .iter()
+                    .map(|(k, v)| (k.as_str(), v.as_str())),
+            )?;
+        }
         executor.write_file("./usr/sbin/policy-rc.d", 0o755, "#!/bin/sh\nexit 101\n")?;
         let (base_passwd, base_files, essential_pkgs) = self.essentials.iter().fold(
             (
@@ -136,13 +147,19 @@ pub trait Executor {
         essentials: Vec<String>,
         packages: Vec<Vec<String>>,
         scripts: Vec<String>,
+        build_env: Vec<(String, String)>,
     ) -> impl Future<Output = io::Result<()>>
     where
         Self: Sized,
     {
         async move {
             self.prepare_tree(fs).await?;
-            self.execute(BuildJob::<Self>::new(essentials, packages, scripts))
+            self.execute(BuildJob::<Self>::new(
+                essentials,
+                packages,
+                scripts,
+                build_env,
+            ))
                 .await?;
             self.process_changes(fs).await
         }

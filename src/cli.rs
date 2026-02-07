@@ -978,10 +978,12 @@ hash = \"{}\"
                     self.spec.as_deref().unwrap_or("default"),
                     self.path.display()
                 );
-                let (essentials, other, scripts) = manifest
+                let (essentials, other, scripts, build_env) = manifest
                     .stage(self.spec.as_deref(), &fs, conf.concurrency(), fetcher, pb)
                     .await?;
-                builder.build(&fs, essentials, other, scripts).await?;
+                builder
+                    .build(&fs, essentials, other, scripts, build_env)
+                    .await?;
                 guard.commit().await?;
                 Ok(())
             })

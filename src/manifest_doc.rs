@@ -29,7 +29,18 @@ pub fn valid_spec_name(s: &str) -> Result<&str, String> {
         Err(format!(
             "invalid spec name \"{s}\", only alphanumeric characters, '-' and '_' are allowed",
         ))
-    } else if ["include", "exclude", "extends", "stage", "run", "meta"].contains(&s) {
+    } else if [
+        "include",
+        "exclude",
+        "extends",
+        "stage",
+        "run",
+        "build-env",
+        "build-script",
+        "meta",
+    ]
+    .contains(&s)
+    {
         Err(format!("invalid spec name \"{}\"", s))
     } else {
         Ok(s)
@@ -859,10 +870,13 @@ where
             map.serialize_entry("exclude", &def.exclude)?;
         }
         if !def.stage.is_empty() {
-            map.serialize_entry("stage", &def.exclude)?;
+            map.serialize_entry("stage", &def.stage)?;
         }
-        if let Some(run) = def.run.as_deref() {
-            map.serialize_entry("run", run)?;
+        if !def.build_env.is_empty() {
+            map.serialize_entry("build-env", &def.build_env)?;
+        }
+        if let Some(build_script) = def.build_script.as_deref() {
+            map.serialize_entry("build-script", build_script)?;
         }
         if !def.meta.is_empty() {
             map.serialize_entry("meta", &def.meta)?;
@@ -909,8 +923,9 @@ where
                 include: Option<Vec<Dependency<String>>>,
                 exclude: Option<Vec<Constraint<String>>>,
                 stage: Option<Vec<String>>,
+                build_env: Option<KVList<String>>,
                 meta: Option<KVList<String>>,
-                run: Option<String>,
+                build_script: Option<String>,
             }
             let mut def = DefaultAcc::default();
 
@@ -942,9 +957,13 @@ where
                         let v = access.next_value::<Vec<String>>()?;
                         set_once!(def.stage, v, "stage");
                     }
-                    "run" => {
+                    "build-env" => {
+                        let v = access.next_value::<KVList<String>>()?;
+                        set_once!(def.build_env, v, "build-env");
+                    }
+                    "build-script" => {
                         let v = access.next_value::<String>()?;
-                        set_once!(def.run, v, "run");
+                        set_once!(def.build_script, v, "build-script");
                     }
                     other => {
                         let key = valid_spec_name(other).map_err(A::Error::custom)?;
@@ -957,14 +976,22 @@ where
                 }
             }
 
-            if def.extends.is_some() || def.include.is_some() || def.exclude.is_some() {
+            if def.extends.is_some()
+                || def.include.is_some()
+                || def.exclude.is_some()
+                || def.stage.is_some()
+                || def.build_env.is_some()
+                || def.build_script.is_some()
+                || def.meta.is_some()
+            {
                 let default_spec = Spec {
                     extends: def.extends,
                     include: def.include.unwrap_or_default(),
                     exclude: def.exclude.unwrap_or_default(),
                     stage: def.stage.unwrap_or_default(),
+                    build_env: def.build_env.unwrap_or_default(),
                     meta: def.meta.unwrap_or_default(),
-                    run: def.run,
+                    build_script: def.build_script,
                 };
 
                 out.push(("".to_string(), default_spec));
@@ -1029,7 +1056,7 @@ fn category(key: &str) -> u8 {
     match key {
         "extends" => 0,
         "include" | "exclude" => 1,
-        "run" => 2,
+        "build-env" | "build-script" => 2,
         "stage" => 3,
         _ => 4,
     }
@@ -1318,7 +1345,7 @@ impl ManifestDoc for toml_edit::DocumentMut {
             .expect("a table of specs");
         fn spec_entry_order(entry: &str) -> u8 {
             match entry {
-                "include" | "exclude" | "extends" | "stage" | "run" => 0,
+                "include" | "exclude" | "extends" | "stage" | "build-env" | "build-script" => 0,
                 "meta" => 1,
                 _ => 2,
             }
