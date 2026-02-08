@@ -19,7 +19,7 @@ use {
         future::Future,
         io,
         num::NonZero,
-        path::Path,
+        path::{Path, PathBuf},
         pin::{pin, Pin},
     },
 };
@@ -83,6 +83,7 @@ pub struct TreeReader<FS: ?Sized> {
     target: Option<String>,
     dir: OwnedFd,
     hash: Hash,
+    source: PathBuf,
     _marker: std::marker::PhantomData<fn(&FS)>,
 }
 
@@ -585,7 +586,14 @@ impl Tree {
         let (hash, size) =
             tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, self.target.as_deref())
                 .await
-                .map(|(hash, size)| (hash.hash(), size))?;
+                .map(|(hash, size)| (hash.hash(), size))
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to stage local artifact directory {}: {}",
+                        path.as_ref().display(),
+                        err
+                    ))
+                })?;
         self.hash = hash.clone();
         self.size = size;
         Ok((hash, size))
@@ -596,10 +604,24 @@ impl Tree {
             path.as_ref(),
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
-        )?;
+        )
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to open local artifact directory {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
         let (hash, size) = tree::hash_dir_inner::<blake3::Hasher>(fd)
             .await
-            .map(|(hash, size)| (hash.hash(), size))?;
+            .map(|(hash, size)| (hash.hash(), size))
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to hash local artifact directory {}: {}",
+                    path.as_ref().display(),
+                    err
+                ))
+            })?;
         self.hash = hash.clone();
         self.size = size;
         Ok((hash, size))
@@ -613,11 +635,19 @@ impl Tree {
             path.as_ref(),
             OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
             Mode::empty(),
-        )?;
+        )
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to open local artifact directory {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
         Ok(Box::new(TreeReader {
             dir: fd,
             target: self.target.clone(),
             hash: self.hash.clone(),
+            source: path.as_ref().to_path_buf(),
             _marker: std::marker::PhantomData,
         })
             as Box<dyn Stage<Target = FS, Output = ()> + Send>)
@@ -652,14 +682,32 @@ where
         fs: &'b Self::Target,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
         Box::pin(async move {
+            let source = self.source.display().to_string();
             if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
-                fs.create_dir_all(parent, 0, 0, 0o755).await?;
+                fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create parent directory {} for artifact {}: {}",
+                        parent.display(),
+                        source.as_str(),
+                        err
+                    ))
+                })?;
             }
             let (hash, _) =
                 tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.name())
-                    .await?;
+                    .await
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to stage local directory artifact {}: {}",
+                            source.as_str(),
+                            err
+                        ))
+                    })?;
             if hash != self.hash {
-                Err(io::Error::other("hash mismatch after copying local tree"))
+                Err(io::Error::other(format!(
+                    "hash mismatch after copying local tree {}",
+                    source.as_str()
+                )))
             } else {
                 Ok(())
             }
@@ -723,7 +771,13 @@ impl File {
                 err
             ))
         })?;
-        let stat = fstat(&fd)?;
+        let stat = fstat(&fd).map_err(|err| {
+            io::Error::other(format!(
+                "failed to stat local artifact file {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
         if !FileType::from_raw_mode(stat.st_mode).is_file() {
             return Err(io::Error::other(format!(
                 "artefact file {} ({}) is not a regular file",
@@ -757,7 +811,13 @@ impl File {
                 err
             ))
         })?;
-        let stat = fstat(&fd)?;
+        let stat = fstat(&fd).map_err(|err| {
+            io::Error::other(format!(
+                "failed to stat local artifact file {}: {}",
+                path.as_ref().display(),
+                err
+            ))
+        })?;
         if !FileType::from_raw_mode(stat.st_mode).is_file() {
             return Err(io::Error::other(format!(
                 "artefact file {} ({}) is not a regular file",
@@ -777,7 +837,15 @@ impl File {
         }
         let (hash, size) = if stat.st_size < 65_536 {
             let mut reader = HashingReader::<blake3::Hasher, _>::new(smol::fs::File::from(fd));
-            smol::io::copy(&mut reader, smol::io::sink()).await?;
+            smol::io::copy(&mut reader, smol::io::sink())
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to hash local artifact file {}: {}",
+                        path.as_ref().display(),
+                        err
+                    ))
+                })?;
             reader.into_hash_and_size()
         } else {
             let hash = smol::unblock(move || {
@@ -787,7 +855,14 @@ impl File {
                 hasher.update(&map[..]);
                 Ok::<_, io::Error>(hasher.into_hash())
             })
-            .await?;
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to hash local artifact file {}: {}",
+                    path.as_ref().display(),
+                    err
+                ))
+            })?;
             (hash, stat.st_size as u64)
         };
         self.hash = hash.clone();
@@ -800,18 +875,52 @@ impl File {
         fs: &FS,
     ) -> io::Result<(Hash, u64)> {
         let st_mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
+        let uri = self.uri.as_str();
+        let target = self.target.as_str();
         let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
         if let Some(parent) = Path::new(&self.target).parent() {
-            fs.create_dir_all(parent, 0, 0, 0o755).await?;
+            fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
+                io::Error::other(format!(
+                    "failed to create parent directory {} for artifact {}: {}",
+                    parent.display(),
+                    uri,
+                    err
+                ))
+            })?;
         }
         if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
             fs.create_file(comp_reader(&self.uri, &mut reader), 0, 0, st_mode, None)
-                .await?
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })?
         } else {
-            fs.create_file(&mut reader, 0, 0, st_mode, None).await?
+            fs.create_file(&mut reader, 0, 0, st_mode, None)
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })?
         }
         .persist(&self.target)
-        .await?;
+        .await
+        .map_err(|err| {
+            io::Error::other(format!(
+                "failed to persist target file {} for artifact {}: {}",
+                target,
+                uri,
+                err
+            ))
+        })?;
         self.size = reader.as_mut().size();
         self.hash = reader.as_mut().hash();
         Ok((self.hash.clone(), self.size))
@@ -856,8 +965,17 @@ where
         fs: &'b Self::Target,
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
         Box::pin(async move {
+            let uri = self.uri.as_str();
+            let target = self.target.as_str();
             if let Some(parent) = Path::new(&self.target).parent() {
-                fs.create_dir_all(parent, 0, 0, 0o755).await?;
+                fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create parent directory {} for artifact {}: {}",
+                        parent.display(),
+                        uri,
+                        err
+                    ))
+                })?;
             }
             if self.unpack && is_comp_ext(self.uri.as_bytes()) {
                 fs.create_file(
@@ -867,9 +985,25 @@ where
                     self.mode.map_or(0o644, |m| m.get() & 0o7777),
                     None,
                 )
-                .await?
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })?
                 .persist(&self.target)
                 .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to persist target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })
             } else {
                 fs.create_file(
                     &mut self.inner,
@@ -878,9 +1012,25 @@ where
                     self.mode.map_or(0o644, |m| m.get() & 0o7777),
                     self.size.map(|s| s.get()),
                 )
-                .await?
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })?
                 .persist(&self.target)
                 .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to persist target file {} for artifact {}: {}",
+                        target,
+                        uri,
+                        err
+                    ))
+                })
             }
         })
     }
@@ -1135,6 +1285,7 @@ mod tree {
         F: Fn(Object) -> Fut,
         Fut: std::future::Future<Output = io::Result<Option<InnerHash<H>>>>,
     {
+        let path = parent.join(&name);
         let fd = match openat2(
             parent_dfd.as_fd(),
             &name,
@@ -1149,11 +1300,21 @@ mod tree {
                 OFlags::CLOEXEC | OFlags::PATH | OFlags::NOFOLLOW,
                 Mode::empty(),
                 ResolveFlags::NO_SYMLINKS | ResolveFlags::NO_XDEV,
-            )?,
-            Err(err) => return Err(err.into()),
+            )
+            .map_err(|err| {
+                io::Error::other(format!("failed to open {}: {}", path.display(), err))
+            })?,
+            Err(err) => {
+                return Err(io::Error::other(format!(
+                    "failed to open {}: {}",
+                    path.display(),
+                    err
+                )))
+            }
         };
-        let stat = fstat(&fd)?;
-        let path = parent.join(&name);
+        let stat = fstat(&fd).map_err(|err| {
+            io::Error::other(format!("failed to stat {}: {}", path.display(), err))
+        })?;
         let mut hasher = H::default();
         hasher.update(&mode(stat.st_mode).to_le_bytes());
         hasher.update(name.as_encoded_bytes());
@@ -1166,7 +1327,13 @@ mod tree {
                 Ok((hasher.finalize_fixed().into(), stat.st_size as u64))
             }
             FileType::Symlink => {
-                let target = readlinkat(&fd, c"", [])?;
+                let target = readlinkat(&fd, c"", []).map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to read symlink {}: {}",
+                        path.display(),
+                        err
+                    ))
+                })?;
                 hasher.update(target.as_bytes());
                 f(Object::Symlink { path, target }).await?;
                 Ok((hasher.finalize_fixed().into(), 1))
@@ -1183,7 +1350,7 @@ mod tree {
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
-                "Unsupported file type",
+                format!("unsupported file type at {}", path.display()),
             )),
         }
     }
@@ -1198,7 +1365,13 @@ mod tree {
         F: Fn(Object) -> Fut,
         Fut: std::future::Future<Output = io::Result<Option<InnerHash<H>>>>,
     {
-        let dir = Dir::read_from(&fd)?;
+        let dir = Dir::read_from(&fd).map_err(|err| {
+            io::Error::other(format!(
+                "failed to read directory {}: {}",
+                path.display(),
+                err
+            ))
+        })?;
         let mut entries = dir
             .filter_ok(|entry| entry.file_name() != c"." && entry.file_name() != c"..")
             .map_ok(|entry| OsStr::from_bytes(entry.file_name().to_bytes()).to_owned())
