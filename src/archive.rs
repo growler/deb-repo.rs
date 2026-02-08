@@ -731,6 +731,16 @@ impl Archive {
     pub(crate) fn base(&self) -> &str {
         self.real_url.as_deref().unwrap_or(&self.url)
     }
+    pub(crate) fn apt_uri(&self) -> String {
+        if let Some(snapshots_template) = &self.snapshots {
+            if let Some(Snapshot::Use(snap)) = &self.snapshot {
+                return snapshots_template
+                    .trim_end_matches('/')
+                    .replace("@SNAPSHOTID@", &snap.format("%Y%m%dT%H%M%SZ").to_string());
+            }
+        }
+        self.url.trim_end_matches('/').to_string()
+    }
     pub fn file_url<P: AsRef<str>>(&self, path: P) -> String {
         if let Some(snapshots_template) = &self.snapshots {
             if let Some(Snapshot::Use(snap)) = &self.snapshot {
@@ -844,7 +854,7 @@ impl Archive {
 impl From<&Archive> for MutableControlStanza {
     fn from(src: &Archive) -> Self {
         let mut cs = MutableControlStanza::parse("Types: deb\n").unwrap();
-        cs.set("URIs", src.url.clone());
+        cs.set("URIs", src.apt_uri());
         cs.set("Suites", src.suites.join(" "));
         cs.set("Components", src.components.join(" "));
         if !src.arch.is_empty() {
@@ -855,12 +865,6 @@ impl From<&Archive> for MutableControlStanza {
         }
         if let Some(signed_by) = &src.signed_by {
             cs.set("Signed-By", String::from(signed_by));
-        }
-        if let Some(snapshots) = &src.snapshots {
-            cs.set("Snapshots", snapshots.clone());
-        }
-        if let Some(snapshot) = &src.snapshot {
-            cs.set("Snapshot", String::from(snapshot));
         }
         cs
     }

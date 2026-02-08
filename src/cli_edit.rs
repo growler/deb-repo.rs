@@ -255,7 +255,7 @@ fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
                 value = value_part[..spacing_start].trim_end();
             }
         }
-        let mut prefix = pending.clone();
+        let prefix = pending.clone();
         pending.clear();
         items.push((key.to_string(), value.trim().to_string()));
         comments.prefix.insert(key.to_string(), prefix);
