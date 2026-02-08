@@ -39,7 +39,8 @@ The resulting binary lives at `target/release/rdebootstrap` (or in `~/.cargo/bin
    `rdebootstrap update --snapshot 20241007T030925Z`  
    This downloads Release/Packages data, solves the specs, and writes `Manifest.<arch>.lock`.
 4. **Build a filesystem tree**  
-   `sudo rdebootstrap build --spec desktop --path ./out/rootfs`
+   `sudo rdebootstrap build --spec desktop --path ./out`  
+   The resulting tree may be used directly with podman (requires the full path because podman enters its own mount namespace): `podman run --rm -it --systemd=always --rootfs "$(pwd)/out" bash -l`
 
 `build` unpacks packages into the target directory, stages artifacts, and runs maintainer scripts in the sandbox so the host stays clean.
 
@@ -78,6 +79,7 @@ Key sections:
 
 ## CLI Tour
 - `init` – bootstrap a manifest from vendor presets or explicit archives.
+- `edit` – edit the manifest or spec metadata.
 - `add archive`, `add local` – append repositories or register a local `.deb`.
 - `include` / `exclude` – add requirements or version constraints to a spec.
 - `drop` – remove requirements or constraints.
