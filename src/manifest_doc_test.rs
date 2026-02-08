@@ -86,7 +86,7 @@ impl TransportProvider for TestTransport {
 
 struct TestGuard;
 
-impl<'a> ContentProviderGuard<'a> for TestGuard {
+impl ContentProviderGuard<'_> for TestGuard {
     async fn commit(self) -> io::Result<()> {
         Ok(())
     }
@@ -101,14 +101,17 @@ impl TestProvider {
     fn new(base: PathBuf) -> Self {
         Self {
             base,
-            transport: TestTransport::default(),
+            transport: TestTransport,
         }
     }
 }
 
 impl ContentProvider for TestProvider {
     type Target = HostFileSystem;
-    type Guard<'a> = TestGuard where Self: 'a;
+    type Guard<'a>
+        = TestGuard
+    where
+        Self: 'a;
 
     async fn init(&self) -> io::Result<Self::Guard<'_>> {
         Ok(TestGuard)
@@ -125,10 +128,7 @@ impl ContentProvider for TestProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_deb(
-        &self,
-        _path: &str,
-    ) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+    async fn ensure_deb(&self, _path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
         Err(io::Error::other("unused in tests"))
     }
 
@@ -149,12 +149,7 @@ impl ContentProvider for TestProvider {
         }
     }
 
-    async fn fetch_index_file(
-        &self,
-        _hash: Hash,
-        _size: u64,
-        _url: &str,
-    ) -> io::Result<IndexFile> {
+    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
         Err(io::Error::other("unused in tests"))
     }
 
@@ -206,9 +201,7 @@ fn add_requirements_default_spec_adds_items_and_comment() {
         .expect("add requirements");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let include = doc["spec"]["include"]
-        .as_array()
-        .expect("include array");
+    let include = doc["spec"]["include"].as_array().expect("include array");
     let items = include
         .iter()
         .filter_map(|item| item.as_str())
@@ -247,9 +240,7 @@ fn add_requirements_prevents_duplicate_comment_on_existing_item() {
         .expect("add requirements");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let include = doc["spec"]["include"]
-        .as_array()
-        .expect("include array");
+    let include = doc["spec"]["include"].as_array().expect("include array");
     assert_eq!(include.len(), 1);
     assert!(text.contains("first-comment"));
     assert!(!text.contains("second-comment"));
@@ -296,9 +287,7 @@ fn add_constraints_default_spec_adds_items_and_comment() {
         .expect("add constraints");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let exclude = doc["spec"]["exclude"]
-        .as_array()
-        .expect("exclude array");
+    let exclude = doc["spec"]["exclude"].as_array().expect("exclude array");
     let items = exclude
         .iter()
         .filter_map(|item| item.as_str())
@@ -337,9 +326,7 @@ fn add_constraints_prevents_duplicate_comment_on_existing_item() {
         .expect("add constraints");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let exclude = doc["spec"]["exclude"]
-        .as_array()
-        .expect("exclude array");
+    let exclude = doc["spec"]["exclude"].as_array().expect("exclude array");
     assert_eq!(exclude.len(), 1);
     assert!(text.contains("first-comment"));
     assert!(!text.contains("second-comment"));
@@ -386,12 +373,13 @@ fn add_archive_adds_entry_and_comment() {
         .expect("add archive");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let archives = doc["archive"]
-        .as_array_of_tables()
-        .expect("archive array");
+    let archives = doc["archive"].as_array_of_tables().expect("archive array");
     assert_eq!(archives.len(), 1);
     let entry = archives.get(0).expect("archive entry");
-    assert_eq!(entry.get("url").and_then(|v| v.as_str()), Some("https://example.invalid/debian"));
+    assert_eq!(
+        entry.get("url").and_then(|v| v.as_str()),
+        Some("https://example.invalid/debian")
+    );
     let suites = entry
         .get("suites")
         .and_then(|v| v.as_array())
@@ -413,14 +401,10 @@ fn add_archive_update_removes_comment_when_none() {
         .expect("add archive");
     let mut updated = archive;
     updated.suites = vec!["testing".to_string()];
-    manifest
-        .add_archive(updated, None)
-        .expect("update archive");
+    manifest.add_archive(updated, None).expect("update archive");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let archives = doc["archive"]
-        .as_array_of_tables()
-        .expect("archive array");
+    let archives = doc["archive"].as_array_of_tables().expect("archive array");
     let entry = archives.get(0).expect("archive entry");
     let suites = entry
         .get("suites")
@@ -444,9 +428,7 @@ fn add_local_package_adds_entry_and_comment() {
         .expect("add local package");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let locals = doc["local"]
-        .as_array_of_tables()
-        .expect("local array");
+    let locals = doc["local"].as_array_of_tables().expect("local array");
     assert_eq!(locals.len(), 1);
     let entry = locals.get(0).expect("local entry");
     assert_eq!(entry.get("path").and_then(|v| v.as_str()), Some("pkg.deb"));
@@ -470,9 +452,7 @@ fn add_local_package_update_removes_comment_when_none() {
         .expect("update local package");
 
     let (text, doc) = render_manifest(&mut manifest);
-    let locals = doc["local"]
-        .as_array_of_tables()
-        .expect("local array");
+    let locals = doc["local"].as_array_of_tables().expect("local array");
     let entry = locals.get(0).expect("local entry");
     assert_eq!(entry.get("size").and_then(|v| v.as_integer()), Some(22));
     assert!(!text.contains("local-comment"));
@@ -676,10 +656,7 @@ fn set_build_env_default_spec_sets_values_and_comments() {
         .expect("add requirements");
 
     let env = make_env(&[("FOO", "bar"), ("BAZ", "qux")]);
-    let comments = make_env_comments(
-        &[("FOO", "# prefix-foo\n")],
-        &[("FOO", " # inline-foo")],
-    );
+    let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
     manifest
         .set_build_env_with_comments(None, env, comments)
         .expect("set build env");
@@ -688,18 +665,15 @@ fn set_build_env_default_spec_sets_values_and_comments() {
     let build_env = doc["spec"]["build-env"]
         .as_table()
         .expect("build-env table");
-    assert_eq!(
-        build_env.get("FOO").and_then(|v| v.as_str()),
-        Some("bar")
-    );
-    assert_eq!(
-        build_env.get("BAZ").and_then(|v| v.as_str()),
-        Some("qux")
-    );
+    assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
+    assert_eq!(build_env.get("BAZ").and_then(|v| v.as_str()), Some("qux"));
     let comments = manifest
         .spec_build_env_comments(None)
         .expect("build env comments");
-    assert_eq!(comments.prefix.get("FOO").map(String::as_str), Some("# prefix-foo\n"));
+    assert_eq!(
+        comments.prefix.get("FOO").map(String::as_str),
+        Some("# prefix-foo\n")
+    );
     assert_eq!(
         comments.inline.get("FOO").map(String::as_str),
         Some(" # inline-foo")
@@ -716,10 +690,7 @@ fn set_build_env_default_spec_updates_and_removes_comments() {
         .expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
-    let comments = make_env_comments(
-        &[("FOO", "# prefix-foo\n")],
-        &[("FOO", " # inline-foo")],
-    );
+    let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
     manifest
         .set_build_env_with_comments(None, env, comments)
         .expect("set build env");
@@ -754,10 +725,7 @@ fn set_build_env_default_spec_removes_table_when_empty() {
         .expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
-    let comments = make_env_comments(
-        &[("FOO", "# prefix-foo\n")],
-        &[("FOO", " # inline-foo")],
-    );
+    let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
     manifest
         .set_build_env_with_comments(None, env, comments)
         .expect("set build env");
@@ -780,10 +748,7 @@ fn set_build_env_named_spec_sets_values_and_comments() {
         .expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
-    let comments = make_env_comments(
-        &[("FOO", "# prefix-foo\n")],
-        &[("FOO", " # inline-foo")],
-    );
+    let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
     manifest
         .set_build_env_with_comments(Some("custom"), env, comments)
         .expect("set build env");
@@ -792,10 +757,7 @@ fn set_build_env_named_spec_sets_values_and_comments() {
     let build_env = doc["spec"]["custom"]["build-env"]
         .as_table()
         .expect("build-env table");
-    assert_eq!(
-        build_env.get("FOO").and_then(|v| v.as_str()),
-        Some("bar")
-    );
+    assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
     assert!(text.contains("prefix-foo"));
 }
 

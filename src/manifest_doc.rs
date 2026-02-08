@@ -386,12 +386,7 @@ impl ManifestFile {
                 let inline = comments.inline.get(key).map(String::as_str).unwrap_or("");
                 if inline.trim().is_empty() {
                     value_item.decor_mut().set_suffix("");
-                } else if inline
-                    .chars()
-                    .next()
-                    .map(|c| c.is_whitespace())
-                    == Some(true)
-                {
+                } else if inline.chars().next().map(|c| c.is_whitespace()) == Some(true) {
                     value_item.decor_mut().set_suffix(inline.trim_end());
                 } else {
                     value_item
@@ -403,10 +398,7 @@ impl ManifestFile {
         }
         Ok(())
     }
-    pub fn spec_build_env_comments(
-        &self,
-        spec_name: Option<&str>,
-    ) -> io::Result<BuildEnvComments> {
+    pub fn spec_build_env_comments(&self, spec_name: Option<&str>) -> io::Result<BuildEnvComments> {
         let (spec_name, _) = self.spec_index_ensure(spec_name)?;
         let mut out = BuildEnvComments::default();
         let spec_table = self
@@ -421,10 +413,7 @@ impl ManifestFile {
                 .get(spec_name)
                 .and_then(toml_edit::Item::as_table)
                 .ok_or_else(|| {
-                    io::Error::other(format!(
-                        "spec {} not found",
-                        spec_display_name(spec_name)
-                    ))
+                    io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
                 })?
         };
         let build_env = match spec_table
@@ -463,11 +452,9 @@ impl ManifestFile {
         let (spec_name, spec_index) = self.spec_index_ensure(spec_name)?;
         self.specs.value_mut_at(spec_index).build_script = script.clone();
         if let Some(script) = script {
-            let entry = self.doc.get_spec_table_entry_mut(
-                spec_name,
-                "build-script",
-                || toml_edit::value(""),
-            );
+            let entry = self
+                .doc
+                .get_spec_table_entry_mut(spec_name, "build-script", || toml_edit::value(""));
             *entry = toml_edit::value(script);
         } else {
             self.doc.remove_spec_table_entry(spec_name, "build-script");
@@ -852,14 +839,12 @@ impl LockFile {
         }
     }
     pub async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
-        path: P,
+        lock_path: P,
         arch: A,
         manifest_hash: &Hash,
     ) -> io::Result<Option<Self>> {
-        let lock_file_path = path
-            .as_ref()
-            .with_extension(format!("{}.lock", arch.as_ref()));
-        match smol::fs::File::open(&lock_file_path).await {
+        let lock_file_path = lock_path.as_ref();
+        match smol::fs::File::open(lock_file_path).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
                 tracing::debug!("lock file {:?} not found", lock_file_path.as_os_str());
                 Ok(None)
@@ -912,7 +897,12 @@ impl LockFile {
             }
         }
     }
-    pub async fn store<P: AsRef<Path>>(&self, path: P, arch: &str, hash: &Hash) -> io::Result<()> {
+    pub async fn store<P: AsRef<Path>>(
+        &self,
+        lock_path: P,
+        arch: &str,
+        hash: &Hash,
+    ) -> io::Result<()> {
         if !self.is_uptodate() {
             return Err(io::Error::other(
                 "cannot store manifest with outdated lock file",
@@ -927,7 +917,7 @@ impl LockFile {
             #[serde(flatten)]
             file: &'a LockFile,
         }
-        let lock_path = path.as_ref().with_extension(format!("{}.lock", arch));
+        let lock_path = lock_path.as_ref();
         let lock = LockFileWithHash {
             timestamp: Utc::now(),
             arch,

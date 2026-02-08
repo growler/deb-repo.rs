@@ -90,6 +90,7 @@
         shell = toolchain: params: {
             inherit buildInputs;
             nativeBuildInputs = nativeBuildInputs ++ [ toolchain ] ++ (with pkgs; [
+                dprint
             ]);
             shellHook = ''
             export RUST_BACKTRACE=1

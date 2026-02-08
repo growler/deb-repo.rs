@@ -3,7 +3,7 @@ use {
         cli::{Command, Config},
         content::{ContentProvider, ContentProviderGuard},
         kvlist::KVList,
-        manifest::Manifest,
+        manifest::{lock_path_for, Manifest},
         manifest_doc::BuildEnvComments,
     },
     anyhow::{anyhow, Result},
@@ -59,7 +59,7 @@ impl<C: Config> Command<C> for Edit {
         let spec = self.opts.spec.as_deref();
         smol::block_on(async move {
             let manifest_path = conf.manifest().to_path_buf();
-            let lock_path = manifest_path.with_extension(format!("{}.lock", conf.arch()));
+            let lock_path = lock_path_for(&manifest_path, conf.lock_base(), conf.arch())?;
             let manifest_backup = smol::fs::read(&manifest_path).await?;
             let lock_backup = match smol::fs::read(&lock_path).await {
                 Ok(bytes) => Some(bytes),
@@ -82,7 +82,9 @@ impl<C: Config> Command<C> for Edit {
                 )
                 .await;
                 if let Err(rollback_err) = rollback {
-                    return Err(anyhow!("update failed: {err}; rollback failed: {rollback_err}"));
+                    return Err(anyhow!(
+                        "update failed: {err}; rollback failed: {rollback_err}"
+                    ));
                 }
                 return Err(err);
             }
@@ -128,12 +130,9 @@ impl EditorCommand {
     }
 }
 
-async fn edit_env<C: Config>(
-    conf: &C,
-    editor: &EditorCommand,
-    spec: Option<&str>,
-) -> Result<()> {
-    let mut manifest = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+async fn edit_env<C: Config>(conf: &C, editor: &EditorCommand, spec: Option<&str>) -> Result<()> {
+    let mut manifest =
+        Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     let env = manifest.spec_build_env(spec)?;
     let comments = manifest.spec_build_env_comments(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".env").tempfile()?;
@@ -151,7 +150,8 @@ async fn edit_script<C: Config>(
     editor: &EditorCommand,
     spec: Option<&str>,
 ) -> Result<()> {
-    let mut manifest = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+    let mut manifest =
+        Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     let script = manifest.spec_build_script(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".sh").tempfile()?;
     if let Some(script) = script {
@@ -237,12 +237,7 @@ fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
         let mut value = value_part.trim_end();
         let mut inline = String::new();
         if let Some(pos) = value_part.find('#') {
-            if pos > 0
-                && value_part[..pos]
-                    .chars()
-                    .last()
-                    .map(|c| c.is_whitespace())
-                    == Some(true)
+            if pos > 0 && value_part[..pos].chars().last().map(|c| c.is_whitespace()) == Some(true)
             {
                 let before = &value_part[..pos];
                 let spacing_start = before
@@ -270,11 +265,14 @@ fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
 async fn run_update<C: Config>(conf: &C) -> Result<()> {
     let fetcher = conf.fetcher()?;
     let guard = fetcher.init().await?;
-    let mut manifest = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+    let mut manifest =
+        Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     manifest
         .update(false, false, conf.concurrency(), fetcher)
         .await?;
-    manifest.store(conf.manifest()).await?;
+    manifest
+        .store_with_lock_base(conf.manifest(), conf.lock_base())
+        .await?;
     guard.commit().await?;
     Ok(())
 }

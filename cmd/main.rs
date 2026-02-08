@@ -6,7 +6,7 @@ use {
         content::HostCache,
         exec::maybe_run_helper,
         sandbox::{run_sandbox, HostSandboxExecutor},
-        HostFileSystem, HttpTransport, Manifest,
+        HostFileSystem, HttpTransport, LockBase, Manifest,
     },
     std::{
         num::NonZero,
@@ -92,6 +92,16 @@ pub struct App {
     #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE, display_order = 0)]
     manifest: PathBuf,
 
+    /// Base path for the lock file (end with a separator to treat as a directory)
+    #[arg(
+        global = true,
+        short = 'l',
+        long = "lock",
+        value_name = "LOCK",
+        display_order = 0
+    )]
+    lock: Option<LockBase>,
+
     #[command(subcommand)]
     cmd: Commands,
 }
@@ -111,6 +121,9 @@ impl cli::Config for App {
     }
     fn manifest(&self) -> &Path {
         &self.manifest
+    }
+    fn lock_base(&self) -> Option<&LockBase> {
+        self.lock.as_ref()
     }
     fn concurrency(&self) -> NonZero<usize> {
         self.concurrency

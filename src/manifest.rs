@@ -18,7 +18,11 @@ use {
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
-    std::{num::NonZero, path::Path},
+    std::{
+        num::NonZero,
+        path::{Path, PathBuf},
+        str::FromStr,
+    },
 };
 
 pub struct Manifest {
@@ -29,6 +33,60 @@ pub struct Manifest {
     lock_updated: bool,
     universe: Option<Box<Universe>>,
     source_universe: Option<SourceUniverse>,
+}
+
+#[derive(Clone, Debug)]
+pub struct LockBase {
+    path: PathBuf,
+    is_dir: bool,
+}
+
+impl LockBase {
+    pub fn new(path: PathBuf, is_dir: bool) -> Self {
+        Self { path, is_dir }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub fn is_dir(&self) -> bool {
+        self.is_dir
+    }
+}
+
+impl FromStr for LockBase {
+    type Err = String;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        if value.is_empty() {
+            return Err("lock path is empty".to_string());
+        }
+        let is_dir = value.ends_with(std::path::MAIN_SEPARATOR)
+            || (std::path::MAIN_SEPARATOR != '/' && value.ends_with('/'));
+        Ok(Self {
+            path: PathBuf::from(value),
+            is_dir,
+        })
+    }
+}
+
+pub(crate) fn lock_path_for(
+    manifest_path: &Path,
+    lock_base: Option<&LockBase>,
+    arch: &str,
+) -> io::Result<PathBuf> {
+    let base = match lock_base {
+        None => manifest_path.to_path_buf(),
+        Some(lock_base) if lock_base.is_dir => {
+            let file_name = manifest_path
+                .file_name()
+                .ok_or_else(|| io::Error::other("manifest file name is missing"))?;
+            lock_base.path.join(file_name)
+        }
+        Some(lock_base) => lock_base.path.to_path_buf(),
+    };
+    Ok(base.with_extension(format!("{}.lock", arch)))
 }
 
 ///
@@ -79,10 +137,18 @@ impl Manifest {
         }
     }
     pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<Self> {
+        Self::from_file_with_lock_base(path, arch, None).await
+    }
+    pub async fn from_file_with_lock_base<A: ToString, P: AsRef<Path>>(
+        path: P,
+        arch: A,
+        lock_base: Option<&LockBase>,
+    ) -> io::Result<Self> {
         let path = smol::fs::canonicalize(path.as_ref()).await?;
         let (manifest, hash) = ManifestFile::from_file(&path).await?;
         let arch = arch.to_string();
-        let lock = LockFile::from_file(&path, &arch, &hash)
+        let lock_path = lock_path_for(&path, lock_base, &arch)?;
+        let lock = LockFile::from_file(&lock_path, &arch, &hash)
             .await?
             .unwrap_or_else(|| manifest.unlocked_lock_file());
         Ok(Manifest {
@@ -102,13 +168,21 @@ impl Manifest {
         self.lock_updated = true;
     }
     pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+        self.store_with_lock_base(path, None).await
+    }
+    pub async fn store_with_lock_base<P: AsRef<Path>>(
+        &self,
+        path: P,
+        lock_base: Option<&LockBase>,
+    ) -> io::Result<()> {
         let (hash, hash_update) = if let Some(hash) = self.hash.clone() {
             (hash, false)
         } else {
             (self.file.store(path.as_ref()).await?, true)
         };
         if self.lock_updated || hash_update {
-            self.lock.store(path.as_ref(), &self.arch, &hash).await?;
+            let lock_path = lock_path_for(path.as_ref(), lock_base, &self.arch)?;
+            self.lock.store(&lock_path, &self.arch, &hash).await?;
         }
         Ok(())
     }
@@ -457,10 +531,7 @@ impl Manifest {
     pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
         Ok(self.file.spec_build_env(spec_name)?.clone())
     }
-    pub fn spec_build_env_comments(
-        &self,
-        spec_name: Option<&str>,
-    ) -> io::Result<BuildEnvComments> {
+    pub fn spec_build_env_comments(&self, spec_name: Option<&str>) -> io::Result<BuildEnvComments> {
         self.file.spec_build_env_comments(spec_name)
     }
     pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
@@ -943,7 +1014,12 @@ impl Manifest {
         concurrency: NonZero<usize>,
         cache: &C,
         pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>, Vec<(String, String)>)>
+    ) -> io::Result<(
+        Vec<String>,
+        Vec<Vec<String>>,
+        Vec<String>,
+        Vec<(String, String)>,
+    )>
     where
         FS: StagingFileSystem,
         P: FnOnce(u64) -> ProgressBar,
@@ -967,7 +1043,12 @@ impl Manifest {
         concurrency: NonZero<usize>,
         cache: &C,
         pb: Option<P>,
-    ) -> io::Result<(Vec<String>, Vec<Vec<String>>, Vec<String>, Vec<(String, String)>)>
+    ) -> io::Result<(
+        Vec<String>,
+        Vec<Vec<String>>,
+        Vec<String>,
+        Vec<(String, String)>,
+    )>
     where
         FS: StagingFileSystem + Send + Clone + 'static,
         P: FnOnce(u64) -> ProgressBar,

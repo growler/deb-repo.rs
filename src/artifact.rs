@@ -684,14 +684,16 @@ where
         Box::pin(async move {
             let source = self.source.display().to_string();
             if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
-                fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
-                    io::Error::other(format!(
-                        "failed to create parent directory {} for artifact {}: {}",
-                        parent.display(),
-                        source.as_str(),
-                        err
-                    ))
-                })?;
+                fs.create_dir_all(parent, 0, 0, 0o755)
+                    .await
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to create parent directory {} for artifact {}: {}",
+                            parent.display(),
+                            source.as_str(),
+                            err
+                        ))
+                    })?;
             }
             let (hash, _) =
                 tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.name())
@@ -879,14 +881,16 @@ impl File {
         let target = self.target.as_str();
         let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
         if let Some(parent) = Path::new(&self.target).parent() {
-            fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
-                io::Error::other(format!(
-                    "failed to create parent directory {} for artifact {}: {}",
-                    parent.display(),
-                    uri,
-                    err
-                ))
-            })?;
+            fs.create_dir_all(parent, 0, 0, 0o755)
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to create parent directory {} for artifact {}: {}",
+                        parent.display(),
+                        uri,
+                        err
+                    ))
+                })?;
         }
         if self.unpack.unwrap_or(true) && is_comp_ext(&self.uri) {
             fs.create_file(comp_reader(&self.uri, &mut reader), 0, 0, st_mode, None)
@@ -894,9 +898,7 @@ impl File {
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to create target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })?
         } else {
@@ -905,9 +907,7 @@ impl File {
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to create target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })?
         }
@@ -916,9 +916,7 @@ impl File {
         .map_err(|err| {
             io::Error::other(format!(
                 "failed to persist target file {} for artifact {}: {}",
-                target,
-                uri,
-                err
+                target, uri, err
             ))
         })?;
         self.size = reader.as_mut().size();
@@ -968,14 +966,16 @@ where
             let uri = self.uri.as_str();
             let target = self.target.as_str();
             if let Some(parent) = Path::new(&self.target).parent() {
-                fs.create_dir_all(parent, 0, 0, 0o755).await.map_err(|err| {
-                    io::Error::other(format!(
-                        "failed to create parent directory {} for artifact {}: {}",
-                        parent.display(),
-                        uri,
-                        err
-                    ))
-                })?;
+                fs.create_dir_all(parent, 0, 0, 0o755)
+                    .await
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to create parent directory {} for artifact {}: {}",
+                            parent.display(),
+                            uri,
+                            err
+                        ))
+                    })?;
             }
             if self.unpack && is_comp_ext(self.uri.as_bytes()) {
                 fs.create_file(
@@ -989,9 +989,7 @@ where
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to create target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })?
                 .persist(&self.target)
@@ -999,9 +997,7 @@ where
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to persist target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })
             } else {
@@ -1016,9 +1012,7 @@ where
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to create target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })?
                 .persist(&self.target)
@@ -1026,9 +1020,7 @@ where
                 .map_err(|err| {
                     io::Error::other(format!(
                         "failed to persist target file {} for artifact {}: {}",
-                        target,
-                        uri,
-                        err
+                        target, uri, err
                     ))
                 })
             }
@@ -1132,16 +1124,12 @@ mod tree {
             sha1::Sha1::NAME => copy_hash_dir_inner::<sha1::Sha1, _, _>(fd, fs, target_path)
                 .await
                 .map(|(hash, size)| (hash.hash(), size)),
-            sha2::Sha256::NAME => {
-                copy_hash_dir_inner::<sha2::Sha256, _, _>(fd, fs, target_path)
-                    .await
-                    .map(|(hash, size)| (hash.hash(), size))
-            }
-            sha2::Sha512::NAME => {
-                copy_hash_dir_inner::<sha2::Sha512, _, _>(fd, fs, target_path)
-                    .await
-                    .map(|(hash, size)| (hash.hash(), size))
-            }
+            sha2::Sha256::NAME => copy_hash_dir_inner::<sha2::Sha256, _, _>(fd, fs, target_path)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
+            sha2::Sha512::NAME => copy_hash_dir_inner::<sha2::Sha512, _, _>(fd, fs, target_path)
+                .await
+                .map(|(hash, size)| (hash.hash(), size)),
             blake3::Hasher::NAME => {
                 copy_hash_dir_inner::<blake3::Hasher, _, _>(fd, fs, target_path)
                     .await

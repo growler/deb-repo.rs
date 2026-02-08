@@ -54,6 +54,7 @@ impl Release {
     pub fn is_empty(&self) -> bool {
         self.inner.with_data(|d| d.is_empty())
     }
+    #[allow(clippy::type_complexity)]
     pub(crate) fn files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],

@@ -30,10 +30,18 @@ pub struct Spec {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub stage: Vec<String>,
 
-    #[serde(default, rename = "build-env", skip_serializing_if = "KVList::is_empty")]
+    #[serde(
+        default,
+        rename = "build-env",
+        skip_serializing_if = "KVList::is_empty"
+    )]
     pub build_env: KVList<String>,
 
-    #[serde(default, rename = "build-script", skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        rename = "build-script",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub build_script: Option<String>,
 
     #[serde(default, skip_serializing_if = "KVList::is_empty")]

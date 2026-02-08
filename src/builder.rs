@@ -45,11 +45,7 @@ impl<E: Executor> BuildJob<E> {
             ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),
         ])?;
         if !self.build_env.is_empty() {
-            executor.envs(
-                self.build_env
-                    .iter()
-                    .map(|(k, v)| (k.as_str(), v.as_str())),
-            )?;
+            executor.envs(self.build_env.iter().map(|(k, v)| (k.as_str(), v.as_str())))?;
         }
         executor.write_file("./usr/sbin/policy-rc.d", 0o755, "#!/bin/sh\nexit 101\n")?;
         let (base_passwd, base_files, essential_pkgs) = self.essentials.iter().fold(
@@ -155,12 +151,9 @@ pub trait Executor {
         async move {
             self.prepare_tree(fs).await?;
             self.execute(BuildJob::<Self>::new(
-                essentials,
-                packages,
-                scripts,
-                build_env,
+                essentials, packages, scripts, build_env,
             ))
-                .await?;
+            .await?;
             self.process_changes(fs).await
         }
     }
