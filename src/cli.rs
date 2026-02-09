@@ -56,10 +56,10 @@ pub mod cmd {
     #[derive(Parser)]
     #[command(
         about = "Create a new manifest file",
-        long_about = "Create a new manifest file from an archive definition.
+        long_about = r#"Create a new manifest file from an archive definition.
 If a vendor name is provided as archive URL, default archives and packages are derived from it.
 Examples:  
-    rdebootstrap init --package mc --package libcom-err2 --url debian"
+    rdebootstrap init --package mc --package libcom-err2 --url debian"#
     )]
     pub struct Init {
         /// Overwrite existing manifest if present
@@ -281,8 +281,8 @@ Examples:
     #[derive(Parser)]
     #[command(
         about = "Remove requirements or constraints from a spec",
-        long_about = "Remove requirements and/or constraints from a spec
-Use --requirements-only or --constraints-only to limit the operation scope."
+        long_about = r#"Remove requirements and/or constraints from a spec
+Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     pub struct Remove {
         #[command(subcommand)]
@@ -300,8 +300,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     #[command(
         about = "Remove requirements or constraints from a spec",
-        long_about = "Remove requirements and/or constraints from a spec
-Use --requirements-only or --constraints-only to limit the operation scope."
+        long_about = r#"Remove requirements and/or constraints from a spec
+Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     pub struct Drop {
         /// Drop only requirements (do not touch constraints)
@@ -433,13 +433,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     #[command(
         about = "Add package requirements to a spec",
-        long_about = "Add one or more package requirements to a spec. Each requirement can be a bare package name or a set, and can include a version relation, e.g.:
+        long_about = r#"Add one or more package requirements to a spec. Each requirement can be a bare package name or a set, and can include a version relation, e.g.:
   foo
   foo (= 1.2.3)
   bar (>= 2.0)
   foo | bar (<< 3.0)
 
-  Alternatively, requirement might be a path to .deb file to include directly."
+  Alternatively, requirement might be a path to .deb file to include directly."#
     )]
     pub struct Include {
         /// Target spec (omit to use the default spec)
@@ -482,10 +482,10 @@ Use --requirements-only or --constraints-only to limit the operation scope."
     #[derive(Parser)]
     #[command(
         about = "Add package constraints to a spec",
-        long_about = "Add one or more constraints to restrict resolution. Examples:
+        long_about = r#"Add one or more constraints to restrict resolution. Examples:
   foo (= 1.2.3)
   foo (<< 2.0)  
-  bar (<= 3.4)"
+  bar (<= 3.4)"#
     )]
     pub struct Exclude {
         /// Target spec (omit to use the default spec)

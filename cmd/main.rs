@@ -22,7 +22,7 @@ use {
     version,
     next_line_help = false,
     about = "Bootstrap Debian-based system tree from a manifest file",
-    long_about = "Bootstrap a Debian root filesystem from a manifest file.
+    long_about = r#"Bootstrap a Debian root filesystem from a manifest file.
 This tool resolves packages from configured repositories, locks and updates
 a snapshot, stages artifacts, and builds a rootfs-like directory tree.
 Typical workflow:  
@@ -33,7 +33,7 @@ Typical workflow:
 Notes:
     -k/--insecure disables TLS verification for archive downloads.
     -K/--no-verify skips Release file signature verification.
-"
+"#
 )]
 pub struct App {
     /// Turns off all output except errors
