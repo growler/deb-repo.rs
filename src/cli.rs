@@ -531,14 +531,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         long_about = "Fetch or retrieve from cache package indexes, solve the specs and update lock file. Optionally set a snapshot before updating."
     )]
     pub struct Update {
-        /// Update lock file even if it appears up to date 
+        /// Update lock file even if it appears up to date
         /// (refresh package indexes and re-resolve everything)
         #[arg(short = 'f', long = "force", action)]
         force: bool,
-        /// Re-fetch package archives even if they appear up to date (implies --force). 
+        /// Re-fetch package archives even if they appear up to date (implies --force).
         #[arg(short = 'A', long = "archives", action)]
         archives: bool,
-        /// Refresh local packages index (implies --force). 
+        /// Refresh local packages index (implies --force).
         #[arg(short = 'L', long = "locals", action)]
         locals: bool,
         /// Snapshot to use for all archives that support it and have snapshotting enabled
@@ -565,13 +565,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                mf.update(
-                    self.archives,
-                    self.locals,
-                    conf.concurrency(),
-                    fetcher,
-                )
-                .await?;
+                mf.update(self.archives, self.locals, conf.concurrency(), fetcher)
+                    .await?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
                     .await?;
                 guard.commit().await?;
