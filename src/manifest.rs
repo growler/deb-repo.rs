@@ -136,22 +136,23 @@ impl Manifest {
             source_universe: None,
         }
     }
-    pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<Self> {
+    pub async fn from_file<A: ToString, P: AsRef<Path>>(path: P, arch: A) -> io::Result<(Self, bool)> {
         Self::from_file_with_lock_base(path, arch, None).await
     }
     pub async fn from_file_with_lock_base<A: ToString, P: AsRef<Path>>(
         path: P,
         arch: A,
         lock_base: Option<&LockBase>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, bool)> {
         let path = smol::fs::canonicalize(path.as_ref()).await?;
         let (manifest, hash) = ManifestFile::from_file(&path).await?;
         let arch = arch.to_string();
         let lock_path = lock_path_for(&path, lock_base, &arch)?;
         let lock = LockFile::from_file(&lock_path, &arch, &hash)
-            .await?
-            .unwrap_or_else(|| manifest.unlocked_lock_file());
-        Ok(Manifest {
+            .await?;
+        let has_valid_lock = lock.is_some();
+        let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file());
+        Ok((Manifest {
             arch: arch.to_string(),
             hash: Some(hash),
             file: manifest,
@@ -159,7 +160,7 @@ impl Manifest {
             lock_updated: false,
             universe: None,
             source_universe: None,
-        })
+        }, has_valid_lock))
     }
     fn mark_file_updated(&mut self) {
         self.hash.take();

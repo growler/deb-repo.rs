@@ -131,7 +131,7 @@ impl EditorCommand {
 }
 
 async fn edit_env<C: Config>(conf: &C, editor: &EditorCommand, spec: Option<&str>) -> Result<()> {
-    let mut manifest =
+    let (mut manifest, _) =
         Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     let env = manifest.spec_build_env(spec)?;
     let comments = manifest.spec_build_env_comments(spec)?;
@@ -150,7 +150,7 @@ async fn edit_script<C: Config>(
     editor: &EditorCommand,
     spec: Option<&str>,
 ) -> Result<()> {
-    let mut manifest =
+    let (mut manifest, _) =
         Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     let script = manifest.spec_build_script(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".sh").tempfile()?;
@@ -265,7 +265,7 @@ fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
 async fn run_update<C: Config>(conf: &C) -> Result<()> {
     let fetcher = conf.fetcher()?;
     let guard = fetcher.init().await?;
-    let mut manifest =
+    let (mut manifest, _) =
         Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     manifest
         .update(false, false, conf.concurrency(), fetcher)
