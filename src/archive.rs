@@ -570,7 +570,6 @@ impl RepositoryFile {
 
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
-#[group(required = true, multiple = true)]
 pub struct Archive {
     /// Repository URL
     #[arg(value_name = "URL")]

@@ -671,6 +671,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         /// as a hexadecimal string.
         #[arg(long = "sri", action)]
         sri: bool,
+        /// Spec name (omit to use the default spec)
         #[arg(value_name = "SPEC")]
         spec: Option<String>,
     }
@@ -702,6 +703,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         long_about = "Print the raw control record for the given package."
     )]
     pub struct ShowPackage {
+        /// Package name
         #[arg(value_name = "PACKAGE")]
         package: String,
     }
