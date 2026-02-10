@@ -671,6 +671,7 @@ impl Manifest {
         concurrency: NonZero<usize>,
         force_archives: bool,
         force_locals: bool,
+        skip_verify: bool,
         cache: &C,
     ) -> io::Result<bool> {
         let arch = self.arch.as_str();
@@ -680,7 +681,14 @@ impl Manifest {
                 .iter()
                 .zip(self.lock.archives_mut())
                 .map(move |(archive, locked)| {
-                    LockedArchive::fetch_or_refresh(locked, archive, arch, force_archives, cache)
+                    LockedArchive::fetch_or_refresh(
+                        locked,
+                        archive,
+                        arch,
+                        force_archives,
+                        skip_verify,
+                        cache,
+                    )
                 }),
         )
         .flatten_unordered(concurrency.get())
@@ -748,12 +756,19 @@ impl Manifest {
         &mut self,
         force_archives: bool,
         force_locals: bool,
+        skip_verify: bool,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("updating locked archive");
         let updated = self
-            .update_locked_archives(concurrency, force_archives, force_locals, cache)
+            .update_locked_archives(
+                concurrency,
+                force_archives,
+                force_locals,
+                skip_verify,
+                cache,
+            )
             .await?;
         if updated {
             tracing::debug!("archives updated, invalidating locked specs");

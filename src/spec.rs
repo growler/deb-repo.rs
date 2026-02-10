@@ -88,15 +88,19 @@ impl LockedArchive {
         archive: &'a Archive,
         arch: &'a str,
         force: bool,
+        skip_verify: bool,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         match locked {
-            Some(locked) => locked.refresh(archive, arch, force, cache),
+            Some(locked) => locked.refresh(archive, arch, force, skip_verify, cache),
             None => {
                 *locked = Some(LockedArchive {
                     suites: vec![LockedSuite::default(); archive.suites.len()],
                 });
-                locked.as_mut().unwrap().refresh(archive, arch, true, cache)
+                locked
+                    .as_mut()
+                    .unwrap()
+                    .refresh(archive, arch, true, skip_verify, cache)
             }
         }
     }
@@ -105,6 +109,7 @@ impl LockedArchive {
         archive: &'a Archive,
         arch: &'a str,
         force: bool,
+        skip_verify: bool,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<bool>> {
         tracing::debug!(
@@ -117,7 +122,7 @@ impl LockedArchive {
                 tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
                 async move {
                     tracing::debug!("Checking locked archive for {} {}", archive.url, suite,);
-                    let path = archive.release_path(suite);
+                    let path = archive.release_path(suite, skip_verify);
                     if !locked.release.path.is_empty() && !force {
                         let rel = cache
                             .fetch_index_file(
@@ -126,7 +131,7 @@ impl LockedArchive {
                                 &archive.file_url(&path),
                             )
                             .await?;
-                        let rel = archive.release_from_file(rel).await;
+                        let rel = archive.release_from_file(rel, skip_verify).await;
                         if rel.is_ok() {
                             return Ok::<_, io::Error>(false);
                         }
@@ -135,7 +140,7 @@ impl LockedArchive {
                     let (rel, hash, size) = cache
                         .ensure_index_file::<blake3::Hasher>(&archive.file_url(&path))
                         .and_then(|(rel, hash, size)| async move {
-                            let rel = archive.release_from_file(rel).await?;
+                            let rel = archive.release_from_file(rel, skip_verify).await?;
                             Ok((rel, hash, size))
                         })
                         .await?;

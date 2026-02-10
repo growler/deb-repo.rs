@@ -32,7 +32,6 @@ Typical workflow:
     4) build            - extract and configure packages into a target directory
 Notes:
     -k/--insecure disables TLS verification for archive downloads.
-    -K/--no-verify skips Release file signature verification.
 "#
 )]
 pub struct App {
@@ -75,10 +74,6 @@ pub struct App {
         display_order = 0
     )]
     pub no_cache: bool,
-
-    /// Do not verify Release files by default (not recommended)
-    #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
-    pub insecure_release: bool,
 
     /// Skip the connection verification (not recommended)
     #[arg(short = 'k', long = "insecure", action, display_order = 0, action)]

@@ -268,7 +268,7 @@ async fn run_update<C: Config>(conf: &C) -> Result<()> {
     let (mut manifest, _) =
         Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
     manifest
-        .update(false, false, conf.concurrency(), fetcher)
+        .update(false, false, false, conf.concurrency(), fetcher)
         .await?;
     manifest
         .store_with_lock_base(conf.manifest(), conf.lock_base())

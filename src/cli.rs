@@ -78,6 +78,10 @@ Examples:
         /// URL might be a vendor name (debian, ubuntu, devuan).
         #[command(flatten)]
         archive: Archive,
+
+        /// Do not verify Release files by default (not recommended)
+        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        insecure_release: bool,
     }
 
     impl<C: Config> Command<C> for Init {
@@ -105,7 +109,14 @@ Examples:
                     self.comment.as_deref().or(comment.as_deref()),
                 );
                 mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(true, false, conf.concurrency(), fetcher).await?;
+                mf.update(
+                    true,
+                    false,
+                    self.insecure_release,
+                    conf.concurrency(),
+                    fetcher,
+                )
+                .await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
                     .await?;
@@ -126,6 +137,10 @@ Examples:
         comment: Option<String>,
         #[command(flatten)]
         archive: Archive,
+
+        /// Do not verify Release files by default (not recommended)
+        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        insecure_release: bool,
     }
     impl<C: Config> Command<C> for AddArchive {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -139,7 +154,8 @@ Examples:
                 )
                 .await?;
                 mf.add_archive(self.archive.clone(), self.comment.as_deref())?;
-                mf.update(false, false, conf.concurrency(), fetcher).await?;
+                mf.update(false, false, false, conf.concurrency(), fetcher)
+                    .await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
@@ -544,6 +560,9 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         /// Snapshot to use for all archives that support it and have snapshotting enabled
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
+        /// Do not verify Release files by default (not recommended)
+        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        insecure_release: bool,
     }
 
     impl<C: Config> Command<C> for Update {
@@ -565,8 +584,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if let Some(snapshot) = &self.snapshot {
                     mf.set_snapshot(*snapshot).await;
                 }
-                mf.update(self.archives, self.locals, conf.concurrency(), fetcher)
-                    .await?;
+                mf.update(
+                    self.archives,
+                    self.locals,
+                    self.insecure_release,
+                    conf.concurrency(),
+                    fetcher,
+                )
+                .await?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
                     .await?;
                 guard.commit().await?;

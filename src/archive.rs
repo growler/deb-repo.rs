@@ -585,8 +585,12 @@ pub struct Archive {
     pub arch: Vec<String>,
 
     /// Allow the repository to be insecure (skip checking release signature)
-    #[arg(short = 'k', long = "allow-insecure")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[arg(short = 'K', long = "allow-insecure")]
+    #[serde(
+        default,
+        rename = "allow-insecure",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub allow_insecure: Option<bool>,
 
     /// A path to PGP keyring file or a @path in an ASCII-armored PGP public key block to inline
@@ -651,15 +655,19 @@ impl Archive {
         self.snapshots = Some(snapshots.as_ref().to_string());
         self
     }
-    pub(crate) fn release_path(&self, suite: &str) -> String {
-        if self.allow_insecure() {
+    pub(crate) fn release_path(&self, suite: &str, skip_verify: bool) -> String {
+        if self.allow_insecure() || skip_verify {
             format!("dists/{}/Release", suite)
         } else {
             format!("dists/{}/InRelease", suite)
         }
     }
-    pub(crate) async fn release_from_file(&self, r: IndexFile) -> io::Result<Release> {
-        if self.allow_insecure() {
+    pub(crate) async fn release_from_file(
+        &self,
+        r: IndexFile,
+        skip_verify: bool,
+    ) -> io::Result<Release> {
+        if self.allow_insecure() || skip_verify {
             Release::new(r).map_err(std::io::Error::other)
         } else {
             self.verify_signed_release(&r).await

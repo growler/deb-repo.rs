@@ -1,0 +1,47 @@
+[[auth]]
+host = "deb.company.com"
+login = "builduser"
+password = "password123"
+
+[[auth]]
+host = "deb.company.com"
+login = "builduser"
+password.env = "BUILD_USER_PASSWORD"
+
+[[auth]]
+host = "deb.company.com"
+login = "builduser"
+password.cmd = "gpg --quiet --decrypt path/to/secrets/pass.gpg"
+# cmd may use environment variables as well, i.e.
+# password.cmd = "gpg --quiet --decrypt ${BUILD_USER_PASSWORD_FILE}" 
+# or
+# password.cmd = "gpg --quiet --decrypt ${HOME}/secrets/pass.gpg"
+
+[[auth]]
+host = "deb.other-company.com"
+cert = "relative/path/to/cert.pem"
+key = "relative/path/to/key.pem"
+
+[[auth]]
+host = "deb.some-other-company.com"
+cert = "relative/path/to/cert.pem"
+key = "relative/path/to/key.pem"
+password = "certpassword"
+# alternatively password.env of password.key might be used
+
+[[auth]]
+host = "deb.yet-another-company.com"
+cert = """
+---BEGIN CERTIFICATE---
+...
+"""
+key = """
+---BEGIN PRIVATE KEY---
+...
+"""
+
+[[auth]]
+host = "some-deb-proxy.other-company.com"
+token = "a_very_long_token_string"
+
+
