@@ -64,6 +64,20 @@ impl Release {
         impl Iterator<Item = Result<(&'a str, Hash, u64, ReleaseFileArch<'a>), ParseError>>,
         ParseError,
     > {
+        let fetch_all_arch = self
+            .field("No-Support-for-Architecture-all")
+            .is_none_or(|v| v.trim_ascii() != "Packages");
+        let arch_list = if fetch_all_arch {
+            ["all"].iter().chain(arch.iter()).copied().collect()
+        } else {
+            vec![]
+        };
+        let arch = if fetch_all_arch {
+            &arch_list
+        } else {
+            arch
+        };
+
         let release_components = self.field("Components").unwrap_or("");
         if components.iter().any(|c| {
             !release_components.split_ascii_whitespace().any(|rc| {
