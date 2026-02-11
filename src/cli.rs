@@ -80,7 +80,7 @@ Examples:
         archive: Archive,
 
         /// Do not verify Release files by default (not recommended)
-        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
 
@@ -139,7 +139,7 @@ Examples:
         archive: Archive,
 
         /// Do not verify Release files by default (not recommended)
-        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
     impl<C: Config> Command<C> for AddArchive {
@@ -561,7 +561,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
         /// Do not verify Release files by default (not recommended)
-        #[arg(short = 'K', long = "no-verify", display_order = 0, action)]
+        #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
 
