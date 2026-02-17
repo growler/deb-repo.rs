@@ -1,7 +1,6 @@
 use crate::{
     archive::SnapshotId,
     control::{MutableControlFile, MutableControlStanza},
-    hash::HashAlgo,
 };
 
 use {
@@ -791,33 +790,15 @@ impl<'a> Iterator for SpecIterator<'a> {
     }
 }
 
-fn universe_hash<'a, I: Iterator<Item = &'a LockedArchive> + 'a>(
-    archives: I,
-    locals: Option<&Packages>,
-) -> Hash {
-    let mut hasher = blake3::Hasher::new();
-    if let Some(locals) = locals {
-        hasher.update(locals.src().as_bytes());
-    }
-    archives
-        .flat_map(|s| s.suites.iter())
-        .flat_map(|s| s.packages.iter())
-        .fold(hasher, |mut hasher, file| {
-            hasher.update(file.hash.as_bytes());
-            hasher
-        })
-        .into_hash()
-}
-
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct LockFile {
+    #[serde(rename = "universe", default)]
+    universe_hash: Option<Hash>,
     archives: Vec<Option<LockedArchive>>,
     #[serde(rename = "locals", skip_serializing_if = "Packages::is_empty", default)]
     local_pkgs: Packages,
     specs: KVList<LockedSpec>,
-    #[serde(skip, default)]
-    universe_hash: Option<Hash>,
 }
 
 impl LockFile {
@@ -842,20 +823,20 @@ impl LockFile {
         lock_path: P,
         arch: A,
         manifest_hash: &Hash,
-    ) -> io::Result<Option<Self>> {
+    ) -> Option<Self> {
         let lock_file_path = lock_path.as_ref();
         match smol::fs::File::open(lock_file_path).await {
             Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                tracing::debug!("lock file {:?} not found", lock_file_path.as_os_str());
-                Ok(None)
+                tracing::debug!("lock file {} not found", lock_file_path.display());
+                None
             }
             Err(e) => {
                 tracing::error!(
-                    "failed to open lock file {:?}: {}",
-                    lock_file_path.as_os_str(),
+                    "failed to open lock file {}: {}",
+                    lock_file_path.display(),
                     e
                 );
-                Err(e)
+                None
             }
             Ok(r) => {
                 let mut buf = Vec::<u8>::new();
@@ -865,27 +846,38 @@ impl LockFile {
                     #[serde(rename = "timestamp")]
                     _timestamp: DateTime<Utc>,
                     arch: String,
-                    hash: Hash,
+                    manifest: Hash,
+                    #[serde(rename = "universe")]
+                    universe_hash: Hash,
                     archives: Vec<LockedArchive>,
                     #[serde(default)]
                     locals: Packages,
                     specs: KVList<LockedSpec>,
                 }
-                r.take(Self::MAX_SIZE).read_to_end(&mut buf).await?;
-                toml_edit::de::from_slice::<LockFileWithHash>(&buf)
-                    .map_err(|err| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidData,
-                            format!("failed to parse locked spec: {}", err),
-                        )
+                r.take(Self::MAX_SIZE)
+                    .read_to_end(&mut buf)
+                    .await
+                    .inspect_err(|err| {
+                        tracing::error!(
+                            "failed to lock file {}: {}",
+                            lock_file_path.display(),
+                            err
+                        );
                     })
-                    .map(|lock| {
-                        if &lock.hash == manifest_hash && lock.arch.as_str() == arch.as_ref() {
+                    .ok()?;
+                toml_edit::de::from_slice::<LockFileWithHash>(&buf)
+                    .inspect_err(|err| {
+                        tracing::error!(
+                            "failed to deserialize lock file {}: {}",
+                            lock_file_path.display(),
+                            err
+                        );
+                    })
+                    .ok()
+                    .and_then(|lock| {
+                        if &lock.manifest == manifest_hash && lock.arch.as_str() == arch.as_ref() {
                             Some(LockFile {
-                                universe_hash: Some(universe_hash(
-                                    lock.archives.iter(),
-                                    (!lock.locals.is_empty()).then_some(&lock.locals),
-                                )),
+                                universe_hash: Some(lock.universe_hash),
                                 archives: lock.archives.into_iter().map(Some).collect(),
                                 local_pkgs: lock.locals,
                                 specs: lock.specs,
@@ -913,7 +905,7 @@ impl LockFile {
         struct LockFileWithHash<'a> {
             timestamp: DateTime<Utc>,
             arch: &'a str,
-            hash: &'a Hash,
+            manifest: &'a Hash,
             #[serde(flatten)]
             file: &'a LockFile,
         }
@@ -921,7 +913,7 @@ impl LockFile {
         let lock = LockFileWithHash {
             timestamp: Utc::now(),
             arch,
-            hash,
+            manifest: hash,
             file: self,
         };
         let mut out = Vec::from("# This file is automatically generated. DO NOT EDIT\n");
@@ -972,11 +964,8 @@ impl LockFile {
         self.archives.remove(index);
         self.universe_hash.take();
     }
-    pub(crate) fn update_universe_hash(&mut self) {
-        self.universe_hash = Some(universe_hash(
-            self.archives.iter().map(|s| s.as_ref().unwrap()),
-            (!self.local_pkgs.is_empty()).then_some(&self.local_pkgs),
-        ));
+    pub(crate) fn set_universe_hash(&mut self, hash: Hash) {
+        self.universe_hash = Some(hash);
     }
     pub fn specs_len(&self) -> usize {
         self.specs.len()

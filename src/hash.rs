@@ -26,6 +26,9 @@ pub trait HashAlgo: FixedOutput + FixedOutputReset + Default + Send {
     fn into_hash(mut self) -> Hash {
         Self::hash(self.finalize_fixed_reset())
     }
+    fn from_hex(hash: &str) -> std::io::Result<HashOutput<Self>> {
+        InnerHash::<Self>::from_hex(hash).map(|h| h.inner)
+    }
 }
 pub trait Hashable<H: HashAlgo> {
     fn hash_into(self, hasher: &mut H);

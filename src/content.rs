@@ -81,12 +81,7 @@ pub trait ContentProvider {
         size: u64,
         url: &str,
     ) -> impl Future<Output = io::Result<IndexFile>>;
-    fn ensure_index_file<H>(
-        &self,
-        url: &str,
-    ) -> impl Future<Output = io::Result<(IndexFile, Hash, u64)>>
-    where
-        H: HashAlgo + 'static;
+    fn fetch_release_file(&self, url: &str) -> impl Future<Output = io::Result<IndexFile>>;
     fn fetch_universe(
         &self,
         archives: UniverseFiles<'_>,
@@ -109,63 +104,166 @@ pub trait ContentProvider {
 }
 
 pub struct UniverseFiles<'a> {
+    arch: &'a str,
     archives: &'a [Archive],
     locked: &'a [Option<LockedArchive>],
 }
 impl<'a> UniverseFiles<'a> {
-    pub(crate) fn new(archives: &'a [Archive], locked: &'a [Option<LockedArchive>]) -> Self {
-        UniverseFiles { archives, locked }
+    pub(crate) fn new(
+        arch: &'a str,
+        archives: &'a [Archive],
+        locked: &'a [Option<LockedArchive>],
+    ) -> Self {
+        UniverseFiles {
+            arch,
+            archives,
+            locked,
+        }
     }
-    pub fn files(
+    pub fn package_files(
         &self,
-    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
+    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, RepositoryFile)>> + '_ {
         self.archives
             .iter()
             .enumerate()
             .zip(self.locked.iter())
-            .map(|((id, archive), locked)| {
-                if let Some(locked) = locked.as_ref() {
-                    Ok((id as u32, archive, locked))
-                } else {
-                    Err(std::io::Error::other(
-                        "lock file is missed or outdated, run update",
-                    ))
-                }
+            .map(|((archive_idx, archive), locked)| {
+                locked
+                    .as_ref()
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "locked archive missing for archive {}",
+                            archive.url
+                        ))
+                    })
+                    .map(move |locked| {
+                        archive.suites.iter().zip(locked.suites.iter()).map(
+                            move |(suite_name, suite)| {
+                                (archive_idx as u32, archive, suite_name, suite)
+                            },
+                        )
+                    })
             })
-            .map_ok(|(id, archive, locked)| {
-                locked.suites.iter().flat_map(move |suite| {
-                    std::iter::once((id, archive, &suite.release))
-                        .chain(suite.packages.iter().map(move |pkg| (id, archive, pkg)))
-                })
+            .flatten_ok()
+            .map_ok(move |(archive_idx, archive, suite_name, suite)| {
+                suite
+                    .rel
+                    .package_files(&archive.components, archive.hash.name(), self.arch)
+                    .map(move |file| {
+                        file.map_ok(move |(path, hash, size)| {
+                            (
+                                archive_idx,
+                                archive,
+                                RepositoryFile::new(
+                                    format!("dists/{}/{}", suite_name, path),
+                                    hash,
+                                    size,
+                                ),
+                            )
+                        })
+                    })
             })
+            .flatten_ok()
+            .flatten_ok()
             .flatten_ok()
     }
     pub fn source_files(
         &self,
-    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
+    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, RepositoryFile)>> + '_ {
         self.archives
             .iter()
             .enumerate()
             .zip(self.locked.iter())
-            .map(|((id, archive), locked)| {
-                if let Some(locked) = locked.as_ref() {
-                    Ok((id, archive, locked))
-                } else {
-                    Err(std::io::Error::other(
-                        "lock file is missed or outdated, run update",
-                    ))
-                }
-            })
-            .map_ok(|(id, archive, locked)| {
-                locked.suites.iter().flat_map(move |suite| {
-                    suite
-                        .sources
-                        .iter()
-                        .map(move |pkg| (id as u32, archive, pkg))
-                })
+            .map(|((archive_idx, archive), locked)| {
+                locked
+                    .as_ref()
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "locked archive missing for archive {}",
+                            archive.url
+                        ))
+                    })
+                    .map(move |locked| {
+                        archive.suites.iter().zip(locked.suites.iter()).map(
+                            move |(suite_name, suite)| {
+                                (archive_idx as u32, archive, suite_name, suite)
+                            },
+                        )
+                    })
             })
             .flatten_ok()
+            .map_ok(move |(archive_idx, archive, suite_name, suite)| {
+                suite
+                    .rel
+                    .source_files(&archive.components, archive.hash.name())
+                    .map(move |file| {
+                        file.map_ok(move |(path, hash, size)| {
+                            (
+                                archive_idx,
+                                archive,
+                                RepositoryFile::new(
+                                    format!("dists/{}/{}", suite_name, path),
+                                    hash,
+                                    size,
+                                ),
+                            )
+                        })
+                    })
+            })
+            .flatten_ok()
+            .flatten_ok()
+            .flatten_ok()
     }
+    // pub fn package_files_(
+    //     &self,
+    // ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
+    //     self.archives
+    //         .iter()
+    //         .enumerate()
+    //         .zip(self.locked.iter())
+    //         .map(|((id, archive), locked)| {
+    //             if let Some(locked) = locked.as_ref() {
+    //                 Ok((id as u32, archive, locked))
+    //             } else {
+    //                 Err(std::io::Error::other(
+    //                     "lock file is missed or outdated, run update",
+    //                 ))
+    //             }
+    //         })
+    //         .map_ok(|(id, archive, locked)| {
+    //             locked
+    //                 .suites
+    //                 .iter()
+    //                 .flat_map(move |suite| suite.packages.iter().map(move |pkg| (id, archive, pkg)))
+    //         })
+    //         .flatten_ok()
+    // }
+    // pub fn source_files_(
+    //     &self,
+    // ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
+    //     self.archives
+    //         .iter()
+    //         .enumerate()
+    //         .zip(self.locked.iter())
+    //         .map(|((id, archive), locked)| {
+    //             if let Some(locked) = locked.as_ref() {
+    //                 Ok((id, archive, locked))
+    //             } else {
+    //                 Err(std::io::Error::other(
+    //                     "lock file is missed or outdated, run update",
+    //                 ))
+    //             }
+    //         })
+    //         .map_ok(|(id, archive, locked)| {
+    //             locked.suites.iter().flat_map(move |suite| {
+    //                 suite
+    //                     .sources
+    //                     .iter()
+    //                     .map(move |pkg| (id as u32, archive, pkg))
+    //             })
+    //         })
+    //         .flatten_ok()
+    // }
     pub fn apt_sources(&self) -> MutableControlFile {
         self.archives
             .iter()
@@ -174,29 +272,40 @@ impl<'a> UniverseFiles<'a> {
                 ctrl
             })
     }
-    pub fn apt_sources_hash(&self) -> (MutableControlFile, Hash) {
-        let mut sources = MutableControlFile::new();
+    pub fn apt_sources_hash(&self) -> io::Result<(MutableControlFile, Hash)> {
         let mut digester = blake3::Hasher::new();
-        self.archives
-            .iter()
-            .zip(self.locked.iter())
-            .flat_map(|(archive, locked)| {
-                sources.add(Into::<MutableControlStanza>::into(archive));
-                locked.as_ref().into_iter().flat_map(move |locked| {
-                    locked.suites.iter().flat_map(move |suite| {
-                        std::iter::once((archive, &suite.release))
-                            .chain(suite.packages.iter().map(move |pkg| (archive, pkg)))
-                    })
-                })
-            })
-            .for_each(|(_, file)| {
-                digester.update(file.hash.as_ref());
-            });
+        let sources = self.apt_sources();
         digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
-        (sources, digester.into_hash())
+        self.package_files().try_for_each(|res| {
+            let (_, _, file) = res?;
+            digester.update(file.hash.as_ref());
+            Ok::<_, io::Error>(())
+        })?;
+        Ok((sources, digester.into_hash()))
     }
-    pub fn hash(&self) -> Hash {
-        self.apt_sources_hash().1
+    // pub fn apt_sources_hash(&self) -> (MutableControlFile, Hash) {
+    //     let mut sources = MutableControlFile::new();
+    //     let mut digester = blake3::Hasher::new();
+    //     self.archives
+    //         .iter()
+    //         .zip(self.locked.iter())
+    //         .flat_map(|(archive, locked)| {
+    //             sources.add(Into::<MutableControlStanza>::into(archive));
+    //             locked.as_ref().into_iter().flat_map(move |locked| {
+    //                 locked
+    //                     .suites
+    //                     .iter()
+    //                     .flat_map(move |suite| suite.packages.iter().map(move |pkg| (archive, pkg)))
+    //             })
+    //         })
+    //         .for_each(|(_, file)| {
+    //             digester.update(file.hash.as_ref());
+    //         });
+    //     digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
+    //     (sources, digester.into_hash())
+    // }
+    pub fn hash(&self) -> io::Result<Hash> {
+        self.apt_sources_hash().map(|(_, hash)| hash)
     }
 }
 
@@ -314,10 +423,8 @@ impl ContentProvider for HostCache {
                                     + 'static,
                             >);
                     }
-                    let mut src = hash.verifying_reader(
-                        size,
-                        self.transport.open(&format!("{}/{}", url, path)).await?,
-                    );
+                    let (inp, _) = self.transport.open(&format!("{}/{}", url, path)).await?;
+                    let mut src = hash.verifying_reader(size, inp);
                     let (dst, path) = tempfile::Builder::new()
                         .tempfile_in(cache.as_ref())?
                         .into_parts();
@@ -337,10 +444,8 @@ impl ContentProvider for HostCache {
                                 + 'static,
                         >)
                 } else {
-                    let src = hash.verifying_reader(
-                        size,
-                        self.transport.open(&format!("{}/{}", url, path)).await?,
-                    );
+                    let (inp, _) = self.transport.open(&format!("{}/{}", url, path)).await?;
+                    let src = hash.verifying_reader(size, inp);
                     Ok(Box::new(DebStage::new(
                         Box::pin(src) as Pin<Box<dyn AsyncRead + Send>>
                     ))
@@ -357,7 +462,7 @@ impl ContentProvider for HostCache {
         let file_path = self.base.join(path);
         tracing::debug!("Ensuring deb at {}", file_path.display());
         let file = smol::fs::File::open(&file_path).await?;
-        let mut rdr = HashingReader::<sha2::Sha256, _>::new(file);
+        let mut rdr = HashingReader::<crate::LocalPackagesHash, _>::new(file);
         let mut deb = DebReader::new(&mut rdr);
         let mut ctrl = deb.extract_control().await?;
         let (hash, size) = rdr.into_hash_and_size();
@@ -376,7 +481,7 @@ impl ContentProvider for HostCache {
             let path = self.base.join(artifact.uri());
             let _ = artifact.hash_local(&path).await;
         } else {
-            let mut src = self.transport.open(artifact.uri()).await?;
+            let (mut src, _) = self.transport.open(artifact.uri()).await?;
             if let Some(cache) = self.cache.as_ref() {
                 let (dst, path) = tempfile::Builder::new()
                     .tempfile_in(cache.as_ref())?
@@ -412,7 +517,7 @@ impl ContentProvider for HostCache {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 file
             } else {
-                let src = self.transport.open(url).await.map_err(|e| {
+                let (src, _) = self.transport.open(url).await.map_err(|e| {
                     io::Error::new(
                         e.kind(),
                         format!("failed to open remote artifact {}: {}", url, e),
@@ -433,7 +538,7 @@ impl ContentProvider for HostCache {
             return artifact.remote(file);
         } else {
             let url = artifact.uri();
-            let src = self.transport.open(url).await.map_err(|e| {
+            let (src, _) = self.transport.open(url).await.map_err(|e| {
                 io::Error::new(
                     e.kind(),
                     format!("failed to open remote artifact {}: {}", url, e),
@@ -449,7 +554,7 @@ impl ContentProvider for HostCache {
     ) -> io::Result<Vec<Packages>> {
         stream::iter(
             archives
-                .files()
+                .package_files()
                 .filter_ok(|(_, _, file)| !file.path.ends_with("Release")),
         )
         .map_ok(|(id, archive, file)| async move {
@@ -480,7 +585,7 @@ impl ContentProvider for HostCache {
         concurrency: NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = archives.apt_sources();
-        let files = stream::iter(archives.files())
+        let files = stream::iter(archives.package_files())
             .map_ok(|(_, src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
@@ -514,7 +619,8 @@ impl ContentProvider for HostCache {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(file);
             }
-            let mut src = hash.verifying_reader(size, self.transport.open(url).await?);
+            let (inp, _) = self.transport.open(url).await?;
+            let mut src = hash.verifying_reader(size, inp);
             let (dst, path) = tempfile::Builder::new()
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
@@ -527,47 +633,17 @@ impl ContentProvider for HostCache {
             tracing::debug!("Cached {} at {}", url, cache_path.display());
             Ok(file)
         } else {
-            IndexFile::read(
-                comp_reader(
-                    url,
-                    hash.verifying_reader(size, self.transport.open(url).await?),
-                )
-                .take(MAX_FILE_SIZE),
-            )
-            .await
+            let (inp, _) = self.transport.open(url).await?;
+            IndexFile::read(comp_reader(url, hash.verifying_reader(size, inp)).take(MAX_FILE_SIZE))
+                .await
         }
     }
-    async fn ensure_index_file<H>(&self, url: &str) -> io::Result<(IndexFile, Hash, u64)>
-    where
-        H: HashAlgo + 'static,
-    {
-        if let Some(cache) = self.cache.as_ref() {
-            let input = self.transport.open(url).await?;
-            let mut src = HashingReader::<H, _>::new(input);
-            let (dst, path) = tempfile::Builder::new()
-                .tempfile_in(cache.as_ref())?
-                .into_parts();
-            let mut dst: smol::fs::File = dst.into();
-            io::copy(comp_reader(url, &mut src), &mut dst).await?;
-            dst.sync_data().await?;
-            let (hash, size) = src.into_hash_and_size();
-            let suff = if url.ends_with("Release") {
-                Some("rel")
-            } else {
-                Some("idx")
-            };
-            let cache_path = hash.store_name(Some(cache.as_ref()), suff, 1);
-            smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
-            path.persist(&cache_path)?;
-            tracing::debug!("Cached {} at {}", url, cache_path.display());
-            let file = IndexFile::from_file(&cache_path).await?;
-            Ok((file, hash, size))
-        } else {
-            let mut input = HashingReader::<H, _>::new(self.transport.open(url).await?);
-            let file = IndexFile::read(comp_reader(url, &mut input).take(MAX_FILE_SIZE)).await?;
-            let (hash, size) = input.into_hash_and_size();
-            Ok((file, hash, size))
-        }
+    async fn fetch_release_file(&self, url: &str) -> io::Result<IndexFile> {
+        let (input, size) = self.transport.open(url).await?;
+        let mut input = input.take(MAX_FILE_SIZE);
+        let mut content = String::with_capacity(size.unwrap_or(0) as usize);
+        input.read_to_string(&mut content).await?;
+        Ok(IndexFile::from_string(content))
     }
     async fn fetch_source_universe(
         &self,

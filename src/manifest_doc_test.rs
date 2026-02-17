@@ -1,22 +1,24 @@
-use std::{
-    io,
-    path::{Path, PathBuf},
-    pin::Pin,
-};
-
-use crate::{
-    archive::{Archive, RepositoryFile},
-    artifact::ArtifactArg,
-    content::{ContentProvider, ContentProviderGuard, DebLocation, IndexFile, UniverseFiles},
-    control::MutableControlStanza,
-    hash::Hash,
-    kvlist::KVList,
-    manifest::Manifest,
-    manifest_doc::BuildEnvComments,
-    packages::Packages,
-    staging::{HostFileSystem, Stage},
-    transport::TransportProvider,
-    Sources,
+use {
+    crate::{
+        archive::{Archive, RepositoryFile},
+        artifact::ArtifactArg,
+        content::{ContentProvider, ContentProviderGuard, DebLocation, UniverseFiles},
+        control::MutableControlStanza,
+        hash::Hash,
+        indexfile::IndexFile,
+        kvlist::KVList,
+        manifest::Manifest,
+        manifest_doc::BuildEnvComments,
+        packages::Packages,
+        staging::{HostFileSystem, Stage},
+        transport::TransportProvider,
+        Sources,
+    },
+    std::{
+        io,
+        path::{Path, PathBuf},
+        pin::Pin,
+    },
 };
 
 const ARCH: &str = "amd64";
@@ -79,7 +81,10 @@ fn make_env_comments(prefix: &[(&str, &str)], inline: &[(&str, &str)]) -> BuildE
 struct TestTransport;
 
 impl TransportProvider for TestTransport {
-    async fn open(&self, _url: &str) -> io::Result<Pin<Box<dyn smol::io::AsyncRead + Send>>> {
+    async fn open(
+        &self,
+        _url: &str,
+    ) -> io::Result<(Pin<Box<dyn smol::io::AsyncRead + Send>>, Option<u64>)> {
         Err(io::Error::other("transport disabled in tests"))
     }
 }
@@ -153,10 +158,7 @@ impl ContentProvider for TestProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_index_file<H>(&self, _url: &str) -> io::Result<(IndexFile, Hash, u64)>
-    where
-        H: crate::hash::HashAlgo + 'static,
-    {
+    async fn fetch_release_file(&self, _url: &str) -> io::Result<IndexFile> {
         Err(io::Error::other("unused in tests"))
     }
 
