@@ -165,9 +165,6 @@ impl Manifest {
             universe: None,
             source_universe: None,
         };
-        // if has_valid_lock {
-        //     manifest.make_locked_packages()?;
-        // }
         Ok((manifest, has_valid_lock))
     }
     fn mark_file_updated(&mut self) {
@@ -590,56 +587,12 @@ impl Manifest {
     fn archives(&self) -> UniverseFiles<'_> {
         UniverseFiles::new(&self.arch, self.file.archives(), self.lock.archives())
     }
-    // fn make_locked_packages(&mut self) -> io::Result<()> {
-    //     for (archive, locked) in self
-    //         .file
-    //         .archives()
-    //         .iter()
-    //         .zip(self.lock.archives_mut().iter_mut())
-    //     {
-    //         let locked = locked.as_mut().ok_or_else(|| {
-    //             io::Error::other(format!(
-    //                 "locked archive missing for archive {}",
-    //                 archive.url
-    //             ))
-    //         })?;
-    //         for (suite_name, suite) in archive.suites.iter().zip(locked.suites.iter_mut()) {
-    //             if suite.packages.is_empty() {
-    //                 let mut packages = Vec::new();
-    //                 let mut sources = Vec::new();
-    //                 for file in
-    //                     suite
-    //                         .rel
-    //                         .files(&archive.components, archive.hash.name(), &[&self.arch])?
-    //                 {
-    //                     let (path, hash, size, arch) = file?;
-    //                     match arch {
-    //                         ReleaseFileArch::Source => sources.push(RepositoryFile::new(
-    //                             format!("dists/{}/{}", suite_name, path),
-    //                             hash,
-    //                             size,
-    //                         )),
-    //                         ReleaseFileArch::Binary(_) => packages.push(RepositoryFile::new(
-    //                             format!("dists/{}/{}", suite_name, path),
-    //                             hash,
-    //                             size,
-    //                         )),
-    //                     }
-    //                 }
-    //                 suite.packages = packages;
-    //                 suite.sources = sources;
-    //             }
-    //         }
-    //     }
-    //     Ok(())
-    // }
     async fn make_universe<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
-        // self.make_locked_packages()?;
         let mut packages = cache.fetch_universe(self.archives(), concurrency).await?;
         if let Some(pkgs) = self.lock.local_pkgs() {
             // local packages have highest priority
@@ -691,7 +644,6 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building source package universe");
-        // self.make_locked_packages()?;
         let sources = cache
             .fetch_source_universe(self.archives(), concurrency)
             .await?;
