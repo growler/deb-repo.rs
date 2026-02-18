@@ -120,6 +120,28 @@ impl<'a> UniverseFiles<'a> {
             locked,
         }
     }
+    pub fn release_files(&self) -> impl Iterator<Item = io::Result<(String, &'a IndexFile)>> + '_ {
+        self.archives
+            .iter()
+            .zip(self.locked.iter())
+            .map(|(archive, locked)| {
+                locked
+                    .as_ref()
+                    .ok_or_else(|| {
+                        io::Error::other(format!(
+                            "locked archive missing for archive {}",
+                            archive.url
+                        ))
+                    })
+                    .map(|locked| {
+                        locked
+                            .suites
+                            .iter()
+                            .map(|suite| (archive.file_url(&suite.path), &suite.file))
+                    })
+            })
+            .flatten_ok()
+    }
     pub fn package_files(
         &self,
     ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, RepositoryFile)>> + '_ {
@@ -214,56 +236,6 @@ impl<'a> UniverseFiles<'a> {
             .flatten_ok()
             .flatten_ok()
     }
-    // pub fn package_files_(
-    //     &self,
-    // ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
-    //     self.archives
-    //         .iter()
-    //         .enumerate()
-    //         .zip(self.locked.iter())
-    //         .map(|((id, archive), locked)| {
-    //             if let Some(locked) = locked.as_ref() {
-    //                 Ok((id as u32, archive, locked))
-    //             } else {
-    //                 Err(std::io::Error::other(
-    //                     "lock file is missed or outdated, run update",
-    //                 ))
-    //             }
-    //         })
-    //         .map_ok(|(id, archive, locked)| {
-    //             locked
-    //                 .suites
-    //                 .iter()
-    //                 .flat_map(move |suite| suite.packages.iter().map(move |pkg| (id, archive, pkg)))
-    //         })
-    //         .flatten_ok()
-    // }
-    // pub fn source_files_(
-    //     &self,
-    // ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, &'a RepositoryFile)>> + '_ {
-    //     self.archives
-    //         .iter()
-    //         .enumerate()
-    //         .zip(self.locked.iter())
-    //         .map(|((id, archive), locked)| {
-    //             if let Some(locked) = locked.as_ref() {
-    //                 Ok((id, archive, locked))
-    //             } else {
-    //                 Err(std::io::Error::other(
-    //                     "lock file is missed or outdated, run update",
-    //                 ))
-    //             }
-    //         })
-    //         .map_ok(|(id, archive, locked)| {
-    //             locked.suites.iter().flat_map(move |suite| {
-    //                 suite
-    //                     .sources
-    //                     .iter()
-    //                     .map(move |pkg| (id as u32, archive, pkg))
-    //             })
-    //         })
-    //         .flatten_ok()
-    // }
     pub fn apt_sources(&self) -> MutableControlFile {
         self.archives
             .iter()
@@ -283,27 +255,6 @@ impl<'a> UniverseFiles<'a> {
         })?;
         Ok((sources, digester.into_hash()))
     }
-    // pub fn apt_sources_hash(&self) -> (MutableControlFile, Hash) {
-    //     let mut sources = MutableControlFile::new();
-    //     let mut digester = blake3::Hasher::new();
-    //     self.archives
-    //         .iter()
-    //         .zip(self.locked.iter())
-    //         .flat_map(|(archive, locked)| {
-    //             sources.add(Into::<MutableControlStanza>::into(archive));
-    //             locked.as_ref().into_iter().flat_map(move |locked| {
-    //                 locked
-    //                     .suites
-    //                     .iter()
-    //                     .flat_map(move |suite| suite.packages.iter().map(move |pkg| (archive, pkg)))
-    //             })
-    //         })
-    //         .for_each(|(_, file)| {
-    //             digester.update(file.hash.as_ref());
-    //         });
-    //     digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
-    //     (sources, digester.into_hash())
-    // }
     pub fn hash(&self) -> io::Result<Hash> {
         self.apt_sources_hash().map(|(_, hash)| hash)
     }
@@ -585,7 +536,7 @@ impl ContentProvider for HostCache {
         concurrency: NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = archives.apt_sources();
-        let files = stream::iter(archives.package_files())
+        let mut files = stream::iter(archives.package_files())
             .map_ok(|(_, src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
@@ -598,6 +549,18 @@ impl ContentProvider for HostCache {
             .try_buffered(concurrency.get())
             .try_collect::<Vec<_>>()
             .await?;
+        archives.release_files().try_for_each(|res| {
+            let (url, file) = res?;
+            let name = crate::strip_url_scheme(&url).replace('/', "_");
+            tracing::debug!("staging release file from {} as {}", &url, &name);
+            files.push((name, file.clone()));
+            Ok::<_, io::Error>(())
+        })?;
+        tracing::debug!(
+            "Staging universe with {} package files: {}",
+            files.len(),
+            files.iter().map(|(path, _)| path).join(",")
+        );
         Ok(Box::new(UniverseFilesStage::<Self::Target> {
             apt_sources: ctrl,
             files,
@@ -609,12 +572,7 @@ impl ContentProvider for HostCache {
     }
     async fn fetch_index_file(&self, hash: Hash, size: u64, url: &str) -> io::Result<IndexFile> {
         if let Some(cache) = self.cache.as_ref() {
-            let suff = if url.ends_with("Release") {
-                Some("rel")
-            } else {
-                Some("idx")
-            };
-            let cache_path = hash.store_name(Some(cache.as_ref()), suff, 1);
+            let cache_path = hash.store_name(Some(cache.as_ref()), Some("idx"), 1);
             if let Ok(file) = IndexFile::from_file(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(file);
