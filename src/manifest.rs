@@ -14,11 +14,13 @@ use {
         version::{IntoConstraint, IntoDependency, ProvidedName},
         Source, SourceUniverse,
     },
+    digest::FixedOutput,
     futures::stream::{self, StreamExt, TryStreamExt},
     indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
     std::{
+        io::Write,
         num::NonZero,
         path::{Path, PathBuf},
         str::FromStr,
@@ -151,21 +153,22 @@ impl Manifest {
         let (manifest, hash) = ManifestFile::from_file(&path).await?;
         let arch = arch.to_string();
         let lock_path = lock_path_for(&path, lock_base, &arch)?;
-        let lock = LockFile::from_file(&lock_path, &arch, &hash).await?;
+        let lock = LockFile::from_file(&lock_path, &arch, &hash).await;
         let has_valid_lock = lock.is_some();
         let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file());
-        Ok((
-            Manifest {
-                arch: arch.to_string(),
-                hash: Some(hash),
-                file: manifest,
-                lock,
-                lock_updated: false,
-                universe: None,
-                source_universe: None,
-            },
-            has_valid_lock,
-        ))
+        let manifest = Manifest {
+            arch: arch.to_string(),
+            hash: Some(hash),
+            file: manifest,
+            lock,
+            lock_updated: false,
+            universe: None,
+            source_universe: None,
+        };
+        // if has_valid_lock {
+        //     manifest.make_locked_packages()?;
+        // }
+        Ok((manifest, has_valid_lock))
     }
     fn mark_file_updated(&mut self) {
         self.hash.take();
@@ -585,14 +588,58 @@ impl Manifest {
         Ok(())
     }
     fn archives(&self) -> UniverseFiles<'_> {
-        UniverseFiles::new(self.file.archives(), self.lock.archives())
+        UniverseFiles::new(&self.arch, self.file.archives(), self.lock.archives())
     }
+    // fn make_locked_packages(&mut self) -> io::Result<()> {
+    //     for (archive, locked) in self
+    //         .file
+    //         .archives()
+    //         .iter()
+    //         .zip(self.lock.archives_mut().iter_mut())
+    //     {
+    //         let locked = locked.as_mut().ok_or_else(|| {
+    //             io::Error::other(format!(
+    //                 "locked archive missing for archive {}",
+    //                 archive.url
+    //             ))
+    //         })?;
+    //         for (suite_name, suite) in archive.suites.iter().zip(locked.suites.iter_mut()) {
+    //             if suite.packages.is_empty() {
+    //                 let mut packages = Vec::new();
+    //                 let mut sources = Vec::new();
+    //                 for file in
+    //                     suite
+    //                         .rel
+    //                         .files(&archive.components, archive.hash.name(), &[&self.arch])?
+    //                 {
+    //                     let (path, hash, size, arch) = file?;
+    //                     match arch {
+    //                         ReleaseFileArch::Source => sources.push(RepositoryFile::new(
+    //                             format!("dists/{}/{}", suite_name, path),
+    //                             hash,
+    //                             size,
+    //                         )),
+    //                         ReleaseFileArch::Binary(_) => packages.push(RepositoryFile::new(
+    //                             format!("dists/{}/{}", suite_name, path),
+    //                             hash,
+    //                             size,
+    //                         )),
+    //                     }
+    //                 }
+    //                 suite.packages = packages;
+    //                 suite.sources = sources;
+    //             }
+    //         }
+    //     }
+    //     Ok(())
+    // }
     async fn make_universe<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building package universe");
+        // self.make_locked_packages()?;
         let mut packages = cache.fetch_universe(self.archives(), concurrency).await?;
         if let Some(pkgs) = self.lock.local_pkgs() {
             // local packages have highest priority
@@ -644,6 +691,7 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("building source package universe");
+        // self.make_locked_packages()?;
         let sources = cache
             .fetch_source_universe(self.archives(), concurrency)
             .await?;
@@ -674,26 +722,42 @@ impl Manifest {
         skip_verify: bool,
         cache: &C,
     ) -> io::Result<bool> {
-        let arch = self.arch.as_str();
-        let updated = stream::iter(
+        let mut updates = stream::iter(
             self.file
                 .archives()
                 .iter()
-                .zip(self.lock.archives_mut())
-                .map(move |(archive, locked)| {
-                    LockedArchive::fetch_or_refresh(
-                        locked,
-                        archive,
-                        arch,
-                        force_archives,
-                        skip_verify,
-                        cache,
-                    )
+                .enumerate()
+                .zip(self.lock.archives())
+                .filter(|(_, locked)| locked.as_ref().is_none_or(|_| force_archives))
+                .map(move |((archive_idx, archive), locked)| {
+                    LockedArchive::fetch_update(locked, archive, archive_idx, skip_verify, cache)
                 }),
         )
         .flatten_unordered(concurrency.get())
-        .try_fold(false, |a, r| async move { Ok(a || r) })
+        .try_collect::<Vec<_>>()
         .await?;
+        updates.sort_unstable_by_key(|(archive_idx, suite_idx, _)| (*archive_idx, *suite_idx));
+        let mut updated = false;
+        for (archive_idx, suite_idx, update) in updates.into_iter() {
+            if let Some(update) = update {
+                match &mut self.lock.archives_mut()[archive_idx] {
+                    None => {
+                        self.lock.archives_mut()[archive_idx] = Some(LockedArchive {
+                            suites: vec![update],
+                        });
+                        updated |= true;
+                    }
+                    Some(archive) => {
+                        if archive.suites.len() > suite_idx {
+                            archive.suites[suite_idx] = update;
+                        } else {
+                            archive.suites.push(update);
+                        }
+                        updated |= true;
+                    }
+                }
+            }
+        }
         let local_pkgs_update = if let Some(local_pkgs) = self.lock.local_pkgs() {
             if local_pkgs.len() == self.file.local_pkgs().len() {
                 local_pkgs
@@ -748,9 +812,26 @@ impl Manifest {
             false
         };
         if updated || local_pkgs_update {
-            self.lock.update_universe_hash();
+            self.update_universe_hash()?;
         }
         Ok(updated || local_pkgs_update)
+    }
+    fn update_universe_hash(&mut self) -> io::Result<()> {
+        let mut hash = blake3::Hasher::default();
+        if let Some(locals) = self.lock.local_pkgs() {
+            let mut local_digest = sha2::Sha256::default();
+            local_digest.write_all(locals.src().as_bytes())?;
+            hash.update(&local_digest.finalize_fixed());
+        }
+        UniverseFiles::new(&self.arch, self.file.archives(), self.lock.archives())
+            .package_files()
+            .try_for_each(|pkg| {
+                let (_, _, file) = pkg?;
+                hash.update(file.hash.as_ref());
+                Ok::<_, io::Error>(())
+            })?;
+        self.lock.set_universe_hash(hash.into_hash());
+        Ok(())
     }
     pub async fn update<C: ContentProvider>(
         &mut self,

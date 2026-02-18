@@ -1,10 +1,5 @@
 use {
-    crate::{
-        control::MutableControlStanza,
-        hash::Hash,
-        indexfile::IndexFile,
-        release::{Release, ReleaseFileArch},
-    },
+    crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::AsyncReadExt,
@@ -698,31 +693,6 @@ impl Archive {
             ));
         }
         Release::try_from(plaintext).map_err(std::io::Error::other)
-    }
-    pub(crate) fn release_files(
-        &self,
-        release: &Release,
-        suite: &str,
-        arch: &str,
-    ) -> io::Result<(Vec<RepositoryFile>, Vec<RepositoryFile>)> {
-        let mut packages = Vec::new();
-        let mut sources = Vec::new();
-        for file in release.files(&self.components, self.hash.name(), &[arch])? {
-            let (path, hash, size, arch) = file?;
-            match arch {
-                ReleaseFileArch::Source => sources.push(RepositoryFile::new(
-                    format!("dists/{}/{}", suite, path),
-                    hash,
-                    size,
-                )),
-                ReleaseFileArch::Binary(_) => packages.push(RepositoryFile::new(
-                    format!("dists/{}/{}", suite, path),
-                    hash,
-                    size,
-                )),
-            }
-        }
-        Ok((packages, sources))
     }
     pub(crate) fn set_base(&mut self) {
         if let Some(snapshots_template) = &self.snapshots {

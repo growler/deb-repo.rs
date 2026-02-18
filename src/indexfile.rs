@@ -1,6 +1,6 @@
 use {
     smol::io::{AsyncRead, AsyncReadExt},
-    std::{io, pin::pin, sync::Arc},
+    std::{io, ops::RangeBounds, pin::pin, sync::Arc},
 };
 
 pub struct IndexFile {
@@ -11,16 +11,15 @@ impl Clone for IndexFile {
     fn clone(&self) -> Self {
         Self {
             inner: match &self.inner {
-                IndexFileInner::Mmap { mmap } => IndexFileInner::Mmap {
-                    mmap: Arc::clone(mmap),
-                },
-                IndexFileInner::MmapReg { mmap, start, end } => IndexFileInner::MmapReg {
+                IndexFileInner::Mmap { mmap, start, end } => IndexFileInner::Mmap {
                     mmap: Arc::clone(mmap),
                     start: *start,
                     end: *end,
                 },
-                IndexFileInner::Slice { data } => IndexFileInner::Slice {
+                IndexFileInner::Slice { data, start, end } => IndexFileInner::Slice {
                     data: Arc::clone(data),
+                    start: *start,
+                    end: *end,
                 },
             },
         }
@@ -43,15 +42,11 @@ impl std::ops::Deref for IndexFile {
 impl AsRef<str> for IndexFile {
     fn as_ref(&self) -> &str {
         match &self.inner {
-            IndexFileInner::Mmap { mmap } => {
-                // Safety: The mmap is guaranteed to be valid UTF-8 as it was created from a text file
-                unsafe { std::str::from_utf8_unchecked(mmap) }
-            }
-            IndexFileInner::MmapReg { mmap, start, end } => {
+            IndexFileInner::Mmap { mmap, start, end } => {
                 // Safety: The mmap region is guaranteed to be valid UTF-8 as it was created from a text file
                 unsafe { std::str::from_utf8_unchecked(&mmap[*start..*end]) }
             }
-            IndexFileInner::Slice { data } => data.as_ref(),
+            IndexFileInner::Slice { data, start, end } => &data.as_ref()[*start..*end],
         }
     }
 }
@@ -62,9 +57,8 @@ impl IndexFile {
     }
     pub fn len(&self) -> usize {
         match &self.inner {
-            IndexFileInner::Mmap { mmap } => mmap.len(),
-            IndexFileInner::MmapReg { start, end, .. } => end - start,
-            IndexFileInner::Slice { data } => data.len(),
+            IndexFileInner::Mmap { start, end, .. } => end - start,
+            IndexFileInner::Slice { start, end, .. } => end - start,
         }
     }
     pub fn is_empty(&self) -> bool {
@@ -72,16 +66,19 @@ impl IndexFile {
     }
     pub fn as_bytes(&self) -> &[u8] {
         match &self.inner {
-            IndexFileInner::Mmap { mmap } => &mmap[..],
-            IndexFileInner::MmapReg { mmap, start, end } => &mmap[*start..*end],
-            IndexFileInner::Slice { data } => data.as_bytes(),
+            IndexFileInner::Mmap { mmap, start, end } => &mmap[*start..*end],
+            IndexFileInner::Slice { data, start, end } => &data.as_bytes()[*start..*end],
         }
     }
     pub async fn read<R: AsyncRead>(r: R) -> io::Result<Self> {
         let mut buf = String::new();
         pin!(r).read_to_string(&mut buf).await?;
         Ok(IndexFile {
-            inner: IndexFileInner::Slice { data: buf.into() },
+            inner: IndexFileInner::Slice {
+                start: 0,
+                end: buf.len(),
+                data: buf.into(),
+            },
         })
     }
     pub async fn from_file<P: AsRef<std::path::Path>>(path: P) -> io::Result<Self> {
@@ -97,6 +94,8 @@ impl IndexFile {
             })?;
             Ok(IndexFile {
                 inner: IndexFileInner::Mmap {
+                    start: 0,
+                    end: mmap.len(),
                     mmap: Arc::new(mmap),
                 },
             })
@@ -104,7 +103,11 @@ impl IndexFile {
             let mut buf = String::with_capacity(meta.len() as usize);
             file.read_to_string(&mut buf).await?;
             Ok(IndexFile {
-                inner: IndexFileInner::Slice { data: buf.into() },
+                inner: IndexFileInner::Slice {
+                    start: 0,
+                    end: buf.len(),
+                    data: buf.into(),
+                },
             })
         }
     }
@@ -122,7 +125,7 @@ impl IndexFile {
             )
         })?;
         Ok(IndexFile {
-            inner: IndexFileInner::MmapReg { mmap, start, end },
+            inner: IndexFileInner::Mmap { mmap, start, end },
         })
     }
     pub fn from_bytes(data: Vec<u8>) -> io::Result<Self> {
@@ -133,8 +136,74 @@ impl IndexFile {
             )
         })?;
         Ok(IndexFile {
-            inner: IndexFileInner::Slice { data: Arc::from(s) },
+            inner: IndexFileInner::Slice {
+                start: 0,
+                end: s.len(),
+                data: Arc::from(s),
+            },
         })
+    }
+    pub fn from_string(data: String) -> Self {
+        IndexFile {
+            inner: IndexFileInner::Slice {
+                start: 0,
+                end: data.len(),
+                data: Arc::from(data),
+            },
+        }
+    }
+    fn slice<R: RangeBounds<usize>>(&self, range: R) -> Self {
+        let start = match range.start_bound() {
+            std::ops::Bound::Included(&s) => s,
+            std::ops::Bound::Excluded(&s) => s + 1,
+            std::ops::Bound::Unbounded => 0,
+        };
+        let end = match range.end_bound() {
+            std::ops::Bound::Included(&e) => e + 1,
+            std::ops::Bound::Excluded(&e) => e,
+            std::ops::Bound::Unbounded => self.len(),
+        };
+        IndexFile {
+            inner: match &self.inner {
+                IndexFileInner::Mmap {
+                    mmap,
+                    start: self_start,
+                    ..
+                } => IndexFileInner::Mmap {
+                    mmap: Arc::clone(mmap),
+                    start: start + self_start,
+                    end: end + self_start,
+                },
+                IndexFileInner::Slice {
+                    data,
+                    start: self_start,
+                    ..
+                } => IndexFileInner::Slice {
+                    data: Arc::clone(data),
+                    start: start + self_start,
+                    end: end + self_start,
+                },
+            },
+        }
+    }
+    pub(crate) fn clear_text(&self) -> Self {
+        const BEGIN: &[u8] = b"-----BEGIN PGP SIGNED MESSAGE-----\n";
+        const SIG_BEGIN: &[u8] = b"\n-----BEGIN PGP SIGNATURE-----";
+
+        let text = self.as_bytes();
+
+        if !text.starts_with(BEGIN) {
+            return self.clone();
+        }
+        let start = match text.windows(2).position(|w| w == b"\n\n") {
+            Some(pos) => pos + 2,
+            None => return self.clone(),
+        };
+        let end = match text.windows(SIG_BEGIN.len()).position(|w| w == SIG_BEGIN) {
+            Some(pos) => pos,
+            None => return self.clone(),
+        };
+        self.slice(start..end)
     }
 }
 
@@ -143,9 +212,12 @@ where
     Arc<str>: From<T>,
 {
     fn from(data: T) -> Self {
+        let data: Arc<str> = Arc::from(data);
         IndexFile {
             inner: IndexFileInner::Slice {
-                data: Arc::from(data),
+                start: 0,
+                end: data.len(),
+                data,
             },
         }
     }
@@ -154,13 +226,12 @@ where
 enum IndexFileInner {
     Mmap {
         mmap: Arc<memmap2::Mmap>,
-    },
-    MmapReg {
-        mmap: Arc<memmap2::Mmap>,
         start: usize,
         end: usize,
     },
     Slice {
         data: Arc<str>,
+        start: usize,
+        end: usize,
     },
 }

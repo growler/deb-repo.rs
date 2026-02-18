@@ -49,6 +49,7 @@ pub use {
     transport::{HttpTransport, TransportProvider},
     version::{Constraint, Dependency, Version, VersionSet},
 };
+pub(crate) type LocalPackagesHash = sha2::Sha256;
 
 pub(crate) fn parse_size(str: &[u8]) -> std::io::Result<u64> {
     let mut result: u64 = 0;

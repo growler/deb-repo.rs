@@ -17,7 +17,10 @@ use {
 };
 
 pub trait TransportProvider: Sync + Send {
-    fn open(&self, url: &str) -> impl Future<Output = io::Result<Pin<Box<dyn AsyncRead + Send>>>>;
+    fn open(
+        &self,
+        url: &str,
+    ) -> impl Future<Output = io::Result<(Pin<Box<dyn AsyncRead + Send>>, Option<u64>)>>;
 }
 
 fn client(insecure: bool) -> &'static HttpClient {
@@ -60,7 +63,7 @@ impl HttpTransport {
 }
 
 impl TransportProvider for HttpTransport {
-    async fn open(&self, url: &str) -> io::Result<Pin<Box<dyn AsyncRead + Send>>> {
+    async fn open(&self, url: &str) -> io::Result<(Pin<Box<dyn AsyncRead + Send>>, Option<u64>)> {
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {
@@ -93,7 +96,11 @@ impl TransportProvider for HttpTransport {
                 let rsp = client(self.insecure).send_async(request).await?;
                 match rsp.status() {
                     StatusCode::OK => {
-                        Ok(Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send>>)
+                        let size = rsp.body().len();
+                        Ok((
+                            Box::pin(rsp.into_body()) as Pin<Box<dyn AsyncRead + Send>>,
+                            size,
+                        ))
                     }
                     StatusCode::NOT_FOUND => Err(io::Error::new(
                         io::ErrorKind::NotFound,
@@ -104,7 +111,13 @@ impl TransportProvider for HttpTransport {
                     ))),
                 }
             }
-            "file" => Ok(Box::pin(smol::fs::File::open(url.path()).await?)),
+            "file" => {
+                let size = smol::fs::metadata(url.path()).await?.len();
+                Ok((
+                    Box::pin(smol::fs::File::open(url.path()).await?),
+                    Some(size),
+                ))
+            }
             s => Err(io::Error::other(format!("unsupported transport {}", s))),
         }
     }

@@ -23,23 +23,26 @@ use {
     itertools::Itertools,
     ouroboros::self_referencing,
     smallvec::SmallVec,
-    std::{fmt, iter},
 };
 
 pub struct Release {
     inner: ReleaseInner,
 }
 
-#[derive(Clone, Copy)]
-pub(crate) enum ReleaseFileArch<'a> {
-    Source,
-    Binary(&'a str),
-}
-impl fmt::Display for ReleaseFileArch<'_> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            ReleaseFileArch::Source => write!(f, "source"),
-            ReleaseFileArch::Binary(arch) => write!(f, "binary-{}", arch),
+impl Clone for Release {
+    fn clone(&self) -> Self {
+        Release {
+            inner: ReleaseInnerTryBuilder {
+                data: self.inner.with_data(|d| d.clone()),
+                #[allow(clippy::borrowed_box)]
+                control_builder: |data: &'_ IndexFile| {
+                    ControlStanza::parse(data).map_err(|err| {
+                        ParseError::from(format!("error parsing release file: {}", err))
+                    })
+                },
+            }
+            .try_build()
+            .expect("failed to clone release file"),
         }
     }
 }
@@ -54,30 +57,11 @@ impl Release {
     pub fn is_empty(&self) -> bool {
         self.inner.with_data(|d| d.is_empty())
     }
-    #[allow(clippy::type_complexity)]
-    pub(crate) fn files<'a, S: AsRef<str>>(
+    fn files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
-        arch: &'a [&'a str],
-    ) -> Result<
-        impl Iterator<Item = Result<(&'a str, Hash, u64, ReleaseFileArch<'a>), ParseError>>,
-        ParseError,
-    > {
-        let fetch_all_arch = self
-            .field("No-Support-for-Architecture-all")
-            .is_none_or(|v| v.trim_ascii() != "Packages");
-        let arch_list = if fetch_all_arch {
-            ["all"].iter().chain(arch.iter()).copied().collect()
-        } else {
-            vec![]
-        };
-        let arch = if fetch_all_arch {
-            &arch_list
-        } else {
-            arch
-        };
-
+    ) -> Result<impl Iterator<Item = Result<(&'a str, &'a str, u64), ParseError>>, ParseError> {
         let release_components = self.field("Components").unwrap_or("");
         if components.iter().any(|c| {
             !release_components.split_ascii_whitespace().any(|rc| {
@@ -102,7 +86,7 @@ impl Release {
         let field = self.field(hash_name).ok_or_else(|| {
             ParseError::from(format!("Field {} not found in the release file", hash_name,))
         })?;
-        let files = field
+        Ok(field
             .lines()
             .map(|l| l.trim())
             .filter(|l| l != &"")
@@ -116,87 +100,123 @@ impl Release {
                 } else {
                     Err(ParseError::from(format!("Invalid release line: {}", line)))
                 }
-            })
-            .try_fold(
-                iter::once(ReleaseFileArch::Source)
-                    .chain(arch.iter().map(|a| ReleaseFileArch::Binary(a)))
-                    .flat_map(|arch| {
-                        components
-                            .iter()
-                            .map(move |c| (c.as_ref(), arch, None::<(&str, Hash, u64)>))
-                    })
-                    .collect::<Vec<_>>(),
-                move |mut files, file| {
-                    let (path, digest, size) = file?;
-                    for (comp, arch, entry) in files.iter_mut() {
-                        if let Some(rest) = path.strip_prefix(*comp) {
-                            match arch {
-                                ReleaseFileArch::Binary(arch) => {
-                                    if let Some(rest) = rest.strip_prefix("/binary-") {
-                                        if let Some(rest) = rest.strip_prefix(*arch) {
-                                            if let Some(
-                                                "" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd",
-                                            ) = rest.strip_prefix("/Packages")
-                                            {
-                                                if size
-                                                    < entry
-                                                        .as_ref()
-                                                        .map_or(u64::MAX, |(_, _, size)| *size)
-                                                {
-                                                    let hash = Hash::from_hex(hash_name, digest)
-                                                        .map_err(|err| {
-                                                            ParseError::from(format!(
-                                                                "invalid hash: {} {}",
-                                                                digest, err
-                                                            ))
-                                                        })?;
-                                                    *entry = Some((path, hash, size));
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                                ReleaseFileArch::Source => {
-                                    if let Some(rest) = rest.strip_prefix("/source") {
-                                        if let Some(
-                                            "" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd",
-                                        ) = rest.strip_prefix("/Sources")
-                                        {
-                                            if size
-                                                < entry
-                                                    .as_ref()
-                                                    .map_or(u64::MAX, |(_, _, size)| *size)
-                                            {
-                                                let hash = Hash::from_hex(hash_name, digest)
-                                                    .map_err(|err| {
-                                                        ParseError::from(format!(
-                                                            "invalid hash: {} {}",
-                                                            digest, err
-                                                        ))
-                                                    })?;
-                                                *entry = Some((path, hash, size));
-                                            }
-                                        }
+            }))
+    }
+    pub(crate) fn package_files<'a, S: AsRef<str>>(
+        &'a self,
+        components: &'a [S],
+        hash_name: &'a str,
+        arch: &'a str,
+    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
+        let fetch_all_arch = self
+            .field("No-Support-for-Architecture-all")
+            .is_none_or(|v| v.trim_ascii() != "Packages");
+        let arch = if fetch_all_arch {
+            vec!["all", arch]
+        } else {
+            vec![arch]
+        };
+        let files = self.files(components, hash_name)?.try_fold(
+            arch.iter()
+                .flat_map(|arch| {
+                    components
+                        .iter()
+                        .map(move |c| (c.as_ref(), *arch, None::<(&str, Hash, u64)>))
+                })
+                .collect::<Vec<_>>(),
+            move |mut files, file| {
+                let (path, digest, size) = file?;
+                for (comp, arch, entry) in files.iter_mut() {
+                    if let Some(rest) = path.strip_prefix(*comp) {
+                        if let Some(rest) = rest.strip_prefix("/binary-") {
+                            if let Some(rest) = rest.strip_prefix(*arch) {
+                                if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
+                                    rest.strip_prefix("/Packages")
+                                {
+                                    if size < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size)
+                                    {
+                                        let hash =
+                                            Hash::from_hex(hash_name, digest).map_err(|err| {
+                                                ParseError::from(format!(
+                                                    "invalid hash: {} {}",
+                                                    digest, err
+                                                ))
+                                            })?;
+                                        *entry = Some((path, hash, size));
                                     }
                                 }
                             }
                         }
                     }
-                    Ok::<_, ParseError>(files)
-                },
-            )?;
+                }
+                Ok::<_, ParseError>(files)
+            },
+        )?;
         Ok(files.into_iter().filter_map(|(comp, arch, entry)| {
             if let Some((path, hash, size)) = entry {
                 // if entry size is zero (empty Packages file), skip it
                 if size == 0 {
                     None
                 } else {
-                    Some(Ok((path, hash, size, arch)))
+                    Some(Ok((path, hash, size)))
                 }
-            } else if matches!(arch, ReleaseFileArch::Binary(_)) {
+            } else if entry.is_none() {
                 Some(Err(ParseError::from(format!(
                     "no Packages file found for component {} {}",
                     comp, arch,
+                ))))
+            } else {
+                None
+            }
+        }))
+    }
+    pub(crate) fn source_files<'a, S: AsRef<str>>(
+        &'a self,
+        components: &'a [S],
+        hash_name: &'a str,
+    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
+        let files = self.files(components, hash_name)?.try_fold(
+            components
+                .iter()
+                .map(move |c| (c.as_ref(), None::<(&str, Hash, u64)>))
+                .collect::<Vec<_>>(),
+            move |mut files, file| {
+                let (path, digest, size) = file?;
+                for (comp, entry) in files.iter_mut() {
+                    if let Some(rest) = path.strip_prefix(*comp) {
+                        if let Some(rest) = rest.strip_prefix("/source") {
+                            if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
+                                rest.strip_prefix("/Sources")
+                            {
+                                if size < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size) {
+                                    let hash =
+                                        Hash::from_hex(hash_name, digest).map_err(|err| {
+                                            ParseError::from(format!(
+                                                "invalid hash: {} {}",
+                                                digest, err
+                                            ))
+                                        })?;
+                                    *entry = Some((path, hash, size));
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok::<_, ParseError>(files)
+            },
+        )?;
+        Ok(files.into_iter().filter_map(|(comp, entry)| {
+            if let Some((path, hash, size)) = entry {
+                // if entry size is zero (empty Sources file), skip it
+                if size == 0 {
+                    None
+                } else {
+                    Some(Ok((path, hash, size)))
+                }
+            } else if entry.is_none() {
+                Some(Err(ParseError::from(format!(
+                    "no Sources file found for component {}",
+                    comp,
                 ))))
             } else {
                 None
