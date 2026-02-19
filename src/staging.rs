@@ -378,30 +378,51 @@ impl StagingFileSystem for HostFileSystem {
                     .tempfile_in(&root)
                     .map(|f| f.into_parts())
                     .inspect_err(|err| {
-                        tracing::error!("failed to create temporary file in {}: {}", root.display(), err)
+                        tracing::error!(
+                            "failed to create temporary file in {}: {}",
+                            root.display(),
+                            err
+                        )
                     })?;
                 if let Some(size) = size {
                     if size > 0 {
-                        let _ = fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64).inspect_err(|err|
-                            tracing::warn!("failed to preallocate file {}: {}", path.display(), err)
-                        );
+                        let _ = fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)
+                            .inspect_err(|err| {
+                                tracing::warn!(
+                                    "failed to preallocate file {}: {}",
+                                    path.display(),
+                                    err
+                                )
+                            });
                     }
                 }
                 if chown_allowed {
-                    fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).inspect_err(|err| 
-                        tracing::error!("failed to set ownership of file {} to {}:{}: {}", path.display(), uid, gid, err)
+                    fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).inspect_err(
+                        |err| {
+                            tracing::error!(
+                                "failed to set ownership of file {} to {}:{}: {}",
+                                path.display(),
+                                uid,
+                                gid,
+                                err
+                            )
+                        },
                     )?;
                 }
                 Ok::<_, io::Error>((file, path))
             })
             .await?;
             let mut file: smol::fs::File = file.into();
-            smol::io::copy(r, &mut file).await.inspect_err(|err| 
-                tracing::error!("failed to write to temporary file {}: {}", path.display(), err)
-            )?;
-            file.sync_data().await.inspect_err(|err|
+            smol::io::copy(r, &mut file).await.inspect_err(|err| {
+                tracing::error!(
+                    "failed to write to temporary file {}: {}",
+                    path.display(),
+                    err
+                )
+            })?;
+            file.sync_data().await.inspect_err(|err| {
                 tracing::error!("failed to sync temporary file {}: {}", path.display(), err)
-            )?;
+            })?;
             Ok(HostFile {
                 base: Arc::clone(&self.root),
                 file,
