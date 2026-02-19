@@ -704,7 +704,7 @@ impl UidMap {
                 _ => None,
             })
             .ok_or_else(|| io::Error::other("no subgid entry"))?;
-        tracing::debug!(
+        eprintln!(
             "user {} has subuid {}-{} and subgid {}-{}",
             user_name,
             subuid.start,
