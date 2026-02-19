@@ -576,6 +576,11 @@ where
             ))
         })
     })?;
+    unsafe {
+        if libc::setgroups(0, std::ptr::null()) != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
     let args = std::env::args_os()
         .map(|s| s.into_c_str())
         .collect::<Result<Vec<_>, Errno>>()?;
