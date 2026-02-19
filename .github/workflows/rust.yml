@@ -24,6 +24,25 @@ jobs:
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
 
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            pkg-config \
+            build-essential \
+            debhelper \
+            devscripts \
+            libbz2-dev \
+            libcurl4-openssl-dev \
+            libgpg-error-dev \
+            libgpgme-dev \
+            liblz4-dev \
+            liblzma-dev \
+            libssl-dev \
+            libunistring-dev \
+            libzstd-dev \
+            zlib1g-dev
+
       - name: Check formatting
         run: cargo fmt --all -- --check
 
