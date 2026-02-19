@@ -25,7 +25,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
 	echo "Creating the target directory"; \
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
-		$(RDEBOOTSTRAP) -m $(CURDIR)/$(1)-build.toml build --path "$$$$TREE"; \
+		$(RDEBOOTSTRAP) -d -n 2 -m $(CURDIR)/$(1)-build.toml build --path "$$$$TREE"; \
 	fi
 
 $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree
