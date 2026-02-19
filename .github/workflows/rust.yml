@@ -20,6 +20,8 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.85.1 # current debian stable
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
