@@ -577,6 +577,9 @@ where
         })
     })?;
     unsafe {
+        if libc::prctl(libc::PR_SET_DUMPABLE, 1, 0, 0, 0) != 0 {
+            return Err(io::Error::last_os_error());
+        }
         if libc::setgroups(0, std::ptr::null()) != 0 {
             return Err(io::Error::last_os_error());
         }
