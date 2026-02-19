@@ -376,7 +376,14 @@ impl StagingFileSystem for HostFileSystem {
                 let (file, path) = tempfile::Builder::new()
                     .permissions(smol::fs::Permissions::from_mode(mode))
                     .tempfile_in(&root)
-                    .map(|f| f.into_parts())?;
+                    .map(|f| f.into_parts())
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to create temp file in {} permissions {:o}",
+                            root.display(),
+                            mode
+                        ))
+                    })?;
                 if let Some(size) = size {
                     if size > 0 {
                         fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)?;
