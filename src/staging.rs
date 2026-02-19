@@ -386,19 +386,20 @@ impl StagingFileSystem for HostFileSystem {
                     })?;
                 if let Some(size) = size {
                     if size > 0 {
-                        let _ = fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)
+                        fallocate(&file, FallocateFlags::KEEP_SIZE, 0, size as u64)
                             .inspect_err(|err| {
                                 tracing::warn!(
                                     "failed to preallocate file {}: {}",
                                     path.display(),
                                     err
                                 )
-                            });
+                            })
+                            .ok();
                     }
                 }
                 if chown_allowed {
-                    fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid))).inspect_err(
-                        |err| {
+                    fchown(&file, Some(Uid::from_raw(uid)), Some(Gid::from_raw(gid)))
+                        .inspect_err(|err| {
                             tracing::error!(
                                 "failed to set ownership of file {} to {}:{}: {}",
                                 path.display(),
@@ -406,8 +407,8 @@ impl StagingFileSystem for HostFileSystem {
                                 gid,
                                 err
                             )
-                        },
-                    )?;
+                        })
+                        .ok();
                 }
                 Ok::<_, io::Error>((file, path))
             })
