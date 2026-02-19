@@ -97,6 +97,10 @@ jobs:
           whoami
           id
           printf "real=%s effective=%s\n" "$(id -ru)" "$(id -u)"
+          echo subuid map
+          cat /etc/subuid
+          echo subgid map
+          cat /etc/subgid
           make debian-packages
 
       - name: Cache ubuntu build tree
