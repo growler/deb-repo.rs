@@ -1064,6 +1064,15 @@ hash = \"{}\"
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
+                let is_root = {
+                    let is_root = rustix::process::geteuid();
+                    tracing::debug!(
+                        "effective UID: {} (is_root: {})",
+                        is_root,
+                        is_root.is_root()
+                    );
+                    is_root.is_root()
+                };
                 let fs = HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await
                     .map_err(|err| {
