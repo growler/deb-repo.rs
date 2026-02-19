@@ -74,6 +74,10 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-debian-build-
 
+      - name: Prepare environment
+        run: |
+          podman info
+
       - name: Build debian packages
         run: make debian-packages
 
