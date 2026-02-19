@@ -47,8 +47,15 @@ jobs:
             libunistring-dev \
             libzstd-dev \
             zlib1g-dev \
-            uidmap \
             podman
+
+      - name: Install newer uidmap from Ubuntu 25.04
+        run: |
+          set -eux
+          echo "deb http://archive.ubuntu.com/ubuntu plucky main" | sudo tee /etc/apt/sources.list.d/plucky.list
+          printf "Package: *\nPin: release n=plucky\nPin-Priority: 100\n" | sudo tee /etc/apt/preferences.d/plucky
+          sudo apt-get update
+          sudo apt-get install -y -t plucky uidmap
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -61,14 +68,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
-
-      - name: Prepare environment
-        run: |
-          sudo cat /etc/subuid
-          sudo cat /etc/subgid
-          sudo usermod --add-subuids 100000-165535 $(whoami)
-          sudo usermod --add-subgids 100000-165535 $(whoami)
-          podman info
 
       - name: Cache debian build tree
         uses: actions/cache@v4
