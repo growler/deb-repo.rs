@@ -2,13 +2,13 @@
 
 CARGO ?= cargo
 PODMAN ?= podman
-RDEBOOTSTRAP := $(CURDIR)/target/release/rdebootstrap
+RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
 
 DISTROS := debian ubuntu
 
 rdebootstrap:
 	@echo "Building rdebootstrap binary"
-	$(CARGO) build --release
+	$(CARGO) build
 
 .PHONY: rdebootstrap packages
 
