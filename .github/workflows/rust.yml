@@ -18,6 +18,7 @@ jobs:
     steps:
       - name: Check environment
         run: |
+          uname -a
           sudo mount
           cat /proc/self/uid_map
           whoami
