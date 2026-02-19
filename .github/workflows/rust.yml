@@ -93,7 +93,11 @@ jobs:
             ${{ runner.os }}-debian-build-
 
       - name: Build debian packages
-        run: make debian-packages
+        run: |
+          whoami
+          id
+          printf "real=%s effective=%s\n" "$(id -ru)" "$(id -u)"
+          make debian-packages
 
       - name: Cache ubuntu build tree
         uses: actions/cache@v4
