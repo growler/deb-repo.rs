@@ -10,7 +10,7 @@ rdebootstrap:
 	@echo "Building rdebootstrap binary"
 	$(CARGO) build --release
 
-.PHONY: rdebootstrap
+.PHONY: rdebootstrap packages
 
 define DISTRO_template
 
@@ -39,6 +39,8 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree
 		--workdir /root/build/src \
 		--rootfs "$$$$TREE:O" \
 		dpkg-buildpackage -us -uc -b
+
+packages: $(1)-packages
 
 .PHONY: $(1)-tree $(1)-packages
 endef

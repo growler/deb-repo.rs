@@ -62,11 +62,42 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
-      - name: Check the environment
-        run: |
-          whoami
-          cat /etc/subuid
-          podman info
+      - name: Cache debian build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/debian-build/**
+            !target/debian-build/*.deb
+            !target/debian-build/*.buildinfo
+            !target/debian-build/*.changes
+          key: ${{ runner.os }}-debian-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-debian-build-
 
       - name: Build debian packages
         run: make debian-packages
+
+      - name: Cache ubuntu build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ubuntu-build/**
+            !target/ubuntu-build/*.deb
+            !target/ubuntu-build/*.buildinfo
+            !target/ubuntu-build/*.changes
+          key: ${{ runner.os }}-ubuntu-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-ubuntu-build-
+
+      - name: Build ubuntu packages
+        run: make ubuntu-packages
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian-build/*.deb
+            target/ubuntu-build/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
