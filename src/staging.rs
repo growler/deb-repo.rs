@@ -270,10 +270,13 @@ impl StagingFileSystem for HostFileSystem {
         mode: u32,
     ) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
-        let owner = if self.chown_allowed {
-            Some((uid, gid))
+        let (owner, mode) = if self.chown_allowed {
+            (Some((uid, gid)), mode)
         } else {
-            None
+            (
+                None,
+                mode & !(libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX),
+            )
         };
         blocking::unblock(move || {
             let target = target?;
@@ -364,6 +367,11 @@ impl StagingFileSystem for HostFileSystem {
         let root = self.root.clone();
         async move {
             let chown_allowed = self.chown_allowed;
+            let mode = if chown_allowed {
+                mode
+            } else {
+                mode & !(libc::S_ISUID | libc::S_ISGID | libc::S_ISVTX)
+            };
             let (file, path) = blocking::unblock(move || {
                 let (file, path) = tempfile::Builder::new()
                     .permissions(smol::fs::Permissions::from_mode(mode))
