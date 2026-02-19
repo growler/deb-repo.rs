@@ -20,6 +20,11 @@ jobs:
         run: |
           sudo mount
           cat /proc/self/uid_map
+          whoami
+          stat -f -c %T .
+          sysctl fs.protected_regular
+          sysctl fs.protected_symlinks
+          sysctl fs.protected_hardlinks
 
       - name: Checkout repository
         uses: actions/checkout@v4
