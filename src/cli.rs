@@ -1073,7 +1073,7 @@ hash = \"{}\"
                     );
                     is_root.is_root()
                 };
-                let fs = HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
+                let fs = HostFileSystem::new(&self.path, is_root)
                     .await
                     .map_err(|err| {
                         anyhow!(
