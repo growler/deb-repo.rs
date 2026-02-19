@@ -116,22 +116,14 @@ impl LockedArchive {
                             Ok((
                                 archive_idx,
                                 suite_idx,
-                                Some(LockedSuite {
-                                    path,
-                                    file,
-                                    rel,
-                                }),
+                                Some(LockedSuite { path, file, rel }),
                             ))
                         }
                     }
                     None => Ok((
                         archive_idx,
                         suite_idx,
-                        Some(LockedSuite {
-                            path,
-                            file,
-                            rel,
-                        }),
+                        Some(LockedSuite { path, file, rel }),
                     )),
                 }
             })
@@ -302,4 +294,3 @@ impl<'de> serde::de::Deserialize<'de> for LockedSuite {
         })
     }
 }
-
