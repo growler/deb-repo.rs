@@ -379,9 +379,10 @@ impl StagingFileSystem for HostFileSystem {
                     .map(|f| f.into_parts())
                     .map_err(|err| {
                         io::Error::other(format!(
-                            "failed to create temp file in {} permissions {:o}",
+                            "failed to create temp file in {} permissions {:o}: {}",
                             root.display(),
-                            mode
+                            mode,
+                            err
                         ))
                     })?;
                 if let Some(size) = size {
