@@ -16,11 +16,11 @@ use {
     std::pin::Pin,
 };
 
+type TransportReader = Pin<Box<dyn AsyncRead + Send>>;
+type OpenResult = io::Result<(TransportReader, Option<u64>)>;
+
 pub trait TransportProvider: Sync + Send {
-    fn open(
-        &self,
-        url: &str,
-    ) -> impl Future<Output = io::Result<(Pin<Box<dyn AsyncRead + Send>>, Option<u64>)>>;
+    fn open(&self, url: &str) -> impl Future<Output = OpenResult>;
 }
 
 fn client(insecure: bool) -> &'static HttpClient {
@@ -63,7 +63,7 @@ impl HttpTransport {
 }
 
 impl TransportProvider for HttpTransport {
-    async fn open(&self, url: &str) -> io::Result<(Pin<Box<dyn AsyncRead + Send>>, Option<u64>)> {
+    async fn open(&self, url: &str) -> OpenResult {
         let url = to_url(url)?;
         match url.scheme() {
             "http" | "https" => {
