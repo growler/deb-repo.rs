@@ -22,14 +22,17 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.85.1 # current debian stable
+          components: rustfmt,clippy
 
       - name: Cache cargo registry + build
         uses: Swatinem/rust-cache@v2
 
       - name: Install system dependencies
+        env: 
+          DEBIAN_FRONTEND: noninteractive
         run: |
           sudo apt-get update
-          sudo apt-get install -y \
+          sudo apt-get install --no-install-recommends -y \
             pkg-config \
             build-essential \
             debhelper \
