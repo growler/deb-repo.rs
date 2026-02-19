@@ -46,7 +46,8 @@ jobs:
             libssl-dev \
             libunistring-dev \
             libzstd-dev \
-            zlib1g-dev
+            zlib1g-dev \
+            podman
 
       - name: Check formatting
         run: cargo fmt --all -- --check
@@ -59,3 +60,6 @@ jobs:
 
       - name: Run tests
         run: cargo test --verbose
+
+      - name: Build debian packages
+        run: make debian-packages

@@ -26,7 +26,7 @@ include = [
     "rustc-1.85",
     "zlib1g-dev",
 ]
-run = """
+build-script = """
 update-alternatives --install /usr/bin/cargo cargo /usr/bin/cargo-1.85 10
 update-alternatives --install /usr/bin/rustc rustc /usr/bin/rustc-1.85 10
 """
