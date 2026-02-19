@@ -62,6 +62,10 @@ jobs:
       - name: Run tests
         run: cargo test --verbose
 
+      - name: Prepare environment
+        run: |
+          podman info
+
       - name: Cache debian build tree
         uses: actions/cache@v4
         with:
@@ -73,10 +77,6 @@ jobs:
           key: ${{ runner.os }}-debian-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
           restore-keys: |
             ${{ runner.os }}-debian-build-
-
-      - name: Prepare environment
-        run: |
-          podman info
 
       - name: Build debian packages
         run: make debian-packages
