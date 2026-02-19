@@ -21,12 +21,7 @@ $(CURDIR)/target/$(1)-build/.spec-id: $(CURDIR)/$(1)-build.toml $(CURDIR)/target
 	@$(RDEBOOTSTRAP) -m "$$<" show spec-hash > "$$@"
 
 $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
-	TREE="$$(<D)/$$$$(cat "$$<")"; \
-	whoami; \
-	id; \
-	id -u; \
-	id -ru; \
-	ls -l $(RDEBOOTSTRAP); \
+	@TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Creating the target directory"; \
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
