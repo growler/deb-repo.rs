@@ -63,9 +63,10 @@ jobs:
         run: cargo test --verbose
 
       - name: Check the environment
-        run: whoami
-        run: cat /etc/subuid
-        run: podman info
+        run: |
+          whoami
+          cat /etc/subuid
+          podman info
 
       - name: Build debian packages
         run: make debian-packages
