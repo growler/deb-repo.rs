@@ -1061,6 +1061,7 @@ hash = \"{}\"
     impl<C: Config<FS = HostFileSystem, Cache = HostCache>> Command<C> for Build {
         fn exec(&self, conf: &C) -> Result<()> {
             let mut builder = HostSandboxExecutor::new(&self.path)?;
+            tracing::debug!("current process state {}", current_process_state(),);
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
@@ -1295,5 +1296,130 @@ impl clap::builder::TypedValueParser for ConstraintParser {
             );
             err
         })
+    }
+}
+
+pub fn current_process_state() -> impl std::fmt::Display {
+    ProcessState::collect()
+}
+
+struct ProcessState {
+    uid: u32,
+    euid: u32,
+    gid: u32,
+    egid: u32,
+    uid_map: String,
+    gid_map: String,
+    setgroups: String,
+    status_filtered: String,
+    chown_test_result: String,
+}
+
+impl ProcessState {
+    fn read_file(path: &str) -> String {
+        std::fs::read_to_string(path).unwrap_or_else(|e| format!("(failed to read {path}: {e})"))
+    }
+
+    fn collect() -> Self {
+        use rustix::process::{getegid, geteuid, getgid, getuid};
+        let uid = getuid().as_raw();
+        let euid = geteuid().as_raw();
+        let gid = getgid().as_raw();
+        let egid = getegid().as_raw();
+
+        let uid_map = Self::read_file("/proc/self/uid_map");
+        let gid_map = Self::read_file("/proc/self/gid_map");
+        let setgroups = Self::read_file("/proc/self/setgroups");
+
+        let status = Self::read_file("/proc/self/status");
+        let mut status_filtered = String::new();
+        for line in status.lines() {
+            if line.starts_with("Uid:")
+                || line.starts_with("Gid:")
+                || line.starts_with("Groups:")
+                || line.starts_with("CapEff:")
+                || line.starts_with("CapPrm:")
+                || line.starts_with("CapBnd:")
+                || line.starts_with("NoNewPrivs:")
+                || line.starts_with("Seccomp:")
+            {
+                status_filtered.push_str(line);
+                status_filtered.push('\n');
+            }
+        }
+
+        // Controlled chown test in current directory
+        let chown_test_result = match Self::chown_test() {
+            Ok(msg) => msg,
+            Err(e) => format!("chown test failed to run: {e}"),
+        };
+
+        Self {
+            uid,
+            euid,
+            gid,
+            egid,
+            uid_map,
+            gid_map,
+            setgroups,
+            status_filtered,
+            chown_test_result,
+        }
+    }
+
+    fn chown_test() -> io::Result<String> {
+        use rustix::fd::OwnedFd;
+        use rustix::fs::{fchown, openat, unlinkat, AtFlags, Mode, OFlags};
+        use rustix::process::{Gid, Uid};
+
+        let path = "rdebootstrap_chown_test";
+
+        // remove if exists
+        let _ = unlinkat(rustix::fs::CWD, path, AtFlags::empty());
+
+        let fd: OwnedFd = openat(
+            rustix::fs::CWD,
+            path,
+            OFlags::CREATE | OFlags::WRONLY,
+            Mode::from_bits_truncate(0o644),
+        )?;
+
+        let result = match fchown(&fd, Some(Uid::from_raw(0)), Some(Gid::from_raw(42))) {
+            Ok(()) => "fchown(fd, 0, 42) succeeded".to_string(),
+            Err(e) => format!("fchown(fd, 0, 42) failed: {e}"),
+        };
+
+        drop(fd);
+        let _ = unlinkat(rustix::fs::CWD, path, AtFlags::empty());
+
+        Ok(result)
+    }
+}
+
+impl std::fmt::Display for ProcessState {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "== ids ==")?;
+        writeln!(
+            f,
+            "uid={} euid={} gid={} egid={}",
+            self.uid, self.euid, self.gid, self.egid
+        )?;
+
+        writeln!(f, "\n== /proc/self/uid_map ==")?;
+        writeln!(f, "{}", self.uid_map)?;
+
+        writeln!(f, "== /proc/self/gid_map ==")?;
+        writeln!(f, "{}", self.gid_map)?;
+
+        writeln!(f, "== /proc/self/setgroups ==")?;
+        writeln!(f, "{}", self.setgroups)?;
+
+        writeln!(f, "== filtered /proc/self/status ==")?;
+        writeln!(f, "{}", self.status_filtered)?;
+
+        writeln!(f, "== chown test ==")?;
+        writeln!(f, "{}", self.chown_test_result)?;
+
+        Ok(())
     }
 }

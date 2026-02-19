@@ -704,14 +704,6 @@ impl UidMap {
                 _ => None,
             })
             .ok_or_else(|| io::Error::other("no subgid entry"))?;
-        eprintln!(
-            "user {} has subuid {}-{} and subgid {}-{}",
-            user_name,
-            subuid.start,
-            subuid.start + subuid.count - 1,
-            subgid.start,
-            subgid.start + subgid.count - 1
-        );
         Ok(Self {
             uid,
             subuid_start: subuid.start,
