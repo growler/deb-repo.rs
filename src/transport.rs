@@ -27,7 +27,7 @@ fn client(insecure: bool) -> &'static HttpClient {
     static SHARED: Lazy<HttpClient> = Lazy::new(|| {
         HttpClient::builder()
             .redirect_policy(RedirectPolicy::Limit(10))
-            .timeout(std::time::Duration::from_secs(30))
+            .timeout(std::time::Duration::from_secs(300))
             .build()
             .expect("Failed to create HTTP client")
     });
