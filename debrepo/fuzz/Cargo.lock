@@ -728,7 +728,7 @@ name = "debrepo-fuzz"
 version = "0.0.0"
 dependencies = [
  "libfuzzer-sys",
- "rdebootstrap",
+ "debrepo",
  "smol",
 ]
 
@@ -1868,8 +1868,8 @@ dependencies = [
 ]
 
 [[package]]
-name = "rdebootstrap"
-version = "0.0.1"
+name = "debrepo"
+version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",

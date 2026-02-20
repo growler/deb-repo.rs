@@ -1,0 +1,47 @@
+[package]
+name = "rdebootstrap"
+version = "0.1.0"
+rust-version = "1.85"
+edition = "2021"
+
+# Used to build debian package with NixOS. With Debian use
+# dpkg-buildpackage -us -uc
+[package.metadata.deb]
+name = "rdebootstrap"
+maintainer = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
+copyright = "2025, Alexey Naidyonov <alexey.naidyonov@gmail.com>"
+section = "utility"
+priority = "optional"
+depends = [
+    "libc6 (>= 2.39)",
+    "libcurl4t64 (>= 7.18.0)",
+    "libgpg-error0 (>= 1.14)",
+    "libgpgme11t64 (>= 1.23.2)",
+    "liblzma5 (>= 5.4.0)",
+]
+assets = [
+    [ "target/release/rdebootstrap", "usr/bin/rdebootstrap", "0755" ],
+]
+
+[[bin]]
+name = "rdebootstrap"
+path = "cmd/main.rs"
+
+[[bin]]
+name = "tar-test"
+path = "cmd/tar.rs"
+
+[[bin]]
+name = "tar-xattr"
+path = "cmd/tar_xattr.rs"
+
+[dependencies]
+debrepo = { path = "../debrepo" }
+anyhow = "1.0.99"
+clap = { version = "4.5.48", features = ["derive", "env"] }
+futures = { version = "0.3", default-features = false, features = ["std"] }
+futures-lite = "2.3.0"
+once_cell = "1.21"
+smol = "2"
+tracing = "0.1.40"
+tracing-subscriber = { version = "0.3.20", default-features = false, features = ["env-filter", "fmt", "std"] }
