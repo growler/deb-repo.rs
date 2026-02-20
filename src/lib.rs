@@ -21,6 +21,7 @@ mod kvlist;
 mod manifest;
 mod manifest_doc;
 mod packages;
+pub mod podman;
 mod release;
 pub mod sandbox;
 mod sources;

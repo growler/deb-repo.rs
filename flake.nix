@@ -77,6 +77,9 @@
             sequoia-sqv
 
             pkg-config 
+
+            debian-devscripts
+            dpkg
         ];
         rust-debian-stable = [ (pkgs.rust-bin.stable."1.85.1".default.override {
           extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];

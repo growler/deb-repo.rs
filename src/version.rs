@@ -484,6 +484,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 pub trait DropConstraint<C> {
     fn drop_constraint(&self, con: &C) -> Option<Option<Self>>
     where

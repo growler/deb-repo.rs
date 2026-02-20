@@ -1,5 +1,5 @@
-rdebootstrap (0.0.1+deb1) UNRELEASED; urgency=medium
+rdebootstrap (0.0.1) stable; urgency=medium
 
   * Initial release 
 
- -- Alekséi Naidénov <alexey.naidyonov@gmail.com>  Wed, 26 Nov 2025 11:51:43 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 20 Feb 2026 11:45:44 +0000

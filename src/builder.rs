@@ -1,9 +1,54 @@
 use {
-    crate::staging::StagingFileSystem,
+    crate::{
+        podman::PodmanSandboxExecutor, sandbox::HostSandboxExecutor, staging::StagingFileSystem,
+        HostFileSystem,
+    },
     serde::{Deserialize, Serialize},
     smol::io,
     std::{ffi::OsStr, future::Future, path::Path},
 };
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, clap::ValueEnum)]
+#[value(rename_all = "kebab_case")]
+pub enum ExecutorKind {
+    Podman,
+    Sandbox,
+}
+pub enum BuildExecutor {
+    Podman(PodmanSandboxExecutor),
+    Sandbox(HostSandboxExecutor),
+}
+impl ExecutorKind {
+    pub fn build_executor(&self, path: &Path) -> io::Result<BuildExecutor> {
+        match self {
+            ExecutorKind::Podman => Ok(BuildExecutor::Podman(PodmanSandboxExecutor::new(path)?)),
+            ExecutorKind::Sandbox => Ok(BuildExecutor::Sandbox(HostSandboxExecutor::new(path)?)),
+        }
+    }
+}
+impl BuildExecutor {
+    pub async fn build(
+        &mut self,
+        fs: &HostFileSystem,
+        essentials: Vec<String>,
+        packages: Vec<Vec<String>>,
+        scripts: Vec<String>,
+        build_env: Vec<(String, String)>,
+    ) -> io::Result<()> {
+        match self {
+            BuildExecutor::Podman(executor) => {
+                executor
+                    .build(fs, essentials, packages, scripts, build_env)
+                    .await
+            }
+            BuildExecutor::Sandbox(executor) => {
+                executor
+                    .build(fs, essentials, packages, scripts, build_env)
+                    .await
+            }
+        }
+    }
+}
 
 #[derive(Serialize, Deserialize)]
 pub struct BuildJob<E: Executor> {
@@ -39,7 +84,7 @@ impl<E: Executor> BuildJob<E> {
             _marker: std::marker::PhantomData,
         }
     }
-    pub(crate) fn run(&self, mut executor: E) -> io::Result<()> {
+    pub(crate) fn run(&self, executor: &mut E) -> io::Result<()> {
         executor.envs([
             ("DEBIAN_FRONTEND", "noninteractive"),
             ("PATH", "/usr/sbin:/usr/bin:/sbin:/bin"),

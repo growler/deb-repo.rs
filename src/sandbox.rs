@@ -325,7 +325,8 @@ pub fn run_sandbox<E: SandboxExecutor>(mut args: std::env::ArgsOs) -> io::Result
     let mut job = InJob::<E, BuildJob<E>>::read_from(rd)?;
     let root_dfd = job.executor.setup_rootfs()?;
     setup_root(&root_dfd)?;
-    job.job.run(job.executor)
+    let (job, mut executor) = (job.job, job.executor);
+    job.run(&mut executor)
 }
 
 fn set_cloexec(fd: impl AsFd, cloexec: bool) -> io::Result<()> {

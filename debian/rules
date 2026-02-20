@@ -22,6 +22,8 @@ endif
 override_dh_auto_install:
 	install -Dm755 target/release/rdebootstrap \
 		$(CURDIR)/debian/rdebootstrap/usr/bin/rdebootstrap
+	install -Dm644 debian/usr.bin.rdebootstrap \
+		$(CURDIR)/debian/rdebootstrap/etc/apparmor.d/usr.bin.rdebootstrap
 
 override_dh_auto_clean:
 	-cargo clean -r

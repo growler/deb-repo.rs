@@ -36,12 +36,11 @@ pub mod cmd {
         super::*,
         crate::{
             artifact::{hash_directory, ArtifactArg},
-            builder::Executor,
+            builder::ExecutorKind,
             comp::is_comp_ext,
             content::{ContentProviderGuard, HostCache},
             hash::{Hash, HashAlgo},
             manifest::Manifest,
-            sandbox::HostSandboxExecutor,
             staging::HostFileSystem,
             version::ProvidedName,
         },
@@ -1053,6 +1052,14 @@ hash = \"{}\"
         /// The spec name to build
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
+        /// Build executor to use
+        #[arg(
+            long = "executor",
+            value_name = "EXECUTOR",
+            value_enum,
+            default_value = "sandbox"
+        )]
+        executor: ExecutorKind,
         /// The target directory
         #[arg(short, long, value_name = "PATH")]
         path: PathBuf,
@@ -1060,7 +1067,7 @@ hash = \"{}\"
 
     impl<C: Config<FS = HostFileSystem, Cache = HostCache>> Command<C> for Build {
         fn exec(&self, conf: &C) -> Result<()> {
-            let mut builder = HostSandboxExecutor::new(&self.path)?;
+            let mut builder = self.executor.build_executor(&self.path)?;
             tracing::debug!("current process state {}", current_process_state(),);
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;

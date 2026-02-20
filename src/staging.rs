@@ -162,6 +162,11 @@ pub struct HostFile {
 
 impl StagingFile for HostFile {
     async fn persist<P: AsRef<Path>>(self, name: P) -> io::Result<()> {
+        tracing::debug!(
+            "persisting file {} to {}",
+            self.path.display(),
+            name.as_ref().display()
+        );
         let to = self.base.as_ref().join(clean_path(name.as_ref())?);
         if to.parent().is_none() {
             return Err(io::Error::new(
@@ -170,28 +175,44 @@ impl StagingFile for HostFile {
             ));
         }
         let file = self.file;
-        let _path = self.path;
+        let path = self.path;
         match blocking::unblock(move || {
-            let file_meta = fstat(&file)?;
-            let dir_met = stat(to.parent().unwrap())?;
+            let file_meta = fstat(&file).inspect_err(|err| {
+                tracing::error!("failed to stat file {}: {}", path.display(), err)
+            })?;
+            let dir_met = stat(to.parent().unwrap()).inspect_err(|err| {
+                tracing::error!(
+                    "failed to stat target directory {}: {}",
+                    to.parent().unwrap_or_else(|| Path::new("/")).display(),
+                    err
+                )
+            })?;
             if file_meta.st_dev == dir_met.st_dev {
-                linkat(&file, "", CWD, &to, AtFlags::EMPTY_PATH)?;
-                futimens(&file, &EPOCH)?;
-                Ok::<_, io::Error>(None)
-            } else {
-                let target = openat(
-                    CWD,
-                    &to,
-                    OFlags::CREATE | OFlags::WRONLY,
-                    Mode::from_raw_mode(file_meta.st_mode),
-                )?;
-                fchown(
-                    &target,
-                    Some(Uid::from_raw(file_meta.st_uid)),
-                    Some(Gid::from_raw(file_meta.st_gid)),
-                )?;
-                Ok(Some((file, target)))
+                match linkat(&file, "", CWD, &to, AtFlags::EMPTY_PATH) {
+                    Ok(()) => {
+                        futimens(&file, &EPOCH)?;
+                    }
+                    Err(_) => {
+                        // linkat failed, switching back to copy
+                    }
+                }
+                return Ok::<_, io::Error>(None);
             }
+            let target = openat(
+                CWD,
+                &to,
+                OFlags::CREATE | OFlags::WRONLY,
+                Mode::from_raw_mode(file_meta.st_mode),
+            )
+            .inspect_err(|err| {
+                tracing::error!("failed to open target file {}: {}", to.display(), err)
+            })?;
+            fchown(
+                &target,
+                Some(Uid::from_raw(file_meta.st_uid)),
+                Some(Gid::from_raw(file_meta.st_gid)),
+            )?;
+            Ok(Some((file, target)))
         })
         .await
         .map_err(|err| {
@@ -270,6 +291,12 @@ impl StagingFileSystem for HostFileSystem {
         mode: u32,
     ) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
+        tracing::debug!(
+            "creating directory {} at {} with mode {:o}",
+            path.as_ref().display(),
+            self.root.display(),
+            mode
+        );
         let (owner, mode) = if self.chown_allowed {
             (Some((uid, gid)), mode)
         } else {
@@ -298,6 +325,12 @@ impl StagingFileSystem for HostFileSystem {
         mode: u32,
     ) -> impl Future<Output = io::Result<()>> {
         let target = self.target_path(path.as_ref());
+        tracing::debug!(
+            "creating directory tree {} at {} with mode {:o}",
+            path.as_ref().display(),
+            self.root.display(),
+            mode
+        );
         let owner = if self.chown_allowed {
             Some((uid, gid))
         } else {
@@ -364,6 +397,11 @@ impl StagingFileSystem for HostFileSystem {
         mode: u32,
         size: Option<usize>,
     ) -> impl Future<Output = io::Result<Self::File>> + 'a {
+        tracing::debug!(
+            "creating temporary file in {} with mode {:o}",
+            self.root.display(),
+            mode
+        );
         let root = self.root.clone();
         async move {
             let chown_allowed = self.chown_allowed;
