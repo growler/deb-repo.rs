@@ -1,7 +1,6 @@
 [package]
 name = "rdebootstrap"
-version = "0.0.1"
-publish = false
+version = "0.1.0"
 rust-version = "1.85"
 edition = "2021"
 
