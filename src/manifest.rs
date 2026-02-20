@@ -2,6 +2,7 @@ use {
     crate::{
         archive::{Archive, RepositoryFile, SnapshotId},
         artifact::{Artifact, ArtifactArg},
+        cli::StageProgress,
         content::{ContentProvider, UniverseFiles},
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
@@ -16,7 +17,6 @@ use {
     },
     digest::FixedOutput,
     futures::stream::{self, StreamExt, TryStreamExt},
-    indicatif::ProgressBar,
     itertools::Itertools,
     smol::io,
     std::{
@@ -1030,10 +1030,10 @@ impl Manifest {
         Vec<Vec<String>>,                               // prioritized packages
         Vec<String>,                                    // scripts
         Vec<(String, String)>,                          // build env
-        Option<ProgressBar>,
+        Option<StageProgress>,
     )>
     where
-        P: FnOnce(u64) -> ProgressBar,
+        P: FnOnce(u64) -> StageProgress,
     {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
         let archives = self.archives();
@@ -1076,7 +1076,7 @@ impl Manifest {
     )>
     where
         FS: StagingFileSystem,
-        P: FnOnce(u64) -> ProgressBar,
+        P: FnOnce(u64) -> StageProgress,
         C: ContentProvider<Target = FS>,
     {
         let (archives, artifacts, installables, essentials, other, scripts, build_env, pb) =
@@ -1084,7 +1084,7 @@ impl Manifest {
         crate::stage::stage_local(installables, artifacts, fs, concurrency, cache, pb.clone())
             .await?;
         if let Some(pb) = pb {
-            pb.finish_using_style();
+            pb.finish();
         }
         let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
         fs.stage(universe_stage).await?;
@@ -1105,7 +1105,7 @@ impl Manifest {
     )>
     where
         FS: StagingFileSystem + Send + Clone + 'static,
-        P: FnOnce(u64) -> ProgressBar,
+        P: FnOnce(u64) -> StageProgress,
         C: ContentProvider<Target = FS>,
     {
         tracing::debug!("running stage_");
@@ -1113,7 +1113,7 @@ impl Manifest {
             self.stage_prepare(name, pb)?;
         crate::stage::stage(installables, artifacts, fs, concurrency, cache, pb.clone()).await?;
         if let Some(pb) = pb {
-            pb.finish_using_style();
+            pb.finish();
         }
         let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
         fs.stage(universe_stage).await?;

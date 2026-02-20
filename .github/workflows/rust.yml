@@ -61,25 +61,17 @@ jobs:
             zlib1g-dev \
             podman
 
-      - name: Install newer uidmap from Ubuntu 25.04
-        run: |
-          set -eux
-          echo "deb http://archive.ubuntu.com/ubuntu plucky main" | sudo tee /etc/apt/sources.list.d/plucky.list
-          printf "Package: *\nPin: release n=plucky\nPin-Priority: 100\n" | sudo tee /etc/apt/preferences.d/plucky
-          sudo apt-get update
-          sudo apt-get install -y -t plucky uidmap
+      - name: Check formatting
+        run: cargo fmt --all -- --check
 
-      # - name: Check formatting
-      #   run: cargo fmt --all -- --check
-      #
-      # - name: Run Clippy
-      #   run: cargo clippy --all-targets --all-features -- -D warnings
+      - name: Run Clippy
+        run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: Build
         run: cargo build
 
-      # - name: Run tests
-      #   run: cargo test
+      - name: Run tests
+        run: cargo test
 
       - name: Cache debian build tree
         uses: actions/cache@v4
@@ -89,43 +81,35 @@ jobs:
             !target/debian-build/*.deb
             !target/debian-build/*.buildinfo
             !target/debian-build/*.changes
-          key: ${{ runner.os }}-debian-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
+          key: debian-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
           restore-keys: |
-            ${{ runner.os }}-debian-build-
+            debian-build-
 
       - name: Build debian packages
-        timeout-minutes: 10
         run: |
-          whoami
-          id
-          printf "real=%s effective=%s\n" "$(id -ru)" "$(id -u)"
-          echo subuid map
-          cat /etc/subuid
-          echo subgid map
-          cat /etc/subgid
-          make debian-packages
+          make debian-packages DOWNLOADS=1
 
-      # - name: Cache ubuntu build tree
-      #   uses: actions/cache@v4
-      #   with:
-      #     path: |
-      #       target/ubuntu-build/**
-      #       !target/ubuntu-build/*.deb
-      #       !target/ubuntu-build/*.buildinfo
-      #       !target/ubuntu-build/*.changes
-      #     key: ${{ runner.os }}-ubuntu-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
-      #     restore-keys: |
-      #       ${{ runner.os }}-ubuntu-build-
-      #
-      # - name: Build ubuntu packages
-      #   run: make ubuntu-packages
-      #
-      # - name: Create GitHub Release
-      #   if: startsWith(github.ref, 'refs/tags/v')
-      #   uses: softprops/action-gh-release@v2
-      #   with:
-      #     files: |
-      #       target/debian-build/*.deb
-      #       target/ubuntu-build/*.deb
-      #   env:
-      #     GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Cache ubuntu build tree
+        uses: actions/cache@v4
+        with:
+          path: |
+            target/ubuntu-build/**
+            !target/ubuntu-build/*.deb
+            !target/ubuntu-build/*.buildinfo
+            !target/ubuntu-build/*.changes
+          key: ubuntu-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
+          restore-keys: |
+            ubuntu-build-
+
+      - name: Build ubuntu packages
+        run: make ubuntu-packages DOWNLOADS=1
+
+      - name: Create GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian-build/*.deb
+            target/ubuntu-build/*.deb
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

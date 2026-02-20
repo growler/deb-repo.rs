@@ -3,6 +3,7 @@
 CARGO ?= cargo
 PODMAN ?= podman
 RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
+DOWNLOADS ?= 10
 
 DISTROS := debian ubuntu
 debian_suffix := deb
@@ -30,7 +31,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
 	echo "Creating the target directory"; \
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
-		$(RDEBOOTSTRAP) -n 2 -m $(CURDIR)/$(1)-build.toml build --executor podman --path "$$$$TREE"; \
+		$(RDEBOOTSTRAP) -n $(DOWNLOADS) -m $(CURDIR)/$(1)-build.toml build --executor podman --path "$$$$TREE"; \
 	fi
 
 $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree

@@ -8,7 +8,17 @@ use {
         StagingFileSystem,
     },
     anyhow::Result,
-    std::{io, num::NonZero, path::Path, str::FromStr},
+    indicatif::ProgressBar,
+    std::{
+        io,
+        num::NonZero,
+        path::Path,
+        str::FromStr,
+        sync::{
+            atomic::{AtomicU64, AtomicU8},
+            Arc,
+        },
+    },
 };
 
 pub trait Config {
@@ -28,6 +38,114 @@ pub trait Config {
 
 pub trait Command<C> {
     fn exec(&self, conf: &C) -> Result<()>;
+}
+
+#[derive(Clone)]
+pub enum StageProgress {
+    Indicatif(ProgressBar),
+    Percent(PercentProgress),
+}
+
+impl StageProgress {
+    pub fn from_progress_bar(pb: ProgressBar) -> Self {
+        Self::Indicatif(pb)
+    }
+
+    pub fn percent(total: u64) -> Self {
+        Self::Percent(PercentProgress::new(total))
+    }
+
+    pub(crate) fn inc(&self, delta: u64) {
+        match self {
+            StageProgress::Indicatif(pb) => pb.inc(delta),
+            StageProgress::Percent(progress) => progress.inc(delta),
+        }
+    }
+
+    pub(crate) fn finish(&self) {
+        match self {
+            StageProgress::Indicatif(pb) => pb.finish_using_style(),
+            StageProgress::Percent(progress) => progress.finish(),
+        }
+    }
+}
+
+pub struct PercentProgress {
+    inner: Arc<PercentProgressInner>,
+}
+impl Clone for PercentProgress {
+    fn clone(&self) -> Self {
+        Self {
+            inner: Arc::clone(&self.inner),
+        }
+    }
+}
+
+struct PercentProgressInner {
+    total: u64,
+    current: AtomicU64,
+    last: AtomicU8,
+}
+
+impl PercentProgress {
+    fn new(total: u64) -> Self {
+        {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout();
+            let _ = stdout.write_all(b"... ");
+            let _ = stdout.flush();
+        }
+        Self {
+            inner: Arc::new(PercentProgressInner {
+                total,
+                current: AtomicU64::new(0),
+                last: AtomicU8::new(0),
+            }),
+        }
+    }
+
+    fn inc(&self, delta: u64) {
+        use std::sync::atomic::Ordering;
+        let current = self
+            .inner
+            .current
+            .fetch_add(delta, Ordering::Relaxed)
+            .saturating_add(delta);
+        self.print_thresholds(self.percent(current));
+    }
+
+    fn finish(&self) {
+        self.print_thresholds(100);
+    }
+
+    fn percent(&self, current: u64) -> u8 {
+        if self.inner.total == 0 {
+            100
+        } else {
+            ((current.saturating_mul(100)) / self.inner.total).min(100) as u8
+        }
+    }
+
+    fn print_thresholds(&self, percent: u8) {
+        use std::sync::atomic::Ordering;
+        let last = self.inner.last.load(Ordering::Relaxed);
+        let next = last + 10;
+        if percent > next
+            && self
+                .inner
+                .last
+                .compare_exchange(last, next, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+        {
+            use std::io::Write as _;
+            let mut stdout = std::io::stdout();
+            let _ = writeln!(stdout, "{}%", next);
+            if next != 100 {
+                let _ = write!(stdout, "... ");
+            }
+            let _ = stdout.flush();
+        }
+    }
 }
 
 pub mod cmd {
@@ -50,7 +168,7 @@ pub mod cmd {
         itertools::Itertools,
         rustix::path::Arg,
         smol::io::AsyncWriteExt,
-        std::path::PathBuf,
+        std::{io::IsTerminal, path::PathBuf},
     };
     #[derive(Parser)]
     #[command(
@@ -1072,16 +1190,7 @@ hash = \"{}\"
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let is_root = {
-                    let is_root = rustix::process::geteuid();
-                    tracing::debug!(
-                        "effective UID: {} (is_root: {})",
-                        is_root,
-                        is_root.is_root()
-                    );
-                    is_root.is_root()
-                };
-                let fs = HostFileSystem::new(&self.path, is_root)
+                let fs = HostFileSystem::new(&self.path, rustix::process::geteuid().is_root())
                     .await
                     .map_err(|err| {
                         anyhow!(
@@ -1104,14 +1213,21 @@ hash = \"{}\"
                     )
                 })?;
                 let pb = if conf.log_level() == 0 {
-                    Some(|size| {
-                        ProgressBar::new(size).with_style(
-                                indicatif::ProgressStyle::with_template(
-                                    "staging files: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
-                                )
-                                .unwrap()
-                                .progress_chars("#>-"),
-                            ).with_finish(indicatif::ProgressFinish::AndClear)
+                    let use_tty = std::io::stderr().is_terminal();
+                    Some(move |size| {
+                        if use_tty {
+                            StageProgress::from_progress_bar(
+                                ProgressBar::new(size).with_style(
+                                    indicatif::ProgressStyle::with_template(
+                                        "staging files: {spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({eta}) {msg}",
+                                    )
+                                    .unwrap()
+                                    .progress_chars("#>-"),
+                                ).with_finish(indicatif::ProgressFinish::AndClear),
+                            )
+                        } else {
+                            StageProgress::percent(size)
+                        }
                     })
                 } else {
                     None

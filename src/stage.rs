@@ -2,12 +2,12 @@ use {
     crate::{
         archive::{Archive, RepositoryFile},
         artifact::Artifact,
+        cli::StageProgress,
         content::{ContentProvider, DebLocation},
         control::{ControlFile, ControlStanza, MutableControlStanza},
         staging::{StagingFile, StagingFileSystem},
     },
     futures::stream::{self, StreamExt, TryStreamExt},
-    indicatif::ProgressBar,
     smol::io,
     std::num::NonZero,
 };
@@ -20,7 +20,7 @@ pub async fn stage_local<'a, FS, C>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem,
@@ -44,7 +44,7 @@ async fn stage_artifacts_local<'a, FS, C>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
@@ -72,7 +72,7 @@ async fn stage_debs_local<'a, C, FS>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + ?Sized,
@@ -161,7 +161,7 @@ pub async fn stage<'a, FS, C>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Send + Clone + 'static,
@@ -184,7 +184,7 @@ async fn stage_artifacts<'a, FS, C>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Clone + Send + 'static,
@@ -214,7 +214,7 @@ async fn stage_debs<'a, C, FS>(
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
-    pb: Option<ProgressBar>,
+    pb: Option<StageProgress>,
 ) -> io::Result<()>
 where
     FS: StagingFileSystem + Send + Clone + 'static,
