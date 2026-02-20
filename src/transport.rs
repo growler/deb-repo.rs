@@ -23,11 +23,47 @@ pub trait TransportProvider: Sync + Send {
     fn open(&self, url: &str) -> impl Future<Output = OpenResult>;
 }
 
+async fn build_http_request(
+    auth: &AuthProvider,
+    scheme: &str,
+    url: &Url,
+) -> io::Result<Request<()>> {
+    let mut request = Request::get(url.as_str());
+    request = match auth.auth(url).await.as_deref() {
+        None => request,
+        Some(Auth::Basic { login, password }) => {
+            tracing::debug!("using basic/digest auth for {}", url);
+            request
+                .authentication(Authentication::basic() | Authentication::digest())
+                .credentials(Credentials::new(login, password))
+        }
+        Some(Auth::Token { token }) => request.header("Authorization", format!("Bearer {}", token)),
+        Some(Auth::Cert {
+            cert,
+            key,
+            password,
+        }) if scheme == "https" => request.ssl_client_certificate(ClientCertificate::pem(
+            cert.clone(),
+            key.as_ref()
+                .map(|k| PrivateKey::pem(k.clone(), password.as_deref().map(|s| s.to_string()))),
+        )),
+        Some(Auth::Cert { .. }) => {
+            return Err(io::Error::other(format!(
+                "client certificates are only supported for https URLs: {}",
+                url
+            )))
+        }
+    };
+    request
+        .body(())
+        .map_err(|err| io::Error::other(format!("failed to build request for {}: {}", url, err)))
+}
+
 fn client(insecure: bool) -> &'static HttpClient {
     static SHARED: Lazy<HttpClient> = Lazy::new(|| {
         HttpClient::builder()
             .redirect_policy(RedirectPolicy::Limit(10))
-            .timeout(std::time::Duration::from_secs(300))
+            .timeout(std::time::Duration::from_secs(30))
             .build()
             .expect("Failed to create HTTP client")
     });
@@ -64,36 +100,28 @@ impl HttpTransport {
 
 impl TransportProvider for HttpTransport {
     async fn open(&self, url: &str) -> OpenResult {
+        const TIMEOUT_RETRIES: usize = 3;
         let url = to_url(url)?;
-        match url.scheme() {
+        let scheme = url.scheme();
+        match scheme {
             "http" | "https" => {
-                let mut request = Request::get(url.as_str());
-                request = match self.auth.auth(&url).await.as_deref() {
-                    None => request,
-                    Some(Auth::Basic { login, password }) => {
-                        tracing::debug!("using basic/digest auth for {}", url);
-                        request
-                            .authentication(Authentication::basic() | Authentication::digest())
-                            .credentials(Credentials::new(login, password))
+                let mut timeout_retries = 0;
+                let rsp = loop {
+                    let request = build_http_request(&self.auth, scheme, &url).await?;
+                    match client(self.insecure).send_async(request).await {
+                        Ok(rsp) => break rsp,
+                        Err(err) if err.is_timeout() && timeout_retries < TIMEOUT_RETRIES => {
+                            timeout_retries += 1;
+                            tracing::warn!(
+                                "timeout fetching {}, retrying {}/{}",
+                                url,
+                                timeout_retries,
+                                TIMEOUT_RETRIES
+                            );
+                        }
+                        Err(err) => return Err(io::Error::from(err)),
                     }
-                    Some(Auth::Token { token }) => {
-                        request.header("Authorization", format!("Bearer {}", token))
-                    }
-                    Some(Auth::Cert {
-                        cert,
-                        key,
-                        password,
-                    }) => request.ssl_client_certificate(ClientCertificate::pem(
-                        cert.clone(),
-                        key.as_ref().map(|k| {
-                            PrivateKey::pem(k.clone(), password.as_deref().map(|s| s.to_string()))
-                        }),
-                    )),
                 };
-                let request = request.body(()).map_err(|err| {
-                    io::Error::other(format!("failed to build request for {}: {}", url, err))
-                })?;
-                let rsp = client(self.insecure).send_async(request).await?;
                 match rsp.status() {
                     StatusCode::OK => {
                         let size = rsp.body().len();

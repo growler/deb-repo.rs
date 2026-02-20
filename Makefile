@@ -37,7 +37,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
 $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
-	set -x ; TREE="$$(<D)/$$$$(cat "$$<")"; \
+	@TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Running the package builder"; \
 	version=$$$$(dpkg-parsechangelog -SVersion); \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
