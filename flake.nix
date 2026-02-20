@@ -72,6 +72,7 @@
             cargo-depgraph
             cargo-benchcmp
             cargo-audit
+            cargo-edit
 
             sequoia-sq
             sequoia-sqv

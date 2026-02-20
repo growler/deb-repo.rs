@@ -84,8 +84,6 @@ jobs:
             !target/debian-build/*.buildinfo
             !target/debian-build/*.changes
           key: debian-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
-          restore-keys: |
-            debian-build-
 
       - name: Build debian packages
         if: startsWith(github.ref, 'refs/tags/v')
@@ -101,9 +99,7 @@ jobs:
             !target/ubuntu-build/*.deb
             !target/ubuntu-build/*.buildinfo
             !target/ubuntu-build/*.changes
-          key: ubuntu-build-${{ hashFiles('Cargo.lock', 'debian-build.amd64.lock') }}
-          restore-keys: |
-            ubuntu-build-
+          key: ubuntu-build-${{ hashFiles('Cargo.lock', 'ubuntu-build.amd64.lock') }}
 
       - name: Build ubuntu packages
         if: startsWith(github.ref, 'refs/tags/v')

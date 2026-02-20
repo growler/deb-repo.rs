@@ -3,6 +3,16 @@ name = "rdebootstrap"
 version = "0.1.0"
 rust-version = "1.85"
 edition = "2021"
+include = [
+    "src/**/*", 
+    "cmd/**/*", 
+    "benches/**/*", 
+    "keyring/**/*",
+    "tests/**/*",
+    "build.rs", 
+    "Cargo.toml", 
+    "README.md",
+]
 
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
@@ -11,8 +21,8 @@ ignored = ["md-5"]
 # dpkg-buildpackage -us -uc
 [package.metadata.deb]
 name = "rdebootstrap"
-maintainer = "Alekséi Naidénov <alexey.naidyonov@gmail.com>"
-copyright = "2025, Alekséi Naidénov <alexey.naidyonov@gmail.com>"
+maintainer = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
+copyright = "2025, Alexey Naidyonov <alexey.naidyonov@gmail.com>"
 section = "utility"
 priority = "optional"
 depends = [
