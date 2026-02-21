@@ -2,14 +2,14 @@
 [[archive]]
 url = "https://ftp.debian.org/debian/"
 snapshots = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"
-snapshot = "20260131T195001Z"
+snapshot = "20260221T221217Z"
 suites = ["trixie", "trixie-updates", "trixie-backports"]
 components = ["main", "contrib", "non-free"]
 
 [[archive]]
 url = "https://security.debian.org/debian-security/"
 snapshots = "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
-snapshot = "20260131T195001Z"
+snapshot = "20260221T221217Z"
 suites = ["trixie-security"]
 components = ["main", "contrib", "non-free"]
 

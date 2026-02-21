@@ -105,7 +105,13 @@ impl EditorCommand {
             .map(|value| value.to_string())
             .or_else(|| env::var("VISUAL").ok())
             .or_else(|| env::var("EDITOR").ok())
-            .ok_or_else(|| anyhow!("editor not configured: set $VISUAL/$EDITOR or pass --edit"))?;
+            .or_else(|| {
+                std::fs::metadata("/usr/bin/edit")
+                    .map(|md| md.is_file())
+                    .is_ok()
+                    .then(|| "/usr/bin/edit".to_string())
+            })
+            .ok_or_else(|| anyhow!("editor not configured and /usr/bin/edit is absent: set $VISUAL/$EDITOR or pass --edit"))?;
         let mut parts = editor.split_whitespace();
         let program = parts
             .next()

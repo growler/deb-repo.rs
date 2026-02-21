@@ -3,6 +3,8 @@
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 export CARGO_HOME := $(CURDIR)/target/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target
+MANPAGE_MD := docs/rdebootstrap.1.md
+MANPAGE := target/man/rdebootstrap.1
 
 %:
 	dh $@
@@ -13,6 +15,7 @@ override_dh_auto_configure:
 
 override_dh_auto_build:
 	cargo build -p rdebootstrap --release --locked --bin rdebootstrap
+	cargo xtask build-man
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
@@ -24,6 +27,8 @@ override_dh_auto_install:
 		$(CURDIR)/debian/rdebootstrap/usr/bin/rdebootstrap
 	install -Dm644 debian/usr.bin.rdebootstrap \
 		$(CURDIR)/debian/rdebootstrap/etc/apparmor.d/usr.bin.rdebootstrap
+	bash -c 'install -Dm644 -t $(CURDIR)/debian/rdebootstrap/usr/share/man/man1 target/man/rdebootstrap*.1'
 
 override_dh_auto_clean:
 	-cargo clean -r
+	rm -rf target/man

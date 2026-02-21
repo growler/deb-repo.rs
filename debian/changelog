@@ -1,6 +1,7 @@
-rdebootstrap (0.1.1) UNRELEASED; urgency=medium
+rdebootstrap (0.1.1) unstable; urgency=medium
 
   * Split the source package into the binary and the library
+  * Ship rdebootstrap(1) manual page
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 21 Feb 2026 08:38:40 +0100
 

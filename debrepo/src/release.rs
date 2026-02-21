@@ -102,7 +102,7 @@ impl Release {
                 }
             }))
     }
-    pub(crate) fn package_files<'a, S: AsRef<str>>(
+    pub fn package_files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
@@ -170,7 +170,7 @@ impl Release {
             }
         }))
     }
-    pub(crate) fn source_files<'a, S: AsRef<str>>(
+    pub fn source_files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
@@ -306,46 +306,3 @@ struct ReleaseInner {
     #[covariant]
     control: ControlStanza<'this>,
 }
-
-// #[cfg(test)]
-// mod tests {
-//     use super::*;
-//     use crate::hash::Hash;
-//
-//     type HashAlgo = sha2::Sha256;
-//
-//     #[test]
-//     fn test_find_release_entry() {
-//         let data = "\
-// SHA256:
-//  6ab13ddda55cf4f5a09f538d474c867bcafc821aee52a47313c2a47384160cc4    93686 contrib/binary-all/Packages
-//  c413f8b439c06cd92877ba816933a99041ea298e36138ae5c239eb75fc31cbe0    27285 contrib/binary-all/Packages.gz
-//  9b6ce8e2bcccc2a0e9d3e5f7864d89ac1dc2ec6335419dd6cc0e6bdd96697325    24088 contrib/binary-all/Packages.xz
-//  adea676f9da362ee55eca0f6f7597b824dfa1b0476eed5ee0414cea2c9a83179      117 contrib/binary-all/Release
-//  3a9ed913ce8eb058e0cf89a3011155699393f25951f08bde90358b6f0c6716d1   233622 contrib/binary-amd64/Packages
-//  25a55976ac9eeb2078c50a9e4adb0984a4379de1e5f654adb6e2d534b3417367    65631 contrib/binary-amd64/Packages.gz
-//  d53b837ab6882732f0e67bc5b693cb958976f248fdfa1cf97209ca948a46a0bd    54116 contrib/binary-amd64/Packages.xz
-//  e3ddd6d88f8c795b5fab1026bfddbb6937f5f3b64c51efad85303e7fd0f8bd28      119 contrib/binary-amd64/Release
-//  5c6a7dcf2bd5502b623043f515648f10769b3d8a129413fd3008ed6fd31a1785   194011 contrib/binary-arm64/Packages
-//  86332f06307512769d23db09b656041e2daf0cfe9eb356c880d8a79f18c6bd03    54718 contrib/binary-arm64/Packages.gz
-//  0601d762ab26a93dcf066d78b4d34f789ca34155929a5dd069a5c50ac58a627e    45652 contrib/binary-arm64/Packages.xz
-// ".to_string().into_boxed_str();
-//         let release = Release::new("sid", "".to_string().into(), data).unwrap();
-//         let (path, size, hash) = release.packages_file("contrib", "all").unwrap();
-//         assert_eq!(
-//             hash,
-//             Digest::try_from("9b6ce8e2bcccc2a0e9d3e5f7864d89ac1dc2ec6335419dd6cc0e6bdd96697325")
-//                 .unwrap()
-//         );
-//         assert_eq!(size, 24088);
-//         assert_eq!(path, "dists/sid/contrib/binary-all/Packages.xz");
-//         let (path, size, hash) = release.packages_file("contrib", "arm64").unwrap();
-//         assert_eq!(
-//             hash,
-//             Digest::try_from("0601d762ab26a93dcf066d78b4d34f789ca34155929a5dd069a5c50ac58a627e")
-//                 .unwrap()
-//         );
-//         assert_eq!(size, 45652);
-//         assert_eq!(path, "dists/sid/contrib/binary-arm64/Packages.xz");
-//     }
-// }

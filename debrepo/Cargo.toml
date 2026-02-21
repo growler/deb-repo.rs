@@ -1,8 +1,16 @@
 [package]
 name = "debrepo"
-version = "0.1.0"
+version = "0.1.1"
 rust-version = "1.85"
 edition = "2021"
+description = "Library for manifest-driven Debian/Ubuntu bootstrap and APT archive resolution."
+license = "MIT"
+documentation = "https://docs.rs/debrepo"
+repository = "https://github.com/growler/rdebootstrap.rs"
+homepage = "https://github.com/growler/rdebootstrap.rs"
+readme = "README.md"
+keywords = ["debian", "deb", "bootstrap", "debootstrap"]
+categories = ["development-tools::build-utils"]
 
 [package.metadata.cargo-machete]
 ignored = ["md-5"]
@@ -23,16 +31,14 @@ chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
 criterion = "0.5.1"
 digest = "0.10"
-filetime = "0.2"
-futures = { version = "0.3", default-features = false, features = ["std"] }
 futures-lite = "2.3.0"
+futures = { version = "0.3", default-features = false, features = ["std"] }
 gpgme = "0.11"
 hex = "0.4"
 indicatif = "0.18.2"
 isahc = { version = "1", default-features = false, features = ["http2"] }
 itertools = "0.13"
 libc = "0.2.175"
-macro_rules_attribute = "0.2.0"
 md-5 = "0.10"
 memchr = "2"
 memmap2 = "0.9.8"
@@ -44,8 +50,8 @@ pin-project-lite = "0.2.13"
 regex = "1.11"
 resolvo = "0.10.0"
 rustix = { version = "1", features = ["fs", "pipe", "thread", "mount"] }
-serde = { version = "1.0.219", features = ["derive"] }
 serde_json = "1.0.140"
+serde = { version = "1.0.219", features = ["derive"] }
 sha1 = "0.10.6"
 sha2 = "0.10"
 smallvec = { version = "1.13", features = ["serde", "union"] }
@@ -56,18 +62,12 @@ tempfile = "3.15"
 thiserror = "2.0.17"
 toml_edit = { version = "0.22.22", features = ["serde"] }
 tracing = "0.1.40"
-tracing-futures = "0.2.5"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["env-filter", "fmt", "std"] }
 url = { version = "2.5.4", features = ["serde"] }
 
 [dependencies.async-compression]
 version = "0.4.32"
 features = ["futures-io", "bzip2", "gzip", "zstd", "lzma", "lz4", "xz"]
-
-[build-dependencies]
-clap_mangen = "0.2.29"
-gpgme = "0.11.0"
-isahc = { version = "1", default-features = false, features = ["http2"] }
 
 [dev-dependencies]
 criterion = "0.5"

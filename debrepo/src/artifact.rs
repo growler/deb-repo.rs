@@ -16,6 +16,7 @@ use {
     smol::{io::AsyncRead, stream::StreamExt},
     std::{
         borrow::Cow,
+        ffi::OsStr,
         future::Future,
         io,
         num::NonZero,
@@ -24,21 +25,138 @@ use {
     },
 };
 
+#[derive(Clone)]
+struct FileModeArgParser;
+
+impl clap::builder::TypedValueParser for FileModeArgParser {
+    type Value = NonZero<u32>;
+
+    fn parse_ref(
+        &self,
+        cmd: &clap::Command,
+        arg: Option<&clap::Arg>,
+        value: &OsStr,
+    ) -> Result<Self::Value, clap::Error> {
+        let value = value.to_str().ok_or_else(|| {
+            let mut err = clap::Error::new(clap::error::ErrorKind::InvalidUtf8).with_cmd(cmd);
+            if let Some(arg) = arg {
+                err.insert(
+                    clap::error::ContextKind::InvalidArg,
+                    clap::error::ContextValue::String(arg.to_string()),
+                );
+            }
+            err
+        })?;
+
+        parse_file_mode(value).map_err(|message| {
+            let mut err = clap::Error::new(clap::error::ErrorKind::ValueValidation).with_cmd(cmd);
+            if let Some(arg) = arg {
+                err.insert(
+                    clap::error::ContextKind::InvalidArg,
+                    clap::error::ContextValue::String(arg.to_string()),
+                );
+            }
+            err.insert(
+                clap::error::ContextKind::InvalidValue,
+                clap::error::ContextValue::String(value.to_string()),
+            );
+            err.insert(
+                clap::error::ContextKind::Custom,
+                clap::error::ContextValue::String(message),
+            );
+            err
+        })
+    }
+}
+
+fn parse_file_mode(value: &str) -> Result<NonZero<u32>, String> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err("mode cannot be empty".to_string());
+    }
+
+    let digits = if let Some(rest) = value.strip_prefix("0o").or(value.strip_prefix("0O")) {
+        rest
+    } else if value.chars().all(|c| c.is_ascii_digit()) {
+        if value.chars().any(|c| c == '8' || c == '9') {
+            return Err("mode must be octal (digits 0-7), e.g. 644 or 755".to_string());
+        }
+        value
+    } else {
+        return Err("mode must be an octal number like 644 or 755".to_string());
+    };
+
+    let digits = digits.trim();
+    if digits.is_empty() {
+        return Err("mode digits are missing".to_string());
+    }
+
+    let parsed =
+        u32::from_str_radix(digits, 8).map_err(|err| format!("invalid mode '{value}': {err}"))?;
+    if parsed == 0 {
+        return Err("mode cannot be zero".to_string());
+    }
+    Ok(NonZero::new(parsed).expect("mode is non-zero"))
+}
+
+fn file_target_path(target: &str, uri: &str) -> io::Result<String> {
+    if target.ends_with('/') {
+        let name = artifact_file_name(uri).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot derive file name from artifact URI: {uri}"),
+            )
+        })?;
+        Ok(format!("{target}{name}"))
+    } else {
+        Ok(target.to_string())
+    }
+}
+
+fn artifact_file_name(uri: &str) -> Option<&str> {
+    let uri = uri.split(['?', '#']).next().unwrap_or(uri);
+    let uri = crate::strip_url_scheme(uri);
+    uri.rsplit('/').find(|s| !s.is_empty())
+}
+
+fn validate_unpacked_path(path: &str) -> io::Result<()> {
+    let path = Path::new(path);
+    if path.is_absolute() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("archive entry path must be relative: {}", path.display()),
+        ));
+    }
+    if path
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "archive entry path must not contain '..': {}",
+                path.display()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 #[derive(Args)]
 pub struct ArtifactArg {
-    /// Target file mode (only if artifact is a single file)
-    #[arg(long = "mode", value_name = "MODE")]
+    /// Target file mode in octal (only if the artifact is a single file), e.g. 0644 or 0755
+    #[arg(long = "mode", value_name = "MODE", value_parser = FileModeArgParser)]
     pub mode: Option<NonZero<u32>>,
     /// Do not unpack (disables auto-unpacking of tar archives and compressed files)
     #[arg(long = "no-unpack", action)]
     pub do_not_unpack: bool,
-    /// A target architecture for the artifact
+    /// Target architecture for the artifact
     #[arg(long = "only-arch", value_name = "ARCH")]
     pub target_arch: Option<String>,
-    /// Artifact URL or path
+    /// Artifact URL or local path
     #[arg(value_name = "URL")]
     pub url: String,
-    /// A target path on the staging filesystem
+    /// Target path inside the staging filesystem (relative to root)
     #[arg(value_name = "TARGET_PATH")]
     pub target: Option<String>,
 }
@@ -125,6 +243,14 @@ impl Artifact {
             None
         };
         let arch = artifact.target_arch.clone();
+        if let Some(target) = target.as_deref() {
+            if !target.starts_with('/') {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("target path must be absolute (starts with '/'): {target}"),
+                ));
+            }
+        }
         if is_url(&uri) {
             let mut artifact = if unpack.unwrap_or(true) && is_tar_ext(uri.as_bytes()) {
                 Artifact::Tar(Tar {
@@ -135,17 +261,19 @@ impl Artifact {
                     target,
                 })
             } else {
+                let file_target = target.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "target must be specified for a file",
+                    )
+                })?;
+                let file_target = file_target_path(file_target, &uri)?;
                 Artifact::File(File {
                     arch,
                     uri,
                     hash: Hash::default(),
                     size: 0,
-                    target: target.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "target must be specified for a file",
-                        )
-                    })?,
+                    target: file_target,
                     mode: artifact.mode,
                     unpack,
                 })
@@ -171,17 +299,19 @@ impl Artifact {
                     target,
                 })
             } else {
+                let file_target = target.as_deref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "target must be specified for a file",
+                    )
+                })?;
+                let file_target = file_target_path(file_target, &uri)?;
                 Artifact::File(File {
                     arch,
                     uri,
                     hash: Hash::default(),
                     size: 0,
-                    target: target.ok_or_else(|| {
-                        io::Error::new(
-                            io::ErrorKind::InvalidInput,
-                            "target must be specified for a file",
-                        )
-                    })?,
+                    target: file_target,
                     mode: artifact.mode,
                     unpack,
                 })
@@ -470,6 +600,7 @@ where
             let entry = entry?;
             match entry {
                 tar::TarEntry::Directory(dir) => {
+                    validate_unpacked_path(dir.path())?;
                     let path = target.map_or_else(
                         || Cow::Borrowed(Path::new(dir.path())),
                         |p| Cow::Owned(Path::new(p).join(dir.path())),
@@ -479,6 +610,7 @@ where
                         .await?;
                 }
                 tar::TarEntry::File(mut file) => {
+                    validate_unpacked_path(file.path())?;
                     let path = target.map_or_else(
                         || Path::new(file.path()).to_path_buf(),
                         |p| Path::new(p).join(file.path()),
@@ -501,6 +633,7 @@ where
                         .await?;
                 }
                 tar::TarEntry::Symlink(link) => {
+                    validate_unpacked_path(link.path())?;
                     let uid = link.uid();
                     let gid = link.gid();
                     let path = target.map_or_else(
@@ -533,13 +666,15 @@ where
             }
         }
         for link in links.drain(..) {
+            validate_unpacked_path(link.path())?;
+            validate_unpacked_path(link.link())?;
             let path = target.map_or_else(
                 || Cow::Borrowed(Path::new(link.path())),
                 |p| Cow::Owned(Path::new(p).join(link.path())),
             );
             let link = target.map_or_else(
-                || Cow::Borrowed(Path::new(link.path())),
-                |p| Cow::Owned(Path::new(p).join(link.path())),
+                || Cow::Borrowed(Path::new(link.link())),
+                |p| Cow::Owned(Path::new(p).join(link.link())),
             );
             fs.hardlink(link, path).await?;
         }

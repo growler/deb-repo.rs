@@ -51,12 +51,12 @@ The resulting binary lives at `target/release/rdebootstrap` (or in
 ## Typical Workflow
 
 1. **Create a manifest**\
-   `rdebootstrap init --url debian --package ca-certificates --package vim`
+   `rdebootstrap init debian --package ca-certificates --package vim`
 2. **Iterate on specs**\
    `rdebootstrap include --spec desktop openssh-server network-manager`\
    `rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'`
 3. **Update and lock**\
-   `rdebootstrap update --snapshot 20241007T030925Z`\
+   `rdebootstrap update --snapshot 20241007T030925Z` (or `--snapshot now`)\
    This downloads Release/Packages data, solves the specs, and writes
    `Manifest.<arch>.lock`.
 4. **Build a filesystem tree**\
@@ -72,8 +72,13 @@ maintainer scripts in the sandbox so the host stays clean.
 
 `Manifest.toml` sits at the project root unless `--manifest <path>` is supplied.
 The lock file is written next to the manifest by default; use `--lock <path>` to
-override the base path (ending the value with `/` treats it as a directory and
-derives the file name from the manifest). A small example:
+override the base path. Lock path rules (for a manifest named `<name>.toml`):
+
+- no `--lock`: `<name>.<arch>.lock`
+- `--lock <dir>/`: `<dir>/<name>.<arch>.lock`
+- `--lock <file>.lock`: `<file>.<arch>.lock` (extension replaced)
+
+A small example:
 
 ```toml
 [[archive]]
@@ -99,8 +104,8 @@ Key sections:
   packages.
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
 - `[spec]` and `[spec.<name>]` — Package requirements/constraints, staged
-  artifacts, and metadata per spec. Specs can inherit from each other via
-  `extends`.
+  artifacts, build-time environment/script, and metadata per spec. Specs can
+  inherit from each other via `extends`.
 
 `rdebootstrap update` keeps the lock file aligned with the manifest, and `build`
 refuses to run if the lock is missing or stale.
@@ -116,10 +121,49 @@ refuses to run if the lock is missing or stale.
 - Content integrity is enforced via the hashes recorded in the lock file;
   disabling cache does not bypass verification.
 
+## Artifacts and Staging
+
+Artifacts are declared at the top level as `[artifact."<name>"]` and referenced
+from specs via `stage = ["<name>", ...]`.
+
+- Artifact `type` is one of: `file`, `tar`, `dir`.
+- Hashes are serialized in SRI form: `<algo>-<base64>` (for example
+  `blake3-...`, `sha256-...`).
+- When `rdebootstrap` computes an artifact hash (for example via `stage`), it
+  uses `blake3`.
+- `TARGET_PATH` is an absolute path inside the target filesystem.
+  - `file.ext /path/target` → `/path/target`
+  - `file.ext /path/target/` → `/path/target/file.ext`
+  - `file.tar /path/target(/?)` → extracted under `/path/target`
+  - `dir /path/target(/?)` → copied under `/path/target`
+- Auto-unpack: tar archives and compressed files (`.gz`, `.xz`, `.bz2`, `.zst`,
+  `.zstd`) are unpacked by default; use `--no-unpack` to keep them as-is.
+- Safety: tar unpacking rejects absolute paths, `..` traversal, and special
+  entries like device nodes.
+
+## Build Environment and Scripts
+
+Specs can set:
+
+- `build-env` — key/value environment variables applied to both `dpkg --configure`
+  and `build-script`.
+- `build-script` — a bash script executed after package configuration. Scripts
+  from `extends` are executed in order (base → derived).
+
+Use `rdebootstrap edit env` / `rdebootstrap edit script` to edit these fields.
+
+`rdebootstrap build` supports `--executor sandbox` (default) and
+`--executor podman`. The executor matters mainly for rootless runs: `sandbox`
+uses the built-in helper, while `podman` runs configuration inside
+`podman run --rootfs ...` (which may require a working rootless podman
+environment such as a valid XDG runtime directory).
+
 ## CLI Tour
 
-- `init` – bootstrap a manifest from vendor presets or explicit archives.
-- `edit` – edit the manifest or spec metadata.
+- `init` – bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
+  `devuan`) or explicit archives.
+- `edit` – edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,
+  `edit script`).
 - `add archive`, `add local` – append repositories or register a local `.deb`.
 - `include` / `exclude` – add requirements or version constraints to a spec.
 - `drop` – remove requirements or constraints.
@@ -132,9 +176,11 @@ refuses to run if the lock is missing or stale.
 
 ## Authentication
 
-- `-a/--auth` selects the archive: omit for optional `auth.toml` in the same
-  directory where Manifest is located, use `file:/path/to/auth.toml` (or just a
-  path), or `vault:<prefix>` to read secrets from Vault.
+- `-a/--auth` selects the auth source: omit for optional `auth.toml` next to the
+  manifest, use `file:/path/to/auth.toml` (or just a path), or
+  `vault:<mount>/<path>` to read secrets from Vault.
+
+Do not commit `auth.toml` to version control.
 
 - Auth file (`auth.toml`) supports per-host entries:
 
@@ -159,9 +205,9 @@ key = "relative/key.pem"
 file dir), and `password.file`/`password.path` load file content. Tokens and
 cert/key accept the same source forms.
 
-- Vault secrets: pass `--auth vault:<prefix>`, where `<prefix>` is the full API
-  path prefix (e.g. `secret/repos` for KV v1, `secret/data/repos` for KV v2).
-  Each host lives at `<prefix>/<host>` with JSON like:
+- Vault secrets: pass `--auth vault:<mount>/<path>` (for example
+  `vault:secret/data/repos`). Each host lives at `<mount>/<path>/<host>` and
+  contains JSON like:
 
 ```json
 { "type": "basic", "login": "user", "password": "secret" }
@@ -179,10 +225,26 @@ Global flags of note:
   as a directory).
 - `--arch <arch>` switches the target architecture (default: host arch).
 - `-n/--downloads <N>` controls concurrent downloads (default: 20).
-- `--cache-dir`, `--no-cache`, `-K/--no-verify`, and `-k/--insecure` adjust
-  caching and verification.
+- `--cache-dir` / `--no-cache` adjust caching.
+- `-k/--insecure` disables TLS certificate and hostname verification
+  (not recommended).
+
+Verification controls (scoped):
+
+- `--no-verify` (on `init`, `add archive`, `update`) skips InRelease signature
+  verification (not recommended).
+- `-K/--allow-insecure` (on archive definitions for `init` and `add archive`, or
+  `allow-insecure = true` in the manifest) fetches `Release` instead of
+  `InRelease`.
 
 Run `rdebootstrap <command> --help` for exhaustive usage information.
+
+## Known Rough Edges
+
+- Staging/unpacking happens concurrently; this makes `rdebootstrap` incompatible
+  with `dpkg-divert` workflows.
+- `-q/--quiet` and `-d/--debug` currently affect only `rdebootstrap` output, not
+  the output of `dpkg --configure` or `build-script`.
 
 ## Development
 

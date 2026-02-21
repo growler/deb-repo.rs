@@ -4,7 +4,7 @@ CARGO ?= cargo
 PODMAN ?= podman
 RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
 DOWNLOADS ?= 10
-
+MANPAGES_DIR := $(CURDIR)/target/man
 DISTROS := debian ubuntu
 debian_suffix := deb
 ubuntu_suffix := ubuntu
@@ -26,6 +26,10 @@ version:
 	echo $$ver \
 	'))
 	@echo "Debian version: ${ver}"
+
+manpages:
+	@echo "Generating binary manpages" ;\
+	$(CARGO) xtask build-man
 
 rdebootstrap:
 	@echo "Building rdebootstrap binary" ;\
@@ -53,7 +57,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
 		podman unshare $(RDEBOOTSTRAP) -n $(DOWNLOADS) -m $(CURDIR)/$(1)-build.toml build --path "$$$$TREE"; \
 	fi
 
-$(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version
+$(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \

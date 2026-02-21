@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "debrepo",
-    "rdebootstrap",
+    "rdebootstrap", 
+    "xtask",
 ]
 resolver = "2"

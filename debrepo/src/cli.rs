@@ -174,9 +174,9 @@ pub mod cmd {
     #[command(
         about = "Create a new manifest file",
         long_about = r#"Create a new manifest file from an archive definition.
-If a vendor name is provided as archive URL, default archives and packages are derived from it.
-Examples:  
-    rdebootstrap init --package mc --package libcom-err2 --url debian"#
+If a vendor name is provided as the archive URL, default archives and packages are derived from it.
+Examples:
+    rdebootstrap init debian --package mc --package libcom-err2"#
     )]
     pub struct Init {
         /// Overwrite existing manifest if present
@@ -191,12 +191,12 @@ Examples:
         #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
         requirements: Vec<String>,
 
-        /// Archive definition (i.e. --url <URL> ...).
+        /// Archive definition (URL plus suite/component/snapshot options).
         /// URL might be a vendor name (debian, ubuntu, devuan).
         #[command(flatten)]
         archive: Archive,
 
-        /// Do not verify Release files by default (not recommended)
+        /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
@@ -245,7 +245,7 @@ Examples:
 
     #[derive(Parser)]
     #[command(
-        about = "Adds an archive",
+        about = "Add an archive",
         long_about = "Add an archive definition to the manifest file."
     )]
     pub struct AddArchive {
@@ -255,7 +255,7 @@ Examples:
         #[command(flatten)]
         archive: Archive,
 
-        /// Do not verify Release files by default (not recommended)
+        /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
@@ -331,7 +331,7 @@ Examples:
     }
 
     #[derive(Parser)]
-    #[command(about = "Adds an archive or a local package")]
+    #[command(about = "Add an archive or a local package to the manifest")]
     pub struct Add {
         #[command(subcommand)]
         cmd: AddCommands,
@@ -414,7 +414,7 @@ Examples:
     #[derive(Parser)]
     #[command(
         about = "Remove requirements or constraints from a spec",
-        long_about = r#"Remove requirements and/or constraints from a spec
+        long_about = r#"Remove requirements and/or constraints from a spec.
 Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     pub struct Remove {
@@ -433,7 +433,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Remove requirements or constraints from a spec",
-        long_about = r#"Remove requirements and/or constraints from a spec
+        long_about = r#"Remove requirements and/or constraints from a spec.
 Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     pub struct Drop {
@@ -491,7 +491,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Stage an artifact into a spec",
-        long_about = "Add an external artifact (URL or file path) to a spec so it is included into the system tree."
+        long_about = "Add an external artifact (URL or file path) to a spec so it is included in the system tree."
     )]
     pub struct Stage {
         /// Target spec (omit to use the default spec)
@@ -661,7 +661,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Update archives and snapshot/lock state",
-        long_about = "Fetch or retrieve from cache package indexes, solve the specs and update lock file. Optionally set a snapshot before updating."
+        long_about = "Refresh archive metadata, solve specs, and rewrite the lock file."
     )]
     pub struct Update {
         /// Update lock file even if it appears up to date
@@ -674,10 +674,10 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         /// Refresh local packages index (implies --force).
         #[arg(short = 'L', long = "locals", action)]
         locals: bool,
-        /// Snapshot to use for all archives that support it and have snapshotting enabled
+        /// Snapshot ID to use for all snapshot-enabled archives (use 'now' for current time)
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
-        /// Do not verify Release files by default (not recommended)
+        /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
     }
@@ -784,7 +784,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
-    #[command(about = "Show a package or a spec hash")]
+    #[command(about = "Show package records or spec information")]
     pub struct Show {
         #[command(subcommand)]
         cmd: ShowCommands,
@@ -879,7 +879,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[command(
         name = "source",
         about = "Show a package's source control record",
-        long_about = "Print the raw control record for the given package's source."
+        long_about = "Print the raw source control record for the given package or source package."
     )]
     pub struct ShowSource {
         /// Find and print source files as artifacts to stage in path.
@@ -1121,7 +1121,10 @@ hash = \"{}\"
     }
 
     #[derive(Parser)]
-    #[command(about = "List manifest items", long_about = "List manifest items")]
+    #[command(
+        about = "List manifest items",
+        long_about = "List manifest items (use --specs to list specs, or --spec <name> to list packages for a spec)."
+    )]
     pub struct List {
         #[arg(short = 'e', long = "only-essential", hide = true)]
         only_essential: bool,
@@ -1164,7 +1167,7 @@ hash = \"{}\"
     #[derive(Parser)]
     #[command(
         about = "Build an installable root for a spec",
-        long_about = "Stage required artifacts and build the spec into the target directory."
+        long_about = "Build an installable root filesystem tree for a spec."
     )]
     pub struct Build {
         /// The spec name to build

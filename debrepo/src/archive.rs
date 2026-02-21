@@ -563,10 +563,14 @@ impl RepositoryFile {
     }
 }
 
+pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
+    t == &T::default()
+}
+
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct Archive {
-    /// Repository URL
+    /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
     #[arg(value_name = "URL")]
     pub url: String,
 
@@ -574,21 +578,17 @@ pub struct Archive {
     #[serde(skip)]
     real_url: Option<String>,
 
-    /// Only include the listed architectures
+    /// Only include the listed architectures (comma-separated)
     #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
 
-    /// Allow the repository to be insecure (skip checking release signature)
-    #[arg(short = 'K', long = "allow-insecure")]
-    #[serde(
-        default,
-        rename = "allow-insecure",
-        skip_serializing_if = "Option::is_none"
-    )]
-    pub allow_insecure: Option<bool>,
+    /// Allow unsigned repository metadata (fetch Release instead of InRelease)
+    #[arg(short = 'K', long = "allow-insecure", action)]
+    #[serde(default, rename = "allow-insecure", skip_serializing_if = "is_default")]
+    pub allow_insecure: bool,
 
-    /// A path to PGP keyring file or a @path in an ASCII-armored PGP public key block to inline
+    /// Path to a PGP keyring file, or an @path to inline an ASCII-armored public key block
     #[arg(long = "signed-by", value_name = "@INLINE-KEY|KEYRING", value_parser = ClapSignedByParser)]
     #[serde(default, rename = "signed-by", skip_serializing_if = "Option::is_none")]
     pub signed_by: Option<SignedBy>,
@@ -613,11 +613,11 @@ pub struct Archive {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
 
-    /// Suite or codename (i.e. "focal", "buster", "stable", "testing", "unstable", etc.)
+    /// Suite or codename (e.g. "stable", "testing", "unstable", "trixie", "noble")
     #[arg(short = 's', long = "suite", value_name = "SUITE", num_args = 1, action = clap::ArgAction::Set)]
     pub suites: Vec<String>,
 
-    /// Space-separated list of components (i.e. "main", "contrib", "non-free", etc.)
+    /// Space-separated list of components (e.g. "main", "contrib", "non-free")
     #[arg(short = 'C', long = "components", value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
@@ -644,14 +644,14 @@ impl Archive {
         self.arch.is_empty() || self.arch.iter().any(|s| s == arch)
     }
     pub fn allow_insecure(&self) -> bool {
-        self.allow_insecure.unwrap_or(false)
+        self.allow_insecure
     }
     pub fn with_snapshots<S: AsRef<str>>(mut self, snapshots: S) -> Self {
         self.snapshots = Some(snapshots.as_ref().to_string());
         self
     }
-    pub(crate) fn release_path(&self, suite: &str, skip_verify: bool) -> String {
-        if self.allow_insecure() || skip_verify {
+    pub(crate) fn release_path(&self, suite: &str) -> String {
+        if self.allow_insecure() {
             format!("dists/{}/Release", suite)
         } else {
             format!("dists/{}/InRelease", suite)
@@ -662,8 +662,10 @@ impl Archive {
         r: IndexFile,
         skip_verify: bool,
     ) -> io::Result<Release> {
-        if self.allow_insecure() || skip_verify {
+        if self.allow_insecure() {
             Release::new(r).map_err(std::io::Error::other)
+        } else if skip_verify {
+            Release::new(r.clear_text()).map_err(std::io::Error::other)
         } else {
             self.verify_signed_release(&r).await
         }
@@ -837,8 +839,8 @@ impl From<&Archive> for MutableControlStanza {
         if !src.arch.is_empty() {
             cs.set("Architectures", src.arch.join(" "));
         }
-        if let Some(allow_insecure) = src.allow_insecure {
-            cs.set("Allow-Insecure", if allow_insecure { "yes" } else { "no" });
+        if src.allow_insecure {
+            cs.set("Allow-Insecure", "yes");
         }
         if let Some(signed_by) = &src.signed_by {
             cs.set("Signed-By", String::from(signed_by));

@@ -105,7 +105,7 @@ impl LockedArchive {
         stream::iter(archive.suites.iter().enumerate())
             .then(move |(suite_idx, suite)| async move {
                 tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
-                let path = archive.release_path(suite, skip_verify);
+                let path = archive.release_path(suite);
                 let file = cache.fetch_release_file(&archive.file_url(&path)).await?;
                 let rel = archive.release_from_file(file.clone(), skip_verify).await?;
                 match locked.as_ref().and_then(|l| l.suites.get(suite_idx)) {

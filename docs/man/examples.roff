@@ -1,0 +1,16 @@
+.SH EXAMPLES
+Create a manifest and iterate on specs:
+.IP
+.EX
+rdebootstrap init debian --package ca-certificates --package vim
+rdebootstrap include --spec desktop openssh-server network-manager
+rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'
+rdebootstrap update --snapshot 20241007T030925Z
+sudo rdebootstrap build --spec desktop --path ./out
+.EE
+.PP
+Use with podman:
+.IP
+.EX
+podman run --rm -it --systemd=always --rootfs "$(pwd)/out" bash -l
+.EE

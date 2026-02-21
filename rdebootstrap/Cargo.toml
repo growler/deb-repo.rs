@@ -1,27 +1,19 @@
 [package]
 name = "rdebootstrap"
-version = "0.1.0"
+version = "0.1.1"
 rust-version = "1.85"
 edition = "2021"
+description = "Debian/Ubuntu bootstrapper that builds a root filesystem tree from a lockable manifest."
+license = "MIT"
+documentation = "https://docs.rs/debrepo"
+repository = "https://github.com/growler/rdebootstrap.rs"
+homepage = "https://github.com/growler/rdebootstrap.rs"
+readme = "README.md"
+keywords = ["debian", "deb", "debootstrap", "rootfs"]
+categories = ["command-line-utilities", "development-tools::build-utils"]
 
-# Used to build debian package with NixOS. With Debian use
-# dpkg-buildpackage -us -uc
-[package.metadata.deb]
-name = "rdebootstrap"
-maintainer = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
-copyright = "2025, Alexey Naidyonov <alexey.naidyonov@gmail.com>"
-section = "utility"
-priority = "optional"
-depends = [
-    "libc6 (>= 2.39)",
-    "libcurl4t64 (>= 7.18.0)",
-    "libgpg-error0 (>= 1.14)",
-    "libgpgme11t64 (>= 1.23.2)",
-    "liblzma5 (>= 5.4.0)",
-]
-assets = [
-    [ "target/release/rdebootstrap", "usr/bin/rdebootstrap", "0755" ],
-]
+[package.metadata.cargo-machete]
+ignored = ["anyhow"] # required by macro from debrepo
 
 [[bin]]
 name = "rdebootstrap"
@@ -35,8 +27,11 @@ path = "cmd/tar.rs"
 name = "tar-xattr"
 path = "cmd/tar_xattr.rs"
 
+[lib]
+path = "cmd/cli.rs"
+
 [dependencies]
-debrepo = { path = "../debrepo" }
+debrepo = { version = "0.1.1", path = "../debrepo" }
 anyhow = "1.0.99"
 clap = { version = "4.5.48", features = ["derive", "env"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }

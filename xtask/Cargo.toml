@@ -1,0 +1,20 @@
+[package]
+name = "xtask"
+version = "0.0.1"
+edition = "2024"
+
+[[bin]]
+name = "build-man"
+path = "build-man/main.rs"
+
+[[bin]]
+name = "update-keyring"
+path = "update-keyring/main.rs"
+
+[dependencies]
+rdebootstrap = { path = "../rdebootstrap" }
+clap = { version = "4.5.48", features = ["derive"] }
+anyhow = "1.0.99"
+gpgme = "0.11"
+isahc = { version = "1", default-features = false, features = ["http2"] }
+tempfile = "3.15"
