@@ -10,29 +10,21 @@ debian_suffix := deb
 ubuntu_suffix := ubuntu
 
 version:
+	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	$(eval ver=$(shell bash -euo pipefail -c ' \
-	ver=$$(git describe --tags --match "v*" | sed -e "s%^v%%"); \
-	ref_type="$${GITHUB_REF_TYPE:-}"; \
-	ref_name="$${GITHUB_REF_NAME:-}"; \
-	if ! { \
-		[[ "$$ref_type" == "branch" && "$$ref_name" == "develop" ]] || \
-		{ [[ "$$ver" =~ ^[0-9]+[0-9\.]+$$ ]] && ! [[ "$$ref_type" == "tag" && "$$ref_name" =~ ^testing ]]; }; \
-	}; then \
-		ver="$$ver+$${GITHUB_RUN_ID:-$$(date +%s)}"; \
+	full=$$(git describe --tags --match "v*"); \
+	base=$$(echo "$$full" | sed -e "s%^v%%"); \
+	debver=$$(dpkg-parsechangelog -SVersion); \
+	if [ "$$base" = "$$debver" ]; then \
+		ver="$$base"; \
+	else \
+		tag=$$(git describe --tags --match "v*" --abbrev=0); \
+		suffix=$${full#$$tag}; \
+		ver="$$debver$$suffix"; \
+		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
 	fi; \
-	[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+untracked"; \
 	echo $$ver \
 	'))
-	@bash -euo pipefail -c ' \
-	ref_type="$${GITHUB_REF_TYPE:-}"; \
-	ref_name="$${GITHUB_REF_NAME:-}"; \
-	ver="$(ver)"; \
-	if { [[ "$$ref_type" != "tag" ]] || ! [[ "$$ref_name" =~ ^debian/ ]]; } && \
-		[[ "$$ver" =~ ^[0-9]+[0-9\.]+$$ ]]; then \
-			echo "Building release version with non-release pipeline. This pipeline should have been skipped."; \
-			exit 1; \
-	fi \
-	'
 	@echo "Debian version: ${ver}"
 
 rdebootstrap:
@@ -66,21 +58,9 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Running the package builder"; \
-	version=$$$$(dpkg-parsechangelog -SVersion); \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
 	maint=$$$$(dpkg-parsechangelog -SMaintainer); \
-	if [ -z "$$$$version" ] || [ -z "$$$$dist" ] || [ -z "$$$$maint" ]; then \
-		echo "Failed to read changelog metadata (version/distribution/maintainer)" >&2; \
-		exit 1; \
-	fi; \
-	suffix="$($(1)_suffix)"; \
-	if [ "v$$(ver)" != "$$$$version" ]; then \
-		version="v$$(ver)"; \
-	fi; \
-	case "$$$$version" in \
-		*+$$$$suffix[0-9]*) new_version="$$$$version" ;; \
-		*) new_version="$$$$version+$$$$suffix""1" ;; \
-	esac; \
+	version="$$(ver)+$($(1)_suffix)"; \
 	if [ "$$$$dist" = "UNRELEASED" ]; then \
 		dch_mode=update; \
 	else \
@@ -89,14 +69,14 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version
 	fi; \
 	cp debian/changelog debian/orig-changelog; \
 	trap 'mv debian/orig-changelog debian/changelog || true' EXIT; \
-	echo $(PODMAN) run --rm --systemd=always \
+	$(PODMAN) run --rm --systemd=always \
 		--volume "$$(<D):/root/build" \
 		--volume "$$(CURDIR):/root/build/src" \
 		--volume "$$(<D)/target:/root/build/src/target" \
 		--workdir /root/build/src \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
-		--env DCH_NEW_VERSION="$$$$new_version" \
+		--env DCH_NEW_VERSION="$$$$version" \
 		--env DCH_MESSAGE="$$$$dch_message" \
 		--env DEBEMAIL="$$$$maint" \
 		--rootfs "$$$$TREE:O" \
