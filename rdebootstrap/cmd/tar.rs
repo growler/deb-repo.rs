@@ -38,17 +38,5 @@ fn main() {
                 }
             }
         }
-        // let mut wr = TarWriter::new(Async::new(std::io::stdout()).unwrap());
-        // let fwd = rd
-        //     .map(|e| {
-        //         if let Ok(entry) = e {
-        //             tracing::trace!(target: "tar-cmd", " entry: {:?}", &entry);
-        //             Ok(entry)
-        //         } else {
-        //             e
-        //         }
-        //     })
-        //     .forward(&mut wr);
-        // fwd.await.unwrap();
     });
 }
