@@ -26,7 +26,7 @@ use {
 };
 
 #[derive(Clone)]
-struct FileModeArgParser;
+pub(crate) struct FileModeArgParser;
 
 impl clap::builder::TypedValueParser for FileModeArgParser {
     type Value = NonZero<u32>;
@@ -69,7 +69,7 @@ impl clap::builder::TypedValueParser for FileModeArgParser {
     }
 }
 
-fn parse_file_mode(value: &str) -> Result<NonZero<u32>, String> {
+pub(crate) fn parse_file_mode(value: &str) -> Result<NonZero<u32>, String> {
     let value = value.trim();
     if value.is_empty() {
         return Err("mode cannot be empty".to_string());
@@ -99,7 +99,22 @@ fn parse_file_mode(value: &str) -> Result<NonZero<u32>, String> {
     Ok(NonZero::new(parsed).expect("mode is non-zero"))
 }
 
-fn file_target_path(target: &str, uri: &str) -> io::Result<String> {
+fn normalize_target_absolute(target: &str) -> io::Result<Cow<'_, str>> {
+    if target.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "target path cannot be empty",
+        ));
+    }
+    if target.starts_with('/') {
+        Ok(target.into())
+    } else {
+        Ok(format!("/{target}").into())
+    }
+}
+
+fn stage_file_target<'a>(target: &'a str, uri: &str) -> io::Result<Cow<'a, str>> {
+    let target = normalize_target_absolute(target)?;
     if target.ends_with('/') {
         let name = artifact_file_name(uri).ok_or_else(|| {
             io::Error::new(
@@ -107,10 +122,23 @@ fn file_target_path(target: &str, uri: &str) -> io::Result<String> {
                 format!("cannot derive file name from artifact URI: {uri}"),
             )
         })?;
+        Ok(format!("{target}{name}").into())
+    } else {
+        Ok(target)
+    }
+}
+
+fn stage_text_target(target: &str, name: &str) -> io::Result<String> {
+    let target = normalize_target_absolute(target)?;
+    if target.ends_with('/') {
         Ok(format!("{target}{name}"))
     } else {
-        Ok(target.to_string())
+        Ok(target.into_owned())
     }
+}
+
+fn stage_dir_target(target: &str) -> io::Result<String> {
+    normalize_target_absolute(target).map(Cow::into_owned)
 }
 
 fn artifact_file_name(uri: &str) -> Option<&str> {
@@ -143,6 +171,7 @@ fn validate_unpacked_path(path: &str) -> io::Result<()> {
 }
 
 #[derive(Args)]
+/// Parsed CLI argument selecting an artifact type.
 pub struct ArtifactArg {
     /// Target file mode in octal (only if the artifact is a single file), e.g. 0644 or 0755
     #[arg(long = "mode", value_name = "MODE", value_parser = FileModeArgParser)]
@@ -167,9 +196,11 @@ pub enum Artifact {
     Tar(Tar),
     Dir(Tree),
     File(File),
+    Text(Text),
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+/// TAR artifact wrapper.
 pub struct Tar {
     #[serde(skip_serializing_if = "Option::is_none")]
     arch: Option<String>,
@@ -180,6 +211,7 @@ pub struct Tar {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
+/// TAR artifact reader for staged extraction.
 pub struct TarReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
     target: Option<String>,
     inner: tar::TarReader<'a, R>,
@@ -187,6 +219,7 @@ pub struct TarReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+/// Filesystem tree artifact wrapper.
 pub struct Tree {
     #[serde(skip_serializing_if = "Option::is_none")]
     arch: Option<String>,
@@ -197,6 +230,7 @@ pub struct Tree {
     #[serde(skip_serializing_if = "Option::is_none")]
     target: Option<String>,
 }
+/// Tree artifact reader for staged extraction.
 pub struct TreeReader<FS: ?Sized> {
     target: Option<String>,
     dir: OwnedFd,
@@ -206,6 +240,7 @@ pub struct TreeReader<FS: ?Sized> {
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
+/// Single file artifact wrapper.
 pub struct File {
     #[serde(skip_serializing_if = "Option::is_none")]
     arch: Option<String>,
@@ -219,6 +254,7 @@ pub struct File {
     #[serde(skip_serializing_if = "Option::is_none")]
     unpack: Option<bool>,
 }
+/// File artifact reader for staged extraction.
 pub struct FileReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
     target: String,
     inner: R,
@@ -230,7 +266,51 @@ pub struct FileReader<'a, R: AsyncRead + Send + 'a, FS: ?Sized> {
     _marker_fs: std::marker::PhantomData<fn(&FS)>,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+/// Inline text artifact wrapper.
+pub struct Text {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    arch: Option<String>,
+    #[serde(skip, default)]
+    uri: String,
+    text: String,
+    target: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mode: Option<NonZero<u32>>,
+}
+/// Inline text reader for staged extraction.
+pub struct TextReader<FS: ?Sized> {
+    target: String,
+    bytes: std::sync::Arc<[u8]>,
+    mode: Option<NonZero<u32>>,
+    uri: String,
+    _marker: std::marker::PhantomData<fn(&FS)>,
+}
+
 impl Artifact {
+    pub(crate) fn text(
+        uri: String,
+        target: String,
+        text: String,
+        mode: Option<NonZero<u32>>,
+        arch: Option<String>,
+    ) -> Self {
+        Artifact::Text(Text {
+            arch,
+            uri,
+            text,
+            target,
+            mode,
+        })
+    }
+
+    pub(crate) fn as_text(&self) -> Option<&Text> {
+        match self {
+            Artifact::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
     pub(crate) async fn new<C>(artifact: &ArtifactArg, cache: &C) -> io::Result<Self>
     where
         C: ContentProvider,
@@ -244,10 +324,10 @@ impl Artifact {
         };
         let arch = artifact.target_arch.clone();
         if let Some(target) = target.as_deref() {
-            if !target.starts_with('/') {
+            if target.is_empty() {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!("target path must be absolute (starts with '/'): {target}"),
+                    "target path cannot be empty",
                 ));
             }
         }
@@ -267,13 +347,12 @@ impl Artifact {
                         "target must be specified for a file",
                     )
                 })?;
-                let file_target = file_target_path(file_target, &uri)?;
                 Artifact::File(File {
                     arch,
                     uri,
                     hash: Hash::default(),
                     size: 0,
-                    target: file_target,
+                    target: file_target.to_string(),
                     mode: artifact.mode,
                     unpack,
                 })
@@ -305,13 +384,12 @@ impl Artifact {
                         "target must be specified for a file",
                     )
                 })?;
-                let file_target = file_target_path(file_target, &uri)?;
                 Artifact::File(File {
                     arch,
                     uri,
                     hash: Hash::default(),
                     size: 0,
-                    target: file_target,
+                    target: file_target.to_string(),
                     mode: artifact.mode,
                     unpack,
                 })
@@ -325,6 +403,7 @@ impl Artifact {
             Artifact::Tar(inner) => is_url(&inner.uri),
             Artifact::File(inner) => is_url(&inner.uri),
             Artifact::Dir(_) => false,
+            Artifact::Text(_) => false,
         }
     }
     pub fn is_local(&self) -> bool {
@@ -340,6 +419,9 @@ impl Artifact {
             )),
             Artifact::Tar(inner) => inner.hash_remote(r).await,
             Artifact::File(inner) => inner.hash_remote(r).await,
+            Artifact::Text(_) => Err(io::Error::other(
+                "inline text artifacts do not support remote readers",
+            )),
         }
     }
     pub async fn hash_stage_remote<
@@ -356,6 +438,9 @@ impl Artifact {
             )),
             Artifact::Tar(inner) => inner.hash_stage_remote(r, fs).await,
             Artifact::File(inner) => inner.hash_stage_remote(r, fs).await,
+            Artifact::Text(_) => Err(io::Error::other(
+                "inline text artifacts do not support remote readers",
+            )),
         }
     }
     pub fn remote<R: AsyncRead + Send + 'static, FS: StagingFileSystem + ?Sized + 'static>(
@@ -368,6 +453,9 @@ impl Artifact {
             )),
             Artifact::Tar(inner) => inner.remote(r),
             Artifact::File(inner) => inner.remote(r),
+            Artifact::Text(_) => Err(io::Error::other(
+                "inline text artifacts do not support remote readers",
+            )),
         }
     }
     pub async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
@@ -379,6 +467,7 @@ impl Artifact {
             Artifact::Dir(inner) => inner.hash_stage_local(path, fs).await,
             Artifact::Tar(inner) => inner.hash_stage_local(path, fs).await,
             Artifact::File(inner) => inner.hash_stage_local(path, fs).await,
+            Artifact::Text(inner) => inner.hash_stage_local(path, fs).await,
         }
     }
     pub async fn hash_local<P: AsRef<Path>>(&mut self, path: P) -> io::Result<(Hash, u64)> {
@@ -386,6 +475,7 @@ impl Artifact {
             Artifact::Dir(inner) => inner.hash_local(path).await,
             Artifact::Tar(inner) => inner.hash_local(path).await,
             Artifact::File(inner) => inner.hash_local(path).await,
+            Artifact::Text(inner) => inner.hash_local(path).await,
         }
     }
     pub async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
@@ -396,13 +486,15 @@ impl Artifact {
             Artifact::Dir(inner) => inner.local(path).await,
             Artifact::Tar(inner) => inner.local(path).await,
             Artifact::File(inner) => inner.local(path).await,
+            Artifact::Text(inner) => inner.local(path).await,
         }
     }
-    pub fn hash(&self) -> &Hash {
+    pub fn hash(&self) -> Hash {
         match self {
-            Artifact::Tar(inner) => &inner.hash,
-            Artifact::Dir(inner) => &inner.hash,
-            Artifact::File(inner) => &inner.hash,
+            Artifact::Tar(inner) => inner.hash.clone(),
+            Artifact::Dir(inner) => inner.hash.clone(),
+            Artifact::File(inner) => inner.hash.clone(),
+            Artifact::Text(inner) => inner.hash(),
         }
     }
     pub fn size(&self) -> u64 {
@@ -410,6 +502,7 @@ impl Artifact {
             Artifact::Tar(inner) => inner.size,
             Artifact::Dir(inner) => inner.size,
             Artifact::File(inner) => inner.size,
+            Artifact::Text(inner) => inner.size(),
         }
     }
     pub fn uri(&self) -> &str {
@@ -417,6 +510,7 @@ impl Artifact {
             Artifact::Tar(inner) => &inner.uri,
             Artifact::Dir(inner) => &inner.path,
             Artifact::File(inner) => &inner.uri,
+            Artifact::Text(inner) => &inner.uri,
         }
     }
     pub fn target(&self) -> Option<&str> {
@@ -424,6 +518,7 @@ impl Artifact {
             Artifact::Tar(inner) => inner.target.as_deref(),
             Artifact::Dir(inner) => inner.target.as_deref(),
             Artifact::File(inner) => Some(&inner.target),
+            Artifact::Text(inner) => Some(&inner.target),
         }
     }
     pub fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
@@ -431,6 +526,7 @@ impl Artifact {
             Artifact::Tar(inner) => inner.update_spec_hash(hasher),
             Artifact::Dir(inner) => inner.update_spec_hash(hasher),
             Artifact::File(inner) => inner.update_spec_hash(hasher),
+            Artifact::Text(inner) => inner.update_spec_hash(hasher),
         }
     }
     pub fn arch(&self) -> Option<&str> {
@@ -438,6 +534,7 @@ impl Artifact {
             Artifact::Tar(inner) => inner.arch.as_deref(),
             Artifact::Dir(inner) => inner.arch.as_deref(),
             Artifact::File(inner) => inner.arch.as_deref(),
+            Artifact::Text(inner) => inner.arch.as_deref(),
         }
     }
     pub(crate) fn with_uri<S: Into<String>>(mut self, uri: S) -> Self {
@@ -445,6 +542,7 @@ impl Artifact {
             Artifact::Tar(inner) => inner.uri = uri.into(),
             Artifact::Dir(inner) => inner.path = uri.into(),
             Artifact::File(inner) => inner.uri = uri.into(),
+            Artifact::Text(inner) => inner.uri = uri.into(),
         }
         self
     }
@@ -452,10 +550,15 @@ impl Artifact {
         let mut table = toml_edit::ser::to_document(self)
             .expect("failed to serialize table")
             .into_table();
-        if let Artifact::File(File {
-            mode: Some(mode), ..
-        }) = self
-        {
+        if let Some(mode) = match self {
+            Artifact::File(File {
+                mode: Some(mode), ..
+            }) => Some(mode),
+            Artifact::Text(Text {
+                mode: Some(mode), ..
+            }) => Some(mode),
+            _ => None,
+        } {
             *table.get_mut("mode").expect("mode field") = format!("0o{:03o}", mode.get())
                 .parse::<toml_edit::Item>()
                 .expect("parsed item");
@@ -585,6 +688,13 @@ where
     }
 }
 
+fn join_path<'a>(base: Option<&str>, path: &'a str) -> Cow<'a, Path> {
+    base.map_or_else(
+        || Cow::Borrowed(Path::new(path)),
+        |base| Cow::Owned(Path::new(base).join(path)),
+    )
+}
+
 impl<'a, R, FS> TarReader<'a, R, FS>
 where
     R: AsyncRead + Send + 'a,
@@ -592,8 +702,12 @@ where
 {
     async fn extract_to(&mut self, fs: &FS) -> io::Result<()> {
         let mut links: Vec<tar::TarLink> = Vec::new();
-        let target = self.target.as_deref();
-        if let Some(parent) = target.and_then(|t| Path::new(t).parent()) {
+        let target = match self.target.as_deref() {
+            Some(target) => Some(stage_dir_target(target)?),
+            None => None,
+        };
+        let target_path = target.as_deref();
+        if let Some(parent) = target_path.and_then(|t| Path::new(t).parent()) {
             fs.create_dir_all(parent, 0, 0, 0o755).await?;
         }
         while let Some(entry) = self.inner.next().await {
@@ -601,17 +715,14 @@ where
             match entry {
                 tar::TarEntry::Directory(dir) => {
                     validate_unpacked_path(dir.path())?;
-                    let path = target.map_or_else(
-                        || Cow::Borrowed(Path::new(dir.path())),
-                        |p| Cow::Owned(Path::new(p).join(dir.path())),
-                    );
+                    let path = join_path(target_path, dir.path());
                     tracing::trace!("creating directory {}", path.display());
                     fs.create_dir_all(path, dir.uid(), dir.gid(), dir.mode())
                         .await?;
                 }
                 tar::TarEntry::File(mut file) => {
                     validate_unpacked_path(file.path())?;
-                    let path = target.map_or_else(
+                    let path = target_path.map_or_else(
                         || Path::new(file.path()).to_path_buf(),
                         |p| Path::new(p).join(file.path()),
                     );
@@ -636,12 +747,9 @@ where
                     validate_unpacked_path(link.path())?;
                     let uid = link.uid();
                     let gid = link.gid();
-                    let path = target.map_or_else(
-                        || Cow::Borrowed(Path::new(link.path())),
-                        |p| Cow::Owned(Path::new(p).join(link.path())),
-                    );
+                    let path = join_path(target_path, link.path());
                     let link = Path::new(link.link());
-                    let link = target.map_or_else(
+                    let link = target_path.map_or_else(
                         || Cow::Borrowed(link),
                         |p| {
                             if link.is_absolute() {
@@ -668,14 +776,8 @@ where
         for link in links.drain(..) {
             validate_unpacked_path(link.path())?;
             validate_unpacked_path(link.link())?;
-            let path = target.map_or_else(
-                || Cow::Borrowed(Path::new(link.path())),
-                |p| Cow::Owned(Path::new(p).join(link.path())),
-            );
-            let link = target.map_or_else(
-                || Cow::Borrowed(Path::new(link.link())),
-                |p| Cow::Owned(Path::new(p).join(link.link())),
-            );
+            let path = join_path(target_path, link.path());
+            let link = join_path(target_path, link.link());
             fs.hardlink(link, path).await?;
         }
         Ok(())
@@ -718,8 +820,12 @@ impl Tree {
                 err
             ))
         })?;
+        let target = match self.target.as_deref() {
+            Some(target) => Some(stage_dir_target(target)?),
+            None => None,
+        };
         let (hash, size) =
-            tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, self.target.as_deref())
+            tree::copy_hash_dir_inner::<blake3::Hasher, _, _>(&fd, fs, target.as_deref())
                 .await
                 .map(|(hash, size)| (hash.hash(), size))
                 .map_err(|err| {
@@ -818,7 +924,11 @@ where
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
         Box::pin(async move {
             let source = self.source.display().to_string();
-            if let Some(parent) = self.target.as_deref().and_then(|t| Path::new(t).parent()) {
+            let target = match self.target.as_deref() {
+                Some(target) => Some(stage_dir_target(target)?),
+                None => None,
+            };
+            if let Some(parent) = target.as_deref().and_then(|t| Path::new(t).parent()) {
                 fs.create_dir_all(parent, 0, 0, 0o755)
                     .await
                     .map_err(|err| {
@@ -830,16 +940,15 @@ where
                         ))
                     })?;
             }
-            let (hash, _) =
-                tree::copy_hash_dir(&self.dir, fs, self.target.as_deref(), self.hash.name())
-                    .await
-                    .map_err(|err| {
-                        io::Error::other(format!(
-                            "failed to stage local directory artifact {}: {}",
-                            source.as_str(),
-                            err
-                        ))
-                    })?;
+            let (hash, _) = tree::copy_hash_dir(&self.dir, fs, target.as_deref(), self.hash.name())
+                .await
+                .map_err(|err| {
+                    io::Error::other(format!(
+                        "failed to stage local directory artifact {}: {}",
+                        source.as_str(),
+                        err
+                    ))
+                })?;
             if hash != self.hash {
                 Err(io::Error::other(format!(
                     "hash mismatch after copying local tree {}",
@@ -1013,9 +1122,9 @@ impl File {
     ) -> io::Result<(Hash, u64)> {
         let st_mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
         let uri = self.uri.as_str();
-        let target = self.target.as_str();
+        let target = stage_file_target(self.target.as_str(), uri)?;
         let mut reader = pin!(HashingReader::<blake3::Hasher, _>::new(r));
-        if let Some(parent) = Path::new(&self.target).parent() {
+        if let Some(parent) = Path::new(target.as_ref()).parent() {
             fs.create_dir_all(parent, 0, 0, 0o755)
                 .await
                 .map_err(|err| {
@@ -1046,7 +1155,7 @@ impl File {
                     ))
                 })?
         }
-        .persist(&self.target)
+        .persist(target.as_ref())
         .await
         .map_err(|err| {
             io::Error::other(format!(
@@ -1086,6 +1195,131 @@ impl File {
     }
 }
 
+impl Text {
+    pub(crate) fn target(&self) -> &str {
+        &self.target
+    }
+
+    pub(crate) fn text(&self) -> &str {
+        &self.text
+    }
+
+    pub(crate) fn mode(&self) -> Option<NonZero<u32>> {
+        self.mode
+    }
+
+    pub(crate) fn arch(&self) -> Option<&str> {
+        self.arch.as_deref()
+    }
+
+    fn update_spec_hash<H: HashAlgo>(&self, hasher: &mut H) {
+        "text".hash_into(hasher);
+        if let Some(arch) = self.arch.as_deref() {
+            true.hash_into(hasher);
+            arch.hash_into(hasher);
+        } else {
+            false.hash_into(hasher);
+        }
+        self.target.hash_into(hasher);
+        let mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
+        mode.hash_into(hasher);
+        let mut text_hash = blake3::Hasher::new();
+        text_hash.update(self.text.as_bytes());
+        let digest = text_hash.finalize();
+        digest.as_slice().hash_into(hasher);
+    }
+    fn size(&self) -> u64 {
+        self.text.len() as u64
+    }
+    fn hash(&self) -> Hash {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(self.text.as_bytes());
+        hasher.into_hash()
+    }
+    async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
+        &self,
+        _path: P,
+    ) -> io::Result<Box<dyn Stage<Target = FS, Output = ()> + Send>> {
+        let bytes: std::sync::Arc<[u8]> = self.text.as_bytes().to_vec().into();
+        Ok(Box::new(TextReader {
+            target: self.target.clone(),
+            bytes,
+            mode: self.mode,
+            uri: self.uri.clone(),
+            _marker: std::marker::PhantomData,
+        })
+            as Box<dyn Stage<Target = FS, Output = ()> + Send>)
+    }
+    async fn hash_stage_local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized>(
+        &mut self,
+        _path: P,
+        _fs: &FS,
+    ) -> io::Result<(Hash, u64)> {
+        let mut hasher = blake3::Hasher::new();
+        let bytes = self.text.as_bytes();
+        hasher.update(bytes);
+        let hash = hasher.into_hash();
+        Ok((hash, bytes.len() as u64))
+    }
+    async fn hash_local<P: AsRef<Path>>(&mut self, _path: P) -> io::Result<(Hash, u64)> {
+        let mut hasher = blake3::Hasher::new();
+        let bytes = self.text.as_bytes();
+        hasher.update(bytes);
+        let hash = hasher.into_hash();
+        Ok((hash, bytes.len() as u64))
+    }
+}
+
+impl<FS> Stage for TextReader<FS>
+where
+    FS: StagingFileSystem + ?Sized,
+{
+    type Target = FS;
+    type Output = ();
+    fn stage<'b>(
+        &'b mut self,
+        fs: &'b Self::Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
+        Box::pin(async move {
+            let uri = self.uri.as_str();
+            let target = stage_text_target(self.target.as_str(), uri)?;
+            if let Some(parent) = Path::new(&target).parent() {
+                fs.create_dir_all(parent, 0, 0, 0o755)
+                    .await
+                    .map_err(|err| {
+                        io::Error::other(format!(
+                            "failed to create parent directory {} for artifact {}: {}",
+                            parent.display(),
+                            uri,
+                            err
+                        ))
+                    })?;
+            }
+            fs.create_file_from_bytes(
+                self.bytes.as_ref(),
+                0,
+                0,
+                self.mode.map_or(0o644, |m| m.get() & 0o7777),
+            )
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to create target file {} for artifact {}: {}",
+                    target, uri, err
+                ))
+            })?
+            .persist(&target)
+            .await
+            .map_err(|err| {
+                io::Error::other(format!(
+                    "failed to persist target file {} for artifact {}: {}",
+                    target, uri, err
+                ))
+            })
+        })
+    }
+}
+
 impl<'a, R, FS> Stage for FileReader<'a, R, FS>
 where
     R: AsyncRead + Send + Unpin + 'a,
@@ -1099,8 +1333,8 @@ where
     ) -> Pin<Box<dyn Future<Output = io::Result<()>> + 'b>> {
         Box::pin(async move {
             let uri = self.uri.as_str();
-            let target = self.target.as_str();
-            if let Some(parent) = Path::new(&self.target).parent() {
+            let target = stage_file_target(self.target.as_str(), uri)?;
+            if let Some(parent) = Path::new(target.as_ref()).parent() {
                 fs.create_dir_all(parent, 0, 0, 0o755)
                     .await
                     .map_err(|err| {
@@ -1127,7 +1361,7 @@ where
                         target, uri, err
                     ))
                 })?
-                .persist(&self.target)
+                .persist(target.as_ref())
                 .await
                 .map_err(|err| {
                     io::Error::other(format!(
@@ -1150,7 +1384,7 @@ where
                         target, uri, err
                     ))
                 })?
-                .persist(&self.target)
+                .persist(target.as_ref())
                 .await
                 .map_err(|err| {
                     io::Error::other(format!(
@@ -1515,5 +1749,34 @@ mod tree {
         )
         .await?;
         Ok((hasher.finalize_fixed().into(), size))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{stage_dir_target, stage_file_target, stage_text_target};
+
+    #[test]
+    fn stage_file_target_appends_filename_for_trailing_slash() {
+        let target = stage_file_target("/opt/target/", "dir/file.txt").expect("target");
+        assert_eq!(target, "/opt/target/file.txt");
+    }
+
+    #[test]
+    fn stage_file_target_prefixes_relative_paths() {
+        let target = stage_file_target("etc/config", "config").expect("target");
+        assert_eq!(target, "/etc/config");
+    }
+
+    #[test]
+    fn stage_text_target_appends_artifact_key() {
+        let target = stage_text_target("/etc/", "artifact-name").expect("target");
+        assert_eq!(target, "/etc/artifact-name");
+    }
+
+    #[test]
+    fn stage_dir_target_prefixes_relative_paths() {
+        let target = stage_dir_target("opt/data").expect("target");
+        assert_eq!(target, "/opt/data");
     }
 }

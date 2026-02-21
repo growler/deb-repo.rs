@@ -11,6 +11,7 @@ use {
     url::Url,
 };
 
+/// Vault-backed authentication provider.
 pub struct VaultAuth {
     client: HttpClient,
     base: Url,

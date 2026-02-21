@@ -16,6 +16,7 @@ use {
     },
     std::{
         io,
+        num::NonZero,
         path::{Path, PathBuf},
         pin::Pin,
     },
@@ -145,6 +146,9 @@ impl ContentProvider for TestProvider {
     }
 
     async fn ensure_artifact(&self, artifact: &mut crate::artifact::Artifact) -> io::Result<()> {
+        if matches!(artifact, crate::artifact::Artifact::Text(_)) {
+            return Ok(());
+        }
         if artifact.is_local() {
             let path = self.base.join(artifact.uri());
             let _ = artifact.hash_local(&path).await?;
@@ -570,6 +574,99 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
         .collect::<Vec<_>>();
     assert_eq!(items, vec!["artifact-dir"]);
     assert!(text.contains("artifact-comment"));
+}
+
+#[test]
+fn upsert_text_artifact_creates_and_updates() {
+    let mut manifest = Manifest::new(ARCH, None);
+    manifest
+        .upsert_text_artifact(
+            "note",
+            "/etc/note".to_string(),
+            "hello".to_string(),
+            None,
+            None,
+        )
+        .expect("create text artifact");
+    let (text, doc) = render_manifest(&mut manifest);
+    assert!(text.contains("type = \"text\""));
+    let artifact = doc["artifact"]["note"].as_table().expect("artifact table");
+    assert_eq!(
+        artifact
+            .get("target")
+            .and_then(|item| item.as_value())
+            .and_then(|value| value.as_str()),
+        Some("/etc/note")
+    );
+    assert_eq!(
+        artifact
+            .get("text")
+            .and_then(|item| item.as_value())
+            .and_then(|value| value.as_str()),
+        Some("hello")
+    );
+
+    manifest
+        .upsert_text_artifact(
+            "note",
+            "/etc/note".to_string(),
+            "updated".to_string(),
+            NonZero::new(0o644),
+            Some("amd64".to_string()),
+        )
+        .expect("update text artifact");
+    let (_, doc) = render_manifest(&mut manifest);
+    let artifact = doc["artifact"]["note"].as_table().expect("artifact table");
+    assert_eq!(
+        artifact
+            .get("text")
+            .and_then(|item| item.as_value())
+            .and_then(|value| value.as_str()),
+        Some("updated")
+    );
+    assert_eq!(
+        artifact
+            .get("mode")
+            .and_then(|item| item.as_value())
+            .map(|value| value.to_string().trim().to_string()),
+        Some("0o644".to_string())
+    );
+}
+
+#[test]
+fn upsert_text_artifact_rejects_non_text() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifact_path = dir.path().join("artifact-file");
+    std::fs::write(&artifact_path, b"data").expect("write artifact");
+    let provider = TestProvider::new(dir.path().to_path_buf());
+    let mut manifest = Manifest::new(ARCH, None);
+    manifest
+        .add_requirements(None, vec!["base"], None)
+        .expect("add requirement");
+    let arg = ArtifactArg {
+        mode: None,
+        do_not_unpack: false,
+        target_arch: None,
+        url: "artifact-file".to_string(),
+        target: Some("/etc/host".to_string()),
+    };
+    smol::block_on(async {
+        manifest
+            .add_artifact(None, &arg, None, &provider)
+            .await
+            .expect("add artifact");
+    });
+
+    let err = manifest
+        .upsert_text_artifact(
+            "artifact-file",
+            "/etc/host".to_string(),
+            "text".to_string(),
+            None,
+            None,
+        )
+        .expect_err("reject non-text");
+    assert!(err.to_string().contains("not text"));
 }
 
 #[test]

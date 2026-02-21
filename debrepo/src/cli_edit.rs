@@ -1,5 +1,6 @@
 use {
     crate::{
+        artifact::FileModeArgParser,
         cli::{Command, Config},
         content::{ContentProvider, ContentProviderGuard},
         kvlist::KVList,
@@ -12,6 +13,7 @@ use {
         collections::HashSet,
         env,
         io::{self, Write},
+        num::NonZero,
         path::Path,
         process::{Command as ProcessCommand, Stdio},
     },
@@ -30,6 +32,7 @@ struct EditOptions {
 
 #[derive(Parser)]
 #[command(about = "Edit the manifest or spec metadata")]
+/// CLI command that edits manifests or spec metadata.
 pub struct Edit {
     #[command(flatten)]
     opts: EditOptions,
@@ -42,6 +45,7 @@ pub struct Edit {
 enum EditCommands {
     Env(EditEnv),
     Script(EditScript),
+    Artifact(EditArtifact),
 }
 
 #[derive(Parser)]
@@ -51,6 +55,26 @@ struct EditEnv;
 #[derive(Parser)]
 #[command(about = "Edit build script for a spec")]
 struct EditScript;
+
+#[derive(Parser)]
+#[command(about = "Edit inline text artifact content")]
+struct EditArtifact {
+    /// Artifact name
+    #[arg(value_name = "NAME")]
+    name: String,
+
+    /// Target path inside the staging filesystem
+    #[arg(long = "target", value_name = "TARGET_PATH")]
+    target: String,
+
+    /// Target file mode in octal, e.g. 0644 or 0755
+    #[arg(long = "mode", value_name = "MODE", value_parser = FileModeArgParser)]
+    mode: Option<NonZero<u32>>,
+
+    /// Target architecture for the artifact
+    #[arg(long = "only-arch", value_name = "ARCH")]
+    target_arch: Option<String>,
+}
 
 impl<C: Config> Command<C> for Edit {
     fn exec(&self, conf: &C) -> Result<()> {
@@ -71,6 +95,8 @@ impl<C: Config> Command<C> for Edit {
                 None => editor.run(&manifest_path)?,
                 Some(EditCommands::Env(_)) => edit_env(conf, &editor, spec).await?,
                 Some(EditCommands::Script(_)) => edit_script(conf, &editor, spec).await?,
+                Some(EditCommands::Artifact(artifact)) => edit_artifact(conf, &editor, artifact)
+                    .await?,
             }
 
             if let Err(err) = run_update(conf).await {
@@ -172,6 +198,47 @@ async fn edit_script<C: Config>(
         Some(contents)
     };
     manifest.set_build_script(spec, script)?;
+    manifest.store_manifest_only(conf.manifest()).await?;
+    Ok(())
+}
+
+async fn edit_artifact<C: Config>(
+    conf: &C,
+    editor: &EditorCommand,
+    artifact: &EditArtifact,
+) -> Result<()> {
+    let (mut manifest, _) =
+        Manifest::from_file_with_lock_base(conf.manifest(), conf.arch(), conf.lock_base()).await?;
+    let mut existing_text = None;
+    let mut existing_mode = None;
+    let mut existing_arch = None;
+    if let Some(existing) = manifest.artifact(&artifact.name) {
+        let existing = existing.as_text().ok_or_else(|| {
+            anyhow!(
+                "artifact {} exists but is not text",
+                artifact.name.as_str()
+            )
+        })?;
+        existing_text = Some(existing.text().to_string());
+        existing_mode = existing.mode();
+        existing_arch = existing.arch().map(str::to_string);
+    }
+    let mut tmp = tempfile::Builder::new().suffix(".txt").tempfile()?;
+    if let Some(text) = existing_text {
+        write!(tmp, "{text}")?;
+    }
+    tmp.flush()?;
+    editor.run(tmp.path())?;
+    let contents = std::fs::read_to_string(tmp.path())?;
+    let mode = artifact.mode.or(existing_mode);
+    let arch = artifact.target_arch.clone().or(existing_arch);
+    manifest.upsert_text_artifact(
+        &artifact.name,
+        artifact.target.clone(),
+        contents,
+        mode,
+        arch,
+    )?;
     manifest.store_manifest_only(conf.manifest()).await?;
     Ok(())
 }

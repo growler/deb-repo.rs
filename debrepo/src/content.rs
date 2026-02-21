@@ -103,6 +103,7 @@ pub trait ContentProvider {
     fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
 }
 
+/// View of archive/suite files used to fetch package universes.
 pub struct UniverseFiles<'a> {
     arch: &'a str,
     archives: &'a [Archive],
@@ -260,6 +261,7 @@ impl<'a> UniverseFiles<'a> {
     }
 }
 
+/// Stage that materializes fetched universe files into a staging filesystem.
 pub struct UniverseFilesStage<FS: StagingFileSystem + ?Sized> {
     apt_sources: MutableControlFile,
     files: Vec<(String, IndexFile)>,
@@ -293,6 +295,7 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
     }
 }
 
+/// Host-side on-disk cache for fetched repository content.
 pub struct HostCache {
     transport: HttpTransport,
     base: Arc<Path>,
@@ -314,6 +317,7 @@ impl HostCache {
 
 const MAX_FILE_SIZE: u64 = 100 * 1024 * 1024; // 100 MiB
 
+/// Guarded access handle for a host cache instance.
 pub struct HostCacheGuard<'a> {
     phantom: std::marker::PhantomData<&'a ()>,
 }
@@ -428,6 +432,9 @@ impl ContentProvider for HostCache {
         Ok((file, ctrl))
     }
     async fn ensure_artifact(&self, artifact: &mut Artifact) -> io::Result<()> {
+        if matches!(artifact, Artifact::Text(_)) {
+            return Ok(());
+        }
         if artifact.is_local() {
             let path = self.base.join(artifact.uri());
             let _ = artifact.hash_local(&path).await;
@@ -456,6 +463,9 @@ impl ContentProvider for HostCache {
         artifact: &'a Artifact,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         tracing::debug!("Fetching artifact_ {}", artifact.uri());
+        if matches!(artifact, Artifact::Text(_)) {
+            return artifact.local("").await;
+        }
         if artifact.is_local() {
             let path = self.base.join(artifact.uri());
             return artifact.local(path).await;

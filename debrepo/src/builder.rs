@@ -51,6 +51,7 @@ impl BuildExecutor {
 }
 
 #[derive(Serialize, Deserialize)]
+/// Build job definition for repository builds.
 pub struct BuildJob<E: Executor> {
     essentials: Vec<String>,
     packages: Vec<Vec<String>>,

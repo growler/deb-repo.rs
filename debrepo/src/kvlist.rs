@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+/// Ordered key-value list with string keys.
 pub struct KVList<R>(Vec<(String, R)>);
 
 #[allow(dead_code)]

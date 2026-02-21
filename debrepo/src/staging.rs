@@ -113,6 +113,7 @@ pub trait StagingFileSystem {
 }
 
 #[derive(Clone)]
+/// Staging filesystem implementation backed by the host OS.
 pub struct HostFileSystem {
     root: Arc<Path>,
     chown_allowed: bool,
@@ -154,6 +155,7 @@ impl HostFileSystem {
     }
 }
 
+/// Staged file handle backed by the host OS.
 pub struct HostFile {
     base: Arc<Path>,
     path: TempPath,
@@ -494,6 +496,7 @@ impl StagingFileSystem for HostFileSystem {
 }
 
 #[derive(Clone, Debug)]
+/// File list for staged package contents.
 pub struct FileList {
     out: std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>,
 }
@@ -524,6 +527,7 @@ impl FileList {
     }
 }
 
+/// Entry in a staged file list.
 pub struct FileListFile {
     uid: u32,
     gid: u32,

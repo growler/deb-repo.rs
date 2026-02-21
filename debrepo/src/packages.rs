@@ -19,6 +19,7 @@ use {
     std::{io, sync::Arc},
 };
 
+/// Memory-mapped Packages file for efficient parsing.
 pub struct MemoryMappedUniverseFile {
     mmap: Arc<memmap2::Mmap>,
     begin: usize,
@@ -235,6 +236,7 @@ impl From<&str> for MultiArch {
 }
 
 #[derive(Default, Clone, Debug)]
+/// Parsed binary package stanza.
 pub struct Package<'a> {
     src: &'a str,
     name: &'a str,
@@ -441,6 +443,7 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
     }
 }
 
+/// Collection of packages parsed from a Packages file.
 pub struct Packages {
     prio: u32,
     archive_id: Option<u32>,

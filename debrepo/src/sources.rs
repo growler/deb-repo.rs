@@ -40,6 +40,7 @@ impl FileHash {
 }
 
 #[derive(Default, Clone, Debug)]
+/// Source package entry parsed from Sources indices.
 pub struct Source<'a> {
     src: &'a str,
     name: &'a str,
@@ -245,6 +246,7 @@ impl<'a> From<&Source<'a>> for MutableControlStanza {
     }
 }
 
+/// Collection of source package entries.
 pub struct Sources {
     inner: Arc<SourcesInner>,
 }
@@ -373,6 +375,7 @@ struct SourcesInner {
 }
 
 #[derive(Default, Clone)]
+/// Source package universe derived from archives.
 pub struct SourceUniverse {
     sources: Vec<Sources>,
 }

@@ -30,6 +30,7 @@ pub enum Auth {
 }
 
 /// Provides per-host authentication from a file (`auth.toml` by default) or Vault prefix.
+/// Authentication provider for transport requests.
 pub struct AuthProvider {
     cache: async_lock::RwLock<HashMap<String, Option<Arc<Auth>>>>,
     entries: HashMap<String, smallvec::SmallVec<[AuthDefinition; 1]>>,

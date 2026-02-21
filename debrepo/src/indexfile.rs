@@ -3,6 +3,7 @@ use {
     std::{io, ops::RangeBounds, pin::pin, sync::Arc},
 };
 
+/// Parsed index file content with hash and size.
 pub struct IndexFile {
     inner: IndexFileInner,
 }

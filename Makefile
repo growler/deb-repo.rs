@@ -19,8 +19,8 @@ version:
 		ver="$$base"; \
 	else \
 		tag=$$(git describe --tags --match "v*" --abbrev=0); \
-		suffix=$${full#$$tag}; \
-		ver="$$debver$$suffix"; \
+		suffix=$${full#$$tag=}; \
+		ver="$$debver~pre$$suffix"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
 	fi; \
 	echo $$ver \

@@ -25,6 +25,7 @@ use {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+/// Build specification for a repository suite.
 pub struct Spec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub extends: Option<String>,
@@ -77,6 +78,7 @@ impl Spec {
 }
 
 #[derive(Clone)]
+/// Locked suite metadata with resolved sources.
 pub struct LockedSuite {
     pub path: String,
     pub file: IndexFile,
@@ -85,6 +87,7 @@ pub struct LockedSuite {
 
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Locked archive metadata within a suite.
 pub struct LockedArchive {
     pub suites: Vec<LockedSuite>,
 }
@@ -133,6 +136,7 @@ impl LockedArchive {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+/// Locked package entry with resolved version and hash.
 pub struct LockedPackage {
     pub orig: Option<u32>,
     pub idx: u32,
@@ -144,6 +148,7 @@ pub struct LockedPackage {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
+/// Locked spec with resolved suites and packages.
 pub struct LockedSpec {
     #[serde(with = "crate::hash::serde::sri::opt")]
     pub hash: Option<Hash>,

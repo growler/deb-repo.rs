@@ -602,6 +602,7 @@ pin_project! {
 /// Instances are produced by [`TarReader`] and keep a handle to the shared
 /// reader state so that dropping them early transparently skips the remaining
 /// payload bytes.
+/// Reader for a regular file entry inside a TAR archive.
 pub struct TarRegularFileReader<'a, R: AsyncRead + 'a> {
     eof: u64,
     inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
@@ -678,6 +679,7 @@ impl<'a, R: AsyncRead> AsyncRead for TarRegularFileReader<'a, R> {
 }
 
 /// Stream tar entries from an `AsyncRead` source.
+/// Streaming TAR reader that yields entries.
 pub struct TarReader<'a, R: AsyncRead + 'a> {
     inner: Arc<Mutex<Pin<Box<TarReaderInner<'a, R>>>>>,
 }
@@ -692,6 +694,7 @@ impl<'a, R: AsyncRead + 'a> TarReader<'a, R> {
 }
 
 /// Hard-link metadata entry.
+/// Hard link entry metadata from a TAR archive.
 pub struct TarLink {
     path_name: Box<str>,
     link_name: Box<str>,
@@ -749,6 +752,7 @@ pub enum DeviceKind {
 }
 
 /// Block/char device metadata entry.
+/// Device node entry metadata from a TAR archive.
 pub struct TarDevice {
     path_name: Box<str>,
     mode: u32,
@@ -868,6 +872,7 @@ impl TarDevice {
 }
 
 /// FIFO (named pipe) entry.
+/// FIFO entry metadata from a TAR archive.
 pub struct TarFifo {
     path_name: Box<str>,
     mode: u32,
@@ -942,6 +947,7 @@ impl TarFifo {
 }
 
 /// Symbolic link entry containing its own metadata.
+/// Symlink entry metadata from a TAR archive.
 pub struct TarSymlink {
     path_name: Box<str>,
     link_name: Box<str>,
@@ -1022,6 +1028,7 @@ impl TarSymlink {
 }
 
 /// Directory metadata entry.
+/// Directory entry metadata from a TAR archive.
 pub struct TarDirectory {
     path_name: Box<str>,
     mode: u32,
@@ -1102,6 +1109,7 @@ impl TarDirectory {
 
 /// Extended attribute list stored in PAX headers.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// List of extended attributes for TAR entries.
 pub struct AttrList {
     inner: Vec<(Box<str>, Box<[u8]>)>,
 }
@@ -1149,6 +1157,7 @@ impl From<Vec<(Box<str>, Box<[u8]>)>> for AttrList {
 
 pin_project! {
     /// Regular file entry paired with the reader that yields its payload.
+    /// Regular file entry with content reader.
     pub struct TarRegularFile<'a, R> {
         path_name: Box<str>,
         size: u64,
@@ -2178,6 +2187,7 @@ pin_project! {
     /// Headers and file payloads are staged inside `buf` until downstream I/O
     /// makes progress, which keeps memory usage predictable while preserving
     /// proper block alignment.
+    /// Streaming TAR writer for composing archive entries.
     pub struct TarWriter<'a, 'b, W, R> {
         // internal buffer for writing headers and file data
         buf: [u8; BLOCK_SIZE * 32],

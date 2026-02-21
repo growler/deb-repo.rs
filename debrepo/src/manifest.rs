@@ -27,6 +27,7 @@ use {
     },
 };
 
+/// Top-level manifest model.
 pub struct Manifest {
     arch: String,
     file: ManifestFile,
@@ -38,6 +39,7 @@ pub struct Manifest {
 }
 
 #[derive(Clone, Debug)]
+/// Base path and metadata for lock files.
 pub struct LockBase {
     path: PathBuf,
     is_dir: bool,
@@ -191,11 +193,14 @@ impl Manifest {
             self.lock.store(&lock_path, &self.arch, &hash).await?;
         }
         Ok(())
-    }
+   }
     pub async fn store_manifest_only<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let hash = self.file.store(path.as_ref()).await?;
         self.hash = Some(hash);
         Ok(())
+    }
+    pub fn artifact(&self, name: &str) -> Option<&Artifact> {
+        self.file.artifact(name)
     }
     pub fn spec_names(&self) -> impl Iterator<Item = &str> {
         self.file.names().map(|s| match s {
@@ -532,6 +537,29 @@ impl Manifest {
             self.mark_lock_updated();
             // TODO: drop empty leaf spec
         }
+        Ok(())
+    }
+    pub fn upsert_text_artifact(
+        &mut self,
+        name: &str,
+        target: String,
+        text: String,
+        mode: Option<std::num::NonZero<u32>>,
+        arch: Option<String>,
+    ) -> io::Result<()> {
+        match self
+            .file
+            .upsert_text_artifact(name, target, text, mode, arch)?
+        {
+            UpdateResult::None => return Ok(()),
+            UpdateResult::Added | UpdateResult::Updated(_) => {}
+        }
+        self.mark_file_updated();
+        let specs = self.file.spec_indices_with_artifact(name);
+        for spec_index in specs {
+            self.refresh_spec_hashes(spec_index)?;
+        }
+        self.mark_lock_updated();
         Ok(())
     }
     pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {

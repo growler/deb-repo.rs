@@ -25,6 +25,7 @@ use {
 };
 
 #[derive(Serialize, Deserialize)]
+/// Sandbox executor that runs commands on the host.
 pub struct HostSandboxExecutor {
     root: PathBuf,
     env: Vec<(OsString, OsString)>,
@@ -170,6 +171,7 @@ where
     fn setup_rootfs(&mut self) -> io::Result<OwnedFd>;
 }
 
+/// Sandbox wrapper with lifecycle and execution helpers.
 pub struct Sandbox<'a, E: SandboxExecutor> {
     runner: &'a mut E,
 }

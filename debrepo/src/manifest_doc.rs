@@ -17,7 +17,7 @@ use {
     itertools::Itertools,
     serde::{Deserialize, Serialize},
     smol::io::AsyncReadExt,
-    std::{collections::HashMap, io, path::Path},
+    std::{collections::HashMap, io, num::NonZero, path::Path},
 };
 
 pub fn valid_spec_name(s: &str) -> Result<&str, String> {
@@ -56,6 +56,7 @@ pub(crate) fn spec_display_name(name: &str) -> &str {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Manifest document with parsed sections.
 pub struct ManifestFile {
     #[serde(skip)]
     doc: toml_edit::DocumentMut,
@@ -99,6 +100,7 @@ pub enum UpdateResult {
 }
 
 #[derive(Default, Clone)]
+/// Parsed build environment comments for a spec.
 pub struct BuildEnvComments {
     pub prefix: HashMap<String, String>,
     pub inline: HashMap<String, String>,
@@ -204,6 +206,15 @@ impl ManifestFile {
     pub fn artifact<'a>(&'a self, name: &str) -> Option<&'a Artifact> {
         self.artifacts.iter().find(|a| a.uri() == name)
     }
+    pub fn spec_indices_with_artifact(&self, name: &str) -> Vec<usize> {
+        self.specs
+            .iter_values()
+            .enumerate()
+            .filter_map(|(idx, spec)| {
+                spec.stage.iter().any(|item| item == name).then_some(idx)
+            })
+            .collect()
+    }
     pub fn add_artifact(
         &mut self,
         spec_name: Option<&str>,
@@ -239,6 +250,52 @@ impl ManifestFile {
             None => self.artifacts.push(artifact),
         }
         Ok(())
+    }
+    pub fn upsert_text_artifact(
+        &mut self,
+        name: &str,
+        target: String,
+        text: String,
+        mode: Option<NonZero<u32>>,
+        arch: Option<String>,
+    ) -> io::Result<UpdateResult> {
+        if let Some((idx, existing)) = self
+            .artifacts
+            .iter()
+            .enumerate()
+            .find(|(_, artifact)| artifact.uri() == name)
+        {
+            let existing = existing
+                .as_text()
+                .ok_or_else(|| io::Error::other(format!("artifact {name} exists but is not text")))?;
+            if existing.text() == text.as_str()
+                && existing.target() == target.as_str()
+                && existing.mode() == mode
+                && existing.arch().map(str::to_string) == arch
+            {
+                return Ok(UpdateResult::None);
+            }
+            let artifact = Artifact::text(
+                name.to_string(),
+                target,
+                text,
+                mode,
+                arch,
+            );
+            self.doc.update_artifact(&artifact, None::<&str>);
+            self.artifacts[idx] = artifact;
+            return Ok(UpdateResult::Updated(idx));
+        }
+        let artifact = Artifact::text(
+            name.to_string(),
+            target,
+            text,
+            mode,
+            arch,
+        );
+        self.doc.update_artifact(&artifact, None::<&str>);
+        self.artifacts.push(artifact);
+        Ok(UpdateResult::Added)
     }
     pub fn remove_artifact(
         &mut self,

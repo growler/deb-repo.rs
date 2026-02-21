@@ -25,6 +25,7 @@ use {
     smallvec::SmallVec,
 };
 
+/// Parsed Release file metadata.
 pub struct Release {
     inner: ReleaseInner,
 }

@@ -87,6 +87,7 @@ fn client(insecure: bool) -> &'static HttpClient {
     }
 }
 
+/// HTTP/HTTPS transport with optional auth and insecure mode.
 pub struct HttpTransport {
     insecure: bool,
     auth: AuthProvider,

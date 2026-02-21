@@ -70,6 +70,7 @@ impl StageProgress {
     }
 }
 
+/// Simple percentage progress reporter for non-interactive output.
 pub struct PercentProgress {
     inner: Arc<PercentProgressInner>,
 }
@@ -148,6 +149,7 @@ impl PercentProgress {
     }
 }
 
+/// CLI subcommand definitions and argument parsing.
 pub mod cmd {
     pub use crate::cli_edit::Edit;
     use {
@@ -178,6 +180,7 @@ If a vendor name is provided as the archive URL, default archives and packages a
 Examples:
     rdebootstrap init debian --package mc --package libcom-err2"#
     )]
+    /// CLI command: initialize a new repository manifest.
     pub struct Init {
         /// Overwrite existing manifest if present
         #[arg(long)]
@@ -248,6 +251,7 @@ Examples:
         about = "Add an archive",
         long_about = "Add an archive definition to the manifest file."
     )]
+    /// CLI command: add an archive to the manifest.
     pub struct AddArchive {
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
@@ -288,6 +292,7 @@ Examples:
         about = "Add a local package",
         long_about = "Add a local .deb package to the manifest file so it can be staged alongside archives."
     )]
+    /// CLI command: add a local package file to the manifest.
     pub struct AddLocalPackage {
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
@@ -332,6 +337,7 @@ Examples:
 
     #[derive(Parser)]
     #[command(about = "Add an archive or a local package to the manifest")]
+    /// CLI command: add archives or packages.
     pub struct Add {
         #[command(subcommand)]
         cmd: AddCommands,
@@ -350,6 +356,7 @@ Examples:
         about = "Remove an archive",
         long_about = "Remove an archive reference from the manifest file."
     )]
+    /// CLI command: remove an archive from the manifest.
     pub struct RemoveArchive {
         #[command(flatten)]
         archive: Archive,
@@ -380,6 +387,7 @@ Examples:
         about = "Remove local package",
         long_about = "Remove a local package from the manifest file."
     )]
+    /// CLI command: remove a local package from the manifest.
     pub struct RemoveLocalPackage {
         #[arg(value_name = "PATH")]
         path: PathBuf,
@@ -417,6 +425,7 @@ Examples:
         long_about = r#"Remove requirements and/or constraints from a spec.
 Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
+    /// CLI command: remove archives or packages.
     pub struct Remove {
         #[command(subcommand)]
         cmd: RemoveCommands,
@@ -436,6 +445,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         long_about = r#"Remove requirements and/or constraints from a spec.
 Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
+    /// CLI command: drop entries from the manifest lock.
     pub struct Drop {
         /// Drop only requirements (do not touch constraints)
         #[arg(
@@ -493,6 +503,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Stage an artifact into a spec",
         long_about = "Add an external artifact (URL or file path) to a spec so it is included in the system tree."
     )]
+    /// CLI command: stage packages into a tree.
     pub struct Stage {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
@@ -537,6 +548,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Remove a staged artifact from a spec",
         long_about = "Remove a previously staged artifact (by URL or file path) from the given spec."
     )]
+    /// CLI command: remove staged packages from a tree.
     pub struct Unstage {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
@@ -574,6 +586,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
 
   Alternatively, requirement might be a path to .deb file to include directly."#
     )]
+    /// CLI command: include packages into the spec.
     pub struct Include {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
@@ -620,6 +633,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
   foo (<< 2.0)  
   bar (<= 3.4)"#
     )]
+    /// CLI command: exclude packages from the spec.
     pub struct Exclude {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
@@ -663,6 +677,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Update archives and snapshot/lock state",
         long_about = "Refresh archive metadata, solve specs, and rewrite the lock file."
     )]
+    /// CLI command: update the lockfile from sources.
     pub struct Update {
         /// Update lock file even if it appears up to date
         /// (refresh package indexes and re-resolve everything)
@@ -722,6 +737,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Search packages in archives",
         long_about = "Search for packages matching the given regex pattern(s)."
     )]
+    /// CLI command: search packages in the universe.
     pub struct Search {
         /// Match only package names (ignore descriptions)
         #[arg(short = 'p', long = "names-only")]
@@ -785,6 +801,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
 
     #[derive(Parser)]
     #[command(about = "Show package records or spec information")]
+    /// CLI command: show manifest and lock details.
     pub struct Show {
         #[command(subcommand)]
         cmd: ShowCommands,
@@ -805,11 +822,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Show a spec hash",
         long_about = "Print the hash of a spec definition. By default the hash is printed as a hexadecimal string; use --sri to emit Subresource Integrity format."
     )]
+    /// CLI command: show hash for a spec entry.
     pub struct ShowSpecHash {
         /// Use SRI format for the hash output
         ///
         /// Outputs the hash as SRI (Subresource Integrity) format, e.g.
-        /// sha256-<base64-encoded-hash>. If not specified, the hash is printed
+        /// `sha256-<base64-encoded-hash>`. If not specified, the hash is printed
         /// as a hexadecimal string.
         #[arg(long = "sri", action)]
         sri: bool,
@@ -844,6 +862,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Show a package's control record",
         long_about = "Print the raw control record for the given package."
     )]
+    /// CLI command: show metadata for a package.
     pub struct ShowPackage {
         /// Package name
         #[arg(value_name = "PACKAGE")]
@@ -881,6 +900,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         about = "Show a package's source control record",
         long_about = "Print the raw source control record for the given package or source package."
     )]
+    /// CLI command: show metadata for a source package.
     pub struct ShowSource {
         /// Find and print source files as artifacts to stage in path.
         /// Fails if there are multiple source packages matching the name.
@@ -999,6 +1019,7 @@ hash = \"{}\"
 
     #[derive(Parser)]
     #[command(about = "Internal tooling helpers", hide = true)]
+    /// CLI command: tool entrypoint for helpers.
     pub struct Tool {
         #[command(subcommand)]
         cmd: ToolCommands,
@@ -1020,6 +1041,7 @@ hash = \"{}\"
         about = "Convert a hex digest to SRI format",
         long_about = "Convert a hex digest and hash name to SRI (Subresource Integrity) format."
     )]
+    /// CLI tool: convert hex hash to SRI format.
     pub struct ToolHexToSri {
         #[arg(value_name = "HASH_NAME")]
         hash: String,
@@ -1043,6 +1065,7 @@ hash = \"{}\"
         about = "Convert an SRI digest to hex",
         long_about = "Convert an SRI (Subresource Integrity) digest to hexadecimal."
     )]
+    /// CLI tool: convert SRI hash to hex format.
     pub struct ToolSriToHex {
         #[arg(value_name = "SRI_DIGEST")]
         digest: String,
@@ -1063,6 +1086,7 @@ hash = \"{}\"
         about = "Hash a file, directory, or stdin",
         long_about = "Hash a file, directory, or stdin. For directories the artifact tree hash (blake3) is used."
     )]
+    /// CLI tool: compute file hashes.
     pub struct ToolHash {
         #[arg(value_name = "HASH_NAME")]
         hash: String,
@@ -1125,6 +1149,7 @@ hash = \"{}\"
         about = "List manifest items",
         long_about = "List manifest items (use --specs to list specs, or --spec <name> to list packages for a spec)."
     )]
+    /// CLI command: list manifest entries.
     pub struct List {
         #[arg(short = 'e', long = "only-essential", hide = true)]
         only_essential: bool,
@@ -1169,6 +1194,7 @@ hash = \"{}\"
         about = "Build an installable root for a spec",
         long_about = "Build an installable root filesystem tree for a spec."
     )]
+    /// CLI command: build repository artifacts.
     pub struct Build {
         /// The spec name to build
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
@@ -1264,6 +1290,7 @@ hash = \"{}\"
 /// }
 /// ```
 #[derive(Clone)]
+/// Parser for dependency strings in CLI arguments.
 pub struct DependencyParser;
 
 impl clap::builder::TypedValueParser for DependencyParser {
@@ -1383,6 +1410,7 @@ pub async fn pretty_print_packages<'a, W: smol::io::AsyncWrite + Unpin>(
 /// }
 /// ```
 #[derive(Clone)]
+/// Parser for version constraints in CLI arguments.
 pub struct ConstraintParser;
 
 impl clap::builder::TypedValueParser for ConstraintParser {

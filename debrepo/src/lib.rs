@@ -2,18 +2,28 @@
 
 mod arch;
 mod archive;
+/// Artifact representations and readers for repository content.
 pub mod artifact;
+/// Authentication providers and credential handling.
 pub mod auth;
 mod auth_vault;
 mod builder;
+/// CLI-facing types and parsers shared by binaries.
 pub mod cli;
 mod cli_edit;
+/// Compression utilities for repository files.
 pub mod comp;
+/// Repository content staging and file generation helpers.
 pub mod content;
+/// Debian control file parsing and mutation.
 pub mod control;
+/// Debian package reader and staging utilities.
 pub mod deb;
+/// Error types for the library.
 pub mod error;
+/// Execution helpers for running external tools.
 pub mod exec;
+/// Hashing helpers and digest encodings.
 pub mod hash;
 mod idmap;
 mod indexfile;
@@ -21,15 +31,19 @@ mod kvlist;
 mod manifest;
 mod manifest_doc;
 mod packages;
+/// Podman-backed sandbox execution.
 pub mod podman;
 mod release;
+/// Sandbox abstractions and executors.
 pub mod sandbox;
 mod sources;
 mod spec;
 mod stage;
 mod staging;
+/// TAR archive reader and writer utilities.
 pub mod tar;
 mod transport;
+/// Package universe representation and query helpers.
 pub mod universe;
 mod version;
 

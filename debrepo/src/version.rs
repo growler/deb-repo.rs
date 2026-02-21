@@ -133,6 +133,7 @@ impl<V: Clone> From<Option<&Version<V>>> for VersionSet<Version<V>> {
 }
 
 #[derive(Clone)]
+/// A dependency constraint with optional architecture and version range.
 pub struct Constraint<R> {
     name: R,
     arch: Option<R>,
@@ -627,6 +628,7 @@ impl<'a, R> IntoIterator for &'a Dependency<R> {
     }
 }
 
+/// Iterator over dependency references in a parsed dependency string.
 pub struct DependencyRefIterator<'a, R> {
     dep: &'a Dependency<R>,
     item: usize,
@@ -901,6 +903,7 @@ impl<V> VersionSet<V> {
 
 /// Version represents a single version number
 #[derive(Serialize, Deserialize, Clone, Default)]
+/// Debian-style version with optional epoch and revision.
 pub struct Version<V> {
     inner: V,
 }
@@ -1263,6 +1266,7 @@ impl<'a> Parser<'a> {
     }
 }
 
+/// Iterator over parsed constraint clauses in a dependency string.
 pub struct ParsedConstraintIterator<'a> {
     straight: bool,
     parser: Parser<'a>,
@@ -1361,6 +1365,7 @@ impl<'a> TryFrom<&'a str> for Dependency<&'a str> {
     }
 }
 
+/// Iterator over provided package name entries.
 pub struct ParsedProvidedNameIterator<'a> {
     parser: Parser<'a>,
 }

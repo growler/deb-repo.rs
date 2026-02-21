@@ -336,6 +336,7 @@ impl resolvo::runtime::AsyncRuntime for SmolAsyncRuntime {
     }
 }
 
+/// Dependency solver over a set of package indexes.
 pub struct Universe {
     inner: resolvo::Solver<InnerUniverse, SmolAsyncRuntime>,
 }

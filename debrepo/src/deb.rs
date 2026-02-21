@@ -358,7 +358,7 @@ where
     ///
     /// # Returns
     ///
-    /// * Result<Self> - An instance of `Deb` wrapped in a `Result`, containing
+    /// * `Result<Self>` - An instance of `Deb` wrapped in a `Result`, containing
     ///     - `Ok`: A successfully initialized reader
     ///     - `Err`: An error if the reader initialization fails.
     ///
@@ -656,6 +656,7 @@ where
     }
 }
 
+/// Stage adapter that extracts a Debian package into a staging filesystem.
 pub struct DebStage<'a, R: AsyncRead + Send, FS: ?Sized> {
     inner: DebReader<'a, R>,
     _phantom: std::marker::PhantomData<fn(&FS)>,

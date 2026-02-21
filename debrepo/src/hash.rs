@@ -102,6 +102,7 @@ impl HashAlgo for blake3::Hasher {
 }
 
 #[derive(Clone, Default)]
+/// Typed hash wrapper with algorithm-specific helpers.
 pub struct InnerHash<D: HashAlgo> {
     inner: HashOutput<D>,
 }
@@ -528,8 +529,10 @@ impl<'de> Deserialize<'de> for Hash {
     }
 }
 
+/// Serde helpers for hash encodings.
 pub mod serde {
     use super::Hash;
+    /// Serde helpers for Subresource Integrity (SRI) strings.
     pub mod sri {
         use {
             super::Hash,
@@ -571,6 +574,7 @@ pub mod serde {
 
             deserializer.deserialize_str(SriVisitor)
         }
+        /// Optional SRI hash encoding helpers.
         pub mod opt {
             use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -598,6 +602,7 @@ pub mod serde {
             }
         }
     }
+    /// Serde helpers for hex-encoded hashes.
     pub mod hex {
         use {super::Hash, ::serde::Serializer};
 
@@ -609,6 +614,7 @@ pub mod serde {
             serializer.serialize_str(&s)
         }
 
+        /// Optional hex hash encoding helpers.
         pub mod opt {
             use serde::{Serialize, Serializer};
 
@@ -629,6 +635,7 @@ pub mod serde {
         }
     }
 
+    /// Serde helpers for base64-encoded hashes.
     pub mod base64 {
         use {super::Hash, ::base64::prelude::*, ::serde::Serializer};
 
@@ -640,6 +647,7 @@ pub mod serde {
             serializer.serialize_str(&s)
         }
 
+        /// Optional base64 hash encoding helpers.
         pub mod opt {
             use serde::{Serialize, Serializer};
 
@@ -662,6 +670,7 @@ pub mod serde {
 }
 
 pin_project! {
+    /// Async reader that computes a hash as it reads.
     pub struct HashingReader<D, R> {
         digester: D,
         counter: u64,
@@ -728,6 +737,7 @@ impl<D: HashAlgo, R: AsyncRead + Send> AsyncRead for HashingReader<D, R> {
     }
 }
 
+/// Synchronous writer that computes a hash of written bytes.
 pub struct SyncHashingWriter<D: HashAlgo, W: std::io::Write> {
     digester: D,
     inner: W,
@@ -762,6 +772,7 @@ impl<D: HashAlgo, W: std::io::Write> std::io::Write for SyncHashingWriter<D, W> 
 }
 
 pin_project! {
+    /// Async writer that computes a hash of written bytes.
     pub struct HashingWriter<D, W> {
         digester: D,
         #[pin]
@@ -810,6 +821,7 @@ impl<D: HashAlgo, W: AsyncWrite + Send> AsyncWrite for HashingWriter<D, W> {
 }
 
 pin_project! {
+    /// Async reader that verifies a hash while reading.
     pub struct VerifyingReader<D: OutputSizeUser, R> {
         digester: D,
         digest: HashOutput<D>,

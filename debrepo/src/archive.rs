@@ -198,6 +198,7 @@ impl clap::builder::TypedValueParser for ClapSignedByParser {
 }
 
 #[derive(Debug, Serialize, Clone, Copy, PartialEq, Eq)]
+/// Snapshot identifier wrapping a UTC timestamp.
 pub struct SnapshotId(pub DateTime<Utc>);
 
 impl SnapshotId {
@@ -262,6 +263,7 @@ impl TryFrom<&str> for SnapshotId {
 }
 
 #[derive(Clone)]
+/// CLI argument parser for snapshot IDs.
 pub struct SnapshotIdArgParser;
 
 impl clap::builder::TypedValueParser for SnapshotIdArgParser {
@@ -543,6 +545,7 @@ impl clap::builder::TypedValueParser for ArchiveHashKindValueParser {
 }
 
 #[derive(Clone, Default, Serialize, Deserialize, Debug)]
+/// Repository file metadata and hashes.
 pub struct RepositoryFile {
     pub(crate) path: String,
     pub(crate) hash: Hash,
@@ -569,6 +572,7 @@ pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
 
 #[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
+/// Archive definition with suites and components.
 pub struct Archive {
     /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
     #[arg(value_name = "URL")]

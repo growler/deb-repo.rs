@@ -11,6 +11,7 @@ use {
 };
 
 #[derive(Serialize, Deserialize)]
+/// Sandbox executor backed by Podman.
 pub struct PodmanSandboxExecutor {
     root: PathBuf,
     env: Vec<(OsString, OsString)>,

@@ -126,20 +126,25 @@ refuses to run if the lock is missing or stale.
 Artifacts are declared at the top level as `[artifact."<name>"]` and referenced
 from specs via `stage = ["<name>", ...]`.
 
-- Artifact `type` is one of: `file`, `tar`, `dir`.
+- Artifact `type` is one of: `file`, `tar`, `dir`, `text`.
 - Hashes are serialized in SRI form: `<algo>-<base64>` (for example
   `blake3-...`, `sha256-...`).
 - When `rdebootstrap` computes an artifact hash (for example via `stage`), it
   uses `blake3`.
-- `TARGET_PATH` is an absolute path inside the target filesystem.
-  - `file.ext /path/target` → `/path/target`
-  - `file.ext /path/target/` → `/path/target/file.ext`
-  - `file.tar /path/target(/?)` → extracted under `/path/target`
-  - `dir /path/target(/?)` → copied under `/path/target`
+- `TARGET_PATH` is treated as an absolute path inside the target filesystem (non-absolute values are
+  auto-prefixed with `/` during staging).
+  - `{file|text}.ext /path/target` → `/path/target`
+  - `{file|text}.ext /path/target/` → `/path/target/file.ext`
+- `file.tar /path/target(/?)` → extracted under `/path/target`
+- `dir /path/target(/?)` → copied under `/path/target`
+- Filename resolution for `{file|text}` artifacts happens during staging; manifests keep the raw
+  `target` value.
 - Auto-unpack: tar archives and compressed files (`.gz`, `.xz`, `.bz2`, `.zst`,
   `.zstd`) are unpacked by default; use `--no-unpack` to keep them as-is.
 - Safety: tar unpacking rejects absolute paths, `..` traversal, and special
   entries like device nodes.
+- Inline text artifacts (`type = "text"`) embed a `text` value in the manifest
+  and write it to `target` during staging.
 
 ## Build Environment and Scripts
 
