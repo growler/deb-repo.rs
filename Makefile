@@ -92,7 +92,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 					echo "Unknown DCH_MODE=$$$$DCH_MODE" >&2; \
 					exit 1 ;; \
 			esac; \
-			dpkg-buildpackage -uc -b -tc'
+			dpkg-buildpackage --no-sign -B -tc'
 
 packages: $(1)-packages
 
