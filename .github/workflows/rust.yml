@@ -77,7 +77,7 @@ jobs:
       - name: Package source files
         # if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          podman unshare dpkg-buildpackage -us -S -tc
+          podman unshare dpkg-buildpackage -us -S -d -tc
           mv ../rdebootstrap_*.{dsc,tar.xz} target
 
       - name: Cache debian build tree
