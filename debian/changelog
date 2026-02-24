@@ -1,3 +1,11 @@
+rdebootstrap (0.1.2) stable; urgency=medium
+
+  * Add command `add artifact`
+  * Change `stage` semantics, now it only adds an artifact to the 
+    specification stage list.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 24 Feb 2026 10:07:15 +0100
+
 rdebootstrap (0.1.1) unstable; urgency=medium
 
   * Split the source package into the binary and the library
