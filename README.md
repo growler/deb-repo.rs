@@ -27,7 +27,7 @@ is exposed as the `debrepo` library for embedding in other tooling.
 ## Requirements
 
 - Linux host with user namespaces enabled (required by the sandbox helper).
-- Rust toolchain ≥ 1.85 (`rustup toolchain install 1.85.0`).
+- Rust toolchain ≥ 1.89 (`rustup toolchain install 1.89.0`).
 - System packages needed by `cargo` plus `gpgme`/`libgpg-error` for Release
   verification.
 - Optional `sudo` when you need ownership preserved inside the target rootfs.

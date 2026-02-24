@@ -10,7 +10,7 @@ snapshot = "20260221T221207Z"
 include = [
     "build-essential",
     "ca-certificates",
-    "cargo-1.85",
+    "cargo-1.89",
     "debhelper",
     "devscripts",
     "libbz2-dev",
@@ -23,10 +23,10 @@ include = [
     "libunistring-dev",
     "libzstd-dev",
     "pkg-config",
-    "rustc-1.85",
+    "rustc-1.89",
     "zlib1g-dev",
 ]
 build-script = """
-update-alternatives --install /usr/bin/cargo cargo /usr/bin/cargo-1.85 10
-update-alternatives --install /usr/bin/rustc rustc /usr/bin/rustc-1.85 10
+update-alternatives --install /usr/bin/cargo cargo /usr/bin/cargo-1.89 10
+update-alternatives --install /usr/bin/rustc rustc /usr/bin/rustc-1.89 10
 """

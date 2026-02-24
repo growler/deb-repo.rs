@@ -82,7 +82,7 @@
             debian-devscripts
             dpkg
         ];
-        rust-debian-stable = [ (pkgs.rust-bin.stable."1.85.1".default.override {
+        rust-debian-stable = [ (pkgs.rust-bin.stable."1.89.0".default.override {
           extensions = [ "rust-analyzer" "rustfmt" "clippy" "rust-src" ];
         })];
         rust-stable = [ (pkgs.rust-bin.stable.latest.default.override {
@@ -98,6 +98,7 @@
             ]);
             shellHook = ''
             export RUST_BACKTRACE=1
+            export CARGO_HOME=$(pwd)/target/cargo-home
             export RUSTFLAGS="-C link-args=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2";
             '';
         } // params;

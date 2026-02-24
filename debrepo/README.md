@@ -17,7 +17,7 @@ as a set of reusable building blocks for other tooling too.
 
 ## Status / compatibility
 
-- **Rust MSRV:** 1.85 (see `Cargo.toml`).
+- **Rust MSRV:** 1.89 (see `Cargo.toml`).
 - **Stability:** 0.x; API may change between releases.
 - **Async runtime:** uses the `smol` ecosystem. Tokio integration is not tested
   or targeted; PRs welcome.

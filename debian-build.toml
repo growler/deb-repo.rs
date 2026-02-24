@@ -21,7 +21,7 @@ include = [
     "devscripts",
     "libdistro-info-perl",
     "debhelper",
-    "cargo",
+    "cargo (>= 1.89.0)",
     "debcargo",
     "dh-cargo",
     "libbz2-dev",

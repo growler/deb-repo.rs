@@ -55,6 +55,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
 		podman unshare $(RDEBOOTSTRAP) -n $(DOWNLOADS) -m $(CURDIR)/$(1)-build.toml build --path "$$$$TREE"; \
+		podman unshare chown -R "$$$$(id -u):$$$$(id -g)" "$$$$TREE"; \
 	fi
 
 $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
@@ -64,7 +65,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 	echo "Running the package builder"; \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
 	maint=$$$$(dpkg-parsechangelog -SMaintainer); \
-	version="$$(ver)+$($(1)_suffix)"; \
+	version="$$(ver)+$($(1)_suffix)1"; \
 	if [ "$$$$dist" = "UNRELEASED" ]; then \
 		dch_mode=update; \
 	else \
@@ -77,6 +78,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 		--volume "$$(<D):/root/build" \
 		--volume "$$(CURDIR):/root/build/src" \
 		--volume "$$(<D)/target:/root/build/src/target" \
+		--volume "$$(CURDIR)/target/cargo-home:/root/build/src/target/cargo-home" \
 		--workdir /root/build/src \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
@@ -87,9 +89,9 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 		/bin/sh -ec ' \
 			case "$$$$DCH_MODE" in \
 				update) \
-					dch -m -v "$$$$DCH_NEW_VERSION" -D UNRELEASED "" ;; \
+					dch -b -m -v "$$$$DCH_NEW_VERSION" -D UNRELEASED "" ;; \
 				new) \
-					dch -b -m -v "$$$$DCH_NEW_VERSION" -D "$$$$DCH_DIST" "$$$$DCH_MESSAGE" ;; \
+					dch -m -v "$$$$DCH_NEW_VERSION" -D "$$$$DCH_DIST" "$$$$DCH_MESSAGE" ;; \
 				*) \
 					echo "Unknown DCH_MODE=$$$$DCH_MODE" >&2; \
 					exit 1 ;; \
