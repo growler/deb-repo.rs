@@ -1,0 +1,104 @@
+#!/bin/sh
+set -euo pipefail
+
+zero_sha="0000000000000000000000000000000000000000"
+dirty_check_needed=false
+semver_tags=""
+
+while read -r local_ref local_sha remote_ref remote_sha; do
+    case "$local_ref" in
+        refs/tags/*)
+            tag="${local_ref#refs/tags/}"
+            if [ "${local_sha}" = "${zero_sha}" ]; then
+                continue
+            fi
+            if printf '%s' "${tag}" | grep -Eq '^v'; then
+                dirty_check_needed=true
+            fi
+            if printf '%s' "${tag}" | grep -Eq '^v[0-9]+\.[0-9]+\.[0-9]+$'; then
+                semver_tags="${semver_tags} ${tag}"
+            fi
+            ;;
+    esac
+done
+
+if ${dirty_check_needed}; then
+    if [ -n "$(git status --porcelain --untracked-files=no)" ]; then
+        echo "error: working tree has tracked changes; push of v* tags requires a clean tree." >&2
+        exit 1
+    fi
+fi
+
+if [ -z "${semver_tags}" ]; then
+    exit 0
+fi
+
+changelog_line="$(head -n 1 debian/changelog || true)"
+parsed="$(printf '%s\n' "${changelog_line}" | sed -n 's/^rdebootstrap (\([^)]\+\)) \([^;]\+\);.*$/\1 \2/p')"
+if [ -z "${parsed}" ]; then
+    echo "error: unable to parse debian/changelog top line; expected 'rdebootstrap (<version>) unstable; ...'." >&2
+    exit 1
+fi
+
+changelog_version="$(printf '%s\n' "${parsed}" | awk '{print $1}')"
+changelog_dist="$(printf '%s\n' "${parsed}" | awk '{print $2}')"
+if [ "${changelog_dist}" != "unstable" ]; then
+    echo "error: debian/changelog top entry must target 'unstable' (found '${changelog_dist}')." >&2
+    exit 1
+fi
+
+cargo_pkg_version() {
+    awk '
+        BEGIN { in_pkg = 0 }
+        /^\[package\]/ { in_pkg = 1; next }
+        /^\[/ { if (in_pkg) { exit } }
+        in_pkg && $1 == "version" {
+            gsub(/"/, "", $3)
+            print $3
+            exit
+        }
+    ' "$1"
+}
+
+debrepo_version="$(cargo_pkg_version debrepo/Cargo.toml)"
+rdebootstrap_version="$(cargo_pkg_version rdebootstrap/Cargo.toml)"
+
+if [ -z "${debrepo_version}" ] || [ -z "${rdebootstrap_version}" ]; then
+    echo "error: unable to read package versions from debrepo/Cargo.toml or rdebootstrap/Cargo.toml." >&2
+    exit 1
+fi
+
+debrepo_dep_version="$(
+    awk '
+        BEGIN { in_deps = 0 }
+        /^\[dependencies\]/ { in_deps = 1; next }
+        /^\[/ { if (in_deps) { exit } }
+        in_deps && $1 == "debrepo" { print; exit }
+    ' rdebootstrap/Cargo.toml | sed -n 's/.*version *= *"\([^"]\+\)".*/\1/p'
+)"
+
+if [ -z "${debrepo_dep_version}" ]; then
+    echo "error: unable to read debrepo dependency version from rdebootstrap/Cargo.toml." >&2
+    exit 1
+fi
+
+for tag in ${semver_tags}; do
+    version="${tag#v}"
+
+    if [ "${changelog_version}" != "${version}" ]; then
+        echo "error: debian/changelog top version '${changelog_version}' does not match tag ${tag}." >&2
+        exit 1
+    fi
+    if [ "${debrepo_version}" != "${version}" ]; then
+        echo "error: debrepo/Cargo.toml version '${debrepo_version}' does not match tag ${tag}." >&2
+        exit 1
+    fi
+    if [ "${rdebootstrap_version}" != "${version}" ]; then
+        echo "error: rdebootstrap/Cargo.toml version '${rdebootstrap_version}' does not match tag ${tag}." >&2
+        exit 1
+    fi
+    if [ "${debrepo_dep_version}" != "${version}" ]; then
+        echo "error: rdebootstrap/Cargo.toml debrepo dependency version '${debrepo_dep_version}' does not match tag ${tag}." >&2
+        exit 1
+    fi
+done
