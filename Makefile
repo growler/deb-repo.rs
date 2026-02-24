@@ -15,7 +15,7 @@ version:
 	full=$$(git describe --tags --match "v*"); \
 	base=$$(echo "$$full" | sed -e "s%^v%%"); \
 	debver=$$(dpkg-parsechangelog -SVersion); \
-	if [ "$$base" = "$$debver" ]; then \
+	if [ -z "$$full" -o "$$base" = "$$debver" ]; then \
 		ver="$$base"; \
 	else \
 		tag=$$(git describe --tags --match "v*" --abbrev=0); \
