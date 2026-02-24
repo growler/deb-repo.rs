@@ -12,8 +12,8 @@ ubuntu_suffix := ubuntu
 version:
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	$(eval ver=$(shell bash -euo pipefail -c ' \
-	full=$$(git describe --tags --match "vv*" 2>/dev/null || true); \
-	base=$$(echo "$$full" | sed -e "s%^vv%%"); \
+	full=$$(git describe --tags --match "v*" 2>/dev/null || true); \
+	base=$$(echo "$$full" | sed -e "s%^v%%"); \
 	debver=$$(dpkg-parsechangelog -SVersion); \
 	if [ "$$base" = "$$debver" ]; then \
 		ver="$$debver"; \
@@ -21,7 +21,7 @@ version:
 		ver="$$debver~pre$$(date +%s)+$$(git rev-parse --short HEAD)"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+untracked"; \
 	else \
-		tag=$$(git describe --tags --match "vv*" --abbrev=0); \
+		tag=$$(git describe --tags --match "v*" --abbrev=0); \
 		suffix=$${full#$$tag-}; \
 		ver="$$debver~pre$$suffix"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
