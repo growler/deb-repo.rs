@@ -250,13 +250,13 @@ fn format_command_label(command: &str, args: Option<&str>) -> String {
     label.push_str("\\fB");
     label.push_str(&escape_roff_inline(command));
     label.push_str("\\fR");
-    if let Some(args) = args {
-        if !args.trim().is_empty() {
-            label.push(' ');
-            label.push_str("\\fI");
-            label.push_str(&escape_roff_inline(args));
-            label.push_str("\\fR");
-        }
+    if let Some(args) = args
+        && !args.trim().is_empty()
+    {
+        label.push(' ');
+        label.push_str("\\fI");
+        label.push_str(&escape_roff_inline(args));
+        label.push_str("\\fR");
     }
     label
 }

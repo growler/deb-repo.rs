@@ -113,8 +113,7 @@ fn read_pax_archive() -> Result<()> {
         let reader = TarReader::new(archive);
         let pax_path = format!(
             "pax/{}/{}.txt",
-            std::iter::repeat("deep")
-                .take(10)
+            std::iter::repeat_n("deep", 10)
                 .collect::<Vec<_>>()
                 .join("/"),
             "c".repeat(200)

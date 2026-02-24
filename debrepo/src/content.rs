@@ -496,7 +496,7 @@ impl ContentProvider for HostCache {
                 tracing::debug!("Cached {} at {}", url, cache_path.display());
                 fs::File::open(cache_path).await?
             };
-            return artifact.remote(file);
+            artifact.remote(file)
         } else {
             let url = artifact.uri();
             let (src, _) = self.transport.open(url).await.map_err(|e| {
@@ -505,7 +505,7 @@ impl ContentProvider for HostCache {
                     format!("failed to open remote artifact {}: {}", url, e),
                 )
             })?;
-            return artifact.remote(src);
+            artifact.remote(src)
         }
     }
     async fn fetch_universe(

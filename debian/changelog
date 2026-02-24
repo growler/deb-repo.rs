@@ -1,6 +1,6 @@
-rdebootstrap (0.1.4) UNRELEASED; urgency=medium
+rdebootstrap (0.1.4) unstable; urgency=medium
 
-  * 
+  * Minor fixes 
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 24 Feb 2026 12:30:06 +0100
 
