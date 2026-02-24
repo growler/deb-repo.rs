@@ -99,6 +99,7 @@
             shellHook = ''
             export RUST_BACKTRACE=1
             export CARGO_HOME=$(pwd)/target/cargo-home
+            export CARGO_REGISTRY_TOKEN=$(gpg --quiet --decrypt ~/.config/secrets/crates.io.gpg)
             export RUSTFLAGS="-C link-args=-Wl,--dynamic-linker=/lib64/ld-linux-x86-64.so.2";
             '';
         } // params;
