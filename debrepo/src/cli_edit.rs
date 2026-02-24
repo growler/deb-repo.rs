@@ -74,6 +74,10 @@ struct EditArtifact {
     /// Target architecture for the artifact
     #[arg(long = "only-arch", value_name = "ARCH")]
     target_arch: Option<String>,
+
+    /// Stage the artifact into a spec (default spec if --spec is omitted)
+    #[arg(long = "stage", action)]
+    stage: bool,
 }
 
 impl<C: Config> Command<C> for Edit {
@@ -95,8 +99,9 @@ impl<C: Config> Command<C> for Edit {
                 None => editor.run(&manifest_path)?,
                 Some(EditCommands::Env(_)) => edit_env(conf, &editor, spec).await?,
                 Some(EditCommands::Script(_)) => edit_script(conf, &editor, spec).await?,
-                Some(EditCommands::Artifact(artifact)) => edit_artifact(conf, &editor, artifact)
-                    .await?,
+                Some(EditCommands::Artifact(artifact)) => {
+                    edit_artifact(conf, &editor, spec, artifact).await?
+                }
             }
 
             if let Err(err) = run_update(conf).await {
@@ -205,6 +210,7 @@ async fn edit_script<C: Config>(
 async fn edit_artifact<C: Config>(
     conf: &C,
     editor: &EditorCommand,
+    spec: Option<&str>,
     artifact: &EditArtifact,
 ) -> Result<()> {
     let (mut manifest, _) =
@@ -213,12 +219,9 @@ async fn edit_artifact<C: Config>(
     let mut existing_mode = None;
     let mut existing_arch = None;
     if let Some(existing) = manifest.artifact(&artifact.name) {
-        let existing = existing.as_text().ok_or_else(|| {
-            anyhow!(
-                "artifact {} exists but is not text",
-                artifact.name.as_str()
-            )
-        })?;
+        let existing = existing
+            .as_text()
+            .ok_or_else(|| anyhow!("artifact {} exists but is not text", artifact.name.as_str()))?;
         existing_text = Some(existing.text().to_string());
         existing_mode = existing.mode();
         existing_arch = existing.arch().map(str::to_string);
@@ -239,6 +242,9 @@ async fn edit_artifact<C: Config>(
         mode,
         arch,
     )?;
+    if artifact.stage {
+        manifest.add_stage_items(spec, vec![artifact.name.clone()], None)?;
+    }
     manifest.store_manifest_only(conf.manifest()).await?;
     Ok(())
 }

@@ -210,9 +210,7 @@ impl ManifestFile {
         self.specs
             .iter_values()
             .enumerate()
-            .filter_map(|(idx, spec)| {
-                spec.stage.iter().any(|item| item == name).then_some(idx)
-            })
+            .filter_map(|(idx, spec)| spec.stage.iter().any(|item| item == name).then_some(idx))
             .collect()
     }
     pub fn add_artifact(
@@ -251,6 +249,27 @@ impl ManifestFile {
         }
         Ok(())
     }
+    pub fn upsert_artifact_only(
+        &mut self,
+        artifact: Artifact,
+        comment: Option<&str>,
+    ) -> io::Result<UpdateResult> {
+        self.doc.update_artifact(&artifact, comment);
+        match self
+            .artifacts
+            .iter()
+            .position(|a| a.uri() == artifact.uri())
+        {
+            Some(idx) => {
+                self.artifacts[idx] = artifact;
+                Ok(UpdateResult::Updated(idx))
+            }
+            None => {
+                self.artifacts.push(artifact);
+                Ok(UpdateResult::Added)
+            }
+        }
+    }
     pub fn upsert_text_artifact(
         &mut self,
         name: &str,
@@ -265,9 +284,9 @@ impl ManifestFile {
             .enumerate()
             .find(|(_, artifact)| artifact.uri() == name)
         {
-            let existing = existing
-                .as_text()
-                .ok_or_else(|| io::Error::other(format!("artifact {name} exists but is not text")))?;
+            let existing = existing.as_text().ok_or_else(|| {
+                io::Error::other(format!("artifact {name} exists but is not text"))
+            })?;
             if existing.text() == text.as_str()
                 && existing.target() == target.as_str()
                 && existing.mode() == mode
@@ -275,24 +294,12 @@ impl ManifestFile {
             {
                 return Ok(UpdateResult::None);
             }
-            let artifact = Artifact::text(
-                name.to_string(),
-                target,
-                text,
-                mode,
-                arch,
-            );
+            let artifact = Artifact::text(name.to_string(), target, text, mode, arch);
             self.doc.update_artifact(&artifact, None::<&str>);
             self.artifacts[idx] = artifact;
             return Ok(UpdateResult::Updated(idx));
         }
-        let artifact = Artifact::text(
-            name.to_string(),
-            target,
-            text,
-            mode,
-            arch,
-        );
+        let artifact = Artifact::text(name.to_string(), target, text, mode, arch);
         self.doc.update_artifact(&artifact, None::<&str>);
         self.artifacts.push(artifact);
         Ok(UpdateResult::Added)
@@ -340,6 +347,15 @@ impl ManifestFile {
         self.add_spec_list_items(spec_name, "include", reqs, comment, |spec| {
             &mut spec.include
         })
+    }
+    pub fn add_stage_items(
+        &mut self,
+        spec_name: Option<&str>,
+        items: Vec<String>,
+        comment: Option<&str>,
+    ) -> io::Result<Option<usize>> {
+        self.add_spec_list_items(spec_name, "stage", items, comment, |spec| &mut spec.stage)
+            .map(|value| value.map(|(idx, _, _)| idx))
     }
     pub fn remove_requirements<'a, I>(
         &mut self,

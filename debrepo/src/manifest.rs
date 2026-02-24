@@ -193,7 +193,7 @@ impl Manifest {
             self.lock.store(&lock_path, &self.arch, &hash).await?;
         }
         Ok(())
-   }
+    }
     pub async fn store_manifest_only<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
         let hash = self.file.store(path.as_ref()).await?;
         self.hash = Some(hash);
@@ -437,6 +437,57 @@ impl Manifest {
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
         self.mark_lock_updated();
+        Ok(())
+    }
+    pub async fn upsert_artifact_only<C>(
+        &mut self,
+        artifact: &ArtifactArg,
+        comment: Option<&str>,
+        cache: &C,
+    ) -> io::Result<()>
+    where
+        C: ContentProvider,
+    {
+        let staged = Artifact::new(artifact, cache).await?;
+        self.upsert_artifact_only_inner(staged, comment)
+    }
+    pub fn upsert_artifact_only_inner(
+        &mut self,
+        artifact: Artifact,
+        comment: Option<&str>,
+    ) -> io::Result<()> {
+        let uri = artifact.uri().to_string();
+        match self.file.upsert_artifact_only(artifact, comment)? {
+            UpdateResult::None => return Ok(()),
+            UpdateResult::Added | UpdateResult::Updated(_) => {}
+        }
+        self.mark_file_updated();
+        let specs = self.file.spec_indices_with_artifact(&uri);
+        for spec_index in specs {
+            self.refresh_spec_hashes(spec_index)?;
+        }
+        self.mark_lock_updated();
+        Ok(())
+    }
+    pub fn add_stage_items(
+        &mut self,
+        spec_name: Option<&str>,
+        items: Vec<String>,
+        comment: Option<&str>,
+    ) -> io::Result<()> {
+        for item in &items {
+            if self.file.artifact(item).is_none() {
+                return Err(io::Error::other(format!(
+                    "artifact {} not found in manifest",
+                    item
+                )));
+            }
+        }
+        if let Some(spec_index) = self.file.add_stage_items(spec_name, items, comment)? {
+            self.mark_file_updated();
+            self.refresh_spec_hashes(spec_index)?;
+            self.mark_lock_updated();
+        }
         Ok(())
     }
     pub fn remove_artifact<S: AsRef<str>>(

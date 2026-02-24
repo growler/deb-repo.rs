@@ -170,7 +170,10 @@ pub mod cmd {
         itertools::Itertools,
         rustix::path::Arg,
         smol::io::AsyncWriteExt,
-        std::{io::IsTerminal, path::PathBuf},
+        std::{
+            io::IsTerminal,
+            path::{Path, PathBuf},
+        },
     };
     #[derive(Parser)]
     #[command(
@@ -328,15 +331,96 @@ Examples:
         }
     }
 
+    #[derive(Parser)]
+    #[command(
+        about = "Add an artifact",
+        long_about = "Add an artifact definition to the manifest file. Use --stage to attach it to a spec."
+    )]
+    /// CLI command: add an artifact definition to the manifest.
+    pub struct AddArtifact {
+        /// Optional comment to record with this change
+        #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
+        comment: Option<String>,
+
+        /// Stage the artifact into a spec (default spec if --spec is omitted)
+        #[arg(long = "stage", action)]
+        stage: bool,
+
+        /// Target spec (omit to use the default spec)
+        #[arg(short = 's', long = "spec", value_name = "SPEC")]
+        spec: Option<String>,
+
+        #[command(flatten)]
+        artifact: ArtifactArg,
+    }
+    impl<C: Config> Command<C> for AddArtifact {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let (mut mf, _) = Manifest::from_file_with_lock_base(
+                    conf.manifest(),
+                    conf.arch(),
+                    conf.lock_base(),
+                )
+                .await?;
+                if let Some(path) = self.artifact.url.strip_prefix('@') {
+                    if path.is_empty() {
+                        return Err(anyhow!("text artifact path is empty"));
+                    }
+                    let name = Path::new(path)
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .ok_or_else(|| anyhow!("text artifact path has no filename: {path}"))?;
+                    let text = std::fs::read(path)
+                        .map_err(|err| anyhow!("failed to read text artifact {}: {}", path, err))
+                        .and_then(|bytes| {
+                            String::from_utf8(bytes)
+                                .map_err(|_| anyhow!("text artifact {} is not valid utf-8", path))
+                        })?;
+                    let target =
+                        self.artifact.target.clone().ok_or_else(|| {
+                            anyhow!("text artifact {} requires TARGET_PATH", path)
+                        })?;
+                    mf.upsert_text_artifact(
+                        name,
+                        target,
+                        text,
+                        self.artifact.mode,
+                        self.artifact.target_arch.clone(),
+                    )?;
+                    if self.stage {
+                        mf.add_stage_items(self.spec.as_deref(), vec![name.to_string()], None)?;
+                    }
+                } else {
+                    mf.upsert_artifact_only(&self.artifact, self.comment.as_deref(), fetcher)
+                        .await?;
+                    if self.stage {
+                        mf.add_stage_items(
+                            self.spec.as_deref(),
+                            vec![self.artifact.url.clone()],
+                            None,
+                        )?;
+                    }
+                }
+                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
+                    .await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
     #[allow(clippy::large_enum_variant)]
     #[derive(Parser)]
     pub enum AddCommands {
         Archive(AddArchive),
         Local(AddLocalPackage),
+        Artifact(AddArtifact),
     }
 
     #[derive(Parser)]
-    #[command(about = "Add an archive or a local package to the manifest")]
+    #[command(about = "Add an archive, local package, or artifact to the manifest")]
     /// CLI command: add archives or packages.
     pub struct Add {
         #[command(subcommand)]
@@ -347,6 +431,7 @@ Examples:
             match &self.cmd {
                 AddCommands::Archive(cmd) => cmd.exec(conf),
                 AddCommands::Local(cmd) => cmd.exec(conf),
+                AddCommands::Artifact(cmd) => cmd.exec(conf),
             }
         }
     }
@@ -509,35 +594,31 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
 
-        /// A comment for the staged artifact
+        /// A comment for the staged artifact entry
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
 
-        #[command(flatten)]
-        artifact: ArtifactArg,
+        /// Artifact name or URI
+        #[arg(value_name = "ARTIFACT")]
+        artifact: String,
     }
 
     impl<C: Config> Command<C> for Stage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let fetcher = conf.fetcher()?;
-                let guard = fetcher.init().await?;
                 let (mut mf, _) = Manifest::from_file_with_lock_base(
                     conf.manifest(),
                     conf.arch(),
                     conf.lock_base(),
                 )
                 .await?;
-                mf.add_artifact(
+                mf.add_stage_items(
                     self.spec.as_deref(),
-                    &self.artifact,
+                    vec![self.artifact.clone()],
                     self.comment.as_deref(),
-                    fetcher,
-                )
-                .await?;
+                )?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
                     .await?;
-                guard.commit().await?;
                 Ok(())
             })
         }

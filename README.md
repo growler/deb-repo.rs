@@ -124,13 +124,14 @@ refuses to run if the lock is missing or stale.
 ## Artifacts and Staging
 
 Artifacts are declared at the top level as `[artifact."<name>"]` and referenced
-from specs via `stage = ["<name>", ...]`.
+from specs via `stage = ["<name>", ...]`. Use `rdebootstrap add artifact` to
+define them and `rdebootstrap stage` to attach them to specs.
 
 - Artifact `type` is one of: `file`, `tar`, `dir`, `text`.
 - Hashes are serialized in SRI form: `<algo>-<base64>` (for example
   `blake3-...`, `sha256-...`).
-- When `rdebootstrap` computes an artifact hash (for example via `stage`), it
-  uses `blake3`.
+- When `rdebootstrap` computes an artifact hash (for example via `add artifact`),
+  it uses `blake3`.
 - `TARGET_PATH` is treated as an absolute path inside the target filesystem (non-absolute values are
   auto-prefixed with `/` during staging).
   - `{file|text}.ext /path/target` → `/path/target`
@@ -144,7 +145,8 @@ from specs via `stage = ["<name>", ...]`.
 - Safety: tar unpacking rejects absolute paths, `..` traversal, and special
   entries like device nodes.
 - Inline text artifacts (`type = "text"`) embed a `text` value in the manifest
-  and write it to `target` during staging.
+  and write it to `target` during staging. `rdebootstrap add artifact @file`
+  creates a text artifact from a UTF-8 file (target path required).
 
 ## Build Environment and Scripts
 
