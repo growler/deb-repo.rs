@@ -19,7 +19,7 @@ version:
 		ver="$$base"; \
 	else \
 		tag=$$(git describe --tags --match "v*" --abbrev=0); \
-		suffix=$${full#$$tag=}; \
+		suffix=$${full#$$tag-}; \
 		ver="$$debver~pre$$suffix"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
 	fi; \
@@ -42,23 +42,20 @@ $(RDEBOOTSTRAP):
 
 define DISTRO_template
 
-$(CURDIR)/target/$(1)-build:
-	@mkdir -p "$$@" "$$@/src" "$$@/target"
+$(CURDIR)/target/$(1)-tree/.spec-id: $(CURDIR)/$(1)-build.toml $(RDEBOOTSTRAP)
+	@mkdir -p $$(@D) && $(RDEBOOTSTRAP) -m "$$<" show spec-hash > "$$@"
 
-$(CURDIR)/target/$(1)-build/.spec-id: $(CURDIR)/$(1)-build.toml $(CURDIR)/target/$(1)-build $(RDEBOOTSTRAP)
-	@$(RDEBOOTSTRAP) -m "$$<" show spec-hash > "$$@"
-
-$(1)-tree: $(CURDIR)/target/$(1)-build/.spec-id
+$(1)-tree: $(CURDIR)/target/$(1)-tree/.spec-id
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Creating the target directory"; \
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
 		podman unshare $(RDEBOOTSTRAP) -n $(DOWNLOADS) -m $(CURDIR)/$(1)-build.toml build --path "$$$$TREE"; \
-		podman unshare chown -R "$$$$(id -u):$$$$(id -g)" "$$$$TREE"; \
+		podman unshare chown -R "0:0" "$$$$TREE"; \
 	fi
 
-$(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
+$(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \
@@ -75,11 +72,10 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 	cp debian/changelog debian/orig-changelog; \
 	trap 'mv debian/orig-changelog debian/changelog || true' EXIT; \
 	$(PODMAN) run --rm --systemd=always \
-		--volume "$$(<D):/root/build" \
+		--volume "$$(CURDIR)/target:/root/build" \
 		--volume "$$(CURDIR):/root/build/src" \
-		--volume "$$(<D)/target:/root/build/src/target" \
-		--volume "$$(CURDIR)/target/cargo-home:/root/build/src/target/cargo-home" \
 		--workdir /root/build/src \
+		--env CARGO_HOME=/root/build/cargo-home \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
 		--env DCH_NEW_VERSION="$$$$version" \
@@ -96,7 +92,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-build/.spec-id $(1)-tree version manpages
 					echo "Unknown DCH_MODE=$$$$DCH_MODE" >&2; \
 					exit 1 ;; \
 			esac; \
-			dpkg-buildpackage -us -uc -b'
+			dpkg-buildpackage -uc -b -tc'
 
 packages: $(1)-packages
 
