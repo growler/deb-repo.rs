@@ -161,6 +161,7 @@ pub mod cmd {
             content::{ContentProviderGuard, HostCache},
             hash::{Hash, HashAlgo},
             manifest::Manifest,
+            manifest_doc::spec_display_name,
             staging::HostFileSystem,
             version::ProvidedName,
         },
@@ -197,6 +198,15 @@ Examples:
         #[arg(short = 'r', long = "package", value_name = "PACKAGE")]
         requirements: Vec<String>,
 
+        /// Meta entry to add to the default spec (NAME VALUE, repeatable)
+        #[arg(
+            long = "meta",
+            value_names = ["NAME", "VALUE"],
+            num_args = 2,
+            action = clap::ArgAction::Append
+        )]
+        meta: Vec<String>,
+
         /// Archive definition (URL plus suite/component/snapshot options).
         /// URL might be a vendor name (debian, ubuntu, devuan).
         #[command(flatten)]
@@ -231,6 +241,9 @@ Examples:
                     archives.iter().cloned(),
                     self.comment.as_deref().or(comment.as_deref()),
                 );
+                for pair in self.meta.chunks_exact(2) {
+                    mf.set_meta(None, &pair[0], &pair[1])?;
+                }
                 mf.add_requirements(None, packages.iter(), None)?;
                 mf.update(
                     true,
@@ -874,6 +887,295 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
+    pub enum SpecCommands {
+        Meta(SpecMeta),
+        Hash(SpecHash),
+        List(SpecList),
+        Packages(SpecPackages),
+        Require(SpecRequire),
+        Forbid(SpecForbid),
+        Remove(SpecRemove),
+        Artifact(SpecArtifact),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Inspect or update specs")]
+    /// CLI command: inspect or update spec data.
+    pub struct Spec {
+        #[command(subcommand)]
+        cmd: SpecCommands,
+    }
+    impl<C: Config> Command<C> for Spec {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                SpecCommands::Meta(cmd) => cmd.exec(conf),
+                SpecCommands::Hash(cmd) => cmd.exec(conf),
+                SpecCommands::List(cmd) => cmd.exec(conf),
+                SpecCommands::Packages(cmd) => cmd.exec(conf),
+                SpecCommands::Require(cmd) => cmd.exec(conf),
+                SpecCommands::Forbid(cmd) => cmd.exec(conf),
+                SpecCommands::Remove(cmd) => cmd.exec(conf),
+                SpecCommands::Artifact(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Inspect or update spec metadata")]
+    /// CLI command: get or set spec metadata entries.
+    pub struct SpecMeta {
+        #[command(subcommand)]
+        cmd: SpecMetaCommands,
+    }
+    impl<C: Config> Command<C> for SpecMeta {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                SpecMetaCommands::Get(cmd) => cmd.exec(conf),
+                SpecMetaCommands::Set(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum SpecMetaCommands {
+        #[command(name = "get", alias = "get-meta")]
+        Get(SpecGetMeta),
+        #[command(name = "set", alias = "set-meta")]
+        Set(SpecSetMeta),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Show a spec hash")]
+    /// CLI command: show hash for a spec entry.
+    pub struct SpecHash {
+        #[command(flatten)]
+        inner: ShowSpecHash,
+    }
+    impl<C: Config> Command<C> for SpecHash {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "List spec names")]
+    /// CLI command: list available spec names.
+    pub struct SpecList;
+    impl<C: Config> Command<C> for SpecList {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let (mf, _) = Manifest::from_file_with_lock_base(
+                    conf.manifest(),
+                    conf.arch(),
+                    conf.lock_base(),
+                )
+                .await?;
+                for name in mf.spec_names() {
+                    println!("{}", name);
+                }
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "List packages for a spec")]
+    /// CLI command: list packages for a spec.
+    pub struct SpecPackages {
+        /// Spec name (omit to use the default spec)
+        #[arg(value_name = "SPEC")]
+        spec: Option<String>,
+        #[arg(short = 'e', long = "only-essential", hide = true)]
+        only_essential: bool,
+    }
+    impl<C: Config> Command<C> for SpecPackages {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                let (mut mf, _) = Manifest::from_file_with_lock_base(
+                    conf.manifest(),
+                    conf.arch(),
+                    conf.lock_base(),
+                )
+                .await?;
+                mf.load_universe(conf.concurrency(), fetcher).await?;
+                guard.commit().await?;
+                let mut pkgs = mf
+                    .spec_packages(self.spec.as_deref())?
+                    .filter(|p| !self.only_essential || p.essential())
+                    .collect::<Vec<_>>();
+                pkgs.sort_by_key(|&pkg| pkg.name());
+                let mut out = std::io::stdout().lock();
+                let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
+                pretty_print_packages(&mut out, pkgs, false).await?;
+                out.flush().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Add package requirements to a spec", alias = "include")]
+    /// CLI command: add package requirements to a spec.
+    pub struct SpecRequire {
+        #[command(flatten)]
+        inner: Include,
+    }
+    impl<C: Config> Command<C> for SpecRequire {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Add package constraints to a spec", alias = "exclude")]
+    /// CLI command: add package constraints to a spec.
+    pub struct SpecForbid {
+        #[command(flatten)]
+        inner: Exclude,
+    }
+    impl<C: Config> Command<C> for SpecForbid {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Remove requirements or constraints from a spec",
+        alias = "drop"
+    )]
+    /// CLI command: remove requirements or constraints from a spec.
+    pub struct SpecRemove {
+        #[command(flatten)]
+        inner: Drop,
+    }
+    impl<C: Config> Command<C> for SpecRemove {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Manage spec artifacts")]
+    /// CLI command: manage spec artifact staging.
+    pub struct SpecArtifact {
+        #[command(subcommand)]
+        cmd: SpecArtifactCommands,
+    }
+    impl<C: Config> Command<C> for SpecArtifact {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                SpecArtifactCommands::Add(cmd) => cmd.exec(conf),
+                SpecArtifactCommands::Remove(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum SpecArtifactCommands {
+        #[command(name = "add", alias = "stage")]
+        Add(SpecArtifactAdd),
+        #[command(name = "remove", alias = "unstage")]
+        Remove(SpecArtifactRemove),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Stage an artifact into a spec")]
+    /// CLI command: stage an artifact into a spec.
+    pub struct SpecArtifactAdd {
+        #[command(flatten)]
+        inner: Stage,
+    }
+    impl<C: Config> Command<C> for SpecArtifactAdd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Remove a staged artifact from a spec")]
+    /// CLI command: unstage an artifact from a spec.
+    pub struct SpecArtifactRemove {
+        #[command(flatten)]
+        inner: Unstage,
+    }
+    impl<C: Config> Command<C> for SpecArtifactRemove {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Get a spec meta value")]
+    /// CLI command: get a spec meta entry.
+    pub struct SpecGetMeta {
+        /// Spec name (omit to use the default spec)
+        #[arg(short = 's', long = "spec", value_name = "SPEC")]
+        spec: Option<String>,
+        /// Meta name
+        #[arg(value_name = "NAME")]
+        name: String,
+    }
+
+    impl<C: Config> Command<C> for SpecGetMeta {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let (mf, _) = Manifest::from_file_with_lock_base(
+                    conf.manifest(),
+                    conf.arch(),
+                    conf.lock_base(),
+                )
+                .await?;
+                match mf.get_meta(self.spec.as_deref(), &self.name)? {
+                    Some(value) => {
+                        println!("{}", value);
+                        Ok(())
+                    }
+                    None => Err(anyhow!(
+                        "meta {} not found in spec {}",
+                        self.name,
+                        spec_display_name(self.spec.as_deref().unwrap_or(""))
+                    )),
+                }
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Set a spec meta value")]
+    /// CLI command: set a spec meta entry.
+    pub struct SpecSetMeta {
+        /// Spec name (omit to use the default spec)
+        #[arg(short = 's', long = "spec", value_name = "SPEC")]
+        spec: Option<String>,
+        /// Meta name
+        #[arg(value_name = "NAME")]
+        name: String,
+        /// Meta value
+        #[arg(value_name = "VALUE")]
+        value: String,
+    }
+
+    impl<C: Config> Command<C> for SpecSetMeta {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let (mut mf, _) = Manifest::from_file_with_lock_base(
+                    conf.manifest(),
+                    conf.arch(),
+                    conf.lock_base(),
+                )
+                .await?;
+                mf.set_meta(self.spec.as_deref(), &self.name, &self.value)?;
+                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
+                    .await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
     pub enum ShowCommands {
         Package(ShowPackage),
         Source(ShowSource),
@@ -1070,6 +1372,171 @@ hash = \"{}\"
                 out.flush().await?;
                 Ok(())
             })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(name = "package", about = "Inspect packages")]
+    /// CLI command: inspect package records.
+    pub struct PackageCmd {
+        #[command(subcommand)]
+        cmd: PackageCommands,
+    }
+    impl<C: Config> Command<C> for PackageCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                PackageCommands::Show(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum PackageCommands {
+        Show(PackageShow),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Show a package's control record")]
+    /// CLI command: show metadata for a package.
+    pub struct PackageShow {
+        #[command(flatten)]
+        inner: ShowPackage,
+    }
+    impl<C: Config> Command<C> for PackageShow {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(name = "source", about = "Inspect source packages")]
+    /// CLI command: inspect source package records.
+    pub struct SourceCmd {
+        #[command(subcommand)]
+        cmd: SourceCommands,
+    }
+    impl<C: Config> Command<C> for SourceCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                SourceCommands::Show(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum SourceCommands {
+        Show(SourceShow),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Show a package's source control record")]
+    /// CLI command: show metadata for a source package.
+    pub struct SourceShow {
+        #[command(flatten)]
+        inner: ShowSource,
+    }
+    impl<C: Config> Command<C> for SourceShow {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(name = "archive", about = "Manage archives")]
+    /// CLI command: manage archive entries.
+    pub struct ArchiveCmd {
+        #[command(subcommand)]
+        cmd: ArchiveCommands,
+    }
+    impl<C: Config> Command<C> for ArchiveCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                ArchiveCommands::Add(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum ArchiveCommands {
+        Add(ArchiveAdd),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Add an archive")]
+    /// CLI command: add an archive.
+    pub struct ArchiveAdd {
+        #[command(flatten)]
+        inner: AddArchive,
+    }
+    impl<C: Config> Command<C> for ArchiveAdd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(name = "artifact", about = "Manage artifacts")]
+    /// CLI command: manage artifact entries.
+    pub struct ArtifactCmd {
+        #[command(subcommand)]
+        cmd: ArtifactCommands,
+    }
+    impl<C: Config> Command<C> for ArtifactCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                ArtifactCommands::Add(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum ArtifactCommands {
+        Add(ArtifactAdd),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Add an artifact")]
+    /// CLI command: add an artifact definition.
+    pub struct ArtifactAdd {
+        #[command(flatten)]
+        inner: AddArtifact,
+    }
+    impl<C: Config> Command<C> for ArtifactAdd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(name = "local", about = "Manage local packages")]
+    /// CLI command: manage local package entries.
+    pub struct LocalCmd {
+        #[command(subcommand)]
+        cmd: LocalCommands,
+    }
+    impl<C: Config> Command<C> for LocalCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            match &self.cmd {
+                LocalCommands::Add(cmd) => cmd.exec(conf),
+            }
+        }
+    }
+
+    #[derive(Parser)]
+    pub enum LocalCommands {
+        Add(LocalAdd),
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Add a local package")]
+    /// CLI command: add a local package.
+    pub struct LocalAdd {
+        #[command(flatten)]
+        inner: AddLocalPackage,
+    }
+    impl<C: Config> Command<C> for LocalAdd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            self.inner.exec(conf)
         }
     }
 

@@ -53,8 +53,8 @@ pub struct Spec {
     )]
     pub build_script: Option<String>,
 
-    #[serde(default, skip_serializing_if = "KVList::is_empty")]
-    pub meta: KVList<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub meta: Vec<String>,
 }
 
 impl Spec {
@@ -65,7 +65,7 @@ impl Spec {
             exclude: Vec::new(),
             stage: Vec::new(),
             build_env: KVList::new(),
-            meta: KVList::new(),
+            meta: Vec::new(),
             build_script: None,
         }
     }
@@ -75,6 +75,43 @@ impl Spec {
             installables: None,
         }
     }
+}
+
+pub(crate) const META_VALUE_MAX_BYTES: usize = 1024;
+
+pub(crate) fn validate_meta_name(name: &str) -> Result<(), String> {
+    let mut chars = name.chars();
+    let first = chars
+        .next()
+        .ok_or_else(|| "meta name is empty".to_string())?;
+    if !first.is_ascii_alphabetic() {
+        return Err("meta name must start with an ASCII letter".to_string());
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.') {
+        return Err(
+            "meta name may only contain ASCII alphanumerics, '_', '-', and '.'".to_string(),
+        );
+    }
+    Ok(())
+}
+
+pub(crate) fn validate_meta_value(value: &str) -> Result<(), String> {
+    if value.len() > META_VALUE_MAX_BYTES {
+        return Err(format!("meta value exceeds {} bytes", META_VALUE_MAX_BYTES));
+    }
+    if value.chars().any(|c| c.is_control()) {
+        return Err("meta value contains non-printable characters".to_string());
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_meta_entry(entry: &str) -> Result<(&str, &str), String> {
+    let (name, value) = entry
+        .split_once(':')
+        .ok_or_else(|| "meta entry must be in \"name:value\" form".to_string())?;
+    validate_meta_name(name)?;
+    validate_meta_value(value)?;
+    Ok((name, value))
 }
 
 #[derive(Clone)]

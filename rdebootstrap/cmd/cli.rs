@@ -171,16 +171,25 @@ debrepo::cli_commands! {
     pub enum Commands<App> {
         Init(deb_cli::cmd::Init),
         Update(deb_cli::cmd::Update),
-        Edit(deb_cli::cmd::Edit),
-        Add(deb_cli::cmd::Add),
+        Build(deb_cli::cmd::Build),
+        Search(deb_cli::cmd::Search),
+        Spec(deb_cli::cmd::Spec),
+        Package(deb_cli::cmd::PackageCmd),
+        Source(deb_cli::cmd::SourceCmd),
+        Archive(deb_cli::cmd::ArchiveCmd),
+        Artifact(deb_cli::cmd::ArtifactCmd),
+        Local(deb_cli::cmd::LocalCmd),
         Include(deb_cli::cmd::Include),
         Exclude(deb_cli::cmd::Exclude),
         Drop(deb_cli::cmd::Drop),
         Stage(deb_cli::cmd::Stage),
         Unstage(deb_cli::cmd::Unstage),
-        Build(deb_cli::cmd::Build),
+        Edit(deb_cli::cmd::Edit),
+        #[command(hide = true)]
+        Add(deb_cli::cmd::Add),
+        #[command(hide = true)]
         List(deb_cli::cmd::List),
-        Search(deb_cli::cmd::Search),
+        #[command(hide = true)]
         Show(deb_cli::cmd::Show),
         #[command(hide = true)]
         Tool(deb_cli::cmd::Tool),

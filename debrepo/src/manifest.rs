@@ -9,7 +9,10 @@ use {
         kvlist::KVList,
         manifest_doc::{spec_display_name, BuildEnvComments, LockFile, ManifestFile, UpdateResult},
         packages::Package,
-        spec::{LockedArchive, LockedPackage, LockedSpec},
+        spec::{
+            parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
+            LockedPackage, LockedSpec,
+        },
         staging::StagingFileSystem,
         universe::Universe,
         version::{IntoConstraint, IntoDependency, ProvidedName},
@@ -341,6 +344,22 @@ impl Manifest {
         }
         Ok(env)
     }
+    fn meta_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(String, String)>> {
+        let mut meta: Vec<(String, String)> = Vec::new();
+        let mut specs = file.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+        specs.reverse();
+        for spec in specs {
+            for entry in &spec.meta {
+                let (key, value) = parse_meta_entry(entry).map_err(io::Error::other)?;
+                if let Some((_, existing)) = meta.iter_mut().find(|(k, _)| k == key) {
+                    *existing = value.to_string();
+                } else {
+                    meta.push((key.to_string(), value.to_string()));
+                }
+            }
+        }
+        Ok(meta)
+    }
     fn artifacts_for_spec<'a>(
         file: &'a ManifestFile,
         arch: &'a str,
@@ -392,6 +411,13 @@ impl Manifest {
             h.update(&[0]);
             h.update(value.as_bytes());
             hasher.update(&h.finalize_fixed());
+        }
+        let meta = Self::meta_for_spec(file, spec_index)?;
+        hasher.update(&meta.len().to_be_bytes());
+        for (key, value) in meta {
+            hasher.update(key.as_bytes());
+            hasher.update(&[0]);
+            hasher.update(value.as_bytes());
         }
         let artifacts =
             Self::artifacts_for_spec(file, arch, spec_index).collect::<io::Result<Vec<_>>>()?;
@@ -624,6 +650,25 @@ impl Manifest {
             .file
             .spec_build_script(spec_name)?
             .map(|script| script.to_string()))
+    }
+    pub fn get_meta(&self, spec_name: Option<&str>, name: &str) -> io::Result<Option<String>> {
+        validate_meta_name(name).map_err(io::Error::other)?;
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        let meta = Self::meta_for_spec(&self.file, spec_index)?;
+        Ok(meta
+            .into_iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value))
+    }
+    pub fn set_meta(&mut self, spec_name: Option<&str>, name: &str, value: &str) -> io::Result<()> {
+        validate_meta_name(name).map_err(io::Error::other)?;
+        validate_meta_value(value).map_err(io::Error::other)?;
+        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        self.file.set_meta_entry(spec_name, name, value)?;
+        self.mark_file_updated();
+        self.refresh_spec_hashes(spec_index)?;
+        self.mark_lock_updated();
+        Ok(())
     }
     pub fn set_build_env(
         &mut self,

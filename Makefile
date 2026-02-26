@@ -18,12 +18,12 @@ version:
 	if [ "$$base" = "$$debver" ]; then \
 		ver="$$debver"; \
 	elif [ -z "$$full" ]; then \
-		ver="$$debver~pre$$(date +%s)+$$(git rev-parse --short HEAD)"; \
+		ver="$$debver~pre-$$(date +%s)+$$(git rev-parse --short HEAD)"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+untracked"; \
 	else \
 		tag=$$(git describe --tags --match "v*" --abbrev=0); \
 		suffix=$${full#$$tag-}; \
-		ver="$$debver~pre$$suffix"; \
+		ver="$$debver~pre-$$suffix"; \
 		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
 	fi; \
 	echo $$ver \

@@ -153,6 +153,20 @@ impl ManifestFile {
             )
         })?;
         manifest.specs_order()?;
+        for (name, spec) in manifest.specs.iter() {
+            for entry in &spec.meta {
+                parse_meta_entry(entry).map_err(|err| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid meta entry in spec {}: {}",
+                            spec_display_name(name),
+                            err
+                        ),
+                    )
+                })?;
+            }
+        }
         let doc = text
             .parse::<toml_edit::DocumentMut>()
             .map_err(|err| {
@@ -467,6 +481,50 @@ impl ManifestFile {
                 }
             }
             table.insert_formatted(&key_entry, item);
+        }
+        Ok(())
+    }
+    pub fn set_meta_entry(
+        &mut self,
+        spec_name: Option<&str>,
+        name: &str,
+        value: &str,
+    ) -> io::Result<()> {
+        let (spec_name, spec_index) = self.spec_index_ensure(spec_name)?;
+        let entry = format!("{}:{}", name, value);
+        let spec = self.specs.value_mut_at(spec_index);
+        let mut found = None;
+        for (idx, item) in spec.meta.iter().enumerate() {
+            if let Ok((item_name, _)) = parse_meta_entry(item) {
+                if item_name == name {
+                    found = Some(idx);
+                    break;
+                }
+            }
+        }
+        match found {
+            Some(idx) => spec.meta[idx] = entry.clone(),
+            None => spec.meta.push(entry.clone()),
+        }
+
+        let arr = self.doc.get_spec_table_items_mut(spec_name, "meta");
+        match found {
+            Some(idx) => {
+                if let Some(item) = arr.get_mut(idx) {
+                    let decor = item.decor().clone();
+                    *item = toml_edit::Value::from(entry.as_str());
+                    *item.decor_mut() = decor;
+                } else {
+                    let mut item = toml_edit::Value::from(entry.as_str());
+                    item.decor_mut().set_prefix("\n    ".to_string());
+                    arr.push_formatted(item);
+                }
+            }
+            None => {
+                let mut item = toml_edit::Value::from(entry.as_str());
+                item.decor_mut().set_prefix("\n    ".to_string());
+                arr.push_formatted(item);
+            }
         }
         Ok(())
     }
@@ -1141,7 +1199,7 @@ where
                 exclude: Option<Vec<Constraint<String>>>,
                 stage: Option<Vec<String>>,
                 build_env: Option<KVList<String>>,
-                meta: Option<KVList<String>>,
+                meta: Option<Vec<String>>,
                 build_script: Option<String>,
             }
             let mut def = DefaultAcc::default();
@@ -1177,6 +1235,10 @@ where
                     "build-env" => {
                         let v = access.next_value::<KVList<String>>()?;
                         set_once!(def.build_env, v, "build-env");
+                    }
+                    "meta" => {
+                        let v = access.next_value::<Vec<String>>()?;
+                        set_once!(def.meta, v, "meta");
                     }
                     "build-script" => {
                         let v = access.next_value::<String>()?;
@@ -1269,13 +1331,15 @@ where
 }
 
 #[inline]
-fn category(key: &str) -> u8 {
+fn spec_entry_order(key: &str) -> u8 {
     match key {
         "extends" => 0,
-        "include" | "exclude" => 1,
-        "build-env" | "build-script" => 2,
+        "meta" => 1,
+        "include" | "exclude" => 2,
         "stage" => 3,
-        _ => 4,
+        "build-env" => 4,
+        "build-script" => 5,
+        _ => 6,
     }
 }
 
@@ -1284,21 +1348,6 @@ fn spec_items() -> toml_edit::Item {
     arr.set_trailing("\n");
     arr.set_trailing_comma(true);
     arr.into()
-}
-
-fn table_items_mut<'a>(table: &'a mut toml_edit::Table, kind: &str) -> &'a mut toml_edit::Array {
-    table
-        .entry(kind)
-        .or_insert_with(|| {
-            let mut arr = toml_edit::Array::new();
-            if arr.is_empty() {
-                arr.set_trailing("\n");
-                arr.set_trailing_comma(true);
-            }
-            arr.into()
-        })
-        .as_array_mut()
-        .expect("a list of spec items")
 }
 
 pub(crate) trait ManifestDoc {
@@ -1344,7 +1393,7 @@ pub(crate) trait ManifestDoc {
             table.get_mut(entry).expect("a valid table entry")
         } else {
             table.insert(entry, dflt());
-            table.sort_values_by(|k1, _, k2, _| category(k1).cmp(&category(k2)));
+            table.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
             table.get_mut(entry).expect("a valid table entry")
         }
     }
@@ -1522,7 +1571,16 @@ pub(crate) trait ManifestDoc {
         }
     }
     fn get_spec_table_items_mut(&mut self, spec_name: &str, kind: &str) -> &mut toml_edit::Array {
-        table_items_mut(self.get_spec_table_mut(spec_name), kind)
+        self.get_spec_table_entry_mut(spec_name, kind, || {
+            let mut arr = toml_edit::Array::new();
+            if arr.is_empty() {
+                arr.set_trailing("\n");
+                arr.set_trailing_comma(true);
+            }
+            arr.into()
+        })
+        .as_array_mut()
+        .expect("a list of spec items")
     }
     fn push_decorated_items<T, I, C>(
         &mut self,
@@ -1560,13 +1618,6 @@ impl ManifestDoc for toml_edit::DocumentMut {
             .or_insert_with(toml_edit::table)
             .as_table_mut()
             .expect("a table of specs");
-        fn spec_entry_order(entry: &str) -> u8 {
-            match entry {
-                "include" | "exclude" | "extends" | "stage" | "build-env" | "build-script" => 0,
-                "meta" => 1,
-                _ => 2,
-            }
-        }
         default_spec.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
         fn entry_order(entry: &str) -> u8 {
             match entry {

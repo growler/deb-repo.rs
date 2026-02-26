@@ -29,5 +29,3 @@ override_dh_auto_install:
 		$(CURDIR)/debian/rdeboostrap/usr/share/man/rdebootstrap.1
 
 override_dh_auto_clean:
-	-cargo clean -r
-	rm -rf target/man
