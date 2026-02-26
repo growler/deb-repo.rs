@@ -46,7 +46,7 @@ $(RDEBOOTSTRAP):
 define DISTRO_template
 
 $(CURDIR)/target/$(1)-tree/.spec-id: $(CURDIR)/$(1)-build.toml $(RDEBOOTSTRAP)
-	@mkdir -p $$(@D) && $(RDEBOOTSTRAP) -m "$$<" show spec-hash > "$$@"
+	@mkdir -p $$(@D) && $(RDEBOOTSTRAP) -m "$$<" spec hash > "$$@"
 
 $(1)-tree: $(CURDIR)/target/$(1)-tree/.spec-id
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
