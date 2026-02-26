@@ -539,6 +539,53 @@ fn add_artifact_prevents_duplicate_stage_and_comment_on_update() {
 }
 
 #[test]
+fn update_locals_refreshes_local_artifact_hashes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let artifact_path = dir.path().join("artifact-file");
+    std::fs::write(&artifact_path, b"before").expect("write artifact");
+    let provider = TestProvider::new(dir.path().to_path_buf());
+
+    let mut manifest = Manifest::new(ARCH, None);
+    manifest
+        .add_requirements(None, ["base"], None)
+        .expect("add requirements");
+    let arg = ArtifactArg {
+        mode: None,
+        do_not_unpack: false,
+        target_arch: None,
+        url: "artifact-file".to_string(),
+        target: Some("/opt/artifact-file".to_string()),
+    };
+    smol::block_on(async {
+        manifest
+            .add_artifact(None, &arg, None, &provider)
+            .await
+            .expect("add artifact");
+    });
+
+    let old_hash = manifest
+        .artifact("artifact-file")
+        .expect("artifact exists")
+        .hash();
+
+    std::fs::write(&artifact_path, b"after").expect("update artifact");
+
+    let updated = smol::block_on(async {
+        manifest
+            .update_local_artifacts(&provider)
+            .await
+            .expect("update locals")
+    });
+    assert!(updated);
+
+    let new_hash = manifest
+        .artifact("artifact-file")
+        .expect("artifact exists")
+        .hash();
+    assert_ne!(old_hash, new_hash);
+}
+
+#[test]
 fn add_artifact_named_spec_adds_stage_and_comment() {
     let dir = tempfile::tempdir().expect("tempdir");
     let artifact_path = dir.path().join("artifact-dir");

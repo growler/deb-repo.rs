@@ -242,7 +242,7 @@ Examples:
                     self.comment.as_deref().or(comment.as_deref()),
                 );
                 for pair in self.meta.chunks_exact(2) {
-                    mf.set_meta(None, &pair[0], &pair[1])?;
+                    mf.set_spec_meta(None, &pair[0], &pair[1])?;
                 }
                 mf.add_requirements(None, packages.iter(), None)?;
                 mf.update(
@@ -268,18 +268,18 @@ Examples:
         long_about = "Add an archive definition to the manifest file."
     )]
     /// CLI command: add an archive to the manifest.
-    pub struct AddArchive {
+    pub struct ArchiveAdd {
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
-        #[command(flatten)]
-        archive: Archive,
-
         /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
+
+        #[command(flatten)]
+        archive: Archive,
     }
-    impl<C: Config> Command<C> for AddArchive {
+    impl<C: Config> Command<C> for ArchiveAdd {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -290,7 +290,13 @@ Examples:
                     conf.lock_base(),
                 )
                 .await?;
-                mf.add_archive(self.archive.clone(), self.comment.as_deref())?;
+                if let Some((archives, _)) = self.archive.as_vendor() {
+                    for archive in archives {
+                        mf.add_archive(archive, self.comment.as_deref())?;
+                    }
+                } else {
+                    mf.add_archive(self.archive.clone(), self.comment.as_deref())?;
+                }
                 mf.update(false, false, false, conf.concurrency(), fetcher)
                     .await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
@@ -309,7 +315,7 @@ Examples:
         long_about = "Add a local .deb package to the manifest file so it can be staged alongside archives."
     )]
     /// CLI command: add a local package file to the manifest.
-    pub struct AddLocalPackage {
+    pub struct DebAdd {
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
@@ -317,7 +323,7 @@ Examples:
         #[arg(value_name = "PATH")]
         path: PathBuf,
     }
-    impl<C: Config> Command<C> for AddLocalPackage {
+    impl<C: Config> Command<C> for DebAdd {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -350,7 +356,7 @@ Examples:
         long_about = "Add an artifact definition to the manifest file. Use --stage to attach it to a spec."
     )]
     /// CLI command: add an artifact definition to the manifest.
-    pub struct AddArtifact {
+    pub struct ArtifactAdd {
         /// Optional comment to record with this change
         #[arg(short = 'c', long = "comment", value_name = "COMMENT")]
         comment: Option<String>,
@@ -366,7 +372,7 @@ Examples:
         #[command(flatten)]
         artifact: ArtifactArg,
     }
-    impl<C: Config> Command<C> for AddArtifact {
+    impl<C: Config> Command<C> for ArtifactAdd {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -424,42 +430,17 @@ Examples:
         }
     }
 
-    #[allow(clippy::large_enum_variant)]
-    #[derive(Parser)]
-    pub enum AddCommands {
-        Archive(AddArchive),
-        Local(AddLocalPackage),
-        Artifact(AddArtifact),
-    }
-
-    #[derive(Parser)]
-    #[command(about = "Add an archive, local package, or artifact to the manifest")]
-    /// CLI command: add archives or packages.
-    pub struct Add {
-        #[command(subcommand)]
-        cmd: AddCommands,
-    }
-    impl<C: Config> Command<C> for Add {
-        fn exec(&self, conf: &C) -> Result<()> {
-            match &self.cmd {
-                AddCommands::Archive(cmd) => cmd.exec(conf),
-                AddCommands::Local(cmd) => cmd.exec(conf),
-                AddCommands::Artifact(cmd) => cmd.exec(conf),
-            }
-        }
-    }
-
     #[derive(Parser)]
     #[command(
         about = "Remove an archive",
         long_about = "Remove an archive reference from the manifest file."
     )]
     /// CLI command: remove an archive from the manifest.
-    pub struct RemoveArchive {
+    pub struct ArchiveRemove {
         #[command(flatten)]
         archive: Archive,
     }
-    impl<C: Config> Command<C> for RemoveArchive {
+    impl<C: Config> Command<C> for ArchiveRemove {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -486,11 +467,11 @@ Examples:
         long_about = "Remove a local package from the manifest file."
     )]
     /// CLI command: remove a local package from the manifest.
-    pub struct RemoveLocalPackage {
+    pub struct DebRemove {
         #[arg(value_name = "PATH")]
         path: PathBuf,
     }
-    impl<C: Config> Command<C> for RemoveLocalPackage {
+    impl<C: Config> Command<C> for DebRemove {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -512,39 +493,14 @@ Examples:
     }
 
     #[derive(Parser)]
-    pub enum RemoveCommands {
-        Archive(RemoveArchive),
-        Local(RemoveLocalPackage),
-    }
-
-    #[derive(Parser)]
     #[command(
-        about = "Remove requirements or constraints from a spec",
-        long_about = r#"Remove requirements and/or constraints from a spec.
-Use --requirements-only or --constraints-only to limit the operation scope."#
-    )]
-    /// CLI command: remove archives or packages.
-    pub struct Remove {
-        #[command(subcommand)]
-        cmd: RemoveCommands,
-    }
-    impl<C: Config> Command<C> for Remove {
-        fn exec(&self, conf: &C) -> Result<()> {
-            match &self.cmd {
-                RemoveCommands::Archive(cmd) => cmd.exec(conf),
-                RemoveCommands::Local(cmd) => cmd.exec(conf),
-            }
-        }
-    }
-
-    #[derive(Parser)]
-    #[command(
+        alias = "drop",
         about = "Remove requirements or constraints from a spec",
         long_about = r#"Remove requirements and/or constraints from a spec.
 Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     /// CLI command: drop entries from the manifest lock.
-    pub struct Drop {
+    pub struct Remove {
         /// Drop only requirements (do not touch constraints)
         #[arg(
             short = 'R',
@@ -569,7 +525,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         #[arg(value_name = "PACKAGE_OR_SET")]
         cons: Vec<String>,
     }
-    impl<C: Config> Command<C> for Drop {
+    impl<C: Config> Command<C> for Remove {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -672,6 +628,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Add package requirements to a spec",
+        alias = "include",
         long_about = r#"Add one or more package requirements to a spec. Each requirement can be a bare package name or a set, and can include a version relation, e.g.:
   foo
   foo (= 1.2.3)
@@ -681,7 +638,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
   Alternatively, requirement might be a path to .deb file to include directly."#
     )]
     /// CLI command: include packages into the spec.
-    pub struct Include {
+    pub struct Require {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
@@ -693,7 +650,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         reqs: Vec<Dependency<String>>,
     }
 
-    impl<C: Config> Command<C> for Include {
+    impl<C: Config> Command<C> for Require {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -722,13 +679,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Add package constraints to a spec",
+        alias = "exclude",
         long_about = r#"Add one or more constraints to restrict resolution. Examples:
   foo (= 1.2.3)
   foo (<< 2.0)  
   bar (<= 3.4)"#
     )]
     /// CLI command: exclude packages from the spec.
-    pub struct Exclude {
+    pub struct Forbid {
         /// Target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
@@ -740,7 +698,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         reqs: Vec<Constraint<String>>,
     }
 
-    impl<C: Config> Command<C> for Exclude {
+    impl<C: Config> Command<C> for Forbid {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -773,17 +731,15 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     /// CLI command: update the lockfile from sources.
     pub struct Update {
-        /// Update lock file even if it appears up to date
-        /// (refresh package indexes and re-resolve everything)
-        #[arg(short = 'f', long = "force", action)]
-        force: bool,
-        /// Re-fetch package archives even if they appear up to date (implies --force).
+        /// Update package archives.
         #[arg(short = 'A', long = "archives", action)]
         archives: bool,
-        /// Refresh local packages index (implies --force).
+        /// Refresh local packages and local artifacts
         #[arg(short = 'L', long = "locals", action)]
         locals: bool,
-        /// Snapshot ID to use for all snapshot-enabled archives (use 'now' for current time)
+        /// Snapshot ID to use for all snapshot-enabled archives (use 'now' for current time).
+        ///
+        /// Snapshot ID to use for all snapshot-enabled archives (use 'now' for current time), implies --archives
         #[arg(short = 's', long = "snapshot", value_name = "SNAPSHOT_ID", value_parser = SnapshotIdArgParser)]
         snapshot: Option<SnapshotId>,
         /// Do not verify InRelease signatures by default (not recommended)
@@ -796,7 +752,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let force = self.force || self.archives || self.locals;
+                let force_archives = self.archives || self.snapshot.is_some();
+                let force = force_archives || self.locals;
                 let (mut mf, has_valid_lock) = Manifest::from_file_with_lock_base(
                     conf.manifest(),
                     conf.arch(),
@@ -811,7 +768,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     mf.set_snapshot(*snapshot).await;
                 }
                 mf.update(
-                    self.archives,
+                    force_archives,
                     self.locals,
                     self.insecure_release,
                     conf.concurrency(),
@@ -945,19 +902,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
-    #[command(about = "Show a spec hash")]
-    /// CLI command: show hash for a spec entry.
-    pub struct SpecHash {
-        #[command(flatten)]
-        inner: ShowSpecHash,
-    }
-    impl<C: Config> Command<C> for SpecHash {
-        fn exec(&self, conf: &C) -> Result<()> {
-            self.inner.exec(conf)
-        }
-    }
-
-    #[derive(Parser)]
     #[command(about = "List spec names")]
     /// CLI command: list available spec names.
     pub struct SpecList;
@@ -982,45 +926,21 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[command(about = "List packages for a spec")]
     /// CLI command: list packages for a spec.
     pub struct SpecPackages {
-        /// Spec name (omit to use the default spec)
-        #[arg(value_name = "SPEC")]
-        spec: Option<String>,
-        #[arg(short = 'e', long = "only-essential", hide = true)]
-        only_essential: bool,
+        #[command(flatten)]
+        inner: List,
     }
     impl<C: Config> Command<C> for SpecPackages {
         fn exec(&self, conf: &C) -> Result<()> {
-            smol::block_on(async move {
-                let fetcher = conf.fetcher()?;
-                let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
-                guard.commit().await?;
-                let mut pkgs = mf
-                    .spec_packages(self.spec.as_deref())?
-                    .filter(|p| !self.only_essential || p.essential())
-                    .collect::<Vec<_>>();
-                pkgs.sort_by_key(|&pkg| pkg.name());
-                let mut out = std::io::stdout().lock();
-                let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
-                pretty_print_packages(&mut out, pkgs, false).await?;
-                out.flush().await?;
-                Ok(())
-            })
+            self.inner.exec(conf)
         }
     }
 
     #[derive(Parser)]
-    #[command(about = "Add package requirements to a spec", alias = "include")]
+    #[command(about = "Add package requirements to a spec")]
     /// CLI command: add package requirements to a spec.
     pub struct SpecRequire {
         #[command(flatten)]
-        inner: Include,
+        inner: Require,
     }
     impl<C: Config> Command<C> for SpecRequire {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -1029,11 +949,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
-    #[command(about = "Add package constraints to a spec", alias = "exclude")]
+    #[command(about = "Add package constraints to a spec")]
     /// CLI command: add package constraints to a spec.
     pub struct SpecForbid {
         #[command(flatten)]
-        inner: Exclude,
+        inner: Forbid,
     }
     impl<C: Config> Command<C> for SpecForbid {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -1042,14 +962,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
-    #[command(
-        about = "Remove requirements or constraints from a spec",
-        alias = "drop"
-    )]
+    #[command(about = "Remove requirements or constraints from a spec")]
     /// CLI command: remove requirements or constraints from a spec.
     pub struct SpecRemove {
         #[command(flatten)]
-        inner: Drop,
+        inner: Remove,
     }
     impl<C: Config> Command<C> for SpecRemove {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -1128,7 +1045,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     conf.lock_base(),
                 )
                 .await?;
-                match mf.get_meta(self.spec.as_deref(), &self.name)? {
+                match mf.get_spec_meta(self.spec.as_deref(), &self.name)? {
                     Some(value) => {
                         println!("{}", value);
                         Ok(())
@@ -1167,35 +1084,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     conf.lock_base(),
                 )
                 .await?;
-                mf.set_meta(self.spec.as_deref(), &self.name, &self.value)?;
+                mf.set_spec_meta(self.spec.as_deref(), &self.name, &self.value)?;
                 mf.store_with_lock_base(conf.manifest(), conf.lock_base())
                     .await?;
                 Ok(())
             })
-        }
-    }
-
-    #[derive(Parser)]
-    pub enum ShowCommands {
-        Package(ShowPackage),
-        Source(ShowSource),
-        SpecHash(ShowSpecHash),
-    }
-
-    #[derive(Parser)]
-    #[command(about = "Show package records or spec information")]
-    /// CLI command: show manifest and lock details.
-    pub struct Show {
-        #[command(subcommand)]
-        cmd: ShowCommands,
-    }
-    impl<C: Config> Command<C> for Show {
-        fn exec(&self, conf: &C) -> Result<()> {
-            match &self.cmd {
-                ShowCommands::Source(cmd) => cmd.exec(conf),
-                ShowCommands::Package(cmd) => cmd.exec(conf),
-                ShowCommands::SpecHash(cmd) => cmd.exec(conf),
-            }
         }
     }
 
@@ -1206,7 +1099,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         long_about = "Print the hash of a spec definition. By default the hash is printed as a hexadecimal string; use --sri to emit Subresource Integrity format."
     )]
     /// CLI command: show hash for a spec entry.
-    pub struct ShowSpecHash {
+    pub struct SpecHash {
         /// Use SRI format for the hash output
         ///
         /// Outputs the hash as SRI (Subresource Integrity) format, e.g.
@@ -1219,7 +1112,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         spec: Option<String>,
     }
 
-    impl<C: Config> Command<C> for ShowSpecHash {
+    impl<C: Config> Command<C> for SpecHash {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mf, _) = Manifest::from_file_with_lock_base(
@@ -1241,18 +1134,17 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
 
     #[derive(Parser)]
     #[command(
-        name = "package",
         about = "Show a package's control record",
         long_about = "Print the raw control record for the given package."
     )]
     /// CLI command: show metadata for a package.
-    pub struct ShowPackage {
+    pub struct PackageShow {
         /// Package name
         #[arg(value_name = "PACKAGE")]
         package: String,
     }
 
-    impl<C: Config> Command<C> for ShowPackage {
+    impl<C: Config> Command<C> for PackageShow {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
@@ -1279,12 +1171,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
 
     #[derive(Parser)]
     #[command(
-        name = "source",
         about = "Show a package's source control record",
         long_about = "Print the raw source control record for the given package or source package."
     )]
     /// CLI command: show metadata for a source package.
-    pub struct ShowSource {
+    pub struct SourceShow {
         /// Find and print source files as artifacts to stage in path.
         /// Fails if there are multiple source packages matching the name.
         #[arg(long = "stage-to", value_name = "PATH")]
@@ -1294,7 +1185,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         package: String,
     }
 
-    impl<C: Config> Command<C> for ShowSource {
+    impl<C: Config> Command<C> for SourceShow {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let name = ProvidedName::try_parse_display(&self.package).map_err(|err| {
@@ -1386,6 +1277,7 @@ hash = \"{}\"
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
                 PackageCommands::Show(cmd) => cmd.exec(conf),
+                PackageCommands::Search(cmd) => cmd.exec(conf),
             }
         }
     }
@@ -1393,16 +1285,17 @@ hash = \"{}\"
     #[derive(Parser)]
     pub enum PackageCommands {
         Show(PackageShow),
+        Search(PackageSearch),
     }
 
     #[derive(Parser)]
-    #[command(about = "Show a package's control record")]
-    /// CLI command: show metadata for a package.
-    pub struct PackageShow {
+    #[command(about = "Search for packages in the universe")]
+    /// CLI command: search for packages in the universe.
+    pub struct PackageSearch {
         #[command(flatten)]
-        inner: ShowPackage,
+        inner: Search,
     }
-    impl<C: Config> Command<C> for PackageShow {
+    impl<C: Config> Command<C> for PackageSearch {
         fn exec(&self, conf: &C) -> Result<()> {
             self.inner.exec(conf)
         }
@@ -1429,19 +1322,6 @@ hash = \"{}\"
     }
 
     #[derive(Parser)]
-    #[command(about = "Show a package's source control record")]
-    /// CLI command: show metadata for a source package.
-    pub struct SourceShow {
-        #[command(flatten)]
-        inner: ShowSource,
-    }
-    impl<C: Config> Command<C> for SourceShow {
-        fn exec(&self, conf: &C) -> Result<()> {
-            self.inner.exec(conf)
-        }
-    }
-
-    #[derive(Parser)]
     #[command(name = "archive", about = "Manage archives")]
     /// CLI command: manage archive entries.
     pub struct ArchiveCmd {
@@ -1452,6 +1332,7 @@ hash = \"{}\"
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
                 ArchiveCommands::Add(cmd) => cmd.exec(conf),
+                ArchiveCommands::Remove(cmd) => cmd.exec(conf),
             }
         }
     }
@@ -1459,19 +1340,7 @@ hash = \"{}\"
     #[derive(Parser)]
     pub enum ArchiveCommands {
         Add(ArchiveAdd),
-    }
-
-    #[derive(Parser)]
-    #[command(about = "Add an archive")]
-    /// CLI command: add an archive.
-    pub struct ArchiveAdd {
-        #[command(flatten)]
-        inner: AddArchive,
-    }
-    impl<C: Config> Command<C> for ArchiveAdd {
-        fn exec(&self, conf: &C) -> Result<()> {
-            self.inner.exec(conf)
-        }
+        Remove(ArchiveRemove),
     }
 
     #[derive(Parser)]
@@ -1495,49 +1364,25 @@ hash = \"{}\"
     }
 
     #[derive(Parser)]
-    #[command(about = "Add an artifact")]
-    /// CLI command: add an artifact definition.
-    pub struct ArtifactAdd {
-        #[command(flatten)]
-        inner: AddArtifact,
-    }
-    impl<C: Config> Command<C> for ArtifactAdd {
-        fn exec(&self, conf: &C) -> Result<()> {
-            self.inner.exec(conf)
-        }
-    }
-
-    #[derive(Parser)]
-    #[command(name = "local", about = "Manage local packages")]
+    #[command(name = "deb", about = "Manage local .deb files")]
     /// CLI command: manage local package entries.
-    pub struct LocalCmd {
+    pub struct DebCmd {
         #[command(subcommand)]
-        cmd: LocalCommands,
+        cmd: DebCommands,
     }
-    impl<C: Config> Command<C> for LocalCmd {
+    impl<C: Config> Command<C> for DebCmd {
         fn exec(&self, conf: &C) -> Result<()> {
             match &self.cmd {
-                LocalCommands::Add(cmd) => cmd.exec(conf),
+                DebCommands::Add(cmd) => cmd.exec(conf),
+                DebCommands::Remove(cmd) => cmd.exec(conf),
             }
         }
     }
 
     #[derive(Parser)]
-    pub enum LocalCommands {
-        Add(LocalAdd),
-    }
-
-    #[derive(Parser)]
-    #[command(about = "Add a local package")]
-    /// CLI command: add a local package.
-    pub struct LocalAdd {
-        #[command(flatten)]
-        inner: AddLocalPackage,
-    }
-    impl<C: Config> Command<C> for LocalAdd {
-        fn exec(&self, conf: &C) -> Result<()> {
-            self.inner.exec(conf)
-        }
+    pub enum DebCommands {
+        Add(DebAdd),
+        Remove(DebRemove),
     }
 
     fn normalize_hash_name(name: &str) -> Result<&'static str> {
@@ -1694,17 +1539,13 @@ hash = \"{}\"
 
     #[derive(Parser)]
     #[command(
-        about = "List manifest items",
-        long_about = "List manifest items (use --specs to list specs, or --spec <name> to list packages for a spec)."
+        about = "List spec packages",
+        long_about = "List spec packages. Use -e to see only essential packages, or -s to specify a non-default spec."
     )]
     /// CLI command: list manifest entries.
     pub struct List {
         #[arg(short = 'e', long = "only-essential", hide = true)]
         only_essential: bool,
-        //
-        /// List available spec names instead of package contents
-        #[arg(long = "specs", conflicts_with = "spec", action)]
-        list_specs: bool,
         /// List packages for the target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,

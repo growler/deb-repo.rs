@@ -176,7 +176,7 @@ environment such as a valid XDG runtime directory).
 - `drop` – remove requirements or constraints.
 - `stage` / `unstage` – add or remove artifacts (local files or URLs).
 - `update` – refresh metadata, solve dependencies, and rewrite the lock file
-  (supports `--snapshot`).
+  (supports `--snapshot`, `--locals` refreshes local packages and local artifacts).
 - `list`, `search`, `show` – inspect the resolved package universe.
 - `build` – expand a spec into a directory, running maintainer scripts within
   the sandbox helper.

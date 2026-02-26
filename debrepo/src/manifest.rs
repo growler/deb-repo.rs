@@ -344,17 +344,17 @@ impl Manifest {
         }
         Ok(env)
     }
-    fn meta_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(String, String)>> {
-        let mut meta: Vec<(String, String)> = Vec::new();
+    fn meta_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(&'_ str, &'_ str)>> {
+        let mut meta: Vec<(&str, &str)> = Vec::new();
         let mut specs = file.ancestors(id).collect::<io::Result<Vec<_>>>()?;
         specs.reverse();
         for spec in specs {
             for entry in &spec.meta {
                 let (key, value) = parse_meta_entry(entry).map_err(io::Error::other)?;
-                if let Some((_, existing)) = meta.iter_mut().find(|(k, _)| k == key) {
-                    *existing = value.to_string();
+                if let Some((_, existing)) = meta.iter_mut().find(|(k, _)| *k == key) {
+                    *existing = value;
                 } else {
-                    meta.push((key.to_string(), value.to_string()));
+                    meta.push((key, value));
                 }
             }
         }
@@ -651,16 +651,25 @@ impl Manifest {
             .spec_build_script(spec_name)?
             .map(|script| script.to_string()))
     }
-    pub fn get_meta(&self, spec_name: Option<&str>, name: &str) -> io::Result<Option<String>> {
+    pub fn get_spec_meta<'a>(
+        &'a self,
+        spec_name: Option<&str>,
+        name: &str,
+    ) -> io::Result<Option<&'a str>> {
         validate_meta_name(name).map_err(io::Error::other)?;
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         let meta = Self::meta_for_spec(&self.file, spec_index)?;
         Ok(meta
             .into_iter()
-            .find(|(key, _)| key == name)
+            .find(|(key, _)| *key == name)
             .map(|(_, value)| value))
     }
-    pub fn set_meta(&mut self, spec_name: Option<&str>, name: &str, value: &str) -> io::Result<()> {
+    pub fn set_spec_meta(
+        &mut self,
+        spec_name: Option<&str>,
+        name: &str,
+        value: &str,
+    ) -> io::Result<()> {
         validate_meta_name(name).map_err(io::Error::other)?;
         validate_meta_value(value).map_err(io::Error::other)?;
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
@@ -909,6 +918,30 @@ impl Manifest {
         self.lock.set_universe_hash(hash.into_hash());
         Ok(())
     }
+    pub(crate) async fn update_local_artifacts<C: ContentProvider>(
+        &mut self,
+        cache: &C,
+    ) -> io::Result<bool> {
+        let mut updates = Vec::new();
+        for artifact in self.file.artifacts_mut().iter_mut() {
+            if artifact.is_remote() || matches!(artifact, Artifact::Text(_)) {
+                continue;
+            }
+            let old_hash = artifact.hash();
+            let old_size = artifact.size();
+            let path = cache.resolve_path(artifact.uri()).await?;
+            artifact.hash_local(&path).await?;
+            if artifact.hash() != old_hash || artifact.size() != old_size {
+                updates.push(artifact.clone());
+            }
+        }
+        let updated = !updates.is_empty();
+        updates.into_iter().try_for_each(|artifact| {
+            self.upsert_artifact_only_inner(artifact, None)?;
+            Ok::<(), io::Error>(())
+        })?;
+        Ok(updated)
+    }
     pub async fn update<C: ContentProvider>(
         &mut self,
         force_archives: bool,
@@ -918,15 +951,15 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("updating locked archive");
-        let updated = self
-            .update_locked_archives(
-                concurrency,
-                force_archives,
-                force_locals,
-                skip_verify,
-                cache,
-            )
-            .await?;
+        let mut updated = false;
+        if force_locals || self.lock_updated {
+            updated = self.update_local_artifacts(cache).await?;
+        }
+        if force_archives || self.lock_updated {
+            updated |= self
+                .update_locked_archives(concurrency, true, false, skip_verify, cache)
+                .await?;
+        }
         if updated {
             tracing::debug!("archives updated, invalidating locked specs");
             self.lock.invalidate_specs();

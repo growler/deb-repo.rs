@@ -217,6 +217,9 @@ impl ManifestFile {
     pub fn artifacts(&self) -> &'_ [Artifact] {
         &self.artifacts
     }
+    pub(crate) fn artifacts_mut(&mut self) -> &'_ mut [Artifact] {
+        &mut self.artifacts
+    }
     pub fn artifact<'a>(&'a self, name: &str) -> Option<&'a Artifact> {
         self.artifacts.iter().find(|a| a.uri() == name)
     }

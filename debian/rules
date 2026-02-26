@@ -26,6 +26,6 @@ override_dh_auto_install:
 	install -Dm644 debian/usr.bin.rdebootstrap \
 		$(CURDIR)/debian/rdebootstrap/etc/apparmor.d/usr.bin.rdebootstrap
 	install -Dm644 target/man/rdebootstrap.1 \
-		$(CURDIR)/debian/rdeboostrap/usr/share/man/rdebootstrap.1
+		$(CURDIR)/debian/rdebootstrap/usr/share/man/rdebootstrap.1
 
 override_dh_auto_clean:

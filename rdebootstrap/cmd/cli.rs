@@ -95,7 +95,7 @@ inside an isolated sandbox so maintainer scripts run in a controlled environment
 
 Typical workflow:
     1) init             - create a manifest with sources and initial packages
-    2) include/exclude  - add package requirements and constraints
+    2) require/forbid   - add package requirements and constraints
     3) update           - refresh archive metadata and rewrite Manifest.<arch>.lock
     4) build            - extract and configure packages into a target directory
 "#
@@ -170,27 +170,22 @@ pub struct App {
 debrepo::cli_commands! {
     pub enum Commands<App> {
         Init(deb_cli::cmd::Init),
+        Archive(deb_cli::cmd::ArchiveCmd),
+        Deb(deb_cli::cmd::DebCmd),
+        Artifact(deb_cli::cmd::ArtifactCmd),
+        Require(deb_cli::cmd::Require),
+        Forbid(deb_cli::cmd::Forbid),
+        Remove(deb_cli::cmd::Remove),
+        Stage(deb_cli::cmd::Stage),
+        Unstage(deb_cli::cmd::Unstage),
+        List(deb_cli::cmd::List),
         Update(deb_cli::cmd::Update),
         Build(deb_cli::cmd::Build),
         Search(deb_cli::cmd::Search),
         Spec(deb_cli::cmd::Spec),
         Package(deb_cli::cmd::PackageCmd),
         Source(deb_cli::cmd::SourceCmd),
-        Archive(deb_cli::cmd::ArchiveCmd),
-        Artifact(deb_cli::cmd::ArtifactCmd),
-        Local(deb_cli::cmd::LocalCmd),
-        Include(deb_cli::cmd::Include),
-        Exclude(deb_cli::cmd::Exclude),
-        Drop(deb_cli::cmd::Drop),
-        Stage(deb_cli::cmd::Stage),
-        Unstage(deb_cli::cmd::Unstage),
         Edit(deb_cli::cmd::Edit),
-        #[command(hide = true)]
-        Add(deb_cli::cmd::Add),
-        #[command(hide = true)]
-        List(deb_cli::cmd::List),
-        #[command(hide = true)]
-        Show(deb_cli::cmd::Show),
         #[command(hide = true)]
         Tool(deb_cli::cmd::Tool),
     }
