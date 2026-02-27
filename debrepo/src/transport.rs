@@ -91,14 +91,24 @@ fn build_client(insecure: bool, force_http11: bool) -> HttpClient {
 
 /// HTTP/HTTPS transport with optional auth and insecure mode.
 pub struct HttpTransport {
-    client: HttpClient,
+    client: once_cell::sync::OnceCell<HttpClient>,
     auth: AuthProvider,
+    insecure: bool,
+    force_http11: bool,
 }
 
 impl HttpTransport {
     pub fn new(auth: AuthProvider, insecure: bool, force_http11: bool) -> Self {
-        let client = build_client(insecure, force_http11);
-        Self { client, auth }
+        Self {
+            insecure,
+            force_http11,
+            auth,
+            client: once_cell::sync::OnceCell::new(),
+        }
+    }
+    fn client(&self) -> &HttpClient {
+        self.client
+            .get_or_init(|| build_client(self.insecure, self.force_http11))
     }
 }
 
@@ -112,7 +122,7 @@ impl TransportProvider for HttpTransport {
                 let mut timeout_retries = 0;
                 let rsp = loop {
                     let request = build_http_request(&self.auth, scheme, &url).await?;
-                    match self.client.send_async(request).await {
+                    match self.client().send_async(request).await {
                         Ok(rsp) => break rsp,
                         Err(err) if err.is_timeout() && timeout_retries < TIMEOUT_RETRIES => {
                             timeout_retries += 1;

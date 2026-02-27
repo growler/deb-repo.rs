@@ -1,3 +1,9 @@
+rdebootstrap (0.1.9) unstable; urgency=medium
+
+  * fix: reverted to lazy isahc initialization 
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 27 Feb 2026 17:56:55 +0100
+
 rdebootstrap (0.1.8) unstable; urgency=medium
 
   * feat: --http1.1 flag. use when HTTP/2 archive servers fail
