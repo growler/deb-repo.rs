@@ -1,3 +1,10 @@
+rdebootstrap (0.1.8) unstable; urgency=medium
+
+  * feat: --http1.1 flag. use when HTTP/2 archive servers fail
+    with "unrecoverable protocol violation"
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Fri, 27 Feb 2026 12:35:44 +0100
+
 rdebootstrap (0.1.7) unstable; urgency=medium
 
   * feat: even more consistent command line interface

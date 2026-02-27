@@ -76,6 +76,7 @@ impl deb_cli::Config for App {
                 HttpTransport::new(
                     AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?,
                     self.insecure,
+                    self.http11,
                 ),
                 self.cache_dir.as_deref(),
             ))
@@ -144,6 +145,10 @@ pub struct App {
     /// Skip TLS certificate and hostname verification (not recommended)
     #[arg(short = 'k', long = "insecure", action, display_order = 0, action)]
     pub insecure: bool,
+
+    /// Force HTTP/1.1 for transport requests
+    #[arg(long = "http1.1", global = true, display_order = 0, action)]
+    pub http11: bool,
 
     /// Auth source (file:<path>, <path>, or vault:<mount>/<path>); defaults to auth.toml next to the manifest if present
     #[arg(short = 'a', long = "auth", value_name = "AUTH", display_order = 0)]

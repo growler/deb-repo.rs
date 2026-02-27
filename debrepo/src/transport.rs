@@ -1,19 +1,15 @@
-use std::future::Future;
-
-use isahc::{
-    auth::{Authentication, Credentials},
-    config::{ClientCertificate, Configurable, PrivateKey, RedirectPolicy},
-    http::StatusCode,
-    HttpClient, Request,
-};
-use once_cell::sync::Lazy;
+use isahc::HttpClientBuilder;
 pub use url::Url;
-
-use crate::auth::{Auth, AuthProvider};
-
 use {
+    crate::auth::{Auth, AuthProvider},
+    isahc::{
+        auth::{Authentication, Credentials},
+        config::{ClientCertificate, Configurable, PrivateKey, RedirectPolicy, VersionNegotiation},
+        http::StatusCode,
+        HttpClient, Request,
+    },
     smol::io::{self, AsyncRead},
-    std::pin::Pin,
+    std::{future::Future, pin::Pin},
 };
 
 type TransportReader = Pin<Box<dyn AsyncRead + Send>>;
@@ -59,43 +55,50 @@ async fn build_http_request(
         .map_err(|err| io::Error::other(format!("failed to build request for {}: {}", url, err)))
 }
 
-fn client(insecure: bool) -> &'static HttpClient {
-    static SHARED: Lazy<HttpClient> = Lazy::new(|| {
-        HttpClient::builder()
-            .redirect_policy(RedirectPolicy::Limit(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .build()
-            .expect("Failed to create HTTP client")
-    });
-    static SHARED_INSECURE: Lazy<HttpClient> = Lazy::new(|| {
-        use isahc::config::SslOption;
-        HttpClient::builder()
-            .redirect_policy(RedirectPolicy::Limit(10))
-            .timeout(std::time::Duration::from_secs(30))
-            .ssl_options(
+trait OptionalExt: Sized {
+    fn optional<F>(self, cond: bool, f: F) -> Self
+    where
+        F: FnOnce(Self) -> Self,
+    {
+        if cond {
+            f(self)
+        } else {
+            self
+        }
+    }
+}
+
+impl OptionalExt for HttpClientBuilder {}
+
+fn build_client(insecure: bool, force_http11: bool) -> HttpClient {
+    HttpClient::builder()
+        .redirect_policy(RedirectPolicy::Limit(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .optional(force_http11, |b| {
+            b.version_negotiation(VersionNegotiation::http11())
+        })
+        .optional(insecure, |b| {
+            use isahc::config::SslOption;
+            b.ssl_options(
                 SslOption::DANGER_ACCEPT_INVALID_CERTS
                     | SslOption::DANGER_ACCEPT_REVOKED_CERTS
                     | SslOption::DANGER_ACCEPT_INVALID_HOSTS,
             )
-            .build()
-            .expect("Failed to create insecure HTTP client")
-    });
-    if insecure {
-        &SHARED_INSECURE
-    } else {
-        &SHARED
-    }
+        })
+        .build()
+        .expect("Failed to create HTTP client")
 }
 
 /// HTTP/HTTPS transport with optional auth and insecure mode.
 pub struct HttpTransport {
-    insecure: bool,
+    client: HttpClient,
     auth: AuthProvider,
 }
 
 impl HttpTransport {
-    pub fn new(auth: AuthProvider, insecure: bool) -> Self {
-        Self { insecure, auth }
+    pub fn new(auth: AuthProvider, insecure: bool, force_http11: bool) -> Self {
+        let client = build_client(insecure, force_http11);
+        Self { client, auth }
     }
 }
 
@@ -109,7 +112,7 @@ impl TransportProvider for HttpTransport {
                 let mut timeout_retries = 0;
                 let rsp = loop {
                     let request = build_http_request(&self.auth, scheme, &url).await?;
-                    match client(self.insecure).send_async(request).await {
+                    match self.client.send_async(request).await {
                         Ok(rsp) => break rsp,
                         Err(err) if err.is_timeout() && timeout_retries < TIMEOUT_RETRIES => {
                             timeout_retries += 1;
