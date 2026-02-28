@@ -19,6 +19,10 @@ use {
         num::NonZero,
         path::{Path, PathBuf},
         pin::Pin,
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        },
     },
 };
 
@@ -196,6 +200,117 @@ impl ContentProvider for TestProvider {
 
     async fn resolve_path<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
         Ok(self.base.join(path.as_ref()))
+    }
+}
+
+const RELEASE_WITH_EMPTY_PACKAGES: &str = concat!(
+    "Origin: test\n",
+    "Label: test\n",
+    "Suite: stable\n",
+    "Codename: stable\n",
+    "Architectures: amd64\n",
+    "Components: main\n",
+    "No-Support-for-Architecture-all: Packages\n",
+    "SHA256:\n",
+    " e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855 0 main/binary-amd64/Packages\n",
+);
+
+struct UpdateProvider {
+    transport: TestTransport,
+    release_fetches: Arc<AtomicUsize>,
+}
+
+impl UpdateProvider {
+    fn new(release_fetches: Arc<AtomicUsize>) -> Self {
+        Self {
+            transport: TestTransport,
+            release_fetches,
+        }
+    }
+}
+
+impl ContentProvider for UpdateProvider {
+    type Target = HostFileSystem;
+    type Guard<'a>
+        = TestGuard
+    where
+        Self: 'a;
+
+    async fn init(&self) -> io::Result<Self::Guard<'_>> {
+        Ok(TestGuard)
+    }
+
+    async fn fetch_deb(
+        &self,
+        _hash: Hash,
+        _size: u64,
+        _url: &DebLocation<'_>,
+    ) -> io::Result<
+        Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+    > {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn ensure_deb(&self, _path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_artifact(
+        &self,
+        _artifact: &crate::artifact::Artifact,
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn ensure_artifact(&self, _artifact: &mut crate::artifact::Artifact) -> io::Result<()> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_release_file(&self, _url: &str) -> io::Result<IndexFile> {
+        self.release_fetches.fetch_add(1, Ordering::Relaxed);
+        Ok(IndexFile::from_string(
+            RELEASE_WITH_EMPTY_PACKAGES.to_string(),
+        ))
+    }
+
+    async fn fetch_universe(
+        &self,
+        archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Vec<Packages>> {
+        archives.package_files().try_for_each(|entry| {
+            let _ = entry?;
+            Ok::<_, io::Error>(())
+        })?;
+        Ok(Vec::new())
+    }
+
+    async fn fetch_universe_stage(
+        &self,
+        _archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_source_universe(
+        &self,
+        _archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Vec<Sources>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    fn transport(&self) -> &impl TransportProvider {
+        &self.transport
+    }
+
+    async fn resolve_path<P: AsRef<Path>>(&self, _path: P) -> io::Result<PathBuf> {
+        Err(io::Error::other("unused in tests"))
     }
 }
 
@@ -957,4 +1072,98 @@ fn set_build_script_named_spec_adds_and_removes_entry() {
     let (_text, doc) = render_manifest(&mut manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert!(spec.get("build-script").is_none());
+}
+
+#[test]
+fn update_without_valid_lock_refreshes_archives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let mut manifest = Manifest::from_archives(
+        ARCH,
+        [make_archive("https://example.invalid/debian", "stable")],
+        None,
+    );
+    smol::block_on(async {
+        manifest
+            .store_manifest_only(&path)
+            .await
+            .expect("store manifest only");
+    });
+
+    let release_fetches = Arc::new(AtomicUsize::new(0));
+    let provider = UpdateProvider::new(Arc::clone(&release_fetches));
+
+    smol::block_on(async {
+        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        assert!(!has_valid_lock);
+        loaded
+            .update(
+                false,
+                false,
+                true,
+                NonZero::new(1).expect("nonzero"),
+                &provider,
+            )
+            .await
+            .expect("update");
+        loaded.store(&path).await.expect("store");
+    });
+
+    assert!(release_fetches.load(Ordering::Relaxed) > 0);
+    assert!(path.with_extension(format!("{}.lock", ARCH)).exists());
+}
+
+#[test]
+fn update_skips_archive_refresh_when_lock_is_valid() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let mut manifest = Manifest::from_archives(
+        ARCH,
+        [make_archive("https://example.invalid/debian", "stable")],
+        None,
+    );
+    smol::block_on(async {
+        manifest
+            .store_manifest_only(&path)
+            .await
+            .expect("store manifest only");
+    });
+
+    let release_fetches = Arc::new(AtomicUsize::new(0));
+    let provider = UpdateProvider::new(Arc::clone(&release_fetches));
+
+    smol::block_on(async {
+        let (mut loaded, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+        loaded
+            .update(
+                false,
+                false,
+                true,
+                NonZero::new(1).expect("nonzero"),
+                &provider,
+            )
+            .await
+            .expect("update");
+        loaded.store(&path).await.expect("store");
+    });
+
+    release_fetches.store(0, Ordering::Relaxed);
+    let provider = UpdateProvider::new(Arc::clone(&release_fetches));
+
+    smol::block_on(async {
+        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        assert!(has_valid_lock);
+        loaded
+            .update(
+                false,
+                false,
+                true,
+                NonZero::new(1).expect("nonzero"),
+                &provider,
+            )
+            .await
+            .expect("update");
+    });
+
+    assert_eq!(release_fetches.load(Ordering::Relaxed), 0);
 }

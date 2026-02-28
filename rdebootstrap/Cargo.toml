@@ -1,6 +1,6 @@
 [package]
 name = "rdebootstrap"
-version = "0.1.9"
+version = "0.1.10"
 rust-version = "1.89"
 edition = "2021"
 description = "Debian/Ubuntu bootstrapper that builds a root filesystem tree from a lockable manifest."
@@ -31,7 +31,7 @@ path = "cmd/tar_xattr.rs"
 path = "cmd/cli.rs"
 
 [dependencies]
-debrepo = { version = "0.1.9", path = "../debrepo" }
+debrepo = { version = "0.1.10", path = "../debrepo" }
 anyhow = "1.0.99"
 clap = { version = "4.5.48", features = ["derive", "env"] }
 futures = { version = "0.3", default-features = false, features = ["std"] }

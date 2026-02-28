@@ -36,6 +36,7 @@ pub struct Manifest {
     file: ManifestFile,
     hash: Option<Hash>,
     lock: LockFile,
+    lock_valid: bool,
     lock_updated: bool,
     universe: Option<Box<Universe>>,
     source_universe: Option<SourceUniverse>,
@@ -121,6 +122,7 @@ impl Manifest {
             hash: None,
             file: ManifestFile::new(comment),
             lock: LockFile::new(),
+            lock_valid: false,
             lock_updated: false,
             universe: None,
             source_universe: None,
@@ -138,6 +140,7 @@ impl Manifest {
             hash: None,
             lock: LockFile::new_with_archives(archives.len()),
             file: ManifestFile::new_with_archives(archives, comment),
+            lock_valid: false,
             lock_updated: false,
             universe: None,
             source_universe: None,
@@ -166,6 +169,7 @@ impl Manifest {
             hash: Some(hash),
             file: manifest,
             lock,
+            lock_valid: has_valid_lock,
             lock_updated: false,
             universe: None,
             source_universe: None,
@@ -175,7 +179,11 @@ impl Manifest {
     fn mark_file_updated(&mut self) {
         self.hash.take();
     }
-    fn mark_lock_updated(&mut self) {
+    fn mark_lock_dirty(&mut self) {
+        self.lock_updated = true;
+    }
+    fn mark_lock_invalid(&mut self) {
+        self.lock_valid = false;
         self.lock_updated = true;
     }
     pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
@@ -240,7 +248,7 @@ impl Manifest {
         self.lock
             .specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
-        self.mark_lock_updated();
+        self.mark_lock_invalid();
         Ok(())
     }
     pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> io::Result<()> {
@@ -257,7 +265,7 @@ impl Manifest {
         self.lock
             .specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
-        self.mark_lock_updated();
+        self.mark_lock_invalid();
         Ok(())
     }
     pub fn drop_archive<S: AsRef<str>>(&mut self, archive_uri: S) -> io::Result<()> {
@@ -274,7 +282,7 @@ impl Manifest {
                     .for_each(|(_, r)| r.invalidate_solution());
                 self.mark_file_updated();
                 self.lock.remove_archive(i);
-                self.lock_updated = true;
+                self.mark_lock_invalid();
                 Ok(())
             }
             None => Err(io::Error::new(
@@ -462,7 +470,7 @@ impl Manifest {
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub async fn upsert_artifact_only<C>(
@@ -492,7 +500,7 @@ impl Manifest {
         for spec_index in specs {
             self.refresh_spec_hashes(spec_index)?;
         }
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn add_stage_items(
@@ -512,7 +520,7 @@ impl Manifest {
         if let Some(spec_index) = self.file.add_stage_items(spec_name, items, comment)? {
             self.mark_file_updated();
             self.refresh_spec_hashes(spec_index)?;
-            self.mark_lock_updated();
+            self.mark_lock_dirty();
         }
         Ok(())
     }
@@ -525,7 +533,7 @@ impl Manifest {
         self.file.remove_artifact(spec_name, artifact.as_ref())?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn add_requirements<S, I>(
@@ -551,7 +559,7 @@ impl Manifest {
                 self.lock.push_spec(spec_name, spec.locked_spec());
             }
             self.mark_file_updated();
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
         }
         Ok(())
     }
@@ -567,7 +575,7 @@ impl Manifest {
         if let Some(spec_index) = self.file.remove_requirements(spec_name, reqs.iter())? {
             self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
             // TODO: drop empty leaf spec
         }
         Ok(())
@@ -595,7 +603,7 @@ impl Manifest {
                 self.lock.push_spec(spec_name, spec.locked_spec());
             }
             self.mark_file_updated();
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
         }
         Ok(())
     }
@@ -611,7 +619,7 @@ impl Manifest {
         if let Some(spec_index) = self.file.remove_constraints(spec_name, reqs.iter())? {
             self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
             // TODO: drop empty leaf spec
         }
         Ok(())
@@ -636,7 +644,7 @@ impl Manifest {
         for spec_index in specs {
             self.refresh_spec_hashes(spec_index)?;
         }
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
@@ -676,7 +684,7 @@ impl Manifest {
         self.file.set_meta_entry(spec_name, name, value)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn set_build_env(
@@ -688,7 +696,7 @@ impl Manifest {
         self.file.set_build_env(spec_name, env)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn set_build_env_with_comments(
@@ -702,7 +710,7 @@ impl Manifest {
             .set_build_env_with_comments(spec_name, env, &comments)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     pub fn set_build_script(
@@ -714,7 +722,7 @@ impl Manifest {
         self.file.set_build_script(spec_name, script)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
-        self.mark_lock_updated();
+        self.mark_lock_dirty();
         Ok(())
     }
     fn archives(&self) -> UniverseFiles<'_> {
@@ -796,7 +804,7 @@ impl Manifest {
             self.mark_file_updated();
             self.lock.invalidate_specs();
             self.drop_universe().await;
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
         }
     }
     async fn update_locked_archives<C: ContentProvider>(
@@ -952,10 +960,10 @@ impl Manifest {
     ) -> io::Result<()> {
         tracing::debug!("updating locked archive");
         let mut updated = false;
-        if force_locals || self.lock_updated {
+        if force_locals || !self.lock_valid {
             updated = self.update_local_artifacts(cache).await?;
         }
-        if force_archives || self.lock_updated {
+        if force_archives || !self.lock_valid {
             updated |= self
                 .update_locked_archives(concurrency, true, false, skip_verify, cache)
                 .await?;
@@ -964,7 +972,7 @@ impl Manifest {
             tracing::debug!("archives updated, invalidating locked specs");
             self.lock.invalidate_specs();
             self.drop_universe().await;
-            self.mark_lock_updated();
+            self.mark_lock_invalid();
         } else if self.lock.specs().all(|(_, l)| l.is_locked()) {
             tracing::debug!("archives up-to-date, all specs locked, skipping resolve");
             return Ok(());
@@ -1066,8 +1074,9 @@ impl Manifest {
                 })?;
             updated
         };
+        self.lock_valid = self.lock.is_uptodate();
         if updated {
-            self.mark_lock_updated();
+            self.mark_lock_dirty();
         }
         Ok(())
     }

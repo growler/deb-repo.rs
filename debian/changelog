@@ -1,3 +1,11 @@
+rdebootstrap (0.1.10) unstable; urgency=medium
+
+  * fix: split lock_updated flat into lock_dirty and lock_update
+    to streamline the logic and fix issue with failing update 
+    command.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 28 Feb 2026 20:53:11 +0100
+
 rdebootstrap (0.1.9) unstable; urgency=medium
 
   * fix: reverted to lazy isahc initialization 
