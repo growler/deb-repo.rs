@@ -53,6 +53,7 @@ The resulting binary lives at `target/release/rdebootstrap` (or in
 1. **Create a manifest**\
    `rdebootstrap init debian --package ca-certificates --package vim`
 2. **Iterate on specs**\
+   `rdebootstrap archive add https://mirror.example/debian --suite bookworm,bookworm-updates --components main,contrib`\
    `rdebootstrap include --spec desktop openssh-server network-manager`\
    `rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'`
 3. **Update and lock**\

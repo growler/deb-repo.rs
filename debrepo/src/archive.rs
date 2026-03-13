@@ -598,7 +598,7 @@ pub struct Archive {
     #[serde(skip)]
     real_url: Option<String>,
 
-    /// Only include the listed architectures (comma-separated)
+    /// Only include the listed architectures as a comma-separated list
     #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
@@ -633,12 +633,12 @@ pub struct Archive {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
 
-    /// Suite or codename (e.g. "stable", "testing", "unstable", "trixie", "noble")
-    #[arg(short = 's', long = "suite", value_name = "SUITE", num_args = 1, action = clap::ArgAction::Set)]
+    /// Suite or codename; use a comma-separated list for multiple values (e.g. "stable", "noble", "trixie,trixie-updates")
+    #[arg(short = 's', long = "suite", value_name = "SUITE", value_delimiter = ',')]
     pub suites: Vec<String>,
 
-    /// Space-separated list of components (e.g. "main", "contrib", "non-free")
-    #[arg(short = 'C', long = "components", value_name = "COMPONENT")]
+    /// Components as a comma-separated list (e.g. "main", "contrib", "non-free")
+    #[arg(short = 'C', long = "components", value_delimiter = ',', value_name = "COMPONENT")]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 
