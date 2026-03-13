@@ -147,7 +147,9 @@ impl LockedArchive {
                 tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
                 let path = archive.release_path(suite);
                 let file = cache.fetch_release_file(&archive.file_url(&path)).await?;
-                let rel = archive.release_from_file(file.clone(), skip_verify).await?;
+                let rel = archive
+                    .release_from_file(file.clone(), skip_verify, cache)
+                    .await?;
                 match locked.as_ref().and_then(|l| l.suites.get(suite_idx)) {
                     Some(suite) => {
                         if suite.path == path && suite.rel.as_bytes().eq(rel.as_bytes()) {
