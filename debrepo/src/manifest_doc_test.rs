@@ -52,6 +52,21 @@ fn render_manifest(manifest: &mut Manifest) -> (String, toml_edit::DocumentMut) 
     (text, doc)
 }
 
+#[test]
+fn store_uses_manifest_owned_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let lock_path = path.with_extension(format!("{}.lock", ARCH));
+    let mut manifest = new_manifest_at(&path);
+
+    smol::block_on(async {
+        manifest.store().await.expect("store");
+    });
+
+    assert!(path.exists());
+    assert!(lock_path.exists());
+}
+
 fn make_archive(url: &str, suite: &str) -> Archive {
     let mut archive = Archive::default();
     archive.url = url.to_string();
@@ -1123,7 +1138,7 @@ fn update_without_valid_lock_refreshes_archives() {
             )
             .await
             .expect("update");
-        loaded.store(&path).await.expect("store");
+        loaded.store().await.expect("store");
     });
 
     assert!(release_fetches.load(Ordering::Relaxed) > 0);
@@ -1162,7 +1177,7 @@ fn update_skips_archive_refresh_when_lock_is_valid() {
             )
             .await
             .expect("update");
-        loaded.store(&path).await.expect("store");
+        loaded.store().await.expect("store");
     });
 
     release_fetches.store(0, Ordering::Relaxed);

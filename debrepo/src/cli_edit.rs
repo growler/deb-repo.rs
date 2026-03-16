@@ -345,7 +345,7 @@ async fn run_update<C: Config>(conf: &C) -> Result<()> {
     manifest
         .update(false, false, false, conf.concurrency(), fetcher)
         .await?;
-    manifest.store(conf.manifest()).await?;
+    manifest.store().await?;
     guard.commit().await?;
     Ok(())
 }

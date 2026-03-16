@@ -251,7 +251,7 @@ Examples:
                 )
                 .await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -292,7 +292,7 @@ Examples:
                     .await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -328,7 +328,7 @@ Examples:
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -402,7 +402,7 @@ Examples:
                         )?;
                     }
                 }
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -427,7 +427,7 @@ Examples:
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -452,7 +452,7 @@ Examples:
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -506,7 +506,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 }
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -542,7 +542,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     vec![self.artifact.clone()],
                     self.comment.as_deref(),
                 )?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 Ok(())
             })
         }
@@ -568,7 +568,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.remove_artifact(self.spec.as_deref(), &self.url)?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 Ok(())
             })
         }
@@ -612,7 +612,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 )?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -654,7 +654,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 )?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -708,7 +708,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     fetcher,
                 )
                 .await?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -997,7 +997,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.set_spec_meta(self.spec.as_deref(), &self.name, &self.value)?;
-                mf.store(conf.manifest()).await?;
+                mf.store().await?;
                 Ok(())
             })
         }

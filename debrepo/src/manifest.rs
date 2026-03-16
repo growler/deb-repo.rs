@@ -60,7 +60,7 @@ pub(crate) fn lock_path_for(manifest_path: &Path, arch: &str) -> PathBuf {
 ///     // Solve dependencies and lock specs
 ///     m.resolve(8, transport).await?;
 ///     // Persist both Manifest.toml and Manifest.<arch>.lock
-///     m.store("Manifest.toml").await?;
+///     m.store().await?;
 ///     Ok(())
 /// }
 /// ```
@@ -155,8 +155,9 @@ impl Manifest {
             _ => None,
         }
     }
-    pub async fn store<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let path = path.as_ref();
+    pub async fn store(&mut self) -> io::Result<()> {
+        let path = self.path.clone();
+        let path = path.as_path();
         let (hash, hash_update) = if let Some(hash) = self.hash.clone() {
             (hash, false)
         } else {
