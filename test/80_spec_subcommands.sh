@@ -12,15 +12,18 @@ assert_stdout_contains "<default>"
 
 run_case_expect_ok "artifact_add" artifact add ./desktop-note.txt /etc/desktop/note.txt
 run_case_expect_ok "spec_require" spec require -s desktop -c "desktop packages" openssh-server
-assert_manifest_contains "# desktop packages"
+assert_manifest_comment_attached_to_list_item "desktop packages" '"openssh-server"'
 
 run_case_expect_ok "spec_forbid" spec forbid -s desktop -c "desktop constraints" 'systemd (<< 1)'
-assert_manifest_contains "# desktop constraints"
+assert_manifest_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
 
 run_case_expect_ok "spec_artifact_add" spec artifact add -s desktop -c "desktop stage" ./desktop-note.txt
-assert_manifest_contains "# desktop stage"
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 
 run_case_expect_ok "spec_meta_set" spec meta set -s desktop role workstation
+assert_manifest_comment_attached_to_list_item "desktop packages" '"openssh-server"'
+assert_manifest_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 run_case_expect_ok "spec_meta_get" spec meta get -s desktop role
 assert_equals "workstation" "$(tr -d '\n' <"${LAST_STDOUT}")" "desktop role"
 
@@ -35,6 +38,9 @@ run_case_expect_ok "spec_hash_before" spec hash desktop
 hash_before="$(tr -d '\n' <"${LAST_STDOUT}")"
 
 run_case_expect_ok "spec_require_extra" spec require -s desktop rsync
+assert_manifest_comment_attached_to_list_item "desktop packages" '"openssh-server"'
+assert_manifest_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 run_case_expect_ok "spec_hash_after" spec hash desktop
 hash_after="$(tr -d '\n' <"${LAST_STDOUT}")"
 assert_not_equals "${hash_before}" "${hash_after}" "desktop spec hash"
@@ -44,9 +50,24 @@ assert_stdout_matches '^[a-z0-9]+-[A-Za-z0-9+/=]+$'
 
 run_case_expect_ok "spec_remove_requirement" spec remove -s desktop --requirements-only rsync
 assert_manifest_lacks "\"rsync\""
+assert_manifest_comment_attached_to_list_item "desktop packages" '"openssh-server"'
+assert_manifest_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
+
+run_case_expect_ok "spec_remove_requirement_main" spec remove -s desktop --requirements-only openssh-server
+assert_manifest_lacks "# desktop packages"
+assert_manifest_lacks_comment_attached_to_list_item "desktop packages" '"openssh-server"'
+assert_manifest_lacks "\"openssh-server\""
+assert_manifest_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 
 run_case_expect_ok "spec_remove_constraint" spec remove -s desktop --constraints-only 'systemd (<< 1)'
+assert_manifest_lacks "# desktop constraints"
+assert_manifest_lacks_comment_attached_to_list_item "desktop constraints" '"systemd (<< 1)"'
 assert_manifest_lacks "\"systemd (<< 1)\""
+assert_manifest_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 
 run_case_expect_ok "spec_artifact_remove" spec artifact remove -s desktop ./desktop-note.txt
+assert_manifest_lacks "# desktop stage"
+assert_manifest_lacks_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 assert_manifest_lacks "[artifact.\"./desktop-note.txt\"]"

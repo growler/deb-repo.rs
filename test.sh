@@ -14,6 +14,7 @@ export RDEBOOTSTRAP
 source "${REPO_ROOT}/test/lib.sh"
 
 require_cmd bash
+require_cmd awk
 require_cmd cargo
 require_cmd cmp
 require_cmd dpkg-deb

@@ -183,6 +183,164 @@ assert_file_matches() {
     grep -E -- "${regex}" "${file}" >/dev/null || die "expected ${file} to match regex: ${regex}"
 }
 
+assert_file_comment_attached_to_list_item() {
+    local file="$1"
+    local comment="$2"
+    local item="$3"
+    awk -v comment="# ${comment}" -v item="${item}" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        {
+            line = trim($0)
+            if (line == comment) {
+                pending = 1
+                next
+            }
+            if (pending) {
+                if (line == "") {
+                    next
+                }
+                if (substr(line, 1, 1) == "\"" && index(line, item) > 0) {
+                    found = 1
+                    exit 0
+                }
+                pending = 0
+            }
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' "${file}" >/dev/null || die "expected ${file} to attach comment '${comment}' to list item containing: ${item}"
+}
+
+assert_file_lacks_comment_attached_to_list_item() {
+    local file="$1"
+    local comment="$2"
+    local item="$3"
+    if awk -v comment="# ${comment}" -v item="${item}" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        {
+            line = trim($0)
+            if (line == comment) {
+                pending = 1
+                next
+            }
+            if (pending) {
+                if (line == "") {
+                    next
+                }
+                if (substr(line, 1, 1) == "\"" && index(line, item) > 0) {
+                    found = 1
+                    exit 0
+                }
+                pending = 0
+            }
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' "${file}" >/dev/null; then
+        die "expected ${file} to not attach comment '${comment}' to list item containing: ${item}"
+    fi
+}
+
+assert_file_comment_attached_to_block() {
+    local file="$1"
+    local comment="$2"
+    local header="$3"
+    local body="$4"
+    awk -v comment="# ${comment}" -v header="${header}" -v body="${body}" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        {
+            line = trim($0)
+            if (line == comment) {
+                pending = 1
+                in_block = 0
+                next
+            }
+            if (pending) {
+                if (line == "") {
+                    next
+                }
+                if (substr(line, 1, 1) == "[" && index(line, header) > 0) {
+                    pending = 0
+                    in_block = 1
+                    next
+                }
+                pending = 0
+            }
+            if (in_block) {
+                if (line != "" && substr(line, 1, 1) == "[") {
+                    in_block = 0
+                } else if (index(line, body) > 0) {
+                    found = 1
+                    exit 0
+                }
+            }
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' "${file}" >/dev/null || die "expected ${file} to attach comment '${comment}' to block '${header}' containing: ${body}"
+}
+
+assert_file_lacks_comment_attached_to_block() {
+    local file="$1"
+    local comment="$2"
+    local header="$3"
+    local body="$4"
+    if awk -v comment="# ${comment}" -v header="${header}" -v body="${body}" '
+        function trim(s) {
+            sub(/^[[:space:]]+/, "", s)
+            sub(/[[:space:]]+$/, "", s)
+            return s
+        }
+        {
+            line = trim($0)
+            if (line == comment) {
+                pending = 1
+                in_block = 0
+                next
+            }
+            if (pending) {
+                if (line == "") {
+                    next
+                }
+                if (substr(line, 1, 1) == "[" && index(line, header) > 0) {
+                    pending = 0
+                    in_block = 1
+                    next
+                }
+                pending = 0
+            }
+            if (in_block) {
+                if (line != "" && substr(line, 1, 1) == "[") {
+                    in_block = 0
+                } else if (index(line, body) > 0) {
+                    found = 1
+                    exit 0
+                }
+            }
+        }
+        END {
+            exit(found ? 0 : 1)
+        }
+    ' "${file}" >/dev/null; then
+        die "expected ${file} to not attach comment '${comment}' to block '${header}' containing: ${body}"
+    fi
+}
+
 assert_equals() {
     local expected="$1"
     local actual="$2"
@@ -223,6 +381,22 @@ assert_manifest_contains() {
 
 assert_manifest_lacks() {
     assert_file_lacks "${MANIFEST}" "$1"
+}
+
+assert_manifest_comment_attached_to_list_item() {
+    assert_file_comment_attached_to_list_item "${MANIFEST}" "$1" "$2"
+}
+
+assert_manifest_lacks_comment_attached_to_list_item() {
+    assert_file_lacks_comment_attached_to_list_item "${MANIFEST}" "$1" "$2"
+}
+
+assert_manifest_comment_attached_to_block() {
+    assert_file_comment_attached_to_block "${MANIFEST}" "$1" "$2" "$3"
+}
+
+assert_manifest_lacks_comment_attached_to_block() {
+    assert_file_lacks_comment_attached_to_block "${MANIFEST}" "$1" "$2" "$3"
 }
 
 require_rootless_podman() {
