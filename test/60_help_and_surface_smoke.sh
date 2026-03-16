@@ -9,15 +9,17 @@ run_case_expect_ok "version" --version
 assert_stdout_contains "rdebootstrap"
 
 run_case_expect_ok "top_help" --help
-for command in init archive deb artifact require forbid remove stage unstage list update build search spec package source edit; do
+for command in init archive deb artifact import require forbid remove stage unstage list update build search spec package source edit; do
     assert_stdout_contains "  ${command}"
 done
-assert_stdout_lacks "  import"
 
-for command in archive deb artifact require forbid remove stage unstage list update build search spec package source edit; do
+for command in archive deb artifact import require forbid remove stage unstage list update build search spec package source edit; do
     run_case_expect_ok "${command}_help" "${command}" --help
     assert_stdout_contains "Usage: rdebootstrap ${command}"
 done
+
+run_case_expect_ok "update_help" update --help
+assert_stdout_contains "--import"
 
 run_case_expect_ok "include_help" include --help
 assert_stdout_contains "Usage: rdebootstrap require"

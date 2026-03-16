@@ -19,16 +19,13 @@ use {
         universe::Universe,
         version::{IntoConstraint, IntoDependency, ProvidedName},
         Source, SourceUniverse,
-    },
-    digest::FixedOutput,
-    futures::stream::{self, StreamExt, TryStreamExt},
-    itertools::Itertools,
-    smol::io,
-    std::{
+    }, digest::FixedOutput, futures::stream::{self, StreamExt, TryStreamExt}, futures_lite::FutureExt, itertools::Itertools, smol::io, std::{
+        future::Future,
         io::Write,
         num::NonZero,
         path::{Path, PathBuf},
-    },
+        pin::Pin,
+    }
 };
 
 /// Top-level manifest model.
@@ -42,11 +39,14 @@ pub struct Manifest {
     lock_updated: bool,
     universe: Option<Box<Universe>>,
     source_universe: Option<SourceUniverse>,
+    import: Option<Box<Manifest>>,
 }
 
 pub(crate) fn lock_path_for(manifest_path: &Path, arch: &str) -> PathBuf {
     manifest_path.with_extension(format!("{}.lock", arch))
 }
+
+type ManifestLoadFuture<'a> = Pin<Box<dyn Future<Output = io::Result<(Manifest, bool)>> + 'a>>;
 
 ///
 /// Example (simplified):
@@ -78,6 +78,7 @@ impl Manifest {
             lock_updated: false,
             universe: None,
             source_universe: None,
+            import: None,
         }
     }
     pub fn from_archives<P, A, I, S>(path: P, arch: A, archives: I, comment: Option<&str>) -> Self
@@ -98,31 +99,89 @@ impl Manifest {
             lock_updated: false,
             universe: None,
             source_universe: None,
+            import: None,
         }
+    }
+    fn from_file_rec(
+        path: PathBuf,
+        arch: String,
+        import_stack: &mut Vec<PathBuf>,
+    ) -> ManifestLoadFuture<'_> {
+        async move {
+            let path = smol::fs::canonicalize(&path).await?;
+            if import_stack.contains(&path) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "circular manifest import detected: {} is already in the import stack",
+                        path.display()
+                    ),
+                ));
+            }
+            import_stack.push(path.clone());
+            let (manifest, hash) = ManifestFile::from_file(&path).await?;
+            let lock_path = lock_path_for(&path, &arch);
+            let lock = LockFile::from_file(&lock_path, &arch, &hash).await;
+            let has_valid_lock = lock.is_some();
+            let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file());
+            let import = if let Some(import) = manifest.import() {
+                let import_path = path
+                    .parent()
+                    .unwrap_or_else(|| Path::new("."))
+                    .join(import.path());
+                let (import_manifest, _) =
+                    Manifest::from_file_rec(import_path.clone(), arch.clone(), import_stack)
+                        .await?;
+                let import_hash = import_manifest.hash.as_ref().ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "imported manifest {} is missing hash",
+                            import_path.display()
+                        ),
+                    )
+                })?;
+                if import.hash() != import_hash {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "imported manifest {} has hash {}, but expected {}",
+                            import_path.display(),
+                            import_hash.to_hex(),
+                            import.hash().to_hex(),
+                        ),
+                    ));
+                }
+                Some(Box::new(import_manifest))
+            } else {
+                None
+            };
+            let manifest = Manifest {
+                arch,
+                path,
+                hash: Some(hash),
+                file: manifest,
+                lock,
+                lock_valid: has_valid_lock,
+                lock_updated: false,
+                universe: None,
+                source_universe: None,
+                import,
+            };
+            Ok((manifest, has_valid_lock))
+        }.boxed_local()
     }
     pub async fn from_file<A: ToString, P: AsRef<Path>>(
         path: P,
         arch: A,
     ) -> io::Result<(Self, bool)> {
-        let path = smol::fs::canonicalize(path.as_ref()).await?;
-        let (manifest, hash) = ManifestFile::from_file(&path).await?;
-        let arch = arch.to_string();
-        let lock_path = lock_path_for(&path, &arch);
-        let lock = LockFile::from_file(&lock_path, &arch, &hash).await;
-        let has_valid_lock = lock.is_some();
-        let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file());
-        let manifest = Manifest {
-            arch: arch.to_string(),
-            path,
-            hash: Some(hash),
-            file: manifest,
-            lock,
-            lock_valid: has_valid_lock,
-            lock_updated: false,
-            universe: None,
-            source_universe: None,
-        };
-        Ok((manifest, has_valid_lock))
+        let mut import_stack = Vec::new();
+        Manifest::from_file_rec(
+            path.as_ref().to_path_buf(),
+            arch.to_string(),
+            &mut import_stack,
+        )
+        .await
     }
     fn mark_file_updated(&mut self) {
         self.hash.take();

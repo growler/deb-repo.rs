@@ -17,7 +17,12 @@ use {
     itertools::Itertools,
     serde::{Deserialize, Serialize},
     smol::io::AsyncReadExt,
-    std::{collections::HashMap, io, num::NonZero, path::Path},
+    std::{
+        collections::HashMap,
+        io,
+        num::NonZero,
+        path::{Path, PathBuf},
+    },
 };
 
 pub fn valid_spec_name(s: &str) -> Result<&str, String> {
@@ -56,10 +61,35 @@ pub(crate) fn spec_display_name(name: &str) -> &str {
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
+/// Manifest import configuration.
+pub struct Import {
+    path: PathBuf,
+    hash: Hash,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    specs: Vec<String>,
+}
+
+impl Import {
+    pub(crate) fn path(&self) -> &Path {
+        &self.path
+    }
+    pub(crate) fn hash(&self) -> &Hash {
+        &self.hash
+    }
+    pub(crate) fn specs(&self) -> impl Iterator<Item = &str> {
+        self.specs.iter().map(String::as_str)
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 /// Manifest document with parsed sections.
 pub struct ManifestFile {
     #[serde(skip)]
     doc: toml_edit::DocumentMut,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    import: Option<Import>,
 
     #[serde(default, rename = "archive", skip_serializing_if = "Vec::is_empty")]
     archives: Vec<Archive>,
@@ -115,6 +145,7 @@ impl ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
             archives: Vec::new(),
             local_pkgs: Vec::new(),
+            import: None,
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
@@ -129,9 +160,18 @@ impl ManifestFile {
             doc,
             archives,
             local_pkgs: Vec::new(),
+            import: None,
             artifacts: Vec::new(),
             specs: KVList::new(),
         }
+    }
+
+    pub(crate) fn has_import(&self) -> bool {
+        self.import.is_some()
+    }
+
+    pub(crate) fn import(&self) -> Option<&Import> {
+        self.import.as_ref()
     }
 
     pub async fn from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, Hash)> {
@@ -338,7 +378,7 @@ impl ManifestFile {
                     "artifact {} not found in spec {}",
                     artifact_uri,
                     spec_display_name(spec_name)
-                )))
+                )));
             }
         }
         if self
@@ -857,7 +897,7 @@ impl ManifestFile {
                     return Err(io::Error::other(format!(
                         "spec {} extends missing ({})",
                         node, name,
-                    )))
+                    )));
                 }
                 Some((extends_id, extends_name)) => {
                     match state.get(&extends_id).copied().unwrap_or(Unvisited) {
@@ -914,7 +954,7 @@ impl<'a> Iterator for SpecIterator<'a> {
                             return Some(Err(io::Error::other(format!(
                                 "spec {} extends unknown spec {}",
                                 name, extends
-                            ))))
+                            ))));
                         }
                         e => e,
                     };
@@ -1638,11 +1678,12 @@ impl ManifestDoc for toml_edit::DocumentMut {
         default_spec.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
         fn entry_order(entry: &str) -> u8 {
             match entry {
-                "archive" => 0,
-                "local" => 1,
-                "artifact" => 2,
-                "spec" => 3,
-                _ => 4,
+                "import" => 0,
+                "archive" => 1,
+                "local" => 2,
+                "artifact" => 3,
+                "spec" => 4,
+                _ => 5,
             }
         }
         self.sort_values_by(|k1, _, k2, _| entry_order(k1).cmp(&entry_order(k2)));
