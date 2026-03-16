@@ -2,7 +2,7 @@ use {
     clap::Parser,
     debrepo::{
         auth::AuthProvider, cli as deb_cli, content::HostCache, HostFileSystem, HttpTransport,
-        LockBase, Manifest, DEFAULT_ARCH,
+        Manifest, DEFAULT_ARCH,
     },
     std::{
         num::NonZero,
@@ -25,9 +25,6 @@ impl deb_cli::Config for App {
     }
     fn manifest(&self) -> &Path {
         &self.manifest
-    }
-    fn lock_base(&self) -> Option<&LockBase> {
-        self.lock.as_ref()
     }
     fn concurrency(&self) -> NonZero<usize> {
         self.concurrency
@@ -157,16 +154,6 @@ pub struct App {
     /// Path to the manifest file
     #[arg(global = true, short, long, default_value = Manifest::DEFAULT_FILE, display_order = 0)]
     pub manifest: PathBuf,
-
-    /// Base path for the lock file (end with a separator to treat as a directory)
-    #[arg(
-        global = true,
-        short = 'l',
-        long = "lock",
-        value_name = "LOCK",
-        display_order = 0
-    )]
-    pub lock: Option<LockBase>,
 
     #[command(subcommand)]
     pub cmd: Commands,

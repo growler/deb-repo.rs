@@ -55,7 +55,6 @@ pub use {
     archive::{Archive, RepositoryFile, SignedBy, Snapshot, SnapshotId},
     async_compression::Level as CompressionLevel,
     builder::{BuildJob, Executor},
-    manifest::LockBase,
     manifest::Manifest,
     packages::{Package, Packages},
     release::Release,

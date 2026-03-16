@@ -2,7 +2,6 @@ use {
     crate::{
         archive::{Archive, SnapshotId, SnapshotIdArgParser},
         content::ContentProvider,
-        manifest::LockBase,
         packages::{InstallPriority, Package},
         version::{Constraint, Dependency, Version},
         StagingFileSystem,
@@ -29,9 +28,6 @@ pub trait Config {
     }
     fn arch(&self) -> &str;
     fn manifest(&self) -> &Path;
-    fn lock_base(&self) -> Option<&LockBase> {
-        None
-    }
     fn concurrency(&self) -> NonZero<usize>;
     fn fetcher(&self) -> io::Result<&Self::Cache>;
 }
@@ -254,8 +250,7 @@ Examples:
                 )
                 .await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -284,12 +279,7 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if let Some((archives, _)) = self.archive.as_vendor() {
                     for archive in archives {
                         mf.add_archive(archive, self.comment.as_deref())?;
@@ -301,8 +291,7 @@ Examples:
                     .await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -332,18 +321,12 @@ Examples:
                     .path
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 let (file, ctrl) = fetcher.ensure_deb(path).await?;
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -377,12 +360,7 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if let Some(path) = self.artifact.url.strip_prefix('@') {
                     if path.is_empty() {
                         return Err(anyhow!("text artifact path is empty"));
@@ -422,8 +400,7 @@ Examples:
                         )?;
                     }
                 }
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -445,16 +422,10 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -476,16 +447,10 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -530,12 +495,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if !self.constraints_only {
                     mf.remove_requirements(self.spec.as_deref(), self.cons.iter())?;
                 }
@@ -544,8 +504,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 }
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -575,19 +534,13 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for Stage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_stage_items(
                     self.spec.as_deref(),
                     vec![self.artifact.clone()],
                     self.comment.as_deref(),
                 )?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 Ok(())
             })
         }
@@ -611,15 +564,9 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for Unstage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.remove_artifact(self.spec.as_deref(), &self.url)?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 Ok(())
             })
         }
@@ -655,12 +602,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_requirements(
                     self.spec.as_deref(),
                     self.reqs.iter(),
@@ -668,8 +610,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 )?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -703,12 +644,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.add_constraints(
                     self.spec.as_deref(),
                     self.reqs.iter(),
@@ -716,8 +652,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 )?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -754,12 +689,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 let guard = fetcher.init().await?;
                 let force_archives = self.archives || self.snapshot.is_some();
                 let force = force_archives || self.locals;
-                let (mut mf, has_valid_lock) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if has_valid_lock && !force {
                     tracing::debug!("Lock file is up to date, nothing to do");
                     return Ok(());
@@ -775,8 +706,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     fetcher,
                 )
                 .await?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 guard.commit().await?;
                 Ok(())
             })
@@ -803,12 +733,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let res = self
@@ -908,12 +833,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecList {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 for name in mf.spec_names() {
                     println!("{}", name);
                 }
@@ -1039,12 +959,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecGetMeta {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 match mf.get_spec_meta(self.spec.as_deref(), &self.name)? {
                     Some(value) => {
                         println!("{}", value);
@@ -1078,15 +993,9 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecSetMeta {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.set_spec_meta(self.spec.as_deref(), &self.name, &self.value)?;
-                mf.store_with_lock_base(conf.manifest(), conf.lock_base())
-                    .await?;
+                mf.store(conf.manifest()).await?;
                 Ok(())
             })
         }
@@ -1115,12 +1024,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecHash {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 let hash = mf.spec_hash(self.spec.as_deref())?;
                 if self.sri {
                     println!("{}", hash.to_sri());
@@ -1149,12 +1053,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let pkg = mf.packages()?.find(|p| self.package == p.name());
@@ -1193,12 +1092,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 })?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_source_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let found = mf.find_source(&name)?;
@@ -1556,12 +1450,7 @@ hash = \"{}\"
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await?;
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let mut pkgs = mf
@@ -1617,19 +1506,15 @@ hash = \"{}\"
                             err
                         )
                     })?;
-                let (manifest, _) = Manifest::from_file_with_lock_base(
-                    conf.manifest(),
-                    conf.arch(),
-                    conf.lock_base(),
-                )
-                .await
-                .map_err(|err| {
-                    anyhow!(
-                        "failed to load manifest from {}: {}",
-                        conf.manifest().display(),
-                        err
-                    )
-                })?;
+                let (manifest, _) = Manifest::from_file(conf.manifest(), conf.arch())
+                    .await
+                    .map_err(|err| {
+                        anyhow!(
+                            "failed to load manifest from {}: {}",
+                            conf.manifest().display(),
+                            err
+                        )
+                    })?;
                 let pb = if conf.log_level() == 0 {
                     let use_tty = std::io::stderr().is_terminal();
                     Some(move |size| {

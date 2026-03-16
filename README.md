@@ -72,12 +72,8 @@ maintainer scripts in the sandbox so the host stays clean.
 ## Manifest Layout
 
 `Manifest.toml` sits at the project root unless `--manifest <path>` is supplied.
-The lock file is written next to the manifest by default; use `--lock <path>` to
-override the base path. Lock path rules (for a manifest named `<name>.toml`):
-
-- no `--lock`: `<name>.<arch>.lock`
-- `--lock <dir>/`: `<dir>/<name>.<arch>.lock`
-- `--lock <file>.lock`: `<file>.<arch>.lock` (extension replaced)
+The lock file is always written next to the manifest. For a manifest named
+`<name>.toml`, the lock file path is `<name>.<arch>.lock`.
 
 A small example:
 
@@ -229,8 +225,6 @@ the Vault client.
 Global flags of note:
 
 - `--manifest <path>` selects an alternate manifest.
-- `-l/--lock <path>` overrides the lock file base path (end with `/` to treat it
-  as a directory).
 - `--arch <arch>` switches the target architecture (default: host arch).
 - `-n/--downloads <N>` controls concurrent downloads (default: 20).
 - `--cache-dir` / `--no-cache` adjust caching.
