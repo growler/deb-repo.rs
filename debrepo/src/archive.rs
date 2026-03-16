@@ -634,11 +634,21 @@ pub struct Archive {
     pub snapshot: Option<Snapshot>,
 
     /// Suite or codename; use a comma-separated list for multiple values (e.g. "stable", "noble", "trixie,trixie-updates")
-    #[arg(short = 's', long = "suite", value_name = "SUITE", value_delimiter = ',')]
+    #[arg(
+        short = 's',
+        long = "suite",
+        value_name = "SUITE",
+        value_delimiter = ','
+    )]
     pub suites: Vec<String>,
 
     /// Components as a comma-separated list (e.g. "main", "contrib", "non-free")
-    #[arg(short = 'C', long = "components", value_delimiter = ',', value_name = "COMPONENT")]
+    #[arg(
+        short = 'C',
+        long = "components",
+        value_delimiter = ',',
+        value_name = "COMPONENT"
+    )]
     #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 
