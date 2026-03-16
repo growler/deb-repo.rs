@@ -9,14 +9,25 @@ use {
     },
     futures::stream::{self, StreamExt, TryStreamExt},
     smol::io,
-    std::num::NonZero,
+    std::{num::NonZero, path::PathBuf},
 };
+
+pub(crate) struct ResolvedArtifact<'a> {
+    pub artifact: &'a Artifact,
+    pub base: Option<PathBuf>,
+}
+
+pub(crate) struct ResolvedInstallable<'a> {
+    pub archive: Option<&'a Archive>,
+    pub file: &'a RepositoryFile,
+    pub base: Option<PathBuf>,
+}
 
 // LOCAL
 
 pub async fn stage_local<'a, FS, C>(
-    installables: Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
-    artifacts: Vec<&'a Artifact>,
+    installables: Vec<ResolvedInstallable<'a>>,
+    artifacts: Vec<ResolvedArtifact<'a>>,
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -40,7 +51,7 @@ where
 }
 
 async fn stage_artifacts_local<'a, FS, C>(
-    artifacts: &'a [&'a Artifact],
+    artifacts: &'a [ResolvedArtifact<'a>],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -51,11 +62,14 @@ where
     C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
+        .try_for_each_concurrent(Some(concurrency.into()), |resolved| {
             let pb = pb.clone();
             async move {
+                let artifact = resolved.artifact;
                 let size = artifact.size();
-                let cached = cache.fetch_artifact(artifact).await?;
+                let cached = cache
+                    .fetch_artifact(artifact, resolved.base.as_deref())
+                    .await?;
                 fs.stage(cached).await?;
                 if let Some(pb) = &pb {
                     pb.inc(size);
@@ -68,7 +82,7 @@ where
 
 async fn stage_debs_local<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(Option<&'a Archive>, &'a RepositoryFile)],
+    packages: &'a [ResolvedInstallable<'a>],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -79,19 +93,26 @@ where
     C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
-        .map(|(source, file)| {
+        .map(|pkg| {
             let pb = pb.clone();
             async move {
-                let url = if let Some(source) = source {
-                    DebLocation::Repository {
+                let url = match pkg.archive {
+                    Some(source) => DebLocation::Repository {
                         url: source.base(),
-                        path: file.path(),
-                    }
-                } else {
-                    DebLocation::Local { path: file.path() }
+                        path: pkg.file.path(),
+                    },
+                    None => DebLocation::Local {
+                        path: pkg.file.path(),
+                        base: pkg.base.as_deref().ok_or_else(|| {
+                            io::Error::other(format!(
+                                "missing local base path for package {}",
+                                pkg.file.path()
+                            ))
+                        })?,
+                    },
                 };
-                let size = file.size();
-                let deb = cache.fetch_deb(file.hash().clone(), size, &url).await?;
+                let size = pkg.file.size();
+                let deb = cache.fetch_deb(pkg.file.hash().clone(), size, &url).await?;
                 let mut ctrl = fs.stage(deb).await?;
                 if let Some(pb) = &pb {
                     pb.inc(size);
@@ -156,8 +177,8 @@ where
 // THREAD SAFE
 //
 pub async fn stage<'a, FS, C>(
-    installables: Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
-    artifacts: Vec<&'a Artifact>,
+    installables: Vec<ResolvedInstallable<'a>>,
+    artifacts: Vec<ResolvedArtifact<'a>>,
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -180,7 +201,7 @@ where
     Ok(())
 }
 async fn stage_artifacts<'a, FS, C>(
-    artifacts: &'a [&'a Artifact],
+    artifacts: &'a [ResolvedArtifact<'a>],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -191,12 +212,15 @@ where
     C: ContentProvider<Target = FS>,
 {
     stream::iter(artifacts.iter().map(Ok::<_, io::Error>))
-        .try_for_each_concurrent(Some(concurrency.into()), |artifact| {
+        .try_for_each_concurrent(Some(concurrency.into()), |resolved| {
             let pb = pb.clone();
+            let artifact = resolved.artifact;
             let size = artifact.size();
             let fs = fs.clone();
             async move {
-                let cached = cache.fetch_artifact(artifact).await?;
+                let cached = cache
+                    .fetch_artifact(artifact, resolved.base.as_deref())
+                    .await?;
                 blocking::unblock(move || smol::block_on(async move { fs.stage(cached).await }))
                     .await?;
                 if let Some(pb) = &pb {
@@ -210,7 +234,7 @@ where
 
 async fn stage_debs<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
-    packages: &'a [(Option<&'a Archive>, &'a RepositoryFile)],
+    packages: &'a [ResolvedInstallable<'a>],
     fs: &FS,
     concurrency: NonZero<usize>,
     cache: &C,
@@ -221,20 +245,27 @@ where
     C: ContentProvider<Target = FS>,
 {
     let new_installed = stream::iter(packages)
-        .map(|(archive, file)| {
+        .map(|pkg| {
             let pb = pb.clone();
-            let url = if let Some(source) = archive {
-                DebLocation::Repository {
-                    url: source.base(),
-                    path: file.path(),
-                }
-            } else {
-                DebLocation::Local { path: file.path() }
-            };
-            let size = file.size();
-            let hash = file.hash().clone();
             let fs = fs.clone();
             async move {
+                let url = match pkg.archive {
+                    Some(source) => DebLocation::Repository {
+                        url: source.base(),
+                        path: pkg.file.path(),
+                    },
+                    None => DebLocation::Local {
+                        path: pkg.file.path(),
+                        base: pkg.base.as_deref().ok_or_else(|| {
+                            io::Error::other(format!(
+                                "missing local base path for package {}",
+                                pkg.file.path()
+                            ))
+                        })?,
+                    },
+                };
+                let size = pkg.file.size();
+                let hash = pkg.file.hash().clone();
                 let deb = cache.fetch_deb(hash, size, &url).await.map_err(|e| {
                     io::Error::new(e.kind(), format!("Error getting deb {}: {}", &url, e))
                 })?;

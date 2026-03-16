@@ -311,7 +311,11 @@ impl Artifact {
         }
     }
 
-    pub(crate) async fn new<C>(artifact: &ArtifactArg, cache: &C) -> io::Result<Self>
+    pub(crate) async fn new<C>(
+        artifact: &ArtifactArg,
+        local_base: Option<&Path>,
+        cache: &C,
+    ) -> io::Result<Self>
     where
         C: ContentProvider,
     {
@@ -357,10 +361,15 @@ impl Artifact {
                     unpack,
                 })
             };
-            cache.ensure_artifact(&mut artifact).await?;
+            cache.ensure_artifact(&mut artifact, None).await?;
             Ok(artifact)
         } else {
-            let path = cache.resolve_path(&artifact.url).await?;
+            let path = local_base.ok_or_else(|| {
+                io::Error::other(format!(
+                    "missing local base path for artifact {}",
+                    artifact.url
+                ))
+            })?;
             let mut artifact = if smol::fs::symlink_metadata(&path).await?.is_dir() {
                 Artifact::Dir(Tree {
                     arch,
@@ -394,7 +403,7 @@ impl Artifact {
                     unpack,
                 })
             };
-            cache.ensure_artifact(&mut artifact).await?;
+            cache.ensure_artifact(&mut artifact, Some(path)).await?;
             Ok(artifact)
         }
     }

@@ -17,7 +17,7 @@ use {
     std::{
         io,
         num::NonZero,
-        path::{Path, PathBuf},
+        path::Path,
         pin::Pin,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -30,6 +30,10 @@ const ARCH: &str = "amd64";
 
 fn new_manifest() -> Manifest {
     Manifest::new("Manifest.toml", ARCH, None)
+}
+
+fn new_manifest_at(path: impl AsRef<Path>) -> Manifest {
+    Manifest::new(path, ARCH, None)
 }
 
 fn render_manifest(manifest: &mut Manifest) -> (String, toml_edit::DocumentMut) {
@@ -107,14 +111,12 @@ impl ContentProviderGuard<'_> for TestGuard {
 }
 
 struct TestProvider {
-    base: PathBuf,
     transport: TestTransport,
 }
 
 impl TestProvider {
-    fn new(base: PathBuf) -> Self {
+    fn new() -> Self {
         Self {
-            base,
             transport: TestTransport,
         }
     }
@@ -142,23 +144,32 @@ impl ContentProvider for TestProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_deb(&self, _path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+    async fn ensure_deb(
+        &self,
+        _path: &str,
+        _source: &Path,
+    ) -> io::Result<(RepositoryFile, MutableControlStanza)> {
         Err(io::Error::other("unused in tests"))
     }
 
     async fn fetch_artifact(
         &self,
         _artifact: &crate::artifact::Artifact,
+        _base: Option<&Path>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_artifact(&self, artifact: &mut crate::artifact::Artifact) -> io::Result<()> {
+    async fn ensure_artifact(
+        &self,
+        artifact: &mut crate::artifact::Artifact,
+        base: Option<&Path>,
+    ) -> io::Result<()> {
         if matches!(artifact, crate::artifact::Artifact::Text(_)) {
             return Ok(());
         }
         if artifact.is_local() {
-            let path = self.base.join(artifact.uri());
+            let path = base.expect("local artifact base path");
             let _ = artifact.hash_local(&path).await?;
             Ok(())
         } else {
@@ -200,10 +211,6 @@ impl ContentProvider for TestProvider {
 
     fn transport(&self) -> &impl TransportProvider {
         &self.transport
-    }
-
-    async fn resolve_path<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
-        Ok(self.base.join(path.as_ref()))
     }
 }
 
@@ -255,18 +262,27 @@ impl ContentProvider for UpdateProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_deb(&self, _path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+    async fn ensure_deb(
+        &self,
+        _path: &str,
+        _source: &Path,
+    ) -> io::Result<(RepositoryFile, MutableControlStanza)> {
         Err(io::Error::other("unused in tests"))
     }
 
     async fn fetch_artifact(
         &self,
         _artifact: &crate::artifact::Artifact,
+        _base: Option<&Path>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn ensure_artifact(&self, _artifact: &mut crate::artifact::Artifact) -> io::Result<()> {
+    async fn ensure_artifact(
+        &self,
+        _artifact: &mut crate::artifact::Artifact,
+        _base: Option<&Path>,
+    ) -> io::Result<()> {
         Err(io::Error::other("unused in tests"))
     }
 
@@ -311,10 +327,6 @@ impl ContentProvider for UpdateProvider {
 
     fn transport(&self) -> &impl TransportProvider {
         &self.transport
-    }
-
-    async fn resolve_path<P: AsRef<Path>>(&self, _path: P) -> io::Result<PathBuf> {
-        Err(io::Error::other("unused in tests"))
     }
 }
 
@@ -589,9 +601,9 @@ fn add_artifact_default_spec_adds_stage_and_comment() {
     let artifact_path = dir.path().join("artifact-dir");
     std::fs::create_dir_all(&artifact_path).expect("create artifact dir");
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -627,9 +639,9 @@ fn add_artifact_prevents_duplicate_stage_and_comment_on_update() {
     let artifact_path = dir.path().join("artifact-dir");
     std::fs::create_dir_all(&artifact_path).expect("create artifact dir");
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -662,9 +674,9 @@ fn update_locals_refreshes_local_artifact_hashes() {
     let dir = tempfile::tempdir().expect("tempdir");
     let artifact_path = dir.path().join("artifact-file");
     std::fs::write(&artifact_path, b"before").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -710,9 +722,9 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
     let artifact_path = dir.path().join("artifact-dir");
     std::fs::create_dir_all(&artifact_path).expect("create artifact dir");
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");
@@ -804,8 +816,8 @@ fn upsert_text_artifact_rejects_non_text() {
     let dir = tempfile::tempdir().expect("tempdir");
     let artifact_path = dir.path().join("artifact-file");
     std::fs::write(&artifact_path, b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
-    let mut manifest = new_manifest();
+    let provider = TestProvider::new();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(None, vec!["base"], None)
         .expect("add requirement");
@@ -841,9 +853,9 @@ fn remove_artifact_default_spec_removes_stage_and_comment() {
     let artifact_path = dir.path().join("artifact-dir");
     std::fs::create_dir_all(&artifact_path).expect("create artifact dir");
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -880,9 +892,9 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
     let artifact_path = dir.path().join("artifact-dir");
     std::fs::create_dir_all(&artifact_path).expect("create artifact dir");
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
-    let provider = TestProvider::new(dir.path().to_path_buf());
+    let provider = TestProvider::new();
 
-    let mut manifest = new_manifest();
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");

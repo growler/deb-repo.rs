@@ -1,8 +1,5 @@
 use {
-    crate::{
-        content::ContentProvider, control::MutableControlStanza, hash::Hash, indexfile::IndexFile,
-        release::Release,
-    },
+    crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::AsyncReadExt,
@@ -27,10 +24,7 @@ pub enum SignedBy {
 
 impl SignedBy {
     pub const MAX_KEY_SIZE: usize = 64 * 1024; // 64 KiB
-    async fn import_into<C>(&self, ctx: &mut gpgme::Context, resolver: &C) -> io::Result<()>
-    where
-        C: ContentProvider + ?Sized,
-    {
+    async fn import_into(&self, ctx: &mut gpgme::Context, base_dir: &Path) -> io::Result<()> {
         match self {
             Self::Builtin => {
                 ctx.import(DEBIAN_KEYRING)?;
@@ -39,7 +33,7 @@ impl SignedBy {
                 ctx.import(key.as_bytes())?;
             }
             Self::Keyring(path) => {
-                let path = resolver.resolve_path(path).await?;
+                let path = resolve_path(base_dir, path);
                 let size = fs::metadata(&path)
                     .await
                     .and_then(|md| {
@@ -73,6 +67,14 @@ impl SignedBy {
             }
         }
         Ok(())
+    }
+}
+
+fn resolve_path(base_dir: &Path, path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        base_dir.join(path)
     }
 }
 
@@ -687,27 +689,23 @@ impl Archive {
             format!("dists/{}/InRelease", suite)
         }
     }
-    pub(crate) async fn release_from_file<C>(
+    pub(crate) async fn release_from_file(
         &self,
         r: IndexFile,
         skip_verify: bool,
-        resolver: &C,
-    ) -> io::Result<Release>
-    where
-        C: ContentProvider + ?Sized,
-    {
+        base_dir: &Path,
+    ) -> io::Result<Release> {
         if self.allow_insecure() {
             Release::new(r).map_err(std::io::Error::other)
         } else if skip_verify {
             Release::new(r.clear_text()).map_err(std::io::Error::other)
         } else {
-            self.verify_signed_release(&r, resolver).await
+            self.verify_signed_release(&r, base_dir).await
         }
     }
-    async fn verify_signed_release<T, C>(&self, data: T, resolver: &C) -> io::Result<Release>
+    async fn verify_signed_release<T>(&self, data: T, base_dir: &Path) -> io::Result<Release>
     where
         T: AsRef<str>,
-        C: ContentProvider + ?Sized,
     {
         let mut ctx = gpgme::Context::from_protocol(gpgme::Protocol::OpenPgp)?;
         let tempdir = tempfile::tempdir()?;
@@ -717,7 +715,7 @@ impl Archive {
         self.signed_by
             .as_ref()
             .unwrap_or(&SignedBy::Builtin)
-            .import_into(&mut ctx, resolver)
+            .import_into(&mut ctx, base_dir)
             .await?;
 
         let mut plaintext = Vec::new();

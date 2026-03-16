@@ -6,6 +6,7 @@ use {
         content::{ContentProvider, UniverseFiles},
         control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
+        is_url,
         kvlist::KVList,
         manifest_doc::{spec_display_name, BuildEnvComments, LockFile, ManifestFile, UpdateResult},
         packages::Package,
@@ -13,6 +14,7 @@ use {
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
             LockedPackage, LockedSpec,
         },
+        stage::{ResolvedArtifact, ResolvedInstallable},
         staging::StagingFileSystem,
         universe::Universe,
         version::{IntoConstraint, IntoDependency, ProvidedName},
@@ -132,21 +134,46 @@ impl Manifest {
         self.lock_valid = false;
         self.lock_updated = true;
     }
-    pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<()> {
+    fn manifest_dir(&self) -> &Path {
+        self.path
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+    }
+    pub(crate) fn local_path<P: AsRef<Path>>(&self, path: P) -> PathBuf {
+        let path = path.as_ref();
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            self.manifest_dir().join(path)
+        }
+    }
+    fn artifact_path(&self, artifact: &Artifact) -> Option<PathBuf> {
+        match artifact {
+            Artifact::Text(_) => None,
+            _ if artifact.is_local() => Some(self.local_path(artifact.uri())),
+            _ => None,
+        }
+    }
+    pub async fn store<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
+        let path = path.as_ref();
         let (hash, hash_update) = if let Some(hash) = self.hash.clone() {
             (hash, false)
         } else {
-            (self.file.store(path.as_ref()).await?, true)
+            (self.file.store(path).await?, true)
         };
         if self.lock_updated || hash_update {
-            let lock_path = lock_path_for(path.as_ref(), &self.arch);
+            let lock_path = lock_path_for(path, &self.arch);
             self.lock.store(&lock_path, &self.arch, &hash).await?;
         }
+        self.path = smol::fs::canonicalize(path).await?;
         Ok(())
     }
     pub async fn store_manifest_only<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let hash = self.file.store(path.as_ref()).await?;
+        let path = path.as_ref();
+        let hash = self.file.store(path).await?;
         self.hash = Some(hash);
+        self.path = smol::fs::canonicalize(path).await?;
         Ok(())
     }
     pub fn artifact(&self, name: &str) -> Option<&Artifact> {
@@ -405,7 +432,8 @@ impl Manifest {
         C: ContentProvider,
     {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        let staged = Artifact::new(artifact, cache).await?;
+        let local_base = (!is_url(&artifact.url)).then(|| self.local_path(&artifact.url));
+        let staged = Artifact::new(artifact, local_base.as_deref(), cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
         self.refresh_spec_hashes(spec_index)?;
@@ -421,7 +449,8 @@ impl Manifest {
     where
         C: ContentProvider,
     {
-        let staged = Artifact::new(artifact, cache).await?;
+        let local_base = (!is_url(&artifact.url)).then(|| self.local_path(&artifact.url));
+        let staged = Artifact::new(artifact, local_base.as_deref(), cache).await?;
         self.upsert_artifact_only_inner(staged, comment)
     }
     pub fn upsert_artifact_only_inner(
@@ -754,6 +783,7 @@ impl Manifest {
         skip_verify: bool,
         cache: &C,
     ) -> io::Result<bool> {
+        let base_dir = self.manifest_dir().to_path_buf();
         let mut updates = stream::iter(
             self.file
                 .archives()
@@ -762,7 +792,14 @@ impl Manifest {
                 .zip(self.lock.archives())
                 .filter(|(_, locked)| locked.as_ref().is_none_or(|_| force_archives))
                 .map(move |((archive_idx, archive), locked)| {
-                    LockedArchive::fetch_update(locked, archive, archive_idx, skip_verify, cache)
+                    LockedArchive::fetch_update(
+                        locked,
+                        archive,
+                        archive_idx,
+                        skip_verify,
+                        base_dir.clone(),
+                        cache,
+                    )
                 }),
         )
         .flatten_unordered(concurrency.get())
@@ -810,8 +847,10 @@ impl Manifest {
         };
         let local_pkgs_update = if force_locals || local_pkgs_update {
             let (local_pkgs, updates) = stream::iter(self.file.local_pkgs().iter())
-                .map(|file| async {
-                    let (real_file, ctrl) = cache.ensure_deb(&file.path).await.map_err(|e| {
+                .map(|file| {
+                    let base = self.local_path(&file.path);
+                    async move {
+                    let (real_file, ctrl) = cache.ensure_deb(&file.path, &base).await.map_err(|e| {
                         io::Error::new(
                             e.kind(),
                             format!("failed to read local package file {}: {}", file.path, e),
@@ -831,7 +870,7 @@ impl Manifest {
                     } else {
                         Ok((ctrl, None))
                     }
-                })
+                }})
                 .buffered(concurrency.get())
                 .try_collect::<(MutableControlFile, Vec<_>)>().await?;
             self.lock.set_local_packages(local_pkgs.try_into()?);
@@ -867,16 +906,21 @@ impl Manifest {
     }
     pub(crate) async fn update_local_artifacts<C: ContentProvider>(
         &mut self,
-        cache: &C,
+        _cache: &C,
     ) -> io::Result<bool> {
         let mut updates = Vec::new();
+        let base_dir = self.manifest_dir().to_path_buf();
         for artifact in self.file.artifacts_mut().iter_mut() {
             if artifact.is_remote() || matches!(artifact, Artifact::Text(_)) {
                 continue;
             }
             let old_hash = artifact.hash();
             let old_size = artifact.size();
-            let path = cache.resolve_path(artifact.uri()).await?;
+            let path = if Path::new(artifact.uri()).is_absolute() {
+                PathBuf::from(artifact.uri())
+            } else {
+                base_dir.join(artifact.uri())
+            };
             artifact.hash_local(&path).await?;
             if artifact.hash() != old_hash || artifact.size() != old_size {
                 updates.push(artifact.clone());
@@ -1063,8 +1107,14 @@ impl Manifest {
         &'a self,
         spec_name: &str,
         spec_index: usize,
-    ) -> io::Result<Vec<&'a Artifact>> {
+    ) -> io::Result<Vec<ResolvedArtifact<'a>>> {
         self.artifacts_for(spec_index)
+            .map(|artifact| {
+                artifact.map(|artifact| ResolvedArtifact {
+                    base: self.artifact_path(artifact),
+                    artifact,
+                })
+            })
             .collect::<io::Result<Vec<_>>>()
             .map_err(|e| {
                 io::Error::new(
@@ -1082,11 +1132,7 @@ impl Manifest {
         &'a self,
         spec_name: &str,
         spec_index: usize,
-    ) -> io::Result<(
-        Vec<(Option<&'a Archive>, &'a RepositoryFile)>,
-        Vec<String>,
-        Vec<Vec<String>>,
-    )> {
+    ) -> io::Result<(Vec<ResolvedInstallable<'a>>, Vec<String>, Vec<Vec<String>>)> {
         let lock = self.valid_lock(spec_name, spec_index)?;
         let mut essentials = Vec::new();
         let mut order = Vec::new();
@@ -1117,7 +1163,11 @@ impl Manifest {
                     }
                     order[ord].push(p.name.clone());
                 }
-                Ok::<_, io::Error>((src, &p.file))
+                Ok::<_, io::Error>(ResolvedInstallable {
+                    base: src.is_none().then(|| self.local_path(p.file.path())),
+                    archive: src,
+                    file: &p.file,
+                })
             })
             .collect::<io::Result<Vec<_>>>()?;
         Ok((installables, essentials, order))
@@ -1128,13 +1178,13 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        UniverseFiles<'a>,                              // archives
-        Vec<&'a Artifact>,                              // artifacts
-        Vec<(Option<&'a Archive>, &'a RepositoryFile)>, // installables
-        Vec<String>,                                    // essentials
-        Vec<Vec<String>>,                               // prioritized packages
-        Vec<String>,                                    // scripts
-        Vec<(String, String)>,                          // build env
+        UniverseFiles<'a>,            // archives
+        Vec<ResolvedArtifact<'a>>,    // artifacts
+        Vec<ResolvedInstallable<'a>>, // installables
+        Vec<String>,                  // essentials
+        Vec<Vec<String>>,             // prioritized packages
+        Vec<String>,                  // scripts
+        Vec<(String, String)>,        // build env
         Option<StageProgress>,
     )>
     where
@@ -1151,8 +1201,11 @@ impl Manifest {
             .collect();
         let build_env = self.build_env_for(spec_index)?;
         let pb = pb.map(|f| {
-            let installables_size: u64 = installables.iter().map(|(_, file)| file.size).sum();
-            let artifacts_size: u64 = artifacts.iter().map(|a| a.size()).sum();
+            let installables_size: u64 = installables.iter().map(|pkg| pkg.file.size).sum();
+            let artifacts_size: u64 = artifacts
+                .iter()
+                .map(|artifact| artifact.artifact.size())
+                .sum();
             f(installables_size + artifacts_size)
         });
         Ok((

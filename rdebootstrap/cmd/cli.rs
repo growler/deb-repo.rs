@@ -69,7 +69,6 @@ impl deb_cli::Config for App {
                 .ok()
                 .and_then(|p| p.into_os_string().into_string().ok());
             Ok(HostCache::new(
-                base,
                 HttpTransport::new(
                     AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?,
                     self.insecure,

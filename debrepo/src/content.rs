@@ -21,13 +21,7 @@ use {
         fs,
         io::{self, AsyncRead, AsyncReadExt},
     },
-    std::{
-        future::Future,
-        num::NonZero,
-        path::{Path, PathBuf},
-        pin::Pin,
-        sync::Arc,
-    },
+    std::{future::Future, num::NonZero, path::Path, pin::Pin, sync::Arc},
 };
 
 pub trait ContentProviderGuard<'a> {
@@ -37,13 +31,13 @@ pub trait ContentProviderGuard<'a> {
 #[derive(Clone, Debug)]
 pub enum DebLocation<'a> {
     Repository { url: &'a str, path: &'a str },
-    Local { path: &'a str },
+    Local { path: &'a str, base: &'a Path },
 }
 impl std::fmt::Display for DebLocation<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             DebLocation::Repository { url, path } => write!(f, "{}/{}", url, path),
-            DebLocation::Local { path } => write!(f, "local:{}", path),
+            DebLocation::Local { path, .. } => write!(f, "local:{}", path),
         }
     }
 }
@@ -67,14 +61,20 @@ pub trait ContentProvider {
     fn ensure_deb(
         &self,
         path: &str,
+        base: &Path,
     ) -> impl Future<Output = io::Result<(RepositoryFile, MutableControlStanza)>>;
     fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
+        base: Option<&'a Path>,
     ) -> impl Future<
         Output = io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>>,
     >;
-    fn ensure_artifact(&self, artifact: &mut Artifact) -> impl Future<Output = io::Result<()>>;
+    fn ensure_artifact(
+        &self,
+        artifact: &mut Artifact,
+        base: Option<&Path>,
+    ) -> impl Future<Output = io::Result<()>>;
     fn fetch_index_file(
         &self,
         hash: Hash,
@@ -100,7 +100,6 @@ pub trait ContentProvider {
         concurrency: NonZero<usize>,
     ) -> impl Future<Output = io::Result<Vec<Sources>>>;
     fn transport(&self) -> &impl TransportProvider;
-    fn resolve_path<P: AsRef<Path>>(&self, path: P) -> impl Future<Output = io::Result<PathBuf>>;
 }
 
 /// View of archive/suite files used to fetch package universes.
@@ -298,18 +297,12 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
 /// Host-side on-disk cache for fetched repository content.
 pub struct HostCache {
     transport: HttpTransport,
-    base: Arc<Path>,
     cache: Option<Arc<Path>>,
 }
 impl HostCache {
-    pub fn new<B: AsRef<Path>, P: AsRef<Path>>(
-        base: B,
-        transport: HttpTransport,
-        cache: Option<P>,
-    ) -> Self {
+    pub fn new<P: AsRef<Path>>(transport: HttpTransport, cache: Option<P>) -> Self {
         Self {
             transport,
-            base: base.as_ref().to_owned().into(),
             cache: cache.map(|p| p.as_ref().to_owned().into()),
         }
     }
@@ -352,9 +345,8 @@ impl ContentProvider for HostCache {
         Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
     > {
         match url {
-            DebLocation::Local { path } => {
-                let file =
-                    hash.verifying_reader(size, smol::fs::File::open(self.base.join(path)).await?);
+            DebLocation::Local { base, .. } => {
+                let file = hash.verifying_reader(size, smol::fs::File::open(base).await?);
                 Ok(Box::new(DebStage::new(
                     Box::pin(file) as Pin<Box<dyn AsyncRead + Send>>
                 ))
@@ -413,8 +405,12 @@ impl ContentProvider for HostCache {
             }
         }
     }
-    async fn ensure_deb(&self, path: &str) -> io::Result<(RepositoryFile, MutableControlStanza)> {
-        let file_path = self.base.join(path);
+    async fn ensure_deb(
+        &self,
+        path: &str,
+        base: &Path,
+    ) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+        let file_path = base.to_path_buf();
         tracing::debug!("Ensuring deb at {}", file_path.display());
         let file = smol::fs::File::open(&file_path).await?;
         let mut rdr = HashingReader::<crate::LocalPackagesHash, _>::new(file);
@@ -431,12 +427,21 @@ impl ContentProvider for HostCache {
         };
         Ok((file, ctrl))
     }
-    async fn ensure_artifact(&self, artifact: &mut Artifact) -> io::Result<()> {
+    async fn ensure_artifact(
+        &self,
+        artifact: &mut Artifact,
+        base: Option<&Path>,
+    ) -> io::Result<()> {
         if matches!(artifact, Artifact::Text(_)) {
             return Ok(());
         }
         if artifact.is_local() {
-            let path = self.base.join(artifact.uri());
+            let path = base.ok_or_else(|| {
+                io::Error::other(format!(
+                    "missing local base path for artifact {}",
+                    artifact.uri()
+                ))
+            })?;
             let _ = artifact.hash_local(&path).await;
         } else {
             let (mut src, _) = self.transport.open(artifact.uri()).await?;
@@ -461,13 +466,19 @@ impl ContentProvider for HostCache {
     async fn fetch_artifact<'a>(
         &self,
         artifact: &'a Artifact,
+        base: Option<&'a Path>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         tracing::debug!("Fetching artifact_ {}", artifact.uri());
         if matches!(artifact, Artifact::Text(_)) {
             return artifact.local("").await;
         }
         if artifact.is_local() {
-            let path = self.base.join(artifact.uri());
+            let path = base.ok_or_else(|| {
+                io::Error::other(format!(
+                    "missing local base path for artifact {}",
+                    artifact.uri()
+                ))
+            })?;
             return artifact.local(path).await;
         } else if let Some(cache) = self.cache.as_ref() {
             let url = artifact.uri();
@@ -642,8 +653,5 @@ impl ContentProvider for HostCache {
     }
     fn transport(&self) -> &impl TransportProvider {
         &self.transport
-    }
-    async fn resolve_path<P: AsRef<Path>>(&self, path: P) -> io::Result<PathBuf> {
-        smol::fs::canonicalize(self.base.join(path.as_ref())).await
     }
 }

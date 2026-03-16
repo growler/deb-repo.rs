@@ -323,7 +323,8 @@ Examples:
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                let (file, ctrl) = fetcher.ensure_deb(path).await?;
+                let base = mf.local_path(path);
+                let (file, ctrl) = fetcher.ensure_deb(path, &base).await?;
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;

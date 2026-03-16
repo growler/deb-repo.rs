@@ -135,6 +135,7 @@ impl LockedArchive {
         archive: &'a Archive,
         archive_idx: usize,
         skip_verify: bool,
+        base_dir: std::path::PathBuf,
         cache: &'a C,
     ) -> LocalBoxStream<'a, io::Result<(usize, usize, Option<LockedSuite>)>> {
         tracing::debug!(
@@ -143,30 +144,33 @@ impl LockedArchive {
             archive.suites.iter().join(" "),
         );
         stream::iter(archive.suites.iter().enumerate())
-            .then(move |(suite_idx, suite)| async move {
-                tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
-                let path = archive.release_path(suite);
-                let file = cache.fetch_release_file(&archive.file_url(&path)).await?;
-                let rel = archive
-                    .release_from_file(file.clone(), skip_verify, cache)
-                    .await?;
-                match locked.as_ref().and_then(|l| l.suites.get(suite_idx)) {
-                    Some(suite) => {
-                        if suite.path == path && suite.rel.as_bytes().eq(rel.as_bytes()) {
-                            Ok((archive_idx, suite_idx, None))
-                        } else {
-                            Ok((
-                                archive_idx,
-                                suite_idx,
-                                Some(LockedSuite { path, file, rel }),
-                            ))
+            .then(move |(suite_idx, suite)| {
+                let base_dir = base_dir.clone();
+                async move {
+                    tracing::debug!("Refreshing locked archive for {} {}", archive.url, suite);
+                    let path = archive.release_path(suite);
+                    let file = cache.fetch_release_file(&archive.file_url(&path)).await?;
+                    let rel = archive
+                        .release_from_file(file.clone(), skip_verify, &base_dir)
+                        .await?;
+                    match locked.as_ref().and_then(|l| l.suites.get(suite_idx)) {
+                        Some(suite) => {
+                            if suite.path == path && suite.rel.as_bytes().eq(rel.as_bytes()) {
+                                Ok((archive_idx, suite_idx, None))
+                            } else {
+                                Ok((
+                                    archive_idx,
+                                    suite_idx,
+                                    Some(LockedSuite { path, file, rel }),
+                                ))
+                            }
                         }
+                        None => Ok((
+                            archive_idx,
+                            suite_idx,
+                            Some(LockedSuite { path, file, rel }),
+                        )),
                     }
-                    None => Ok((
-                        archive_idx,
-                        suite_idx,
-                        Some(LockedSuite { path, file, rel }),
-                    )),
                 }
             })
             .boxed_local()
