@@ -67,7 +67,7 @@ fn main() -> ExitCode {
     match app.cmd.exec(&app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(err) => {
-            println!("{}", err);
+            eprintln!("{}", err);
             ExitCode::FAILURE
         }
     }

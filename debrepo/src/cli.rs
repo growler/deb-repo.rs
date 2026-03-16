@@ -9,7 +9,7 @@ use {
     anyhow::Result,
     indicatif::ProgressBar,
     std::{
-        io,
+        io::{self, Write},
         num::NonZero,
         path::Path,
         str::FromStr,
@@ -166,7 +166,6 @@ pub mod cmd {
         indicatif::ProgressBar,
         itertools::Itertools,
         rustix::path::Arg,
-        smol::io::AsyncWriteExt,
         std::{
             io::IsTerminal,
             path::{Path, PathBuf},
@@ -425,6 +424,13 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if let Some((archives, _)) = self.archive.as_vendor() {
+                    for archive in archives {
+                        mf.drop_archive(&archive.url)?;
+                    }
+                } else {
+                    mf.drop_archive(&self.archive.url)?;
+                }
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
@@ -449,7 +455,12 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
+                let path = self
+                    .path
+                    .as_str()
+                    .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                mf.drop_local_package(path)?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
@@ -761,10 +772,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     })
                     .collect::<Vec<_>>();
                 pkgs.sort_by_key(|&pkg| pkg.name());
-                let mut out = std::io::stdout().lock();
-                let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
-                pretty_print_packages(&mut out, pkgs, false).await?;
-                out.flush().await?;
+                let out = pretty_print_packages(pkgs, false)?;
+                std::io::stdout().lock().write_all(&out)?;
                 Ok(())
             })
         }
@@ -1060,8 +1069,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 guard.commit().await?;
                 let pkg = mf.packages()?.find(|p| self.package == p.name());
                 if let Some(pkg) = pkg {
-                    let mut out = async_io::Async::new(std::io::stdout().lock())?;
-                    out.write_all(pkg.src().as_bytes()).await?;
+                    std::io::stdout().lock().write_all(pkg.src().as_bytes())?;
                     Ok(())
                 } else {
                     Err(anyhow!("package {} not found", &self.package))
@@ -1101,7 +1109,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if found.is_empty() {
                     return Err(anyhow!("package/source {} not found", &self.package));
                 }
-                let mut out = async_io::Async::new(std::io::stdout().lock())?;
+                let mut out = std::io::stdout().lock();
                 if let Some(target) = self.stage_to.as_deref() {
                     if found.len() > 1 {
                         return Err(anyhow!(
@@ -1116,7 +1124,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                         if first {
                             first = false;
                         } else {
-                            out.write_all(b"\n").await?;
+                            out.write_all(b"\n")?;
                         }
                         let file_name = match artifact.path.rsplit('/').next() {
                             Some(name) => name,
@@ -1137,26 +1145,24 @@ hash = \"{}\"
                                 artifact.hash.to_sri(),
                             )
                             .as_bytes(),
-                        )
-                        .await?;
+                        )?;
                         if is_comp_ext(&artifact.path) {
-                            out.write_all(b"unpack = false\n").await?;
+                            out.write_all(b"unpack = false\n")?;
                         }
                         staged.push(&artifact.path);
                     }
-                    out.write_all(b"\nstage = [\n").await?;
+                    out.write_all(b"\nstage = [\n")?;
                     for staged in staged {
-                        out.write_all(format!("    \"{}\",\n", staged).as_bytes())
-                            .await?;
+                        out.write_all(format!("    \"{}\",\n", staged).as_bytes())?;
                     }
-                    out.write_all(b"]\n").await?;
+                    out.write_all(b"]\n")?;
                 } else {
                     for src in found.iter() {
-                        out.write_all(src.as_ref().as_bytes()).await?;
-                        out.write_all(b"\n").await?;
+                        out.write_all(src.as_ref().as_bytes())?;
+                        out.write_all(b"\n")?;
                     }
                 }
-                out.flush().await?;
+                out.flush()?;
                 Ok(())
             })
         }
@@ -1460,10 +1466,8 @@ hash = \"{}\"
                     .filter(|p| !self.only_essential || p.essential())
                     .collect::<Vec<_>>();
                 pkgs.sort_by_key(|&pkg| pkg.name());
-                let mut out = std::io::stdout().lock();
-                let mut out = smol::io::BufWriter::new(async_io::Async::new(&mut out)?);
-                pretty_print_packages(&mut out, pkgs, false).await?;
-                out.flush().await?;
+                let out = pretty_print_packages(pkgs, false)?;
+                std::io::stdout().lock().write_all(&out)?;
                 Ok(())
             })
         }
@@ -1631,11 +1635,10 @@ impl<'a> From<&'a Package<'a>> for PackageDisplay<'a> {
     }
 }
 
-pub async fn pretty_print_packages<'a, W: smol::io::AsyncWrite + Unpin>(
-    f: &mut W,
+pub fn pretty_print_packages<'a>(
     iter: impl IntoIterator<Item = &'a Package<'a>>,
     sort: bool,
-) -> Result<usize> {
+) -> Result<Vec<u8>> {
     let mut w0 = 0usize;
     let mut w1 = 0usize;
     let mut w2 = 0usize;
@@ -1662,17 +1665,14 @@ pub async fn pretty_print_packages<'a, W: smol::io::AsyncWrite + Unpin>(
     }
     let mut buf = Vec::new();
     for p in packages.iter() {
-        use smol::io::AsyncWriteExt;
         use std::io::Write;
-        buf.truncate(0);
         writeln!(
             &mut buf,
             "{:>w0$} {:<w2$} {:>w3$} {:<w4$}",
             p.arch, p.name, p.ver, p.desc
         )?;
-        f.write_all(&buf).await?;
     }
-    Ok(packages.len())
+    Ok(buf)
 }
 
 /// A parser type for converting command-line argument strings into a `Constraint`.

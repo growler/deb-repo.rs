@@ -725,6 +725,10 @@ impl ManifestFile {
             UpdateResult::Added
         }
     }
+    pub fn remove_local_pkg(&mut self, index: usize) -> RepositoryFile {
+        self.doc.drop_local_pkg(index);
+        self.local_pkgs.remove(index)
+    }
     pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> UpdateResult {
         if let Some((i, src)) = self
             .archives
@@ -1082,6 +1086,13 @@ impl LockFile {
     pub fn update_local_package(&mut self, id: usize, pkg: MutableControlStanza) -> io::Result<()> {
         let mut pkgs = MutableControlFile::from(&self.local_pkgs);
         pkgs.set_at(id, pkg);
+        self.local_pkgs = pkgs.try_into()?;
+        self.universe_hash.take();
+        Ok(())
+    }
+    pub fn remove_local_package(&mut self, index: usize) -> io::Result<()> {
+        let mut pkgs = MutableControlFile::from(&self.local_pkgs);
+        pkgs.remove_at(index);
         self.local_pkgs = pkgs.try_into()?;
         self.universe_hash.take();
         Ok(())
@@ -1502,6 +1513,9 @@ pub(crate) trait ManifestDoc {
         ));
         pkg_table.decor_mut().set_prefix(comment);
         local_arr.push(pkg_table);
+    }
+    fn drop_local_pkg(&mut self, index: usize) {
+        self.get_local_packages().remove(index);
     }
     fn update_archives(&mut self, index: usize, archive: &Archive, comment: Option<&str>) {
         let archives_arr = self.get_archives();

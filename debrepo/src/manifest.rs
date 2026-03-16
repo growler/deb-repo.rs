@@ -258,6 +258,29 @@ impl Manifest {
             )),
         }
     }
+    pub fn drop_local_package<S: AsRef<str>>(&mut self, package_path: S) -> io::Result<()> {
+        let pos = self
+            .file
+            .local_pkgs()
+            .iter()
+            .find_position(|file| file.path == package_path.as_ref());
+        match pos {
+            Some((i, _)) => {
+                self.file.remove_local_pkg(i);
+                self.lock
+                    .specs_mut()
+                    .for_each(|(_, r)| r.invalidate_solution());
+                self.mark_file_updated();
+                self.lock.remove_local_package(i)?;
+                self.mark_lock_invalid();
+                Ok(())
+            }
+            None => Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                format!("local package {} not found", package_path.as_ref()),
+            )),
+        }
+    }
     pub fn installables<'a>(
         &'a self,
         name: Option<&'a str>,

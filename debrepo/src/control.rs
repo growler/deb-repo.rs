@@ -525,6 +525,9 @@ impl MutableControlFile {
     pub fn set_at(&mut self, index: usize, stanza: MutableControlStanza) {
         self.stanzas[index] = stanza
     }
+    pub fn remove_at(&mut self, index: usize) -> MutableControlStanza {
+        self.stanzas.remove(index)
+    }
     /// Creates a new stanza and returns a mutable reference to it.
     pub fn new_stanza(&mut self) -> &'_ mut MutableControlStanza {
         let l = self.stanzas.len();
