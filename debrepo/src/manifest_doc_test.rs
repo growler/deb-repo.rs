@@ -28,6 +28,10 @@ use {
 
 const ARCH: &str = "amd64";
 
+fn new_manifest() -> Manifest {
+    Manifest::new("Manifest.toml", ARCH, None)
+}
+
 fn render_manifest(manifest: &mut Manifest) -> (String, toml_edit::DocumentMut) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
@@ -316,7 +320,7 @@ impl ContentProvider for UpdateProvider {
 
 #[test]
 fn add_requirements_default_spec_adds_items_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["foo"], Some("req-comment"))
         .expect("add requirements");
@@ -333,7 +337,7 @@ fn add_requirements_default_spec_adds_items_and_comment() {
 
 #[test]
 fn add_requirements_named_spec_adds_items_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["bar"], Some("named-comment"))
         .expect("add requirements");
@@ -352,7 +356,7 @@ fn add_requirements_named_spec_adds_items_and_comment() {
 
 #[test]
 fn add_requirements_prevents_duplicate_comment_on_existing_item() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["dup"], Some("first-comment"))
         .expect("add requirements");
@@ -369,7 +373,7 @@ fn add_requirements_prevents_duplicate_comment_on_existing_item() {
 
 #[test]
 fn remove_requirements_default_spec_removes_items_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["foo"], Some("remove-comment"))
         .expect("add requirements");
@@ -386,7 +390,7 @@ fn remove_requirements_default_spec_removes_items_and_comments() {
 
 #[test]
 fn remove_requirements_named_spec_removes_items_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["foo"], Some("remove-comment"))
         .expect("add requirements");
@@ -402,7 +406,7 @@ fn remove_requirements_named_spec_removes_items_and_comments() {
 
 #[test]
 fn add_constraints_default_spec_adds_items_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_constraints(None, ["foo (>= 1.0)"], Some("exclude-comment"))
         .expect("add constraints");
@@ -419,7 +423,7 @@ fn add_constraints_default_spec_adds_items_and_comment() {
 
 #[test]
 fn add_constraints_named_spec_adds_items_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_constraints(Some("custom"), ["bar (<< 2.0)"], Some("exclude-comment"))
         .expect("add constraints");
@@ -438,7 +442,7 @@ fn add_constraints_named_spec_adds_items_and_comment() {
 
 #[test]
 fn add_constraints_prevents_duplicate_comment_on_existing_item() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_constraints(None, ["dup (>= 1)"], Some("first-comment"))
         .expect("add constraints");
@@ -455,7 +459,7 @@ fn add_constraints_prevents_duplicate_comment_on_existing_item() {
 
 #[test]
 fn remove_constraints_default_spec_removes_items_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_constraints(None, ["foo (<= 2.0)"], Some("remove-comment"))
         .expect("add constraints");
@@ -471,7 +475,7 @@ fn remove_constraints_default_spec_removes_items_and_comments() {
 
 #[test]
 fn remove_constraints_named_spec_removes_items_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_constraints(Some("custom"), ["foo (= 1)"], Some("remove-comment"))
         .expect("add constraints");
@@ -487,7 +491,7 @@ fn remove_constraints_named_spec_removes_items_and_comments() {
 
 #[test]
 fn add_archive_adds_entry_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     let archive = make_archive("https://example.invalid/debian", "stable");
     manifest
         .add_archive(archive, Some("archive-comment"))
@@ -515,7 +519,7 @@ fn add_archive_adds_entry_and_comment() {
 
 #[test]
 fn add_archive_update_removes_comment_when_none() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     let archive = make_archive("https://example.invalid/debian", "stable");
     manifest
         .add_archive(archive.clone(), Some("archive-comment"))
@@ -541,7 +545,7 @@ fn add_archive_update_removes_comment_when_none() {
 
 #[test]
 fn add_local_package_adds_entry_and_comment() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     let file = RepositoryFile::new("pkg.deb".to_string(), Hash::default(), 10);
     let ctrl = make_control("pkg");
     manifest
@@ -559,7 +563,7 @@ fn add_local_package_adds_entry_and_comment() {
 
 #[test]
 fn add_local_package_update_removes_comment_when_none() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     let file = RepositoryFile::new("pkg.deb".to_string(), Hash::default(), 10);
     let ctrl = make_control("pkg");
     manifest
@@ -587,7 +591,7 @@ fn add_artifact_default_spec_adds_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -625,7 +629,7 @@ fn add_artifact_prevents_duplicate_stage_and_comment_on_update() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -660,7 +664,7 @@ fn update_locals_refreshes_local_artifact_hashes() {
     std::fs::write(&artifact_path, b"before").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -708,7 +712,7 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");
@@ -740,7 +744,7 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
 
 #[test]
 fn upsert_text_artifact_creates_and_updates() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .upsert_text_artifact(
             "note",
@@ -801,7 +805,7 @@ fn upsert_text_artifact_rejects_non_text() {
     let artifact_path = dir.path().join("artifact-file");
     std::fs::write(&artifact_path, b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, vec!["base"], None)
         .expect("add requirement");
@@ -839,7 +843,7 @@ fn remove_artifact_default_spec_removes_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -878,7 +882,7 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new(dir.path().to_path_buf());
 
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");
@@ -911,7 +915,7 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
 
 #[test]
 fn set_build_env_default_spec_sets_values_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -945,7 +949,7 @@ fn set_build_env_default_spec_sets_values_and_comments() {
 
 #[test]
 fn set_build_env_default_spec_updates_and_removes_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -980,7 +984,7 @@ fn set_build_env_default_spec_updates_and_removes_comments() {
 
 #[test]
 fn set_build_env_default_spec_removes_table_when_empty() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -1003,7 +1007,7 @@ fn set_build_env_default_spec_removes_table_when_empty() {
 
 #[test]
 fn set_build_env_named_spec_sets_values_and_comments() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");
@@ -1024,7 +1028,7 @@ fn set_build_env_named_spec_sets_values_and_comments() {
 
 #[test]
 fn set_build_script_default_spec_adds_and_removes_entry() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(None, ["base"], None)
         .expect("add requirements");
@@ -1050,7 +1054,7 @@ fn set_build_script_default_spec_adds_and_removes_entry() {
 
 #[test]
 fn set_build_script_named_spec_adds_and_removes_entry() {
-    let mut manifest = Manifest::new(ARCH, None);
+    let mut manifest = new_manifest();
     manifest
         .add_requirements(Some("custom"), ["base"], None)
         .expect("add requirements");
@@ -1079,6 +1083,7 @@ fn update_without_valid_lock_refreshes_archives() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     let mut manifest = Manifest::from_archives(
+        &path,
         ARCH,
         [make_archive("https://example.invalid/debian", "stable")],
         None,
@@ -1118,6 +1123,7 @@ fn update_skips_archive_refresh_when_lock_is_valid() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     let mut manifest = Manifest::from_archives(
+        &path,
         ARCH,
         [make_archive("https://example.invalid/debian", "stable")],
         None,

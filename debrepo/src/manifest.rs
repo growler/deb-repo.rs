@@ -32,6 +32,7 @@ use {
 /// Top-level manifest model.
 pub struct Manifest {
     arch: String,
+    path: PathBuf,
     file: ManifestFile,
     hash: Option<Hash>,
     lock: LockFile,
@@ -64,9 +65,10 @@ pub(crate) fn lock_path_for(manifest_path: &Path, arch: &str) -> PathBuf {
 ///
 impl Manifest {
     pub const DEFAULT_FILE: &str = "Manifest.toml";
-    pub fn new<A: ToString>(arch: A, comment: Option<&str>) -> Self {
+    pub fn new<P: AsRef<Path>, A: ToString>(path: P, arch: A, comment: Option<&str>) -> Self {
         Manifest {
             arch: arch.to_string(),
+            path: path.as_ref().to_path_buf(),
             hash: None,
             file: ManifestFile::new(comment),
             lock: LockFile::new(),
@@ -76,8 +78,9 @@ impl Manifest {
             source_universe: None,
         }
     }
-    pub fn from_archives<A, I, S>(arch: A, archives: I, comment: Option<&str>) -> Self
+    pub fn from_archives<P, A, I, S>(path: P, arch: A, archives: I, comment: Option<&str>) -> Self
     where
+        P: AsRef<Path>,
         A: ToString,
         I: IntoIterator<Item = S>,
         S: Into<Archive>,
@@ -85,6 +88,7 @@ impl Manifest {
         let archives: Vec<Archive> = archives.into_iter().map(|s| s.into()).collect();
         Manifest {
             arch: arch.to_string(),
+            path: path.as_ref().to_path_buf(),
             hash: None,
             lock: LockFile::new_with_archives(archives.len()),
             file: ManifestFile::new_with_archives(archives, comment),
@@ -107,6 +111,7 @@ impl Manifest {
         let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file());
         let manifest = Manifest {
             arch: arch.to_string(),
+            path,
             hash: Some(hash),
             file: manifest,
             lock,

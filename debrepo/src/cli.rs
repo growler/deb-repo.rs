@@ -233,6 +233,7 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let mut mf = Manifest::from_archives(
+                    conf.manifest(),
                     conf.arch(),
                     archives.iter().cloned(),
                     self.comment.as_deref().or(comment.as_deref()),
