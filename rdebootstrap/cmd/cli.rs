@@ -161,6 +161,7 @@ pub struct App {
 debrepo::cli_commands! {
     pub enum Commands<App> {
         Init(deb_cli::cmd::Init),
+        Import(deb_cli::cmd::ImportCmd),
         Archive(deb_cli::cmd::ArchiveCmd),
         Deb(deb_cli::cmd::DebCmd),
         Artifact(deb_cli::cmd::ArtifactCmd),

@@ -275,6 +275,14 @@ impl<'a> Package<'a> {
             Hash::from_hex(hash_field_name, digest)?,
         ))
     }
+    pub fn filename(&self) -> io::Result<&'a str> {
+        self.field("Filename").ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("package {} lacks field Filename", self),
+            )
+        })
+    }
     pub fn src(&self) -> &'a str {
         self.src
     }

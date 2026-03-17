@@ -51,9 +51,11 @@ pub fn valid_spec_name(s: &str) -> Result<&str, String> {
     }
 }
 
+pub(crate) const DEFAULT_SPEC_DISPLAY_NAME: &str = "<default>";
+
 pub(crate) fn spec_display_name(name: &str) -> &str {
     if name.is_empty() {
-        "<default>"
+        DEFAULT_SPEC_DISPLAY_NAME
     } else {
         name
     }
@@ -166,14 +168,25 @@ impl ManifestFile {
         }
     }
 
-    pub(crate) fn has_import(&self) -> bool {
-        self.import.is_some()
-    }
-
     pub(crate) fn import(&self) -> Option<&Import> {
         self.import.as_ref()
     }
 
+    pub(crate) fn set_import<P: Into<PathBuf>, S: ToString, I: IntoIterator<Item = S>>(
+        &mut self,
+        path: P,
+        hash: Hash,
+        specs: I,
+    ) {
+        let specs = specs.into_iter().map(|s| s.to_string()).collect();
+        let import = Import {
+            path: path.into(),
+            hash,
+            specs,
+        };
+        self.doc.upsert_import(&import);
+        self.import = Some(import);
+    }
     pub async fn from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, Hash)> {
         let r = smol::fs::File::open(&path).await?.take(Self::MAX_SIZE);
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(r);
@@ -229,15 +242,16 @@ impl ManifestFile {
         Ok(hash)
     }
 
-    pub fn unlocked_lock_file(&self) -> LockFile {
+    pub(crate) fn unlocked_lock_file(&self, imported_universe_hash: Option<Hash>) -> LockFile {
         LockFile {
-            archives: self.archives().iter().map(|_| None).collect(),
+            archives: self.local_archives().iter().map(|_| None).collect(),
             local_pkgs: Packages::default(),
             specs: self
                 .specs()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
                 .collect(),
             universe_hash: None,
+            imported_universe_hash,
         }
     }
     pub fn spec_index_ensure<'a>(&self, name: Option<&'a str>) -> io::Result<(&'a str, usize)> {
@@ -724,7 +738,8 @@ impl ManifestFile {
             }
         }
     }
-    pub fn archives(&self) -> &'_ [Archive] {
+    /// List of archives defined in this manifest (not including imported ones)
+    pub fn local_archives(&self) -> &'_ [Archive] {
         &self.archives
     }
     pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
@@ -973,6 +988,12 @@ impl<'a> Iterator for SpecIterator<'a> {
 pub(crate) struct LockFile {
     #[serde(rename = "universe", default)]
     universe_hash: Option<Hash>,
+    #[serde(
+        rename = "imported-universe",
+        skip_serializing_if = "Option::is_none",
+        default
+    )]
+    imported_universe_hash: Option<Hash>,
     archives: Vec<Option<LockedArchive>>,
     #[serde(rename = "locals", skip_serializing_if = "Packages::is_empty", default)]
     local_pkgs: Packages,
@@ -981,26 +1002,32 @@ pub(crate) struct LockFile {
 
 impl LockFile {
     pub const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         LockFile {
             universe_hash: None,
+            imported_universe_hash: None,
             archives: Vec::new(),
             local_pkgs: Packages::default(),
             specs: KVList::new(),
         }
     }
-    pub fn new_with_archives(archives: usize) -> Self {
+    pub(crate) fn new_with_archives(archives: usize) -> Self {
         LockFile {
             universe_hash: None,
+            imported_universe_hash: None,
             archives: vec![None; archives],
             local_pkgs: Packages::default(),
             specs: KVList::new(),
         }
     }
-    pub async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
+    pub(crate) fn universe_hash(&self) -> Option<&Hash> {
+        self.universe_hash.as_ref()
+    }
+    pub(crate) async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
         lock_path: P,
         arch: A,
         manifest_hash: &Hash,
+        imported_universe_hash: Option<&Hash>,
     ) -> Option<Self> {
         let lock_file_path = lock_path.as_ref();
         match smol::fs::File::open(lock_file_path).await {
@@ -1027,6 +1054,8 @@ impl LockFile {
                     manifest: Hash,
                     #[serde(rename = "universe")]
                     universe_hash: Hash,
+                    #[serde(rename = "imported-universe", default)]
+                    imported_universe_hash: Option<Hash>,
                     archives: Vec<LockedArchive>,
                     #[serde(default)]
                     locals: Packages,
@@ -1053,9 +1082,13 @@ impl LockFile {
                     })
                     .ok()
                     .and_then(|lock| {
-                        if &lock.manifest == manifest_hash && lock.arch.as_str() == arch.as_ref() {
+                        if &lock.manifest == manifest_hash
+                            && lock.arch.as_str() == arch.as_ref()
+                            && lock.imported_universe_hash.as_ref() == imported_universe_hash
+                        {
                             Some(LockFile {
                                 universe_hash: Some(lock.universe_hash),
+                                imported_universe_hash: lock.imported_universe_hash,
                                 archives: lock.archives.into_iter().map(Some).collect(),
                                 local_pkgs: lock.locals,
                                 specs: lock.specs,
@@ -1103,7 +1136,8 @@ impl LockFile {
         crate::safe_store(lock_path, smol::io::Cursor::new(out)).await?;
         Ok(())
     }
-    pub fn archives(&self) -> &'_ [Option<LockedArchive>] {
+    /// List of archives defined in this manifest (not including imported ones)
+    pub fn local_archives(&self) -> &'_ [Option<LockedArchive>] {
         &self.archives
     }
     pub fn local_pkgs(&self) -> Option<&'_ Packages> {
@@ -1406,6 +1440,7 @@ fn spec_items() -> toml_edit::Item {
 
 pub(crate) trait ManifestDoc {
     fn init_manifest(self, comment: Option<&str>) -> Self;
+    fn upsert_import(&mut self, import: &Import);
     fn get_doc_entry_mut(
         &mut self,
         entry: &str,
@@ -1651,6 +1686,17 @@ pub(crate) trait ManifestDoc {
         C: AsRef<str>;
 }
 
+fn entry_order(entry: &str) -> u8 {
+    match entry {
+        "import" => 0,
+        "archive" => 1,
+        "local" => 2,
+        "artifact" => 3,
+        "spec" => 4,
+        _ => 5,
+    }
+}
+
 impl ManifestDoc for toml_edit::DocumentMut {
     fn init_manifest(mut self, comment: Option<&str>) -> Self {
         if let Some(comment) = comment {
@@ -1676,18 +1722,22 @@ impl ManifestDoc for toml_edit::DocumentMut {
             .as_table_mut()
             .expect("a table of specs");
         default_spec.sort_values_by(|k1, _, k2, _| spec_entry_order(k1).cmp(&spec_entry_order(k2)));
-        fn entry_order(entry: &str) -> u8 {
-            match entry {
-                "import" => 0,
-                "archive" => 1,
-                "local" => 2,
-                "artifact" => 3,
-                "spec" => 4,
-                _ => 5,
+        self.sort_values_by(|k1, _, k2, _| entry_order(k1).cmp(&entry_order(k2)));
+        self
+    }
+    fn upsert_import(&mut self, import: &Import) {
+        let table = toml_edit::ser::to_document(import)
+            .expect("failed to serialize import")
+            .into_table();
+        match self.entry("import") {
+            toml_edit::Entry::Vacant(e) => {
+                e.insert(toml_edit::Item::Table(table));
+            }
+            toml_edit::Entry::Occupied(mut e) => {
+                *e.get_mut() = toml_edit::Item::Table(table);
             }
         }
         self.sort_values_by(|k1, _, k2, _| entry_order(k1).cmp(&entry_order(k2)));
-        self
     }
     fn get_doc_entry_mut(
         &mut self,

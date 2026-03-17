@@ -82,6 +82,13 @@ impl std::fmt::Display for MutableControlField<'_> {
 }
 
 impl<'a> MutableControlField<'a> {
+    /// Creates a new field
+    pub fn new<N: Into<Cow<'a, str>>, V: Into<Cow<'a, str>>>(name: N, val: V) -> Self {
+        Self {
+            name: name.into(),
+            value: val.into(),
+        }
+    }
     /// Sets the field value
     pub fn set<S: Into<Cow<'a, str>>>(&mut self, value: S) {
         self.value = value.into()

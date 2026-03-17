@@ -693,6 +693,9 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
+        /// Refresh the imported manifest hash and re-resolve against the updated import
+        #[arg(short = 'I', long = "import", action)]
+        refresh_import: bool,
     }
 
     impl<C: Config> Command<C> for Update {
@@ -701,9 +704,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let force_archives = self.archives || self.snapshot.is_some();
-                let force = force_archives || self.locals;
+                let mut force = force_archives || self.locals || self.refresh_import;
                 let (mut mf, has_valid_lock) =
                     Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if self.refresh_import {
+                    force |= mf.update_import()?;
+                }
                 if has_valid_lock && !force {
                     tracing::debug!("Lock file is up to date, nothing to do");
                     return Ok(());
@@ -721,6 +727,54 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 .await?;
                 mf.store().await?;
                 guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(
+        about = "Add or replace an imported manifest",
+        long_about = "Configure a manifest import: validates the imported manifest and writes [import] to the downstream manifest."
+    )]
+    /// CLI command: configure a manifest import.
+    pub struct ImportCmd {
+        /// Path to the manifest file to import (absolute or relative to current manifest directory)
+        #[arg(value_name = "PATH")]
+        path: PathBuf,
+
+        /// Spec name to export from the imported manifest (repeatable, at least one required)
+        #[arg(long = "spec", value_name = "SPEC", value_delimiter = ',')]
+        specs: Vec<String>,
+    }
+
+    impl<C: Config> Command<C> for ImportCmd {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let import_abs = mf.local_path(&self.path);
+                let (imported, _) = Manifest::from_file(&import_abs, conf.arch()).await?;
+                let imported_specs: Vec<&str> = self
+                    .specs
+                    .iter()
+                    .map(|s| {
+                        if imported.spec_names().any(|name| name == s) {
+                            Ok(s.as_str())
+                        } else {
+                            Err(io::Error::other(format!(
+                                "spec \"{}\" not found in imported manifest {}",
+                                s,
+                                import_abs.display(),
+                            )))
+                        }
+                    })
+                    .collect::<io::Result<Vec<_>>>()?;
+                mf.set_import(&self.path, &imported, imported_specs)?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
+                guard.commit().await?;
+                mf.store().await?;
                 Ok(())
             })
         }

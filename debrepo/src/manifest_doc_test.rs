@@ -345,6 +345,108 @@ impl ContentProvider for UpdateProvider {
     }
 }
 
+struct UniverseCountProvider {
+    transport: TestTransport,
+    universe_fetches: Arc<AtomicUsize>,
+}
+
+impl UniverseCountProvider {
+    fn new(universe_fetches: Arc<AtomicUsize>) -> Self {
+        Self {
+            transport: TestTransport,
+            universe_fetches,
+        }
+    }
+}
+
+impl ContentProvider for UniverseCountProvider {
+    type Target = HostFileSystem;
+    type Guard<'a>
+        = TestGuard
+    where
+        Self: 'a;
+
+    async fn init(&self) -> io::Result<Self::Guard<'_>> {
+        Ok(TestGuard)
+    }
+
+    async fn fetch_deb(
+        &self,
+        _hash: Hash,
+        _size: u64,
+        _url: &DebLocation<'_>,
+    ) -> io::Result<
+        Box<dyn Stage<Target = Self::Target, Output = MutableControlStanza> + Send + 'static>,
+    > {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn ensure_deb(
+        &self,
+        _path: &str,
+        _source: &Path,
+    ) -> io::Result<(RepositoryFile, MutableControlStanza)> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_artifact(
+        &self,
+        _artifact: &crate::artifact::Artifact,
+        _base: Option<&Path>,
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn ensure_artifact(
+        &self,
+        _artifact: &mut crate::artifact::Artifact,
+        _base: Option<&Path>,
+    ) -> io::Result<()> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_release_file(&self, _url: &str) -> io::Result<IndexFile> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_universe(
+        &self,
+        archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Vec<Packages>> {
+        self.universe_fetches.fetch_add(1, Ordering::Relaxed);
+        archives.package_files().try_for_each(|entry| {
+            let _ = entry?;
+            Ok::<_, io::Error>(())
+        })?;
+        Ok(Vec::new())
+    }
+
+    async fn fetch_universe_stage(
+        &self,
+        _archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    async fn fetch_source_universe(
+        &self,
+        _archives: UniverseFiles<'_>,
+        _concurrency: NonZero<usize>,
+    ) -> io::Result<Vec<Sources>> {
+        Err(io::Error::other("unused in tests"))
+    }
+
+    fn transport(&self) -> &impl TransportProvider {
+        &self.transport
+    }
+}
+
 #[test]
 fn add_requirements_default_spec_adds_items_and_comment() {
     let mut manifest = new_manifest();
@@ -1199,4 +1301,58 @@ fn update_skips_archive_refresh_when_lock_is_valid() {
     });
 
     assert_eq!(release_fetches.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn load_universe_fetches_each_manifest_in_import_chain() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let imported_path = dir.path().join("imported").join("Manifest.toml");
+    let downstream_path = dir.path().join("downstream").join("Manifest.toml");
+    let concurrency = NonZero::new(1).expect("nonzero");
+
+    let mut imported = Manifest::from_archives(
+        &imported_path,
+        ARCH,
+        [make_archive("https://example.invalid/debian", "stable")],
+        None,
+    );
+    let release_fetches = Arc::new(AtomicUsize::new(0));
+    let update_provider = UpdateProvider::new(Arc::clone(&release_fetches));
+    smol::block_on(async {
+        imported
+            .store_manifest_only(&imported_path)
+            .await
+            .expect("store imported manifest");
+        imported
+            .update(false, false, true, concurrency, &update_provider)
+            .await
+            .expect("update imported manifest");
+        imported.store().await.expect("store imported lock");
+    });
+
+    let mut downstream = new_manifest_at(&downstream_path);
+    downstream
+        .set_import("../imported/Manifest.toml", &imported, ["base"])
+        .expect("set import");
+    smol::block_on(async {
+        downstream
+            .store_manifest_only(&downstream_path)
+            .await
+            .expect("store downstream manifest");
+    });
+
+    let universe_fetches = Arc::new(AtomicUsize::new(0));
+    let universe_provider = UniverseCountProvider::new(Arc::clone(&universe_fetches));
+    smol::block_on(async {
+        let (mut loaded, has_valid_lock) = Manifest::from_file(&downstream_path, ARCH)
+            .await
+            .expect("load downstream manifest");
+        assert!(!has_valid_lock);
+        loaded
+            .load_universe(concurrency, &universe_provider)
+            .await
+            .expect("load universe");
+    });
+
+    assert_eq!(universe_fetches.load(Ordering::Relaxed), 2);
 }
