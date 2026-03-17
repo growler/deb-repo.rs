@@ -16,8 +16,153 @@ use {
     ouroboros::self_referencing,
     serde::{Deserialize, Serialize},
     smol::io::{AsyncRead, AsyncReadExt},
-    std::{io, sync::Arc},
+    std::{fmt, io, sync::Arc},
 };
+
+#[derive(Default, Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PackageOrigin {
+    #[default]
+    Unknown,
+    Local {
+        manifest_id: u32,
+    },
+    Archive {
+        manifest_id: u32,
+        archive_id: u32,
+    },
+}
+
+impl PackageOrigin {
+    pub const fn manifest(&self) -> Option<u32> {
+        match self {
+            Self::Unknown => None,
+            Self::Local { manifest_id } | Self::Archive { manifest_id, .. } => Some(*manifest_id),
+        }
+    }
+    pub const fn archive(&self) -> Option<u32> {
+        match self {
+            Self::Archive { archive_id, .. } => Some(*archive_id),
+            Self::Unknown | Self::Local { .. } => None,
+        }
+    }
+    pub const fn is_unknown(&self) -> bool {
+        matches!(self, Self::Unknown)
+    }
+    pub const fn legacy_local() -> Self {
+        Self::Local { manifest_id: 0 }
+    }
+}
+
+impl Serialize for PackageOrigin {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        match self {
+            Self::Unknown => serializer.serialize_str(""),
+            Self::Local { manifest_id } => serializer.serialize_str(&format!(":{manifest_id}")),
+            Self::Archive {
+                manifest_id,
+                archive_id,
+            } => serializer.serialize_str(&format!(":{manifest_id}:{archive_id}")),
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for PackageOrigin {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        struct PackageOriginVisitor;
+
+        impl PackageOriginVisitor {
+            fn parse_u32<E: serde::de::Error>(value: &str, field: &str) -> Result<u32, E> {
+                value
+                    .parse()
+                    .map_err(|err| E::custom(format!("invalid {field} {value:?}: {err}")))
+            }
+
+            fn parse_str<E: serde::de::Error>(value: &str) -> Result<PackageOrigin, E> {
+                if value.is_empty() {
+                    return Ok(PackageOrigin::Unknown);
+                }
+                let rest = value.strip_prefix(':').ok_or_else(|| {
+                    E::custom(
+                        "package origin string must be empty or begin with ':' \
+                        (expected ':<manifest>' or ':<manifest>:<archive>')",
+                    )
+                })?;
+                let mut parts = rest.split(':');
+                let manifest_id = Self::parse_u32(
+                    parts
+                        .next()
+                        .ok_or_else(|| E::custom("missing manifest id"))?,
+                    "manifest id",
+                )?;
+                match (parts.next(), parts.next()) {
+                    (None, None) => Ok(PackageOrigin::Local { manifest_id }),
+                    (Some(archive_id), None) => Ok(PackageOrigin::Archive {
+                        manifest_id,
+                        archive_id: Self::parse_u32(archive_id, "archive id")?,
+                    }),
+                    _ => Err(E::custom(
+                        "package origin string must be ':<manifest>' or ':<manifest>:<archive>'",
+                    )),
+                }
+            }
+        }
+
+        impl<'de> serde::de::Visitor<'de> for PackageOriginVisitor {
+            type Value = PackageOrigin;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                write!(
+                    f,
+                    "an origin integer, an empty string, ':<manifest>', or ':<manifest>:<archive>'"
+                )
+            }
+
+            fn visit_u64<E>(self, value: u64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(PackageOrigin::Archive {
+                    manifest_id: 0,
+                    archive_id: value.try_into().map_err(|_| {
+                        E::custom(format!("archive id {value} does not fit into u32"))
+                    })?,
+                })
+            }
+
+            fn visit_i64<E>(self, value: i64) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                let archive_id: u64 = value
+                    .try_into()
+                    .map_err(|_| E::custom("archive id must be non-negative"))?;
+                self.visit_u64(archive_id)
+            }
+
+            fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Self::parse_str(value)
+            }
+
+            fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Self::parse_str(value.as_str())
+            }
+        }
+
+        deserializer.deserialize_any(PackageOriginVisitor)
+    }
+}
 
 /// Memory-mapped Packages file for efficient parsing.
 pub struct MemoryMappedUniverseFile {
@@ -129,7 +274,7 @@ impl MemoryMappedUniverseFile {
             files.push(
                 Packages::new(
                     IndexFile::mmap_region(Arc::clone(&mmap), begin, end)?,
-                    None,
+                    PackageOrigin::Unknown,
                     Some(prio),
                 )
                 .map_err(io::Error::other)?,
@@ -454,14 +599,14 @@ impl<'a> From<&Package<'a>> for MutableControlStanza {
 /// Collection of packages parsed from a Packages file.
 pub struct Packages {
     prio: u32,
-    archive_id: Option<u32>,
+    origin: PackageOrigin,
     inner: Arc<PackagesInner>,
 }
 
 impl Default for Packages {
     fn default() -> Self {
         Packages {
-            archive_id: None,
+            origin: PackageOrigin::Unknown,
             prio: 500,
             inner: Arc::new(
                 PackagesInnerTryBuilder {
@@ -480,7 +625,7 @@ impl Default for Packages {
 impl Clone for Packages {
     fn clone(&self) -> Self {
         Packages {
-            archive_id: self.archive_id,
+            origin: self.origin,
             prio: self.prio,
             inner: Arc::clone(&self.inner),
         }
@@ -527,27 +672,30 @@ impl Packages {
     pub fn with_prio(self, prio: u32) -> Self {
         Self {
             prio,
-            archive_id: self.archive_id,
+            origin: self.origin,
             inner: self.inner,
         }
     }
-    pub fn archive_id(&self) -> Option<usize> {
-        self.archive_id.map(|id| id as usize)
+    pub fn origin(&self) -> PackageOrigin {
+        self.origin
     }
-    pub fn with_archive_id(self, archive_id: u32) -> Self {
+    pub fn archive_id(&self) -> Option<usize> {
+        self.origin.archive().map(|id| id as usize)
+    }
+    pub fn with_origin(self, origin: PackageOrigin) -> Self {
         Self {
-            archive_id: Some(archive_id),
+            origin,
             prio: self.prio,
             inner: self.inner,
         }
     }
     pub fn new(
         data: IndexFile,
-        archive_id: Option<u32>,
+        origin: PackageOrigin,
         prio: Option<u32>,
     ) -> Result<Self, ParseError> {
         Ok(Packages {
-            archive_id,
+            origin,
             prio: prio.unwrap_or(500),
             inner: Arc::new(
                 PackagesInnerTryBuilder {
@@ -609,14 +757,14 @@ impl<'de> Deserialize<'de> for Packages {
 impl TryFrom<&str> for Packages {
     type Error = ParseError;
     fn try_from(inp: &str) -> Result<Self, Self::Error> {
-        Self::new(inp.to_owned().into(), None, None)
+        Self::new(inp.to_owned().into(), PackageOrigin::Unknown, None)
     }
 }
 
 impl TryFrom<String> for Packages {
     type Error = ParseError;
     fn try_from(inp: String) -> Result<Self, Self::Error> {
-        Self::new(inp.into(), None, None)
+        Self::new(inp.into(), PackageOrigin::Unknown, None)
     }
 }
 
@@ -627,7 +775,7 @@ impl TryFrom<Vec<u8>> for Packages {
             String::from_utf8(inp)
                 .map_err(|err| ParseError::from(format!("{}", err)))?
                 .into(),
-            None,
+            PackageOrigin::Unknown,
             None,
         )
     }
@@ -644,6 +792,99 @@ struct PackagesInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde::{Deserialize, Serialize};
     use static_assertions::assert_impl_all;
     assert_impl_all!(MutableControlStanza: Send, Sync);
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct WirePackageOrigin {
+        value: PackageOrigin,
+    }
+
+    #[test]
+    fn package_origin_accessors_match_variants() {
+        assert_eq!(PackageOrigin::Unknown.manifest(), None);
+        assert_eq!(PackageOrigin::Unknown.archive(), None);
+        assert_eq!(PackageOrigin::Local { manifest_id: 7 }.manifest(), Some(7));
+        assert_eq!(PackageOrigin::Local { manifest_id: 7 }.archive(), None);
+        assert_eq!(
+            PackageOrigin::Archive {
+                manifest_id: 3,
+                archive_id: 9
+            }
+            .manifest(),
+            Some(3)
+        );
+        assert_eq!(
+            PackageOrigin::Archive {
+                manifest_id: 3,
+                archive_id: 9
+            }
+            .archive(),
+            Some(9)
+        );
+    }
+
+    #[test]
+    fn package_origin_serializes_new_string_forms() {
+        assert_eq!(
+            toml_edit::ser::to_string(&WirePackageOrigin {
+                value: PackageOrigin::Unknown
+            })
+            .unwrap(),
+            "value = \"\"\n"
+        );
+        assert_eq!(
+            toml_edit::ser::to_string(&WirePackageOrigin {
+                value: PackageOrigin::Local { manifest_id: 5 }
+            })
+            .unwrap(),
+            "value = \":5\"\n"
+        );
+        assert_eq!(
+            toml_edit::ser::to_string(&WirePackageOrigin {
+                value: PackageOrigin::Archive {
+                    manifest_id: 2,
+                    archive_id: 8
+                }
+            })
+            .unwrap(),
+            "value = \":2:8\"\n"
+        );
+    }
+
+    #[test]
+    fn package_origin_deserializes_legacy_and_new_forms() {
+        assert_eq!(
+            toml_edit::de::from_str::<WirePackageOrigin>("value = 7\n")
+                .unwrap()
+                .value,
+            PackageOrigin::Archive {
+                manifest_id: 0,
+                archive_id: 7
+            }
+        );
+        assert_eq!(
+            toml_edit::de::from_str::<WirePackageOrigin>("value = \"\"\n")
+                .unwrap()
+                .value,
+            PackageOrigin::Unknown
+        );
+        assert_eq!(
+            toml_edit::de::from_str::<WirePackageOrigin>("value = \":4\"\n")
+                .unwrap()
+                .value,
+            PackageOrigin::Local { manifest_id: 4 }
+        );
+        assert_eq!(
+            toml_edit::de::from_str::<WirePackageOrigin>("value = \":4:12\"\n")
+                .unwrap()
+                .value,
+            PackageOrigin::Archive {
+                manifest_id: 4,
+                archive_id: 12
+            }
+        );
+        assert!(toml_edit::de::from_str::<WirePackageOrigin>("value = \"7\"\n").is_err());
+    }
 }

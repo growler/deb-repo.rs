@@ -8,7 +8,7 @@ use {
         deb::DebReader,
         deb::DebStage,
         hash::{Hash, HashAlgo, HashingReader},
-        packages::Packages,
+        packages::{PackageOrigin, Packages},
         sources::Sources,
         spec::LockedArchive,
         staging::Stage,
@@ -105,17 +105,20 @@ pub trait ContentProvider {
 /// View of archive/suite files used to fetch package universes.
 pub struct UniverseFiles<'a> {
     arch: &'a str,
+    manifest_id: u32,
     archives: &'a [Archive],
     locked: &'a [Option<LockedArchive>],
 }
 impl<'a> UniverseFiles<'a> {
     pub(crate) fn new(
         arch: &'a str,
+        manifest_id: u32,
         archives: &'a [Archive],
         locked: &'a [Option<LockedArchive>],
     ) -> Self {
         UniverseFiles {
             arch,
+            manifest_id,
             archives,
             locked,
         }
@@ -144,12 +147,12 @@ impl<'a> UniverseFiles<'a> {
     }
     pub fn package_files(
         &self,
-    ) -> impl Iterator<Item = io::Result<(u32, &'a Archive, RepositoryFile)>> + '_ {
+    ) -> impl Iterator<Item = io::Result<(u32, u32, &'a Archive, RepositoryFile)>> + '_ {
         self.archives
             .iter()
             .enumerate()
             .zip(self.locked.iter())
-            .map(|((archive_idx, archive), locked)| {
+            .map(move |((archive_idx, archive), locked)| {
                 locked
                     .as_ref()
                     .ok_or_else(|| {
@@ -161,30 +164,39 @@ impl<'a> UniverseFiles<'a> {
                     .map(move |locked| {
                         archive.suites.iter().zip(locked.suites.iter()).map(
                             move |(suite_name, suite)| {
-                                (archive_idx as u32, archive, suite_name, suite)
+                                (
+                                    self.manifest_id,
+                                    archive_idx as u32,
+                                    archive,
+                                    suite_name,
+                                    suite,
+                                )
                             },
                         )
                     })
             })
             .flatten_ok()
-            .map_ok(move |(archive_idx, archive, suite_name, suite)| {
-                suite
-                    .rel
-                    .package_files(&archive.components, archive.hash.name(), self.arch)
-                    .map(move |file| {
-                        file.map_ok(move |(path, hash, size)| {
-                            (
-                                archive_idx,
-                                archive,
-                                RepositoryFile::new(
-                                    format!("dists/{}/{}", suite_name, path),
-                                    hash,
-                                    size,
-                                ),
-                            )
+            .map_ok(
+                move |(manifest_id, archive_idx, archive, suite_name, suite)| {
+                    suite
+                        .rel
+                        .package_files(&archive.components, archive.hash.name(), self.arch)
+                        .map(move |file| {
+                            file.map_ok(move |(path, hash, size)| {
+                                (
+                                    manifest_id,
+                                    archive_idx,
+                                    archive,
+                                    RepositoryFile::new(
+                                        format!("dists/{}/{}", suite_name, path),
+                                        hash,
+                                        size,
+                                    ),
+                                )
+                            })
                         })
-                    })
-            })
+                },
+            )
             .flatten_ok()
             .flatten_ok()
             .flatten_ok()
@@ -249,7 +261,7 @@ impl<'a> UniverseFiles<'a> {
         let sources = self.apt_sources();
         digester.update(blake3::hash(sources.to_string().as_bytes()).as_bytes());
         self.package_files().try_for_each(|res| {
-            let (_, _, file) = res?;
+            let (_, _, _, file) = res?;
             digester.update(file.hash.as_ref());
             Ok::<_, io::Error>(())
         })?;
@@ -527,9 +539,9 @@ impl ContentProvider for HostCache {
         stream::iter(
             archives
                 .package_files()
-                .filter_ok(|(_, _, file)| !file.path.ends_with("Release")),
+                .filter_ok(|(_, _, _, file)| !file.path.ends_with("Release")),
         )
-        .map_ok(|(id, archive, file)| async move {
+        .map_ok(|(manifest_id, archive_id, archive, file)| async move {
             let prio = archive.priority;
             let url = archive.file_url(file.path());
             tracing::debug!("Fetching Package file from {}", &url);
@@ -537,7 +549,15 @@ impl ContentProvider for HostCache {
                 .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
                 .await?;
             let pkg = blocking::unblock(move || {
-                Packages::new(file, Some(id), prio).map_err(|e| {
+                Packages::new(
+                    file,
+                    PackageOrigin::Archive {
+                        manifest_id,
+                        archive_id,
+                    },
+                    prio,
+                )
+                .map_err(|e| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!("failed to parse Packages file {}: {}", &url, e),
@@ -558,7 +578,7 @@ impl ContentProvider for HostCache {
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
         let ctrl = archives.apt_sources();
         let mut files = stream::iter(archives.package_files())
-            .map_ok(|(_, src, file)| async move {
+            .map_ok(|(_, _, src, file)| async move {
                 let url = src.file_url(file.path());
                 let file = self
                     .fetch_index_file(file.hash.clone(), file.size, &url)

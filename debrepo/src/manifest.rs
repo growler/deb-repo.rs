@@ -4,12 +4,12 @@ use {
         artifact::{Artifact, ArtifactArg},
         cli::StageProgress,
         content::{ContentProvider, UniverseFiles},
-        control::{Field, MutableControlField, MutableControlFile, MutableControlStanza},
+        control::{MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
         is_url,
         kvlist::KVList,
         manifest_doc::{spec_display_name, BuildEnvComments, LockFile, ManifestFile, UpdateResult},
-        packages::Package,
+        packages::{Package, PackageOrigin},
         spec::{
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
             LockedPackage, LockedSpec,
@@ -225,6 +225,15 @@ impl Manifest {
         } else {
             self.manifest_dir().join(path)
         }
+    }
+    fn manifests(&self) -> impl Iterator<Item = (u32, &Manifest)> {
+        std::iter::successors(Some(self), |manifest| manifest.import.as_deref())
+            .enumerate()
+            .map(|(id, manifest)| (id as u32, manifest))
+    }
+    fn manifest_by_id(&self, manifest_id: u32) -> Option<&Manifest> {
+        self.manifests()
+            .find_map(|(id, manifest)| (id == manifest_id).then_some(manifest))
     }
     fn artifact_path(&self, artifact: &Artifact) -> Option<PathBuf> {
         match artifact {
@@ -442,21 +451,48 @@ impl Manifest {
             .valid_lock(spec_name, spec_index)?
             .installables()
             .map(move |p| {
-                let src = p
-                    .orig
-                    .map(|id| {
-                        self.file.get_archive(id as usize).ok_or_else(|| {
-                            io::Error::new(
+                let src =
+                    match p.orig {
+                        PackageOrigin::Unknown => {
+                            return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "invalid archive index {} in spec {}",
-                                    id,
+                                    "package {} in spec {} has unknown origin",
+                                    p.name,
                                     spec_display_name(spec_name)
                                 ),
-                            )
-                        })
-                    })
-                    .transpose()?;
+                            ));
+                        }
+                        PackageOrigin::Local { .. } => None,
+                        PackageOrigin::Archive {
+                            manifest_id,
+                            archive_id,
+                        } => {
+                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "invalid manifest id {} in spec {}",
+                                        manifest_id,
+                                        spec_display_name(spec_name)
+                                    ),
+                                )
+                            })?;
+                            Some(manifest.file.get_archive(archive_id as usize).ok_or_else(
+                                || {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "invalid archive index {} for manifest {} in spec {}",
+                                            archive_id,
+                                            manifest_id,
+                                            spec_display_name(spec_name)
+                                        ),
+                                    )
+                                },
+                            )?)
+                        }
+                    };
                 Ok::<_, io::Error>((src, p.order as usize, &p.file))
             }))
     }
@@ -867,31 +903,13 @@ impl Manifest {
         self.mark_lock_dirty();
         Ok(())
     }
-    fn archives(&self) -> UniverseFiles<'_> {
+    fn archives(&self, manifest_id: u32) -> UniverseFiles<'_> {
         UniverseFiles::new(
             &self.arch,
+            manifest_id,
             self.file.local_archives(),
             self.lock.local_archives(),
         )
-    }
-    async fn local_packages(&self, base_path: &Path) -> io::Result<Option<Packages>> {
-        if self.lock.local_pkgs().is_none() {
-            return Ok(None);
-        }
-        // self.lock.local_pkgs().unwrap().packages().map(|pkg| {
-        //     let pkg: MutableControlStanza = pkg.into();
-        //     let filepath = Path::new(pkg.field("Filename").ok_or_else(|| {
-        //         io::Error::new(
-        //             io::ErrorKind::InvalidData,
-        //             format!("local package is missing Filename field:\n{}", pkg),
-        //         )
-        //     })?);
-        //     if filepath.is_relative() {
-        //         base_path.join(filepath)
-        //
-        //     }
-        // });
-        unimplemented!()
     }
     async fn universe_packages<C: ContentProvider>(
         &self,
@@ -901,17 +919,19 @@ impl Manifest {
         tracing::debug!("preparing universe packages");
         let mut packages = Vec::new();
         let mut local_packages = Vec::new();
-        let mut manifest = Some(self);
-        while let Some(current) = manifest {
+        for (manifest_id, current) in self.manifests() {
             let current_packages = cache
-                .fetch_universe(current.archives(), concurrency)
+                .fetch_universe(current.archives(manifest_id), concurrency)
                 .await?;
             packages.extend(current_packages);
             if let Some(pkgs) = current.lock.local_pkgs() {
                 // local packages have highest priority
-                local_packages.push(pkgs.clone().with_prio(0))
+                local_packages.push(
+                    pkgs.clone()
+                        .with_prio(0)
+                        .with_origin(PackageOrigin::Local { manifest_id }),
+                )
             }
-            manifest = current.import.as_deref();
         }
         packages.extend(local_packages);
         Ok(packages)
@@ -970,7 +990,7 @@ impl Manifest {
     ) -> io::Result<()> {
         tracing::debug!("building source package universe");
         let sources = cache
-            .fetch_source_universe(self.archives(), concurrency)
+            .fetch_source_universe(self.archives(0), concurrency)
             .await?;
         self.source_universe = Some(SourceUniverse::from_sources(sources));
         Ok(())
@@ -1112,12 +1132,13 @@ impl Manifest {
         }
         UniverseFiles::new(
             &self.arch,
+            0,
             self.file.local_archives(),
             self.lock.local_archives(),
         )
         .package_files()
         .try_for_each(|pkg| {
-            let (_, _, file) = pkg?;
+            let (_, _, _, file) = pkg?;
             hash.update(file.hash.as_ref());
             Ok::<_, io::Error>(())
         })?;
@@ -1201,7 +1222,17 @@ impl Manifest {
         let updated = {
             let file = &self.file;
             let arch = self.arch.as_str();
-            let archives = file.local_archives();
+            let archive_hashes: Vec<Vec<_>> = self
+                .manifests()
+                .map(|(_, manifest)| {
+                    manifest
+                        .file
+                        .local_archives()
+                        .iter()
+                        .map(|archive| archive.hash)
+                        .collect()
+                })
+                .collect();
             let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
             let mut updated = false;
             std::iter::zip(file.specs().enumerate(), self.lock.specs_mut())
@@ -1229,21 +1260,30 @@ impl Manifest {
                         })
                         .map(|(order, solvable)| {
                             let (pkgs, pkg) = universe.package_with_pkgs(solvable).unwrap();
-                            let archive = pkgs
-                                .archive_id()
-                                .map(|id| {
-                                    archives.get(id).ok_or_else(|| {
-                                        io::Error::other(format!(
-                                            "invalid archive index {} for package {} in spec {}",
-                                            id,
-                                            pkg.name(),
-                                            spec_display_name(spec_name)
-                                        ))
-                                    })
-                                })
-                                .transpose()?;
+                            let origin = pkgs.origin();
+                            let hash_kind = match origin {
+                                PackageOrigin::Unknown | PackageOrigin::Local { .. } => "SHA256",
+                                PackageOrigin::Archive {
+                                    manifest_id,
+                                    archive_id,
+                                } => {
+                                    archive_hashes
+                                        .get(manifest_id as usize)
+                                        .and_then(|archives| archives.get(archive_id as usize))
+                                        .copied()
+                                        .ok_or_else(|| {
+                                            io::Error::other(format!(
+                                                "invalid archive index {} for package {} in manifest {} spec {}",
+                                                archive_id,
+                                                pkg.name(),
+                                                manifest_id,
+                                                spec_display_name(spec_name)
+                                            ))
+                                        })?
+                                        .name()
+                                }
+                            };
                             let name = pkg.name().to_string();
-                            let hash_kind = archive.map_or("SHA256", |archive| archive.hash.name());
                             let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
                                 io::Error::other(format!(
                                     "failed to parse package {} record while processing spec {}: {}",
@@ -1261,7 +1301,7 @@ impl Manifest {
                                 },
                                 idx: solvable.into(),
                                 order: order as u32,
-                                orig: pkgs.archive_id().map(|id| id as u32),
+                                orig: origin,
                                 name,
                             })
                         })
@@ -1356,40 +1396,80 @@ impl Manifest {
         let lock = self.valid_lock(spec_name, spec_index)?;
         let mut essentials = Vec::new();
         let mut order = Vec::new();
-        let installables = lock
-            .installables()
-            .map(|p| {
-                let src = p
-                    .orig
-                    .map(|id| {
-                        self.file.get_archive(id as usize).ok_or_else(|| {
-                            io::Error::new(
+        let installables =
+            lock.installables()
+                .map(|p| {
+                    let (src, base) = match p.orig {
+                        PackageOrigin::Unknown => {
+                            return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 format!(
-                                    "invalid archive index {} in spec {}",
-                                    id,
+                                    "package {} in spec {} has unknown origin",
+                                    p.name,
                                     spec_display_name(spec_name)
                                 ),
-                            )
-                        })
-                    })
-                    .transpose()?;
-                if p.order == 0 {
-                    essentials.push(p.name.clone());
-                } else {
-                    let ord = p.order as usize - 1;
-                    if ord >= order.len() {
-                        order.resize(ord + 1, Vec::new());
+                            ));
+                        }
+                        PackageOrigin::Local { manifest_id } => {
+                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "invalid manifest id {} in spec {}",
+                                        manifest_id,
+                                        spec_display_name(spec_name)
+                                    ),
+                                )
+                            })?;
+                            (None, Some(manifest.local_path(p.file.path())))
+                        }
+                        PackageOrigin::Archive {
+                            manifest_id,
+                            archive_id,
+                        } => {
+                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "invalid manifest id {} in spec {}",
+                                        manifest_id,
+                                        spec_display_name(spec_name)
+                                    ),
+                                )
+                            })?;
+                            let archive = manifest
+                                .file
+                                .get_archive(archive_id as usize)
+                                .ok_or_else(|| {
+                                    io::Error::new(
+                                        io::ErrorKind::InvalidData,
+                                        format!(
+                                            "invalid archive index {} for manifest {} in spec {}",
+                                            archive_id,
+                                            manifest_id,
+                                            spec_display_name(spec_name)
+                                        ),
+                                    )
+                                })?;
+                            (Some(archive), None)
+                        }
+                    };
+                    if p.order == 0 {
+                        essentials.push(p.name.clone());
+                    } else {
+                        let ord = p.order as usize - 1;
+                        if ord >= order.len() {
+                            order.resize(ord + 1, Vec::new());
+                        }
+                        order[ord].push(p.name.clone());
                     }
-                    order[ord].push(p.name.clone());
-                }
-                Ok::<_, io::Error>(ResolvedInstallable {
-                    base: src.is_none().then(|| self.local_path(p.file.path())),
-                    archive: src,
-                    file: &p.file,
+                    Ok::<_, io::Error>(ResolvedInstallable {
+                        base,
+                        archive: src,
+                        file: &p.file,
+                    })
                 })
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+                .collect::<io::Result<Vec<_>>>()?;
         Ok((installables, essentials, order))
     }
     #[allow(clippy::type_complexity)]
@@ -1411,7 +1491,7 @@ impl Manifest {
         P: FnOnce(u64) -> StageProgress,
     {
         let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
-        let archives = self.archives();
+        let archives = self.archives(0);
         let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
         let artifacts = self.staging_artifacts(spec_name, spec_index)?;
         let scripts = self

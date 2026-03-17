@@ -3,6 +3,7 @@ use {
         content::{ContentProvider, IndexFile},
         hash::Hash,
         kvlist::KVList,
+        packages::PackageOrigin,
         version::{Constraint, Dependency},
         Archive, Release, RepositoryFile,
     },
@@ -181,7 +182,11 @@ impl LockedArchive {
 #[serde(deny_unknown_fields)]
 /// Locked package entry with resolved version and hash.
 pub struct LockedPackage {
-    pub orig: Option<u32>,
+    #[serde(
+        default = "PackageOrigin::legacy_local",
+        skip_serializing_if = "PackageOrigin::is_unknown"
+    )]
+    pub orig: PackageOrigin,
     pub idx: u32,
     pub name: String,
     pub order: u32,
@@ -211,6 +216,63 @@ impl LockedSpec {
     }
     pub fn installables(&self) -> impl Iterator<Item = &LockedPackage> {
         self.installables.iter().flat_map(|v| v.iter())
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::items_after_test_module)]
+mod tests {
+    use super::*;
+
+    #[derive(Debug, Deserialize, Serialize)]
+    struct WireLockedPackage {
+        #[serde(
+            default = "PackageOrigin::legacy_local",
+            skip_serializing_if = "PackageOrigin::is_unknown"
+        )]
+        orig: PackageOrigin,
+    }
+
+    #[test]
+    fn locked_package_origin_defaults_to_legacy_local_when_missing() {
+        let pkg: WireLockedPackage = toml_edit::de::from_str("").unwrap();
+        assert_eq!(pkg.orig, PackageOrigin::Local { manifest_id: 0 });
+    }
+
+    #[test]
+    fn locked_package_origin_serializes_unknown_by_omitting_field() {
+        let pkg = WireLockedPackage {
+            orig: PackageOrigin::Unknown,
+        };
+        assert_eq!(toml_edit::ser::to_string(&pkg).unwrap(), "");
+    }
+
+    #[test]
+    fn locked_package_origin_round_trips_new_archive_form() {
+        let pkg = WireLockedPackage {
+            orig: PackageOrigin::Archive {
+                manifest_id: 3,
+                archive_id: 11,
+            },
+        };
+        assert_eq!(
+            toml_edit::ser::to_string(&pkg).unwrap(),
+            "orig = \":3:11\"\n"
+        );
+        let parsed: WireLockedPackage = toml_edit::de::from_str("orig = \":3:11\"\n").unwrap();
+        assert_eq!(parsed.orig, pkg.orig);
+    }
+
+    #[test]
+    fn locked_package_origin_accepts_legacy_integer_form() {
+        let pkg: WireLockedPackage = toml_edit::de::from_str("orig = 9\n").unwrap();
+        assert_eq!(
+            pkg.orig,
+            PackageOrigin::Archive {
+                manifest_id: 0,
+                archive_id: 9
+            }
+        );
     }
 }
 

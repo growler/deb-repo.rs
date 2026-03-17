@@ -56,7 +56,7 @@ pub use {
     async_compression::Level as CompressionLevel,
     builder::{BuildJob, Executor},
     manifest::Manifest,
-    packages::{Package, Packages},
+    packages::{Package, PackageOrigin, Packages},
     release::Release,
     sources::{Source, SourceUniverse, Sources},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},

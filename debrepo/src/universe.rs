@@ -926,8 +926,12 @@ mod tests {
                 init_trace();
                 let mut uni = Universe::new(
                     "amd64",
-                    vec![Packages::new($src.to_string().into(), None, None)
-                        .expect("failed to parse test source")]
+                    vec![Packages::new(
+                        $src.to_string().into(),
+                        crate::PackageOrigin::Unknown,
+                        None,
+                    )
+                    .expect("failed to parse test source")]
                     .into_iter(),
                 )
                 .unwrap();
