@@ -1119,15 +1119,18 @@ impl Manifest {
         Ok(())
     }
     pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
-        Ok(self.file.spec_build_env(spec_name)?.clone())
+        let spec_index = self.get_spec_idx(spec_name)?;
+        Ok(self.file.spec_build_env(spec_index)?.clone())
     }
     pub fn spec_build_env_comments(&self, spec_name: Option<&str>) -> io::Result<BuildEnvComments> {
-        self.file.spec_build_env_comments(spec_name)
+        let spec_index = self.get_spec_idx(spec_name)?;
+        self.file.spec_build_env_comments(spec_index)
     }
     pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
+        let spec_index = self.get_spec_idx(spec_name)?;
         Ok(self
             .file
-            .spec_build_script(spec_name)?
+            .spec_build_script(spec_index)?
             .map(|script| script.to_string()))
     }
     pub fn get_spec_meta<'a>(

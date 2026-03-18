@@ -258,15 +258,6 @@ impl ManifestFile {
         self.doc.get_spec_table_mut(spec_name);
         spec_index
     }
-    pub fn spec_index_ensure<'a>(&self, name: Option<&'a str>) -> io::Result<(&'a str, usize)> {
-        let spec_name = name
-            .map_or_else(|| Ok(""), |name| valid_spec_name(name))
-            .map_err(io::Error::other)?;
-        let spec_index = self.spec_index(spec_name).ok_or_else(|| {
-            io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
-        })?;
-        Ok((spec_name, spec_index))
-    }
     #[allow(dead_code)]
     pub fn artifacts(&self) -> &'_ [Artifact] {
         &self.artifacts
@@ -458,12 +449,10 @@ impl ManifestFile {
     {
         self.remove_spec_list_item(spec_index, "exclude", reqs, |spec| &mut spec.exclude)
     }
-    pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<&KVList<String>> {
-        let (_, spec_index) = self.spec_index_ensure(spec_name)?;
+    pub(crate) fn spec_build_env(&self, spec_index: usize) -> io::Result<&KVList<String>> {
         Ok(&self.specs.value_at(spec_index).build_env)
     }
-    pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<&str>> {
-        let (_, spec_index) = self.spec_index_ensure(spec_name)?;
+    pub(crate) fn spec_build_script(&self, spec_index: usize) -> io::Result<Option<&str>> {
         Ok(self.specs.value_at(spec_index).build_script.as_deref())
     }
     pub(crate) fn set_build_env(
@@ -588,8 +577,8 @@ impl ManifestFile {
         }
         Ok(())
     }
-    pub fn spec_build_env_comments(&self, spec_name: Option<&str>) -> io::Result<BuildEnvComments> {
-        let (spec_name, _) = self.spec_index_ensure(spec_name)?;
+    pub(crate) fn spec_build_env_comments(&self, spec_index: usize) -> io::Result<BuildEnvComments> {
+        let spec_name = self.spec_name(spec_index);
         let mut out = BuildEnvComments::default();
         let spec_table = self
             .doc

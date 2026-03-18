@@ -89,7 +89,7 @@ where
     I: IntoIterator<Item = S>,
     S: IntoDependency<String>,
 {
-    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    let spec_idx = lookup_spec_idx(manifest, spec_name)?;
     let reqs = reqs
         .into_iter()
         .map(|req| req.into_dependency())
@@ -126,7 +126,7 @@ where
     I: IntoIterator<Item = S>,
     S: IntoConstraint<String>,
 {
-    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    let spec_idx = lookup_spec_idx(manifest, spec_name)?;
     let cons = cons
         .into_iter()
         .map(|con| con.into_constraint())
@@ -171,7 +171,7 @@ fn remove_artifact(
     spec_name: Option<&str>,
     artifact: &str,
 ) -> io::Result<()> {
-    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    let spec_idx = lookup_spec_idx(manifest, spec_name)?;
     manifest.remove_artifact(spec_idx, artifact)
 }
 
@@ -192,6 +192,18 @@ fn ensure_spec_idx(manifest: &mut ManifestFile, spec_name: Option<&str>) -> io::
         return Ok(spec_idx);
     }
     Ok(manifest.push_empty_spec(spec_name))
+}
+
+fn lookup_spec_idx(manifest: &ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+    let spec_name = spec_name
+        .map_or_else(|| Ok(""), valid_spec_name)
+        .map_err(io::Error::other)?;
+    manifest.spec_index(spec_name).ok_or_else(|| {
+        io::Error::other(format!(
+            "spec {} not found",
+            crate::manifest_doc::spec_display_name(spec_name)
+        ))
+    })
 }
 
 async fn make_local_artifact(
@@ -1264,8 +1276,9 @@ fn set_build_env_default_spec_sets_values_and_comments() {
         .expect("build-env table");
     assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
     assert_eq!(build_env.get("BAZ").and_then(|v| v.as_str()), Some("qux"));
+    let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
     let comments = manifest
-        .spec_build_env_comments(None)
+        .spec_build_env_comments(spec_idx)
         .expect("build env comments");
     assert_eq!(
         comments.prefix.get("FOO").map(String::as_str),
@@ -1300,8 +1313,9 @@ fn set_build_env_default_spec_updates_and_removes_comments() {
         build_env.get("FOO").and_then(|v| v.as_str()),
         Some("updated")
     );
+    let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
     let comments = manifest
-        .spec_build_env_comments(None)
+        .spec_build_env_comments(spec_idx)
         .expect("build env comments");
     assert!(comments.prefix.is_empty());
     assert!(comments.inline.is_empty());

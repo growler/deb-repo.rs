@@ -62,6 +62,7 @@ COMMON = "base"
 [spec.bootable-base]
 extends = "base"
 include = ["gzip"]
+stage = ["./extra.txt"]
 build-script = """
 printf '%s\n' "$MIDDLE_ONLY" > /opt/import/middle-env.txt
 printf '%s\n' "bootable" >> /opt/import/script-order.txt
@@ -85,7 +86,6 @@ cat >>"${MANIFEST}" <<'EOF'
 [spec.frontend]
 extends = "bootable-base"
 include = ["rsync"]
-stage = ["./extra.txt"]
 build-script = """
 printf '%s\n' "$CHILD_ONLY" > /opt/import/child-env.txt
 printf '%s\n' "$COMMON" > /opt/import/common-env.txt
@@ -99,6 +99,7 @@ CHILD_ONLY = "from-frontend"
 EOF
 
 run_case_expect_ok "downstream_update" update
+run_case_expect_ok "downstream_artifact_add" artifact add --stage -s frontend ./base.txt /opt/import/downstream.txt
 run_case_expect_ok "frontend_meta_origin" spec meta get -s frontend origin
 assert_equals "system" "$(tr -d '\n' <"${LAST_STDOUT}")" "frontend meta origin"
 run_case_expect_ok "frontend_meta_layer" spec meta get -s frontend layer
@@ -112,6 +113,7 @@ run_case_rdb build -s frontend --path "${IMPORTED_TREE}"
 assert_runtime_packages "${IMPORTED_TREE}" tar gzip rsync shared-import
 assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/base.txt "imported artifact"
 assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/extra.txt "extra imported artifact"
+assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/downstream.txt "downstream artifact"
 assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/base-env.txt "from-base"
 assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/middle-env.txt "from-bootable"
 assert_runtime_file_content "${IMPORTED_TREE}" /opt/import/child-env.txt "from-frontend"
