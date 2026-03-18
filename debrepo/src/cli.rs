@@ -249,7 +249,6 @@ Examples:
                     fetcher,
                 )
                 .await?;
-                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
                 Ok(())
@@ -289,7 +288,6 @@ Examples:
                 }
                 mf.update(false, false, false, conf.concurrency(), fetcher)
                     .await?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -325,7 +323,6 @@ Examples:
                 let base = mf.local_path(path);
                 let (file, ctrl) = fetcher.ensure_deb(path, &base).await?;
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -405,6 +402,7 @@ Examples:
                         )?;
                     }
                 }
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
                 Ok(())
@@ -435,7 +433,6 @@ Examples:
                 } else {
                     mf.drop_archive(&self.archive.url)?;
                 }
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -465,7 +462,6 @@ Examples:
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.drop_local_package(path)?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -519,7 +515,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if !self.requirements_only {
                     mf.remove_constraints(self.spec.as_deref(), self.cons.iter())?;
                 }
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -561,7 +556,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     vec![self.artifact.clone()],
                     self.comment.as_deref(),
                 )?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -591,7 +590,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
                 mf.remove_artifact(self.spec.as_deref(), &self.url)?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -633,7 +636,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -675,7 +677,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     self.reqs.iter(),
                     self.comment.as_deref(),
                 )?;
-                mf.load_universe(conf.concurrency(), fetcher).await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -767,8 +768,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
-                guard.commit().await?;
                 mf.store().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
@@ -1052,9 +1053,16 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecSetMeta {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 mf.set_spec_meta(self.spec.as_deref(), &self.name, &self.value)?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
+                guard.commit().await?;
                 Ok(())
             })
         }
