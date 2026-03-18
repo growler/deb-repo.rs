@@ -92,7 +92,9 @@ println!("package = {:?}", control.package_name());
 - `universe::Universe`: combine multiple `Packages` inputs and solve with
   `resolvo`.
 - `StagingFileSystem`: stage files into a target filesystem layout.
-- `Manifest` / `LockBase`: manifest + lockfile structures used by `rdebootstrap`.
+- `Manifest` / lockfile support: manifest + lockfile structures used by
+  `rdebootstrap`, including optional manifest imports and downstream
+  `imported-universe` lock tracking.
 
 Full API docs are on https://docs.rs/debrepo.
 

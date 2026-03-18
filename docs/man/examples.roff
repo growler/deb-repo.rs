@@ -4,11 +4,21 @@ Create a manifest and iterate on specs:
 .EX
 rdebootstrap init debian --package ca-certificates --package vim
 rdebootstrap archive add https://mirror.example/debian --suite bookworm,bookworm-updates --components main,contrib
-rdebootstrap include --spec desktop openssh-server network-manager
-rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'
+rdebootstrap require --spec desktop openssh-server network-manager
+rdebootstrap forbid --spec desktop 'systemd-hwe (= 255.5-1)'
 rdebootstrap update --snapshot 20241007T030925Z
 sudo rdebootstrap build --spec desktop --path ./out
 .EE
+.PP
+Reuse a locked base manifest and export named parent specs:
+.IP
+.EX
+rdebootstrap import ../system/Manifest.toml --spec base --spec bootable-base
+rdebootstrap update
+.EE
+.PP
+Downstream specs may then set \fBextends = "base"\fR or
+\fBextends = "bootable-base"\fR in \fBManifest.toml\fR.
 .PP
 Use with podman:
 .IP

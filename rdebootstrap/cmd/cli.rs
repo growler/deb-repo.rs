@@ -92,9 +92,10 @@ inside an isolated sandbox so maintainer scripts run in a controlled environment
 
 Typical workflow:
     1) init             - create a manifest with sources and initial packages
-    2) require/forbid   - add package requirements and constraints
-    3) update           - refresh archive metadata and rewrite Manifest.<arch>.lock
-    4) build            - extract and configure packages into a target directory
+    2) import           - optionally reuse archives, artifacts, local packages, and named parent specs from another locked manifest
+    3) require/forbid   - add package requirements and constraints
+    4) update           - refresh archive metadata, import fingerprints, and Manifest.<arch>.lock
+    5) build            - extract and configure packages into a target directory
 "#
 )]
 pub struct App {

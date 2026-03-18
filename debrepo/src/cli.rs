@@ -675,7 +675,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Update archives and snapshot/lock state",
-        long_about = "Refresh archive metadata, solve specs, and rewrite the lock file."
+        long_about = "Refresh archive metadata, solve specs, rewrite the lock file, and refresh stored import fingerprints when [import] is present."
     )]
     /// CLI command: update the lockfile from sources.
     pub struct Update {
@@ -729,7 +729,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Add or replace an imported manifest",
-        long_about = "Configure a manifest import: validates the imported manifest and writes [import] to the downstream manifest."
+        long_about = "Configure a manifest import: validates an already-locked imported manifest, exports selected named specs for downstream extends, and writes [import] to the downstream manifest."
     )]
     /// CLI command: configure a manifest import.
     pub struct ImportCmd {

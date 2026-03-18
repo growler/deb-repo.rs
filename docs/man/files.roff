@@ -6,6 +6,11 @@ Default manifest file name.
 \fBManifest.<arch>.lock\fR
 Default lock file name (written next to the manifest).
 .TP
+\fB[import].path\fR target and its matching \fI<name>.<arch>.lock\fR
+When a manifest uses \fB[import]\fR, commands that load the effective package
+or source universe must be able to read the imported manifest and its same-arch
+lock file.
+.TP
 \fBauth.toml\fR
 Optional auth file in the manifest directory (when \fB--auth\fR is omitted).
 .TP

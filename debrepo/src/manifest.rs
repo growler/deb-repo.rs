@@ -1445,9 +1445,15 @@ impl Manifest {
         if force_locals || !self.lock_valid {
             updated |= self.update_local_artifacts(cache).await?;
         }
-        if force_archives || !self.lock_valid {
+        if force_archives || force_locals || !self.lock_valid {
             updated |= self
-                .update_locked_archives(concurrency, true, false, skip_verify, cache)
+                .update_locked_archives(
+                    concurrency,
+                    force_archives || !self.lock_valid,
+                    force_locals,
+                    skip_verify,
+                    cache,
+                )
                 .await?;
         }
         if updated {

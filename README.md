@@ -8,9 +8,10 @@ is exposed as the `debrepo` library for embedding in other tooling.
 
 ## Highlights
 
-- **Declarative input** – `Manifest.toml` lists archives, specs, staged files,
-  local `.deb`s, and metadata while `Manifest.<arch>.lock` captures the fully
-  resolved set for reproducible builds.
+- **Declarative input** – `Manifest.toml` lists archives, optional imports,
+  specs, staged files, local `.deb`s, and metadata while
+  `Manifest.<arch>.lock` captures the fully resolved set for reproducible
+  builds.
 - **Deterministic resolution** – Release and Packages files are fetched with GPG
   verification, optional snapshot pinning, and a solver that locks each spec
   before anything is installed.
@@ -18,8 +19,8 @@ is exposed as the `debrepo` library for embedding in other tooling.
   namespace; run as root for production ownership or unprivileged while
   iterating.
 - **Rich spec tooling** – add/drop requirements and constraints per spec, stage
-  local files or HTTP artifacts, and include local packages that ship alongside
-  the manifest.
+  local files or HTTP artifacts, include local packages that ship alongside the
+  manifest, and reuse selected parent specs from another locked manifest.
 - **Fast, resumable downloads** – concurrent fetcher (`-n/--downloads`) backed
   by a shared cache and optional transport relaxations for air-gapped or test
   environments.
@@ -54,13 +55,15 @@ The resulting binary lives at `target/release/rdebootstrap` (or in
    `rdebootstrap init debian --package ca-certificates --package vim`
 2. **Iterate on specs**\
    `rdebootstrap archive add https://mirror.example/debian --suite bookworm,bookworm-updates --components main,contrib`\
-   `rdebootstrap include --spec desktop openssh-server network-manager`\
-   `rdebootstrap exclude --spec desktop 'systemd-hwe (= 255.5-1)'`
-3. **Update and lock**\
+   `rdebootstrap require --spec desktop openssh-server network-manager`\
+   `rdebootstrap forbid --spec desktop 'systemd-hwe (= 255.5-1)'`
+3. **Reuse a locked base manifest (optional)**\
+   `rdebootstrap import ../system/Manifest.toml --spec base --spec bootable-base`
+4. **Update and lock**\
    `rdebootstrap update --snapshot 20241007T030925Z` (or `--snapshot now`)\
    This downloads Release/Packages data, solves the specs, and writes
    `Manifest.<arch>.lock`.
-4. **Build a filesystem tree**\
+5. **Build a filesystem tree**\
    `sudo rdebootstrap build --spec desktop --path ./out`\
    The resulting tree may be used directly with podman (requires the full path
    because podman enters its own mount namespace):
@@ -72,21 +75,33 @@ maintainer scripts in the sandbox so the host stays clean.
 ## Manifest Layout
 
 `Manifest.toml` sits at the project root unless `--manifest <path>` is supplied.
-The lock file is always written next to the manifest. For a manifest named
-`<name>.toml`, the lock file path is `<name>.<arch>.lock`.
+The lock file is always written in the same directory as the selected
+manifest. For a manifest named `<name>.toml`, the lock file path is
+`<name>.<arch>.lock`.
 
-A small example:
+A small example with an imported base spec:
 
 ```toml
+[import]
+path = "../system/Manifest.toml"
+hash = "blake3-..."
+specs = ["base"]
+
 [[archive]]
 url = "https://ftp.debian.org/debian/"
 suites = ["trixie"]
 components = ["main"]
 snapshots = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"
 
-[spec]
+[artifact."motd"]
+type = "text"
+target = "/etc/motd"
+text = "hello from rdebootstrap\n"
+
+[spec.frontend]
+extends = "base"
 include = ["ca-certificates", "openssh-server"]
-stage = ["README.md"]
+stage = ["motd"]
 
 [[local]]
 path = "target/debian/mytool_0.1.0_amd64.deb"
@@ -97,6 +112,9 @@ Key sections:
 
 - `[[archive]]` — APT repositories with suites, components, optional snapshot
   templates, trusted keys, and priorities.
+- `[import]` — Reuse archives, artifacts, local packages, and selected named
+  specs from another manifest. `path`, `hash`, and non-empty `specs` are
+  required when present.
 - `[[local]]` — Local `.deb` files copied into the cache and treated like repo
   packages.
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
@@ -104,8 +122,18 @@ Key sections:
   artifacts, build-time environment/script, and metadata per spec. Specs can
   inherit from each other via `extends`.
 
-`rdebootstrap update` keeps the lock file aligned with the manifest, and `build`
-refuses to run if the lock is missing or stale.
+`rdebootstrap import` writes `[import]`, pins the imported manifest bytes in
+`hash`, and validates the selected named specs. Imported archives are prepended
+to the effective archive list, imported artifacts join the visible artifact
+namespace, and imported `[[local]]` entries join the effective package
+universe. Imported local paths stay anchored to the imported manifest
+directory.
+
+The downstream lock keeps only downstream-local `archives` and `locals`, plus
+an `imported-universe` fingerprint for imported lock state. `rdebootstrap
+update` refreshes stale import metadata, re-solves specs when the imported
+manifest or imported lock changed, and `build` refuses to run if the resulting
+lock is missing or stale.
 
 ## Cache and Fetching
 
@@ -121,13 +149,13 @@ refuses to run if the lock is missing or stale.
 ## Artifacts and Staging
 
 Artifacts are declared at the top level as `[artifact."<name>"]` and referenced
-from specs via `stage = ["<name>", ...]`. Use `rdebootstrap add artifact` to
+from specs via `stage = ["<name>", ...]`. Use `rdebootstrap artifact add` to
 define them and `rdebootstrap stage` to attach them to specs.
 
 - Artifact `type` is one of: `file`, `tar`, `dir`, `text`.
 - Hashes are serialized in SRI form: `<algo>-<base64>` (for example
   `blake3-...`, `sha256-...`).
-- When `rdebootstrap` computes an artifact hash (for example via `add artifact`),
+- When `rdebootstrap` computes an artifact hash (for example via `artifact add`),
   it uses `blake3`.
 - `TARGET_PATH` is treated as an absolute path inside the target filesystem (non-absolute values are
   auto-prefixed with `/` during staging).
@@ -142,7 +170,7 @@ define them and `rdebootstrap stage` to attach them to specs.
 - Safety: tar unpacking rejects absolute paths, `..` traversal, and special
   entries like device nodes.
 - Inline text artifacts (`type = "text"`) embed a `text` value in the manifest
-  and write it to `target` during staging. `rdebootstrap add artifact @file`
+  and write it to `target` during staging. `rdebootstrap artifact add @file`
   creates a text artifact from a UTF-8 file (target path required).
 
 ## Build Environment and Scripts
@@ -166,15 +194,21 @@ environment such as a valid XDG runtime directory).
 
 - `init` – bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
   `devuan`) or explicit archives.
+- `import` – add or replace `[import]` using another already-locked manifest and
+  export selected named parent specs.
 - `edit` – edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,
   `edit script`).
-- `add archive`, `add local` – append repositories or register a local `.deb`.
-- `include` / `exclude` – add requirements or version constraints to a spec.
-- `drop` – remove requirements or constraints.
-- `stage` / `unstage` – add or remove artifacts (local files or URLs).
+- `archive add`, `deb add` – append repositories or register a local `.deb`.
+- `require` / `forbid` – add requirements or version constraints to a spec
+  (`include` / `exclude` remain aliases).
+- `remove` – remove requirements or constraints (`drop` remains an alias).
+- `artifact add`, `stage`, `unstage` – define, add, or remove staged artifacts.
 - `update` – refresh metadata, solve dependencies, and rewrite the lock file
-  (supports `--snapshot`, `--locals` refreshes local packages and local artifacts).
-- `list`, `search`, `show` – inspect the resolved package universe.
+  (supports `--snapshot`, `--locals` refreshes local packages and local
+  artifacts, and refreshes stored import fingerprints when `[import]` is
+  present).
+- `list`, `search`, `spec`, `package`, `source` – inspect resolved specs and
+  package/source metadata.
 - `build` – expand a spec into a directory, running maintainer scripts within
   the sandbox helper.
 
