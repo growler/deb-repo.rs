@@ -118,13 +118,6 @@ pub struct ManifestFile {
     specs: KVList<Spec>,
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
-enum DFSNodeState {
-    Unvisited,
-    Visited,
-    Done,
-}
-
 pub enum UpdateResult {
     None,
     Added,
@@ -187,7 +180,7 @@ impl ManifestFile {
         self.doc.upsert_import(&import);
         self.import = Some(import);
     }
-    pub async fn from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, Hash)> {
+    pub(crate) async fn from_file<P: AsRef<Path>>(path: P) -> io::Result<(Self, Hash)> {
         let r = smol::fs::File::open(&path).await?.take(Self::MAX_SIZE);
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(r);
         let mut buf = Vec::<u8>::new();
@@ -205,7 +198,6 @@ impl ManifestFile {
                 format!("failed to parse manifest: {}", err),
             )
         })?;
-        manifest.specs_order()?;
         for (name, spec) in manifest.specs.iter() {
             for entry in &spec.meta {
                 parse_meta_entry(entry).map_err(|err| {
@@ -843,144 +835,6 @@ impl ManifestFile {
     pub fn names(&self) -> impl Iterator<Item = &'_ str> {
         self.specs.iter_keys()
     }
-    pub fn descendants(&self, id: usize) -> Vec<usize> {
-        let mut result = Vec::new();
-        let mut queue = std::collections::VecDeque::new();
-        queue.push_back(id);
-        while let Some(curr) = queue.pop_front() {
-            if result.contains(&curr) {
-                continue;
-            }
-            result.push(curr);
-            for (i, (_, r)) in self.specs.iter().enumerate() {
-                if r.extends.as_deref() == Some(self.specs.key_at(curr)) {
-                    queue.push_back(i);
-                }
-            }
-        }
-        result
-    }
-    pub fn ancestors(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Spec>> {
-        SpecIterator {
-            specs: &self.specs,
-            visited: Vec::new(),
-            cur: Some(id),
-        }
-    }
-    #[allow(clippy::type_complexity)]
-    pub fn requirements_for(
-        &self,
-        id: usize,
-    ) -> io::Result<(Vec<Dependency<String>>, Vec<Constraint<String>>)> {
-        let mut reqs = Vec::new();
-        let mut cons = Vec::new();
-        for spec in self.ancestors(id) {
-            let spec = spec?;
-            reqs.extend(spec.include.iter().cloned());
-            cons.extend(spec.exclude.iter().cloned().map(|c| !c));
-        }
-        Ok((reqs, cons))
-    }
-    pub fn specs_order(&self) -> io::Result<Vec<usize>> {
-        use DFSNodeState::*;
-        let mut state: HashMap<usize, DFSNodeState> = HashMap::with_capacity(self.specs.len());
-        let mut stack: Vec<usize> = Vec::with_capacity(self.specs.len());
-        let mut order: Vec<usize> = Vec::with_capacity(self.specs.len());
-
-        for (id, key) in self.specs.iter_keys().enumerate() {
-            if state.get(&id).copied().unwrap_or(Unvisited) == Unvisited {
-                self.dfs(id, key, &mut state, &mut stack, &mut order)?;
-            }
-        }
-        Ok(order)
-    }
-    fn dfs<'a>(
-        &'a self,
-        id: usize,
-        node: &'a str,
-        state: &mut HashMap<usize, DFSNodeState>,
-        stack: &mut Vec<usize>,
-        order: &mut Vec<usize>,
-    ) -> io::Result<()> {
-        use DFSNodeState::*;
-        state.insert(id, Visited);
-        stack.push(id);
-
-        if let Some(name) = self.specs[id].extends.as_deref() {
-            match self.specs.iter_keys().enumerate().find(|(_, n)| *n == name) {
-                None => {
-                    return Err(io::Error::other(format!(
-                        "spec {} extends missing ({})",
-                        node, name,
-                    )));
-                }
-                Some((extends_id, extends_name)) => {
-                    match state.get(&extends_id).copied().unwrap_or(Unvisited) {
-                        Unvisited => {
-                            self.dfs(extends_id, extends_name, state, stack, order)?;
-                        }
-                        Visited => {
-                            let start_idx =
-                                stack.iter().rposition(|&s| s == extends_id).unwrap_or(0);
-                            let cycle: Vec<String> = stack[start_idx..]
-                                .iter()
-                                .copied()
-                                .map(|id| self.specs.key_at(id).to_string())
-                                .collect();
-                            return Err(io::Error::other(format!(
-                                "specs form a cycle: {}",
-                                cycle.join(" <- ")
-                            )));
-                        }
-                        Done => {}
-                    }
-                }
-            }
-        }
-
-        stack.pop();
-        state.insert(id, Done);
-        order.push(id);
-        Ok(())
-    }
-}
-
-struct SpecIterator<'a> {
-    specs: &'a KVList<Spec>,
-    visited: Vec<&'a str>,
-    cur: Option<usize>,
-}
-impl<'a> Iterator for SpecIterator<'a> {
-    type Item = io::Result<&'a Spec>;
-    fn next(&mut self) -> Option<Self::Item> {
-        match self.cur {
-            Some(i) => {
-                let (name, spec) = self.specs.entry_at(i);
-                if self.visited.contains(&name) {
-                    return Some(Err(io::Error::other(format!(
-                        "spec extension cycle detected at {}",
-                        name
-                    ))));
-                }
-                self.visited.push(name);
-                if let Some(extends) = spec.extends.as_deref() {
-                    self.cur = match self.specs.iter().position(|(n, _)| n == extends) {
-                        None => {
-                            return Some(Err(io::Error::other(format!(
-                                "spec {} extends unknown spec {}",
-                                name, extends
-                            ))));
-                        }
-                        e => e,
-                    };
-                } else {
-                    self.cur = None;
-                }
-                Some(Ok(spec))
-            }
-            None => None,
-        }
-    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -1029,7 +883,7 @@ impl LockFile {
     pub(crate) fn set_imported_universe_hash(&mut self, hash: Hash) {
         self.imported_universe_hash.replace(hash);
     }
-    // loads lock file from path. returns None if the lock file 
+    // loads lock file from path. returns None if the lock file
     // has outdated manifest hash or outdated imported universe hash (if any)
     pub(crate) async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
         lock_path: P,

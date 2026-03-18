@@ -78,6 +78,12 @@ impl Spec {
     }
 }
 
+impl Default for Spec {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 pub(crate) const META_VALUE_MAX_BYTES: usize = 1024;
 
 pub(crate) fn validate_meta_name(name: &str) -> Result<(), String> {

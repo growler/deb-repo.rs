@@ -15,12 +15,12 @@ use {
         packages::{Package, PackageOrigin},
         spec::{
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
-            LockedPackage, LockedSpec,
+            LockedPackage, LockedSpec, Spec,
         },
         stage::{ResolvedArtifact, ResolvedInstallable},
         staging::StagingFileSystem,
         universe::Universe,
-        version::{IntoConstraint, IntoDependency, ProvidedName},
+        version::{Constraint, Dependency, IntoConstraint, IntoDependency, ProvidedName},
         Packages, Source, SourceUniverse,
     },
     futures::stream::{self, StreamExt, TryStreamExt},
@@ -28,6 +28,7 @@ use {
     itertools::Itertools,
     smol::io,
     std::{
+        collections::HashMap,
         future::Future,
         num::NonZero,
         path::{Path, PathBuf},
@@ -54,6 +55,66 @@ pub(crate) fn lock_path_for(manifest_path: &Path, arch: &str) -> PathBuf {
 }
 
 type ManifestLoadFuture<'a> = Pin<Box<dyn Future<Output = io::Result<(Manifest, bool)>> + 'a>>;
+
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum DFSNodeState {
+    Unvisited,
+    Visited,
+    Done,
+}
+
+#[derive(Clone, Copy)]
+struct ManifestSpecRef<'a> {
+    manifest: &'a Manifest,
+    id: usize,
+}
+
+impl<'a> ManifestSpecRef<'a> {
+    fn key(self) -> (*const Manifest, usize) {
+        (self.manifest as *const Manifest, self.id)
+    }
+
+    fn entry(self) -> (&'a str, &'a Spec) {
+        self.manifest
+            .local_spec_entry(self.id)
+            .expect("manifest spec reference must point to an existing spec")
+    }
+}
+
+struct SpecIterator<'a> {
+    visited: Vec<(*const Manifest, usize)>,
+    cur: Option<ManifestSpecRef<'a>>,
+}
+
+impl<'a> Iterator for SpecIterator<'a> {
+    type Item = io::Result<ManifestSpecRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.cur?;
+        let (name, spec) = current.entry();
+        if self.visited.contains(&current.key()) {
+            return Some(Err(io::Error::other(format!(
+                "spec extension cycle detected at {}",
+                spec_display_name(name)
+            ))));
+        }
+        self.visited.push(current.key());
+        self.cur = match spec.extends.as_deref() {
+            Some(extends) => match current.manifest.resolve_spec(extends) {
+                Some(parent) => Some(parent),
+                None => {
+                    return Some(Err(io::Error::other(format!(
+                        "spec {} extends unknown spec {}",
+                        spec_display_name(name),
+                        extends
+                    ))));
+                }
+            },
+            None => None,
+        };
+        Some(Ok(current))
+    }
+}
 
 ///
 /// Example (simplified):
@@ -188,6 +249,7 @@ impl Manifest {
                 source_universe: None,
                 import,
             };
+            manifest.specs_order()?;
             Ok((manifest, has_valid_lock))
         }
         .boxed_local()
@@ -237,6 +299,158 @@ impl Manifest {
     fn manifest_by_id(&self, manifest_id: u32) -> Option<&Manifest> {
         self.manifests()
             .find_map(|(id, manifest)| (id == manifest_id).then_some(manifest))
+    }
+    fn local_spec_entry(&self, id: usize) -> Option<(&str, &Spec)> {
+        self.file
+            .specs()
+            .enumerate()
+            .find_map(|(idx, entry)| (idx == id).then_some(entry))
+    }
+    fn local_spec_ref(&self, id: usize) -> Option<ManifestSpecRef<'_>> {
+        self.local_spec_entry(id)
+            .map(|_| ManifestSpecRef { manifest: self, id })
+    }
+    fn resolve_local_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+        self.file
+            .specs()
+            .enumerate()
+            .find_map(|(id, (spec_name, _))| {
+                (spec_name == name).then_some(ManifestSpecRef { manifest: self, id })
+            })
+    }
+    fn resolve_imported_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+        let import_desc = self.file.import()?;
+        if !import_desc.specs().any(|spec| spec == name) {
+            return None;
+        }
+        self.import.as_deref()?.resolve_local_spec(name)
+    }
+    fn resolve_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+        self.resolve_local_spec(name)
+            .or_else(|| self.resolve_imported_spec(name))
+    }
+    fn ancestors_refs(&self, id: usize) -> SpecIterator<'_> {
+        SpecIterator {
+            visited: Vec::new(),
+            cur: self.local_spec_ref(id),
+        }
+    }
+    pub fn ancestors(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Spec>> + '_ {
+        self.ancestors_refs(id)
+            .map(|spec| spec.map(|spec| spec.entry().1))
+    }
+    pub fn descendants(&self, id: usize) -> Vec<usize> {
+        let mut result = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(id);
+        while let Some(curr) = queue.pop_front() {
+            if result.contains(&curr) {
+                continue;
+            }
+            let parent_name = self
+                .local_spec_entry(curr)
+                .map(|(name, _)| name)
+                .expect("spec index must point to an existing local spec");
+            result.push(curr);
+            for (child_id, (_, spec)) in self.file.specs().enumerate() {
+                if spec.extends.as_deref() == Some(parent_name) {
+                    queue.push_back(child_id);
+                }
+            }
+        }
+        result
+    }
+    #[allow(clippy::type_complexity)]
+    pub fn requirements_for(
+        &self,
+        id: usize,
+    ) -> io::Result<(Vec<Dependency<String>>, Vec<Constraint<String>>)> {
+        let mut reqs = Vec::new();
+        let mut cons = Vec::new();
+        for spec in self.ancestors(id) {
+            let spec = spec?;
+            reqs.extend(spec.include.iter().cloned());
+            cons.extend(spec.exclude.iter().cloned().map(|c| !c));
+        }
+        Ok((reqs, cons))
+    }
+    pub fn specs_order(&self) -> io::Result<Vec<usize>> {
+        use DFSNodeState::*;
+
+        let spec_count = self.file.specs().count();
+        let mut state = HashMap::<usize, DFSNodeState>::with_capacity(spec_count);
+        let mut stack = Vec::<usize>::with_capacity(spec_count);
+        let mut order = Vec::<usize>::with_capacity(spec_count);
+
+        for (id, (name, _)) in self.file.specs().enumerate() {
+            if state.get(&id).copied().unwrap_or(Unvisited) == Unvisited {
+                self.dfs(id, name, &mut state, &mut stack, &mut order)?;
+            }
+        }
+        Ok(order)
+    }
+    fn dfs<'a>(
+        &'a self,
+        id: usize,
+        node: &'a str,
+        state: &mut HashMap<usize, DFSNodeState>,
+        stack: &mut Vec<usize>,
+        order: &mut Vec<usize>,
+    ) -> io::Result<()> {
+        use DFSNodeState::*;
+
+        state.insert(id, Visited);
+        stack.push(id);
+
+        if let Some(name) = self
+            .local_spec_entry(id)
+            .and_then(|(_, spec)| spec.extends.as_deref())
+        {
+            if let Some(parent) = self.resolve_local_spec(name) {
+                match state.get(&parent.id).copied().unwrap_or(Unvisited) {
+                    Unvisited => {
+                        let extends_name = parent.entry().0;
+                        self.dfs(parent.id, extends_name, state, stack, order)?;
+                    }
+                    Visited => {
+                        let start_idx = stack
+                            .iter()
+                            .rposition(|&spec_id| spec_id == parent.id)
+                            .unwrap_or(0);
+                        let cycle: Vec<String> = stack[start_idx..]
+                            .iter()
+                            .filter_map(|&spec_id| {
+                                self.local_spec_entry(spec_id)
+                                    .map(|(name, _)| spec_display_name(name).to_string())
+                            })
+                            .collect();
+                        return Err(io::Error::other(format!(
+                            "specs form a cycle: {}",
+                            cycle.join(" <- ")
+                        )));
+                    }
+                    Done => {}
+                }
+            } else if self.resolve_imported_spec(name).is_some() {
+                self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+            } else {
+                return Err(io::Error::other(format!(
+                    "spec {} extends missing ({})",
+                    node, name,
+                )));
+            }
+        }
+
+        stack.pop();
+        state.insert(id, Done);
+        order.push(id);
+        Ok(())
+    }
+    fn artifact_ref(&self, name: &str) -> Option<(&Manifest, &Artifact)> {
+        self.file
+            .artifact(name)
+            .map(|artifact| (self, artifact))
+            .or_else(|| self.import.as_deref()?.artifact_ref(name))
     }
     fn artifact_path(&self, artifact: &Artifact) -> Option<PathBuf> {
         match artifact {
@@ -558,25 +772,16 @@ impl Manifest {
             }))
     }
     fn scripts_for(&self, id: usize) -> io::Result<Vec<&str>> {
-        Self::scripts_for_spec(&self.file, id)
-    }
-    fn build_env_for(&self, id: usize) -> io::Result<Vec<(String, String)>> {
-        Self::build_env_for_spec(&self.file, id)
-    }
-    fn artifacts_for(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Artifact>> + '_ {
-        Self::artifacts_for_spec(&self.file, self.arch.as_str(), id)
-    }
-    fn scripts_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<&str>> {
-        let mut scripts = file
+        let mut scripts = self
             .ancestors(id)
             .filter_map_ok(|spec| spec.build_script.as_deref())
             .collect::<io::Result<Vec<_>>>()?;
         scripts.reverse();
         Ok(scripts)
     }
-    fn build_env_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(String, String)>> {
+    fn build_env_for(&self, id: usize) -> io::Result<Vec<(String, String)>> {
         let mut env: Vec<(String, String)> = Vec::new();
-        let mut specs = file.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+        let mut specs = self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
         specs.reverse();
         for spec in specs {
             for (key, value) in spec.build_env.iter() {
@@ -589,9 +794,47 @@ impl Manifest {
         }
         Ok(env)
     }
-    fn meta_for_spec(file: &ManifestFile, id: usize) -> io::Result<Vec<(&'_ str, &'_ str)>> {
+    fn artifacts_for(
+        &self,
+        id: usize,
+    ) -> impl Iterator<Item = io::Result<(&'_ Manifest, &'_ Artifact)>> + '_ {
+        let arch = self.arch.as_str();
+        self.ancestors_refs(id)
+            .map_ok(|spec| {
+                let (_, spec) = spec.entry();
+                spec.stage.iter().map(String::as_str)
+            })
+            .flatten_ok()
+            .filter_map(move |artifact| {
+                artifact
+                    .and_then(|artifact_name| {
+                        let (manifest, artifact) =
+                            self.artifact_ref(artifact_name).ok_or_else(|| {
+                                io::Error::new(
+                                    io::ErrorKind::InvalidData,
+                                    format!(
+                                        "missing artifact '{}' in spec stage list",
+                                        artifact_name
+                                    ),
+                                )
+                            })?;
+                        Ok(
+                            if artifact
+                                .arch()
+                                .is_none_or(|target_arch| target_arch == arch)
+                            {
+                                Some((manifest, artifact))
+                            } else {
+                                None
+                            },
+                        )
+                    })
+                    .transpose()
+            })
+    }
+    fn meta_for_spec(&self, id: usize) -> io::Result<Vec<(&'_ str, &'_ str)>> {
         let mut meta: Vec<(&str, &str)> = Vec::new();
-        let mut specs = file.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+        let mut specs = self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
         specs.reverse();
         for spec in specs {
             for entry in &spec.meta {
@@ -605,51 +848,16 @@ impl Manifest {
         }
         Ok(meta)
     }
-    fn artifacts_for_spec<'a>(
-        file: &'a ManifestFile,
-        arch: &'a str,
-        id: usize,
-    ) -> impl Iterator<Item = io::Result<&'a Artifact>> + 'a {
-        file.ancestors(id)
-            .map_ok(|spec| spec.stage.iter().map(String::as_str))
-            .flatten_ok()
-            .filter_map(move |artifact| {
-                artifact
-                    .and_then(|artifact| {
-                        let artifact = file.artifact(artifact).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("missing artifact '{}' in spec stage list", artifact),
-                            )
-                        })?;
-                        Ok(
-                            if artifact
-                                .arch()
-                                .is_none_or(|target_arch| target_arch == arch)
-                            {
-                                Some(artifact)
-                            } else {
-                                None
-                            },
-                        )
-                    })
-                    .transpose()
-            })
-    }
-    fn spec_hasher(
-        file: &ManifestFile,
-        arch: &str,
-        spec_index: usize,
-    ) -> io::Result<blake3::Hasher> {
+    fn spec_hasher(&self, spec_index: usize) -> io::Result<blake3::Hasher> {
         use digest::FixedOutput;
         let mut hasher = blake3::Hasher::default();
-        let scripts = Self::scripts_for_spec(file, spec_index)?;
+        let scripts = self.scripts_for(spec_index)?;
         for script in scripts {
             let mut h = blake3::Hasher::default();
             h.update(script.as_bytes());
             hasher.update(&h.finalize_fixed());
         }
-        let build_env = Self::build_env_for_spec(file, spec_index)?;
+        let build_env = self.build_env_for(spec_index)?;
         for (key, value) in build_env {
             let mut h = blake3::Hasher::default();
             h.update(key.as_bytes());
@@ -657,38 +865,48 @@ impl Manifest {
             h.update(value.as_bytes());
             hasher.update(&h.finalize_fixed());
         }
-        let meta = Self::meta_for_spec(file, spec_index)?;
+        let meta = self.meta_for_spec(spec_index)?;
         hasher.update(&meta.len().to_be_bytes());
         for (key, value) in meta {
             hasher.update(key.as_bytes());
             hasher.update(&[0]);
             hasher.update(value.as_bytes());
         }
-        let artifacts =
-            Self::artifacts_for_spec(file, arch, spec_index).collect::<io::Result<Vec<_>>>()?;
-        for artifact in artifacts {
+        let artifacts = self
+            .artifacts_for(spec_index)
+            .collect::<io::Result<Vec<_>>>()?;
+        for (_, artifact) in artifacts {
             artifact.update_spec_hash(&mut hasher);
         }
         Ok(hasher)
     }
     fn refresh_spec_hashes(&mut self, spec_index: usize) -> io::Result<()> {
-        let file = &self.file;
-        let arch = self.arch.as_str();
-        for idx in file.descendants(spec_index).into_iter() {
-            let lock = self.lock.get_spec_mut(idx);
-            if !lock.is_locked() {
+        for idx in self.descendants(spec_index).into_iter() {
+            let package_hashes = {
+                let lock = self.lock.get_spec(idx);
+                if !lock.is_locked() {
+                    None
+                } else {
+                    Some(
+                        lock.installables()
+                            .map(|pkg| pkg.file.hash.clone())
+                            .collect::<Vec<_>>(),
+                    )
+                }
+            };
+            let Some(package_hashes) = package_hashes else {
                 continue;
+            };
+            let mut hasher = self.spec_hasher(idx)?;
+            for hash in package_hashes {
+                hasher.update(hash.as_ref());
             }
-            let mut hasher = Self::spec_hasher(file, arch, idx)?;
-            for pkg in lock.installables() {
-                hasher.update(pkg.file.hash.as_ref());
-            }
-            lock.hash = Some(hasher.into_hash());
+            self.lock.get_spec_mut(idx).hash = Some(hasher.into_hash());
         }
         Ok(())
     }
     fn invalidate_locked_specs(&mut self, spec: usize) {
-        for spec_index in self.file.descendants(spec).into_iter() {
+        for spec_index in self.descendants(spec).into_iter() {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
         }
     }
@@ -749,7 +967,7 @@ impl Manifest {
         comment: Option<&str>,
     ) -> io::Result<()> {
         for item in &items {
-            if self.file.artifact(item).is_none() {
+            if self.artifact_ref(item).is_none() {
                 return Err(io::Error::other(format!(
                     "artifact {} not found in manifest",
                     item
@@ -905,7 +1123,7 @@ impl Manifest {
     ) -> io::Result<Option<&'a str>> {
         validate_meta_name(name).map_err(io::Error::other)?;
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        let meta = Self::meta_for_spec(&self.file, spec_index)?;
+        let meta = self.meta_for_spec(spec_index)?;
         Ok(meta
             .into_iter()
             .find(|(key, _)| *key == name)
@@ -1261,8 +1479,6 @@ impl Manifest {
     ) -> io::Result<()> {
         self.load_universe(concurrency, cache).await?;
         let updated = {
-            let file = &self.file;
-            let arch = self.arch.as_str();
             let archive_hashes: Vec<Vec<_>> = self
                 .manifests()
                 .map(|(_, manifest)| {
@@ -1274,17 +1490,16 @@ impl Manifest {
                         .collect()
                 })
                 .collect();
-            let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
             let mut updated = false;
-            std::iter::zip(file.specs().enumerate(), self.lock.specs_mut())
-                .filter_map(|((id, (ns, s)), (nl, l))| {
-                    debug_assert_eq!(ns, nl);
-                    (!l.is_locked()).then_some((id, ns, s, l))
-                })
-                .try_for_each(|(spec_index, spec_name, _spec, lock)| {
-                    tracing::debug!("resolving spec {}", spec_display_name(spec_name));
-                    let (reqs, cons) = file.requirements_for(spec_index)?;
-                    let mut hasher = Self::spec_hasher(file, arch, spec_index)?;
+            for (spec_index, (spec_name, _)) in self.file.specs().enumerate() {
+                if self.lock.get_spec(spec_index).is_locked() {
+                    continue;
+                }
+                tracing::debug!("resolving spec {}", spec_display_name(spec_name));
+                let (reqs, cons) = self.requirements_for(spec_index)?;
+                let mut hasher = self.spec_hasher(spec_index)?;
+                let installables = {
+                    let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
                     let solvables = universe.solve(reqs, cons).map_err(|conflict| {
                         io::Error::other(format!(
                             "failed to solve spec {}:\n{}",
@@ -1293,7 +1508,7 @@ impl Manifest {
                         ))
                     })?;
                     let sorted = universe.installation_order(&solvables);
-                    let installables = sorted
+                    sorted
                         .into_iter()
                         .enumerate()
                         .flat_map(|(order, solvables)| {
@@ -1346,16 +1561,14 @@ impl Manifest {
                                 name,
                             })
                         })
-                        .collect::<io::Result<Vec<_>>>()?;
-                    *lock = LockedSpec {
-                        installables: Some(installables),
-                        hash: Some(hasher.into_hash()),
-                    };
-                    if !updated {
-                        updated = true;
-                    }
-                    Ok::<(), io::Error>(())
-                })?;
+                        .collect::<io::Result<Vec<_>>>()?
+                };
+                *self.lock.get_spec_mut(spec_index) = LockedSpec {
+                    installables: Some(installables),
+                    hash: Some(hasher.into_hash()),
+                };
+                updated = true;
+            }
             updated
         };
         self.lock_valid = self.lock.is_uptodate();
@@ -1411,8 +1624,8 @@ impl Manifest {
     ) -> io::Result<Vec<ResolvedArtifact<'a>>> {
         self.artifacts_for(spec_index)
             .map(|artifact| {
-                artifact.map(|artifact| ResolvedArtifact {
-                    base: self.artifact_path(artifact),
+                artifact.map(|(manifest, artifact)| ResolvedArtifact {
+                    base: manifest.artifact_path(artifact),
                     artifact,
                 })
             })
