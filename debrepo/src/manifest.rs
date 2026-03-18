@@ -616,6 +616,37 @@ impl Manifest {
     pub fn spec_names(&self) -> impl Iterator<Item = &str> {
         self.file.names().map(spec_display_name)
     }
+    fn normalize_spec_name(spec_name: Option<&str>) -> io::Result<&str> {
+        spec_name
+            .map_or_else(|| Ok(""), valid_spec_name)
+            .map_err(io::Error::other)
+    }
+    fn lookup_spec_idx(&self, spec_name: Option<&str>) -> io::Result<Option<usize>> {
+        Ok(self.file.spec_index(Self::normalize_spec_name(spec_name)?))
+    }
+    fn get_spec_idx(&self, spec_name: Option<&str>) -> io::Result<usize> {
+        let spec_name = Self::normalize_spec_name(spec_name)?;
+        self.file.spec_index(spec_name).ok_or_else(|| {
+            io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
+        })
+    }
+    fn get_or_create_spec_idx(&mut self, spec_name: Option<&str>) -> io::Result<usize> {
+        let spec_name = Self::normalize_spec_name(spec_name)?;
+        if let Some(spec_index) = self.file.spec_index(spec_name) {
+            return Ok(spec_index);
+        }
+        let file_specs = self.file.specs().count();
+        if self.lock.specs_len() != file_specs {
+            return Err(io::Error::other(
+                "[internal error] inconsistent spec state between manifest and lock",
+            ));
+        }
+        let spec_index = self.file.push_empty_spec(spec_name);
+        self.lock.push_spec(spec_name, Spec::new().locked_spec());
+        self.mark_file_updated();
+        self.mark_lock_dirty();
+        Ok(spec_index)
+    }
     fn valid_lock(&self, name: &str, idx: usize) -> io::Result<&LockedSpec> {
         if idx < self.lock.specs_len() {
             self.lock.get_spec(idx).as_locked().ok_or_else(|| {
@@ -724,7 +755,8 @@ impl Manifest {
     ) -> io::Result<
         impl Iterator<Item = io::Result<(Option<&'a Archive>, usize, &'a RepositoryFile)>> + 'a,
     > {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
+        let spec_index = self.get_spec_idx(name)?;
+        let spec_name = self.file.spec_name(spec_index);
         Ok(self
             .valid_lock(spec_name, spec_index)?
             .installables()
@@ -897,10 +929,10 @@ impl Manifest {
     where
         C: ContentProvider,
     {
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         let local_base = (!is_url(&artifact.url)).then(|| self.local_path(&artifact.url));
         let staged = Artifact::new(artifact, local_base.as_deref(), cache).await?;
-        self.file.add_artifact(spec_name, staged, comment)?;
+        let spec_index = self.get_or_create_spec_idx(spec_name)?;
+        self.file.add_artifact(spec_index, staged, comment)?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -943,6 +975,10 @@ impl Manifest {
         items: Vec<String>,
         comment: Option<&str>,
     ) -> io::Result<()> {
+        if items.is_empty() {
+            Self::normalize_spec_name(spec_name)?;
+            return Ok(());
+        }
         for item in &items {
             if self.file.artifact(item).is_none() {
                 return Err(io::Error::other(format!(
@@ -951,7 +987,8 @@ impl Manifest {
                 )));
             }
         }
-        if let Some(spec_index) = self.file.add_stage_items(spec_name, items, comment)? {
+        let spec_index = self.get_or_create_spec_idx(spec_name)?;
+        if self.file.add_stage_items(spec_index, items, comment)? {
             self.mark_file_updated();
             self.invalidate_locked_specs(spec_index);
             self.mark_lock_dirty();
@@ -963,8 +1000,8 @@ impl Manifest {
         spec_name: Option<&str>,
         artifact: S,
     ) -> io::Result<()> {
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        self.file.remove_artifact(spec_name, artifact.as_ref())?;
+        let spec_index = self.get_spec_idx(spec_name)?;
+        self.file.remove_artifact(spec_index, artifact.as_ref())?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -980,18 +1017,17 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: IntoDependency<String>,
     {
-        if let Some((spec_index, spec_name, spec)) = self.file.add_requirements(
-            spec_name,
-            reqs.into_iter()
-                .map(|s| s.into_dependency())
-                .collect::<Result<Vec<_>, _>>()?,
-            comment,
-        )? {
-            if self.lock.specs_len() > spec_index {
-                self.invalidate_locked_specs(spec_index);
-            } else {
-                self.lock.push_spec(spec_name, spec.locked_spec());
-            }
+        let reqs = reqs
+            .into_iter()
+            .map(|s| s.into_dependency())
+            .collect::<Result<Vec<_>, _>>()?;
+        if reqs.is_empty() {
+            Self::normalize_spec_name(spec_name)?;
+            return Ok(());
+        }
+        let spec_index = self.get_or_create_spec_idx(spec_name)?;
+        if self.file.add_requirements(spec_index, reqs, comment)? {
+            self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
             self.mark_lock_invalid();
         }
@@ -1006,7 +1042,8 @@ impl Manifest {
             .into_iter()
             .map(|s| s.into_dependency())
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(spec_index) = self.file.remove_requirements(spec_name, reqs.iter())? {
+        let spec_index = self.get_spec_idx(spec_name)?;
+        if self.file.remove_requirements(spec_index, reqs.iter())? {
             self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
             self.mark_lock_invalid();
@@ -1024,18 +1061,17 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: IntoConstraint<String>,
     {
-        if let Some((spec_index, spec_name, spec)) = self.file.add_constraints(
-            spec_name,
-            reqs.into_iter()
-                .map(|s| s.into_constraint())
-                .collect::<Result<Vec<_>, _>>()?,
-            comment,
-        )? {
-            if self.lock.specs_len() > spec_index {
-                self.invalidate_locked_specs(spec_index);
-            } else {
-                self.lock.push_spec(spec_name, spec.locked_spec());
-            }
+        let reqs = reqs
+            .into_iter()
+            .map(|s| s.into_constraint())
+            .collect::<Result<Vec<_>, _>>()?;
+        if reqs.is_empty() {
+            Self::normalize_spec_name(spec_name)?;
+            return Ok(());
+        }
+        let spec_index = self.get_or_create_spec_idx(spec_name)?;
+        if self.file.add_constraints(spec_index, reqs, comment)? {
+            self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
             self.mark_lock_invalid();
         }
@@ -1050,7 +1086,8 @@ impl Manifest {
             .into_iter()
             .map(|s| s.into_constraint())
             .collect::<Result<Vec<_>, _>>()?;
-        if let Some(spec_index) = self.file.remove_constraints(spec_name, reqs.iter())? {
+        let spec_index = self.get_spec_idx(spec_name)?;
+        if self.file.remove_constraints(spec_index, reqs.iter())? {
             self.invalidate_locked_specs(spec_index);
             self.mark_file_updated();
             self.mark_lock_invalid();
@@ -1099,7 +1136,7 @@ impl Manifest {
         name: &str,
     ) -> io::Result<Option<&'a str>> {
         validate_meta_name(name).map_err(io::Error::other)?;
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        let spec_index = self.get_spec_idx(spec_name)?;
         let meta = self.meta_for_spec(spec_index)?;
         Ok(meta
             .into_iter()
@@ -1114,8 +1151,8 @@ impl Manifest {
     ) -> io::Result<()> {
         validate_meta_name(name).map_err(io::Error::other)?;
         validate_meta_value(value).map_err(io::Error::other)?;
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        self.file.set_meta_entry(spec_name, name, value)?;
+        let spec_index = self.get_or_create_spec_idx(spec_name)?;
+        self.file.set_meta_entry(spec_index, name, value)?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -1126,8 +1163,15 @@ impl Manifest {
         spec_name: Option<&str>,
         env: KVList<String>,
     ) -> io::Result<()> {
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        self.file.set_build_env(spec_name, env)?;
+        let spec_index = if env.is_empty() {
+            match self.lookup_spec_idx(spec_name)? {
+                Some(spec_index) => spec_index,
+                None => return Ok(()),
+            }
+        } else {
+            self.get_or_create_spec_idx(spec_name)?
+        };
+        self.file.set_build_env(spec_index, env)?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -1139,9 +1183,16 @@ impl Manifest {
         env: KVList<String>,
         comments: BuildEnvComments,
     ) -> io::Result<()> {
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
+        let spec_index = if env.is_empty() {
+            match self.lookup_spec_idx(spec_name)? {
+                Some(spec_index) => spec_index,
+                None => return Ok(()),
+            }
+        } else {
+            self.get_or_create_spec_idx(spec_name)?
+        };
         self.file
-            .set_build_env_with_comments(spec_name, env, &comments)?;
+            .set_build_env_with_comments(spec_index, env, &comments)?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -1152,8 +1203,15 @@ impl Manifest {
         spec_name: Option<&str>,
         script: Option<String>,
     ) -> io::Result<()> {
-        let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
-        self.file.set_build_script(spec_name, script)?;
+        let spec_index = if script.is_none() {
+            match self.lookup_spec_idx(spec_name)? {
+                Some(spec_index) => spec_index,
+                None => return Ok(()),
+            }
+        } else {
+            self.get_or_create_spec_idx(spec_name)?
+        };
+        self.file.set_build_script(spec_index, script)?;
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
@@ -1574,7 +1632,8 @@ impl Manifest {
         &'a self,
         name: Option<&str>,
     ) -> io::Result<impl Iterator<Item = &'a Package<'a>>> {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
+        let spec_index = self.get_spec_idx(name)?;
+        let spec_name = self.file.spec_name(spec_index);
         let lock = self.valid_lock(spec_name, spec_index)?;
         let universe = self
             .universe
@@ -1588,7 +1647,8 @@ impl Manifest {
         }))
     }
     pub fn spec_hash(&self, name: Option<&str>) -> io::Result<Hash> {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
+        let spec_index = self.get_spec_idx(name)?;
+        let spec_name = self.file.spec_name(spec_index);
         self.valid_lock(spec_name, spec_index)?
             .hash
             .as_ref()
@@ -1727,7 +1787,8 @@ impl Manifest {
     where
         P: FnOnce(u64) -> StageProgress,
     {
-        let (spec_name, spec_index) = self.file.spec_index_ensure(name)?;
+        let spec_index = self.get_spec_idx(name)?;
+        let spec_name = self.file.spec_name(spec_index);
         let archives = self.archives(0);
         let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
         let artifacts = self.staging_artifacts(spec_name, spec_index)?;
@@ -1813,5 +1874,45 @@ impl Manifest {
         let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
         fs.stage(universe_stage).await?;
         Ok((essentials, other, scripts, build_env))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn get_or_create_spec_idx_marks_manifest_and_lock_dirty_when_creating() {
+        const ARCH: &str = "amd64";
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Manifest.toml");
+
+        let mut manifest = smol::block_on(async {
+            let file = ManifestFile::new(None);
+            file.store(&path).await.expect("store manifest");
+            let (manifest, _) = Manifest::from_file(&path, ARCH)
+                .await
+                .expect("load manifest");
+            manifest
+        });
+
+        assert!(
+            manifest.hash.is_some(),
+            "loaded manifest should start clean"
+        );
+        assert!(
+            !manifest.lock_updated,
+            "loaded manifest should start with clean lock"
+        );
+
+        let spec_index = manifest
+            .get_or_create_spec_idx(Some("custom"))
+            .expect("create missing spec");
+
+        assert_eq!(spec_index, 0);
+        assert!(manifest.hash.is_none(), "new spec must dirty manifest");
+        assert!(manifest.lock_updated, "new spec must mark lock updated");
+        assert_eq!(manifest.file.spec_name(spec_index), "custom");
+        assert_eq!(manifest.lock.specs_len(), 1);
     }
 }

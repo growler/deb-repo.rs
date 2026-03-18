@@ -1053,7 +1053,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecSetMeta {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }

@@ -1,17 +1,18 @@
 use {
     crate::{
         archive::{Archive, RepositoryFile},
-        artifact::ArtifactArg,
+        artifact::{Artifact, ArtifactArg},
         content::{ContentProvider, ContentProviderGuard, DebLocation, UniverseFiles},
         control::MutableControlStanza,
         hash::Hash,
         indexfile::IndexFile,
         kvlist::KVList,
         manifest::Manifest,
-        manifest_doc::BuildEnvComments,
+        manifest_doc::{valid_spec_name, BuildEnvComments, ManifestFile},
         packages::Packages,
         staging::{HostFileSystem, Stage, StagingFileSystem},
         transport::TransportProvider,
+        version::{Constraint, Dependency, IntoConstraint, IntoDependency},
         Sources,
     },
     std::{
@@ -29,22 +30,19 @@ use {
 
 const ARCH: &str = "amd64";
 
-fn new_manifest() -> Manifest {
-    Manifest::new("Manifest.toml", ARCH, None)
+fn new_manifest() -> ManifestFile {
+    ManifestFile::new(None)
 }
 
 fn new_manifest_at(path: impl AsRef<Path>) -> Manifest {
     Manifest::new(path, ARCH, None)
 }
 
-fn render_manifest(manifest: &mut Manifest) -> (String, toml_edit::DocumentMut) {
+fn render_manifest(manifest: &ManifestFile) -> (String, toml_edit::DocumentMut) {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     smol::block_on(async {
-        manifest
-            .store_manifest_only(&path)
-            .await
-            .expect("store manifest");
+        manifest.store(&path).await.expect("store manifest");
     });
     let text = std::fs::read_to_string(&path).expect("read manifest");
     let doc = text
@@ -63,6 +61,160 @@ fn make_artifact_arg(url: &str, target: &str) -> ArtifactArg {
     }
 }
 
+fn add_requirements<S, I>(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    reqs: I,
+    comment: Option<&str>,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: IntoDependency<String>,
+{
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    let reqs = reqs
+        .into_iter()
+        .map(|req| req.into_dependency())
+        .collect::<Result<Vec<_>, _>>()?;
+    manifest.add_requirements(spec_idx, reqs, comment)?;
+    Ok(())
+}
+
+fn remove_requirements<S, I>(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    reqs: I,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: IntoDependency<String>,
+{
+    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    let reqs = reqs
+        .into_iter()
+        .map(|req| req.into_dependency())
+        .collect::<Result<Vec<_>, _>>()?;
+    manifest.remove_requirements(spec_idx, reqs.iter())?;
+    Ok(())
+}
+
+fn add_constraints<S, I>(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    cons: I,
+    comment: Option<&str>,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: IntoConstraint<String>,
+{
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    let cons = cons
+        .into_iter()
+        .map(|con| con.into_constraint())
+        .collect::<Result<Vec<_>, _>>()?;
+    manifest.add_constraints(spec_idx, cons, comment)?;
+    Ok(())
+}
+
+fn remove_constraints<S, I>(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    cons: I,
+) -> io::Result<()>
+where
+    I: IntoIterator<Item = S>,
+    S: IntoConstraint<String>,
+{
+    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    let cons = cons
+        .into_iter()
+        .map(|con| con.into_constraint())
+        .collect::<Result<Vec<_>, _>>()?;
+    manifest.remove_constraints(spec_idx, cons.iter())?;
+    Ok(())
+}
+
+fn set_build_env_with_comments(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    env: KVList<String>,
+    comments: BuildEnvComments,
+) -> io::Result<()> {
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    manifest.set_build_env_with_comments(spec_idx, env, &comments)
+}
+
+fn add_stage_items(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    items: Vec<String>,
+    comment: Option<&str>,
+) -> io::Result<()> {
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    manifest.add_stage_items(spec_idx, items, comment)?;
+    Ok(())
+}
+
+fn add_artifact(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    artifact: Artifact,
+    comment: Option<&str>,
+) -> io::Result<()> {
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    manifest.add_artifact(spec_idx, artifact, comment)
+}
+
+fn remove_artifact(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    artifact: &str,
+) -> io::Result<()> {
+    let spec_idx = manifest.spec_index_ensure(spec_name)?.1;
+    manifest.remove_artifact(spec_idx, artifact)
+}
+
+fn set_build_script(
+    manifest: &mut ManifestFile,
+    spec_name: Option<&str>,
+    script: Option<String>,
+) -> io::Result<()> {
+    let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+    manifest.set_build_script(spec_idx, script)
+}
+
+fn ensure_spec_idx(manifest: &mut ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+    let spec_name = spec_name
+        .map_or_else(|| Ok(""), valid_spec_name)
+        .map_err(io::Error::other)?;
+    if let Some(spec_idx) = manifest.spec_index(spec_name) {
+        return Ok(spec_idx);
+    }
+    Ok(manifest.push_empty_spec(spec_name))
+}
+
+async fn make_local_artifact(
+    base_dir: &Path,
+    artifact: &ArtifactArg,
+    provider: &TestProvider,
+) -> io::Result<Artifact> {
+    let local_base = (!crate::is_url(&artifact.url)).then(|| {
+        let path = Path::new(&artifact.url);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            base_dir.join(path)
+        }
+    });
+    Artifact::new(artifact, local_base.as_deref(), provider).await
+}
+
+async fn manifest_hash(path: &Path) -> io::Result<Hash> {
+    let (_, hash) = ManifestFile::from_file(path).await?;
+    Ok(hash)
+}
+
 fn update_manifest_file(path: &Path, update: impl FnOnce(&mut toml_edit::DocumentMut)) {
     let text = std::fs::read_to_string(path).expect("read manifest");
     let mut doc = text
@@ -75,20 +227,21 @@ fn update_manifest_file(path: &Path, update: impl FnOnce(&mut toml_edit::Documen
 async fn create_locked_imported_manifest(dir: &Path, provider: &TestProvider) -> io::Result<()> {
     let path = dir.join("imported.toml");
     std::fs::write(dir.join("base.txt"), b"base artifact\n")?;
-    let mut manifest = new_manifest_at(&path);
-    manifest
-        .upsert_artifact_only(
-            &make_artifact_arg("./base.txt", "/opt/import/base.txt"),
-            None,
-            provider,
-        )
-        .await?;
-    manifest.store_manifest_only(&path).await?;
-    update_manifest_file(&path, |doc| {
-        let mut stage = toml_edit::Array::new();
-        stage.push("./base.txt");
-        doc["spec"]["base"]["stage"] = toml_edit::Item::Value(stage.into());
-    });
+    let mut manifest = new_manifest();
+    let artifact = make_local_artifact(
+        dir,
+        &make_artifact_arg("./base.txt", "/opt/import/base.txt"),
+        provider,
+    )
+    .await?;
+    manifest.upsert_artifact_only(artifact, None)?;
+    add_stage_items(
+        &mut manifest,
+        Some("base"),
+        vec!["./base.txt".to_string()],
+        None,
+    )?;
+    manifest.store(&path).await?;
     let (mut manifest, _) = Manifest::from_file(&path, ARCH).await?;
     manifest
         .resolve(NonZero::new(1).expect("nonzero"), provider)
@@ -97,13 +250,34 @@ async fn create_locked_imported_manifest(dir: &Path, provider: &TestProvider) ->
 }
 
 #[test]
-fn store_uses_manifest_owned_path() {
+fn store_rejects_unlocked_manifest_without_writing_files() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     let lock_path = path.with_extension(format!("{}.lock", ARCH));
     let mut manifest = new_manifest_at(&path);
 
     smol::block_on(async {
+        let err = manifest.store().await.expect_err("store must fail");
+        assert!(err.to_string().contains("run update first"));
+    });
+
+    assert!(!path.exists());
+    assert!(!lock_path.exists());
+}
+
+#[test]
+fn store_uses_manifest_owned_path_when_lock_is_live() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let path = dir.path().join("imported.toml");
+    let lock_path = path.with_extension(format!("{}.lock", ARCH));
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create locked manifest");
+        let (mut manifest, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        assert!(has_valid_lock);
         manifest.store().await.expect("store");
     });
 
@@ -117,14 +291,6 @@ fn make_archive(url: &str, suite: &str) -> Archive {
     archive.suites = vec![suite.to_string()];
     archive.components = vec!["main".to_string()];
     archive
-}
-
-fn make_control(name: &str) -> MutableControlStanza {
-    let mut ctrl = MutableControlStanza::new();
-    ctrl.set("Package", name.to_string());
-    ctrl.set("Architecture", ARCH);
-    ctrl.set("Version", "1");
-    ctrl
 }
 
 fn make_env(items: &[(&str, &str)]) -> KVList<String> {
@@ -513,11 +679,9 @@ impl ContentProvider for UniverseCountProvider {
 #[test]
 fn add_requirements_default_spec_adds_items_and_comment() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["foo"], Some("req-comment"))
-        .expect("add requirements");
+    add_requirements(&mut manifest, None, ["foo"], Some("req-comment")).expect("add requirements");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let include = doc["spec"]["include"].as_array().expect("include array");
     let items = include
         .iter()
@@ -530,11 +694,15 @@ fn add_requirements_default_spec_adds_items_and_comment() {
 #[test]
 fn add_requirements_named_spec_adds_items_and_comment() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(Some("custom"), ["bar"], Some("named-comment"))
-        .expect("add requirements");
+    add_requirements(
+        &mut manifest,
+        Some("custom"),
+        ["bar"],
+        Some("named-comment"),
+    )
+    .expect("add requirements");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let include = doc["spec"]["custom"]["include"]
         .as_array()
         .expect("include array");
@@ -549,14 +717,12 @@ fn add_requirements_named_spec_adds_items_and_comment() {
 #[test]
 fn add_requirements_prevents_duplicate_comment_on_existing_item() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["dup"], Some("first-comment"))
+    add_requirements(&mut manifest, None, ["dup"], Some("first-comment"))
         .expect("add requirements");
-    manifest
-        .add_requirements(None, ["dup"], Some("second-comment"))
+    add_requirements(&mut manifest, None, ["dup"], Some("second-comment"))
         .expect("add requirements");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let include = doc["spec"]["include"].as_array().expect("include array");
     assert_eq!(include.len(), 1);
     assert!(text.contains("first-comment"));
@@ -566,14 +732,11 @@ fn add_requirements_prevents_duplicate_comment_on_existing_item() {
 #[test]
 fn remove_requirements_default_spec_removes_items_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["foo"], Some("remove-comment"))
+    add_requirements(&mut manifest, None, ["foo"], Some("remove-comment"))
         .expect("add requirements");
-    manifest
-        .remove_requirements(None, ["foo"])
-        .expect("remove requirements");
+    remove_requirements(&mut manifest, None, ["foo"]).expect("remove requirements");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert!(spec.get("include").is_none());
     assert!(!text.contains("remove-comment"));
@@ -583,14 +746,16 @@ fn remove_requirements_default_spec_removes_items_and_comments() {
 #[test]
 fn remove_requirements_named_spec_removes_items_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(Some("custom"), ["foo"], Some("remove-comment"))
-        .expect("add requirements");
-    manifest
-        .remove_requirements(Some("custom"), ["foo"])
-        .expect("remove requirements");
+    add_requirements(
+        &mut manifest,
+        Some("custom"),
+        ["foo"],
+        Some("remove-comment"),
+    )
+    .expect("add requirements");
+    remove_requirements(&mut manifest, Some("custom"), ["foo"]).expect("remove requirements");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert!(spec.get("include").is_none());
     assert!(!text.contains("remove-comment"));
@@ -599,11 +764,15 @@ fn remove_requirements_named_spec_removes_items_and_comments() {
 #[test]
 fn add_constraints_default_spec_adds_items_and_comment() {
     let mut manifest = new_manifest();
-    manifest
-        .add_constraints(None, ["foo (>= 1.0)"], Some("exclude-comment"))
-        .expect("add constraints");
+    add_constraints(
+        &mut manifest,
+        None,
+        ["foo (>= 1.0)"],
+        Some("exclude-comment"),
+    )
+    .expect("add constraints");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let exclude = doc["spec"]["exclude"].as_array().expect("exclude array");
     let items = exclude
         .iter()
@@ -616,11 +785,15 @@ fn add_constraints_default_spec_adds_items_and_comment() {
 #[test]
 fn add_constraints_named_spec_adds_items_and_comment() {
     let mut manifest = new_manifest();
-    manifest
-        .add_constraints(Some("custom"), ["bar (<< 2.0)"], Some("exclude-comment"))
-        .expect("add constraints");
+    add_constraints(
+        &mut manifest,
+        Some("custom"),
+        ["bar (<< 2.0)"],
+        Some("exclude-comment"),
+    )
+    .expect("add constraints");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let exclude = doc["spec"]["custom"]["exclude"]
         .as_array()
         .expect("exclude array");
@@ -635,14 +808,12 @@ fn add_constraints_named_spec_adds_items_and_comment() {
 #[test]
 fn add_constraints_prevents_duplicate_comment_on_existing_item() {
     let mut manifest = new_manifest();
-    manifest
-        .add_constraints(None, ["dup (>= 1)"], Some("first-comment"))
+    add_constraints(&mut manifest, None, ["dup (>= 1)"], Some("first-comment"))
         .expect("add constraints");
-    manifest
-        .add_constraints(None, ["dup (>= 1)"], Some("second-comment"))
+    add_constraints(&mut manifest, None, ["dup (>= 1)"], Some("second-comment"))
         .expect("add constraints");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let exclude = doc["spec"]["exclude"].as_array().expect("exclude array");
     assert_eq!(exclude.len(), 1);
     assert!(text.contains("first-comment"));
@@ -652,14 +823,16 @@ fn add_constraints_prevents_duplicate_comment_on_existing_item() {
 #[test]
 fn remove_constraints_default_spec_removes_items_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_constraints(None, ["foo (<= 2.0)"], Some("remove-comment"))
-        .expect("add constraints");
-    manifest
-        .remove_constraints(None, ["foo (<= 2.0)"])
-        .expect("remove constraints");
+    add_constraints(
+        &mut manifest,
+        None,
+        ["foo (<= 2.0)"],
+        Some("remove-comment"),
+    )
+    .expect("add constraints");
+    remove_constraints(&mut manifest, None, ["foo (<= 2.0)"]).expect("remove constraints");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert!(spec.get("exclude").is_none());
     assert!(!text.contains("remove-comment"));
@@ -668,14 +841,16 @@ fn remove_constraints_default_spec_removes_items_and_comments() {
 #[test]
 fn remove_constraints_named_spec_removes_items_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_constraints(Some("custom"), ["foo (= 1)"], Some("remove-comment"))
-        .expect("add constraints");
-    manifest
-        .remove_constraints(Some("custom"), ["foo (= 1)"])
-        .expect("remove constraints");
+    add_constraints(
+        &mut manifest,
+        Some("custom"),
+        ["foo (= 1)"],
+        Some("remove-comment"),
+    )
+    .expect("add constraints");
+    remove_constraints(&mut manifest, Some("custom"), ["foo (= 1)"]).expect("remove constraints");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert!(spec.get("exclude").is_none());
     assert!(!text.contains("remove-comment"));
@@ -685,11 +860,9 @@ fn remove_constraints_named_spec_removes_items_and_comments() {
 fn add_archive_adds_entry_and_comment() {
     let mut manifest = new_manifest();
     let archive = make_archive("https://example.invalid/debian", "stable");
-    manifest
-        .add_archive(archive, Some("archive-comment"))
-        .expect("add archive");
+    manifest.add_archive(archive, Some("archive-comment"));
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let archives = doc["archive"].as_array_of_tables().expect("archive array");
     assert_eq!(archives.len(), 1);
     let entry = archives.get(0).expect("archive entry");
@@ -713,14 +886,12 @@ fn add_archive_adds_entry_and_comment() {
 fn add_archive_update_removes_comment_when_none() {
     let mut manifest = new_manifest();
     let archive = make_archive("https://example.invalid/debian", "stable");
-    manifest
-        .add_archive(archive.clone(), Some("archive-comment"))
-        .expect("add archive");
+    manifest.add_archive(archive.clone(), Some("archive-comment"));
     let mut updated = archive;
     updated.suites = vec!["testing".to_string()];
-    manifest.add_archive(updated, None).expect("update archive");
+    manifest.add_archive(updated, None);
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let archives = doc["archive"].as_array_of_tables().expect("archive array");
     let entry = archives.get(0).expect("archive entry");
     let suites = entry
@@ -739,12 +910,9 @@ fn add_archive_update_removes_comment_when_none() {
 fn add_local_package_adds_entry_and_comment() {
     let mut manifest = new_manifest();
     let file = RepositoryFile::new("pkg.deb".to_string(), Hash::default(), 10);
-    let ctrl = make_control("pkg");
-    manifest
-        .add_local_package(file, ctrl, Some("local-comment"))
-        .expect("add local package");
+    manifest.add_local_pkg(file, Some("local-comment"));
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let locals = doc["local"].as_array_of_tables().expect("local array");
     assert_eq!(locals.len(), 1);
     let entry = locals.get(0).expect("local entry");
@@ -757,18 +925,12 @@ fn add_local_package_adds_entry_and_comment() {
 fn add_local_package_update_removes_comment_when_none() {
     let mut manifest = new_manifest();
     let file = RepositoryFile::new("pkg.deb".to_string(), Hash::default(), 10);
-    let ctrl = make_control("pkg");
-    manifest
-        .add_local_package(file, ctrl, Some("local-comment"))
-        .expect("add local package");
+    manifest.add_local_pkg(file, Some("local-comment"));
 
     let file = RepositoryFile::new("pkg.deb".to_string(), Hash::default(), 22);
-    let ctrl = make_control("pkg");
-    manifest
-        .add_local_package(file, ctrl, None)
-        .expect("update local package");
+    manifest.add_local_pkg(file, None);
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let locals = doc["local"].as_array_of_tables().expect("local array");
     let entry = locals.get(0).expect("local entry");
     assert_eq!(entry.get("size").and_then(|v| v.as_integer()), Some(22));
@@ -783,10 +945,8 @@ fn add_artifact_default_spec_adds_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new();
 
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -794,14 +954,11 @@ fn add_artifact_default_spec_adds_stage_and_comment() {
         url: "artifact-dir".to_string(),
         target: None,
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(None, &arg, Some("artifact-comment"), &provider)
-            .await
-            .expect("add artifact");
-    });
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(&mut manifest, None, artifact, Some("artifact-comment")).expect("add artifact");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let stage = doc["spec"]["stage"].as_array().expect("stage array");
     let items = stage
         .iter()
@@ -821,10 +978,8 @@ fn add_artifact_prevents_duplicate_stage_and_comment_on_update() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new();
 
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -832,18 +987,18 @@ fn add_artifact_prevents_duplicate_stage_and_comment_on_update() {
         url: "artifact-dir".to_string(),
         target: None,
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(None, &arg, Some("artifact-comment"), &provider)
-            .await
-            .expect("add artifact");
-        manifest
-            .add_artifact(None, &arg, None, &provider)
-            .await
-            .expect("update artifact");
-    });
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(
+        &mut manifest,
+        None,
+        artifact.clone(),
+        Some("artifact-comment"),
+    )
+    .expect("add artifact");
+    add_artifact(&mut manifest, None, artifact, None).expect("update artifact");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let stage = doc["spec"]["stage"].as_array().expect("stage array");
     assert_eq!(stage.len(), 1);
     assert!(!text.contains("artifact-comment"));
@@ -904,10 +1059,8 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new();
 
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(Some("custom"), ["base"], None)
-        .expect("add requirements");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -915,14 +1068,17 @@ fn add_artifact_named_spec_adds_stage_and_comment() {
         url: "artifact-dir".to_string(),
         target: None,
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(Some("custom"), &arg, Some("artifact-comment"), &provider)
-            .await
-            .expect("add artifact");
-    });
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(
+        &mut manifest,
+        Some("custom"),
+        artifact,
+        Some("artifact-comment"),
+    )
+    .expect("add artifact");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let stage = doc["spec"]["custom"]["stage"]
         .as_array()
         .expect("stage array");
@@ -946,7 +1102,7 @@ fn upsert_text_artifact_creates_and_updates() {
             None,
         )
         .expect("create text artifact");
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     assert!(text.contains("type = \"text\""));
     let artifact = doc["artifact"]["note"].as_table().expect("artifact table");
     assert_eq!(
@@ -973,7 +1129,7 @@ fn upsert_text_artifact_creates_and_updates() {
             Some("amd64".to_string()),
         )
         .expect("update text artifact");
-    let (_, doc) = render_manifest(&mut manifest);
+    let (_, doc) = render_manifest(&manifest);
     let artifact = doc["artifact"]["note"].as_table().expect("artifact table");
     assert_eq!(
         artifact
@@ -997,10 +1153,8 @@ fn upsert_text_artifact_rejects_non_text() {
     let artifact_path = dir.path().join("artifact-file");
     std::fs::write(&artifact_path, b"data").expect("write artifact");
     let provider = TestProvider::new();
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(None, vec!["base"], None)
-        .expect("add requirement");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirement");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -1008,12 +1162,9 @@ fn upsert_text_artifact_rejects_non_text() {
         url: "artifact-file".to_string(),
         target: Some("/etc/host".to_string()),
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(None, &arg, None, &provider)
-            .await
-            .expect("add artifact");
-    });
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(&mut manifest, None, artifact, None).expect("add artifact");
 
     let err = manifest
         .upsert_text_artifact(
@@ -1023,7 +1174,8 @@ fn upsert_text_artifact_rejects_non_text() {
             None,
             None,
         )
-        .expect_err("reject non-text");
+        .err()
+        .expect("reject non-text");
     assert!(err.to_string().contains("not text"));
 }
 
@@ -1035,10 +1187,8 @@ fn remove_artifact_default_spec_removes_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new();
 
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -1046,17 +1196,12 @@ fn remove_artifact_default_spec_removes_stage_and_comment() {
         url: "artifact-dir".to_string(),
         target: None,
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(None, &arg, Some("artifact-comment"), &provider)
-            .await
-            .expect("add artifact");
-    });
-    manifest
-        .remove_artifact(None, "artifact-dir")
-        .expect("remove artifact");
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(&mut manifest, None, artifact, Some("artifact-comment")).expect("add artifact");
+    remove_artifact(&mut manifest, None, "artifact-dir").expect("remove artifact");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert!(spec.get("stage").is_none());
     let artifacts = doc.get("artifact").and_then(|item| item.as_table());
@@ -1074,10 +1219,8 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
     std::fs::write(artifact_path.join("data.txt"), b"data").expect("write artifact");
     let provider = TestProvider::new();
 
-    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
-    manifest
-        .add_requirements(Some("custom"), ["base"], None)
-        .expect("add requirements");
+    let mut manifest = new_manifest();
+    add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
     let arg = ArtifactArg {
         mode: None,
         do_not_unpack: false,
@@ -1085,17 +1228,18 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
         url: "artifact-dir".to_string(),
         target: None,
     };
-    smol::block_on(async {
-        manifest
-            .add_artifact(Some("custom"), &arg, Some("artifact-comment"), &provider)
-            .await
-            .expect("add artifact");
-    });
-    manifest
-        .remove_artifact(Some("custom"), "artifact-dir")
-        .expect("remove artifact");
+    let artifact =
+        smol::block_on(make_local_artifact(dir.path(), &arg, &provider)).expect("build artifact");
+    add_artifact(
+        &mut manifest,
+        Some("custom"),
+        artifact,
+        Some("artifact-comment"),
+    )
+    .expect("add artifact");
+    remove_artifact(&mut manifest, Some("custom"), "artifact-dir").expect("remove artifact");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert!(spec.get("stage").is_none());
     let artifacts = doc.get("artifact").and_then(|item| item.as_table());
@@ -1108,17 +1252,13 @@ fn remove_artifact_named_spec_removes_stage_and_comment() {
 #[test]
 fn set_build_env_default_spec_sets_values_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
 
     let env = make_env(&[("FOO", "bar"), ("BAZ", "qux")]);
     let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-    manifest
-        .set_build_env_with_comments(None, env, comments)
-        .expect("set build env");
+    set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let build_env = doc["spec"]["build-env"]
         .as_table()
         .expect("build-env table");
@@ -1142,22 +1282,17 @@ fn set_build_env_default_spec_sets_values_and_comments() {
 #[test]
 fn set_build_env_default_spec_updates_and_removes_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
     let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-    manifest
-        .set_build_env_with_comments(None, env, comments)
-        .expect("set build env");
+    set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
 
     let env = make_env(&[("FOO", "updated")]);
-    manifest
-        .set_build_env_with_comments(None, env, BuildEnvComments::default())
+    set_build_env_with_comments(&mut manifest, None, env, BuildEnvComments::default())
         .expect("update build env");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let build_env = doc["spec"]["build-env"]
         .as_table()
         .expect("build-env table");
@@ -1177,21 +1312,21 @@ fn set_build_env_default_spec_updates_and_removes_comments() {
 #[test]
 fn set_build_env_default_spec_removes_table_when_empty() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
     let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-    manifest
-        .set_build_env_with_comments(None, env, comments)
-        .expect("set build env");
+    set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
 
-    manifest
-        .set_build_env_with_comments(None, KVList::new(), BuildEnvComments::default())
-        .expect("clear build env");
+    set_build_env_with_comments(
+        &mut manifest,
+        None,
+        KVList::new(),
+        BuildEnvComments::default(),
+    )
+    .expect("clear build env");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert!(spec.get("build-env").is_none());
     assert!(!text.contains("prefix-foo"));
@@ -1200,17 +1335,14 @@ fn set_build_env_default_spec_removes_table_when_empty() {
 #[test]
 fn set_build_env_named_spec_sets_values_and_comments() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(Some("custom"), ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
 
     let env = make_env(&[("FOO", "bar")]);
     let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-    manifest
-        .set_build_env_with_comments(Some("custom"), env, comments)
+    set_build_env_with_comments(&mut manifest, Some("custom"), env, comments)
         .expect("set build env");
 
-    let (text, doc) = render_manifest(&mut manifest);
+    let (text, doc) = render_manifest(&manifest);
     let build_env = doc["spec"]["custom"]["build-env"]
         .as_table()
         .expect("build-env table");
@@ -1221,25 +1353,20 @@ fn set_build_env_named_spec_sets_values_and_comments() {
 #[test]
 fn set_build_script_default_spec_adds_and_removes_entry() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(None, ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
 
-    manifest
-        .set_build_script(None, Some("echo hello\n".to_string()))
+    set_build_script(&mut manifest, None, Some("echo hello\n".to_string()))
         .expect("set build script");
 
-    let (_text, doc) = render_manifest(&mut manifest);
+    let (_text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert_eq!(
         spec.get("build-script").and_then(|v| v.as_str()),
         Some("echo hello\n")
     );
 
-    manifest
-        .set_build_script(None, None)
-        .expect("remove build script");
-    let (_text, doc) = render_manifest(&mut manifest);
+    set_build_script(&mut manifest, None, None).expect("remove build script");
+    let (_text, doc) = render_manifest(&manifest);
     let spec = doc["spec"].as_table().expect("spec table");
     assert!(spec.get("build-script").is_none());
 }
@@ -1247,44 +1374,100 @@ fn set_build_script_default_spec_adds_and_removes_entry() {
 #[test]
 fn set_build_script_named_spec_adds_and_removes_entry() {
     let mut manifest = new_manifest();
-    manifest
-        .add_requirements(Some("custom"), ["base"], None)
-        .expect("add requirements");
+    add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
 
-    manifest
-        .set_build_script(Some("custom"), Some("echo hello\n".to_string()))
-        .expect("set build script");
+    set_build_script(
+        &mut manifest,
+        Some("custom"),
+        Some("echo hello\n".to_string()),
+    )
+    .expect("set build script");
 
-    let (_text, doc) = render_manifest(&mut manifest);
+    let (_text, doc) = render_manifest(&manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert_eq!(
         spec.get("build-script").and_then(|v| v.as_str()),
         Some("echo hello\n")
     );
 
-    manifest
-        .set_build_script(Some("custom"), None)
-        .expect("remove build script");
-    let (_text, doc) = render_manifest(&mut manifest);
+    set_build_script(&mut manifest, Some("custom"), None).expect("remove build script");
+    let (_text, doc) = render_manifest(&manifest);
     let spec = doc["spec"]["custom"].as_table().expect("spec table");
     assert!(spec.get("build-script").is_none());
+}
+
+#[test]
+fn manifest_setters_create_missing_spec_consistently() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
+
+    manifest
+        .set_spec_meta(Some("custom"), "owner", "ops")
+        .expect("set spec meta");
+    manifest
+        .set_build_env(Some("custom"), make_env(&[("FOO", "bar")]))
+        .expect("set build env");
+    manifest
+        .set_build_script(Some("custom"), Some("echo hello\n".to_string()))
+        .expect("set build script");
+
+    assert_eq!(manifest.spec_names().collect::<Vec<_>>(), vec!["custom"]);
+    assert_eq!(
+        manifest
+            .get_spec_meta(Some("custom"), "owner")
+            .expect("get meta"),
+        Some("ops")
+    );
+    let env = manifest
+        .spec_build_env(Some("custom"))
+        .expect("get build env");
+    assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(
+        manifest
+            .spec_build_script(Some("custom"))
+            .expect("get build script")
+            .as_deref(),
+        Some("echo hello\n")
+    );
+}
+
+#[test]
+fn manifest_missing_spec_noops_do_not_create_spec() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = new_manifest_at(dir.path().join("Manifest.toml"));
+
+    manifest
+        .set_build_env(Some("custom"), KVList::new())
+        .expect("empty build env is a no-op");
+    manifest
+        .set_build_script(Some("custom"), None)
+        .expect("missing build script is a no-op");
+    manifest
+        .add_requirements(Some("custom"), Vec::<Dependency<String>>::new(), None)
+        .expect("empty requirements are a no-op");
+    manifest
+        .add_constraints(Some("custom"), Vec::<Constraint<String>>::new(), None)
+        .expect("empty constraints are a no-op");
+    manifest
+        .add_stage_items(Some("custom"), Vec::new(), None)
+        .expect("empty stage items are a no-op");
+
+    assert!(manifest.spec_names().next().is_none());
+    assert!(manifest.spec_build_script(Some("custom")).is_err());
 }
 
 #[test]
 fn update_without_valid_lock_refreshes_archives() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
-    let mut manifest = Manifest::from_archives(
-        &path,
-        ARCH,
-        [make_archive("https://example.invalid/debian", "stable")],
-        None,
-    );
     smol::block_on(async {
-        manifest
-            .store_manifest_only(&path)
-            .await
-            .expect("store manifest only");
+        ManifestFile::new_with_archives(
+            vec![make_archive("https://example.invalid/debian", "stable")],
+            None,
+        )
+        .store(&path)
+        .await
+        .expect("store manifest only");
     });
 
     let release_fetches = Arc::new(AtomicUsize::new(0));
@@ -1314,17 +1497,14 @@ fn update_without_valid_lock_refreshes_archives() {
 fn update_skips_archive_refresh_when_lock_is_valid() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
-    let mut manifest = Manifest::from_archives(
-        &path,
-        ARCH,
-        [make_archive("https://example.invalid/debian", "stable")],
-        None,
-    );
     smol::block_on(async {
-        manifest
-            .store_manifest_only(&path)
-            .await
-            .expect("store manifest only");
+        ManifestFile::new_with_archives(
+            vec![make_archive("https://example.invalid/debian", "stable")],
+            None,
+        )
+        .store(&path)
+        .await
+        .expect("store manifest only");
     });
 
     let release_fetches = Arc::new(AtomicUsize::new(0));
@@ -1399,18 +1579,20 @@ fn resolve_rejects_downstream_stage_reference_to_imported_artifact() {
     let dir = tempfile::tempdir().expect("tempdir");
     let provider = TestProvider::new();
     let downstream_path = dir.path().join("downstream.toml");
-    let mut downstream = new_manifest_at(&downstream_path);
-
     smol::block_on(async {
         create_locked_imported_manifest(dir.path(), &provider)
             .await
             .expect("create imported manifest");
+        let mut downstream = new_manifest();
+        downstream.set_import(
+            Path::new("imported.toml"),
+            manifest_hash(&dir.path().join("imported.toml"))
+                .await
+                .expect("imported hash"),
+            ["base"],
+        );
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
-            .await
-            .expect("set import");
-        downstream
-            .store_manifest_only(&downstream_path)
+            .store(&downstream_path)
             .await
             .expect("store downstream manifest");
     });
@@ -1441,18 +1623,20 @@ fn stage_local_allows_inherited_imported_artifact_stage() {
     let provider = TestProvider::new();
     let downstream_path = dir.path().join("downstream.toml");
     let root = dir.path().join("root");
-    let mut downstream = new_manifest_at(&downstream_path);
-
     smol::block_on(async {
         create_locked_imported_manifest(dir.path(), &provider)
             .await
             .expect("create imported manifest");
+        let mut downstream = new_manifest();
+        downstream.set_import(
+            Path::new("imported.toml"),
+            manifest_hash(&dir.path().join("imported.toml"))
+                .await
+                .expect("imported hash"),
+            ["base"],
+        );
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
-            .await
-            .expect("set import");
-        downstream
-            .store_manifest_only(&downstream_path)
+            .store(&downstream_path)
             .await
             .expect("store downstream manifest");
     });
