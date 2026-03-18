@@ -8,7 +8,10 @@ use {
         hash::{Hash, HashAlgo},
         is_url,
         kvlist::KVList,
-        manifest_doc::{spec_display_name, BuildEnvComments, LockFile, ManifestFile, UpdateResult},
+        manifest_doc::{
+            spec_display_name, valid_spec_name, BuildEnvComments, LockFile, ManifestFile,
+            UpdateResult,
+        },
         packages::{Package, PackageOrigin},
         spec::{
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
@@ -20,14 +23,12 @@ use {
         version::{IntoConstraint, IntoDependency, ProvidedName},
         Packages, Source, SourceUniverse,
     },
-    digest::FixedOutput,
     futures::stream::{self, StreamExt, TryStreamExt},
     futures_lite::FutureExt,
     itertools::Itertools,
     smol::io,
     std::{
         future::Future,
-        io::Write,
         num::NonZero,
         path::{Path, PathBuf},
         pin::Pin,
@@ -108,6 +109,9 @@ impl Manifest {
             import: None,
         }
     }
+    // recursively loads manifest and its imports, returning the top-level manifest and whether it
+    // has a valid lock file. Fails if any import is not locked, however, does not
+    // fail it its own import record is stale.
     fn from_file_rec(
         path: PathBuf,
         arch: String,
@@ -126,7 +130,7 @@ impl Manifest {
             }
             import_stack.push(path.clone());
             let (manifest, hash) = ManifestFile::from_file(&path).await?;
-            let import = if let Some(import) = manifest.import() {
+            let (import, stale_import) = if let Some(import) = manifest.import() {
                 let import_path = path
                     .parent()
                     .unwrap_or_else(|| Path::new("."))
@@ -140,11 +144,14 @@ impl Manifest {
                         format!(
                             "imported manifest {} is not locked; lock if first\n{}",
                             import_path.display(),
-                            import_stack.iter().map(|p| p.display().to_string()).join("\n")
+                            import_stack
+                                .iter()
+                                .map(|p| p.display().to_string())
+                                .join("\n")
                         ),
                     ));
                 }
-                let import_hash = import_manifest.hash.as_ref().ok_or_else(|| {
+                let stale_import = import_manifest.hash.as_ref().ok_or_else(|| {
                     io::Error::new(
                         io::ErrorKind::InvalidData,
                         format!(
@@ -152,29 +159,23 @@ impl Manifest {
                             import_path.display()
                         ),
                     )
-                })?;
-                if import.hash() != import_hash {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "imported manifest {} has changed (expected hash {}, got {}); run update --import to refresh",
-                            import_path.display(),
-                            import.hash().to_hex(),
-                            import_hash.to_hex(),
-                        ),
-                    ));
-                }
-                Some(Box::new(import_manifest))
+                })? != import.hash();
+                (Some(Box::new(import_manifest)), stale_import)
+            } else {
+                (None, false)
+            };
+            let imported_universe_hash = import
+                .as_deref()
+                .and_then(|import| import.lock.universe_hash());
+            let lock_path = lock_path_for(&path, &arch);
+            let lock = if !stale_import {
+                LockFile::from_file(&lock_path, &arch, &hash, imported_universe_hash).await
             } else {
                 None
             };
-            let imported_universe_hash = import.as_deref().and_then(|import| {
-                import.lock.universe_hash()
-            });
-            let lock_path = lock_path_for(&path, &arch);
-            let lock = LockFile::from_file(&lock_path, &arch, &hash, imported_universe_hash).await;
             let has_valid_lock = lock.is_some();
-            let lock = lock.unwrap_or_else(|| manifest.unlocked_lock_file(imported_universe_hash.cloned()));
+            let lock = lock
+                .unwrap_or_else(|| manifest.unlocked_lock_file(imported_universe_hash.cloned()));
             let manifest = Manifest {
                 arch,
                 path,
@@ -188,8 +189,10 @@ impl Manifest {
                 import,
             };
             Ok((manifest, has_valid_lock))
-        }.boxed_local()
+        }
+        .boxed_local()
     }
+    /// Loads from the given path. Fail if import is stale.
     pub async fn from_file<A: ToString, P: AsRef<Path>>(
         path: P,
         arch: A,
@@ -242,30 +245,59 @@ impl Manifest {
             _ => None,
         }
     }
-    pub fn set_import<P: Into<PathBuf>, S: ToString, I: IntoIterator<Item = S>>(
+    pub async fn set_import<P: AsRef<Path>, S: ToString, I: IntoIterator<Item = S>>(
         &mut self,
         path: P,
-        imported: &Manifest,
         specs: I,
     ) -> io::Result<()> {
+        let specs = specs
+            .into_iter()
+            .map(|s| s.to_string())
+            .map(|s| {
+                let name = valid_spec_name(&s).map_err(io::Error::other)?;
+                if self.file.specs().any(|(n, _)| n == name) {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "spec name {} conflicts with existing spec in manifest",
+                            name
+                        ),
+                    ))
+                } else {
+                    Ok(s)
+                }
+            })
+            .collect::<io::Result<Vec<_>>>()?;
         let mut import_stack = vec![self.path.clone()];
-        let mut cur = Some(imported);
-        while let Some(manifest) = cur {
-            if import_stack.contains(&manifest.path) {
-                return Err(io::Error::other(format!(
-                    "circular manifest import detected: {}\n{}",
-                    manifest.path.display(),
-                    import_stack
-                        .iter()
-                        .map(|p| p.display().to_string())
-                        .join("\n")
-                )));
+        let (imported, import_has_valid_lock) = Manifest::from_file_rec(
+            self.local_path(path.as_ref()),
+            self.arch.clone(),
+            &mut import_stack,
+        )
+        .await?;
+        if !import_has_valid_lock {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "imported manifest {} is not locked; lock if first",
+                    path.as_ref().display(),
+                ),
+            ));
+        }
+        for spec in &specs {
+            if !imported.file.specs().any(|(n, _)| n == spec) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "imported manifest {} does not contain spec {}",
+                        path.as_ref().display(),
+                        spec
+                    ),
+                ));
             }
-            import_stack.push(manifest.path.clone());
-            cur = manifest.import.as_deref();
         }
         self.file.set_import(
-            path,
+            path.as_ref(),
             imported.hash.clone().ok_or_else(|| {
                 io::Error::other(format!(
                     "imported manifest {} lacks hash",
@@ -281,40 +313,69 @@ impl Manifest {
         self.mark_lock_invalid();
         Ok(())
     }
-    pub fn update_import(&mut self) -> io::Result<bool> {
-        if let Some(import) = self.import.as_deref() {
-            let import_hash = import.hash.as_ref().ok_or_else(|| {
+    fn update_import(&mut self) -> io::Result<bool> {
+        if self.import.is_none() {
+            return Ok(false);
+        }
+        let import_desc = self.file.import().ok_or_else(|| {
+            io::Error::other(
+                "[internal error] consistent import state in Manifest and ManifestFile",
+            )
+        })?;
+        let import = self.import.as_deref().unwrap();
+        // the import is source of truth here, we need to update
+        // the internal references and validate the specs
+        let imported_hash = import.hash.as_ref().ok_or_else(|| {
+            io::Error::other(format!(
+                "[internal error] imported manifest {} lacks hash",
+                import.path.display()
+            ))
+        })?;
+        let imported_universe_hash = import
+            .lock
+            .universe_hash()
+            .ok_or_else(|| {
                 io::Error::other(format!(
-                    "imported manifest {} lacks hash",
+                    "[internal error] imported manifest {} lock lacks universe hash",
                     import.path.display()
                 ))
-            })?;
-            let import_desc = self.file.import().ok_or_else(|| {
-                io::Error::other("consistent import state in Manifest and ManifestFile")
-            })?;
-            if import_hash != import_desc.hash() {
-                self.file.set_import(
-                    import_desc.path().to_path_buf(),
-                    import_hash.clone(),
-                    import_desc
-                        .specs()
-                        .map(|s| s.to_string())
-                        .collect::<Vec<String>>(),
-                );
-                self.mark_file_updated();
-                self.lock
-                    .specs_mut()
-                    .for_each(|(_, r)| r.invalidate_solution());
-                self.mark_lock_invalid();
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        } else {
-            Err(io::Error::other(
-                "no [import] configured; run rdebootstrap import <path> --spec <name>... first",
-            ))
+            })?
+            .clone();
+        if imported_hash == import_desc.hash()
+            && self.lock.imported_universe_hash() == Some(&imported_universe_hash)
+        {
+            // no change, skip
+            return Ok(false);
         }
+        for spec in import_desc.specs() {
+            if !import.file.specs().any(|(n, _)| n == spec) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!(
+                        "imported manifest {} does not contain spec {}",
+                        import_desc.path().display(),
+                        spec
+                    ),
+                ));
+            }
+        }
+        if imported_hash != import_desc.hash() {
+            self.file.set_import(
+                import_desc.path().to_path_buf(),
+                imported_hash.clone(),
+                import_desc
+                    .specs()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<String>>(),
+            );
+            self.mark_file_updated();
+        }
+        self.lock.set_imported_universe_hash(imported_universe_hash);
+        self.lock
+            .specs_mut()
+            .for_each(|(_, r)| r.invalidate_solution());
+        self.mark_lock_invalid();
+        Ok(true)
     }
 
     pub async fn store(&mut self) -> io::Result<()> {
@@ -915,36 +976,39 @@ impl Manifest {
         &self,
         concurrency: NonZero<usize>,
         cache: &C,
-    ) -> io::Result<Vec<Packages>> {
+    ) -> io::Result<(Vec<Packages>, Hash)> {
         tracing::debug!("preparing universe packages");
+        let mut hash = blake3::Hasher::default();
         let mut packages = Vec::new();
-        let mut local_packages = Vec::new();
         for (manifest_id, current) in self.manifests() {
-            let current_packages = cache
-                .fetch_universe(current.archives(manifest_id), concurrency)
-                .await?;
-            packages.extend(current_packages);
             if let Some(pkgs) = current.lock.local_pkgs() {
+                hash.update(pkgs.src().as_bytes());
                 // local packages have highest priority
-                local_packages.push(
+                packages.push(
                     pkgs.clone()
                         .with_prio(0)
                         .with_origin(PackageOrigin::Local { manifest_id }),
                 )
             }
+            let current_packages = cache
+                .fetch_universe(current.archives(manifest_id), concurrency)
+                .await?;
+            current_packages.iter().for_each(|pkg| {
+                hash.update(pkg.src().as_bytes());
+            });
+            packages.extend(current_packages);
         }
-        packages.extend(local_packages);
-        Ok(packages)
+        Ok((packages, hash.into_hash()))
     }
     async fn make_universe<C: ContentProvider>(
         &mut self,
         concurrency: NonZero<usize>,
         cache: &C,
-    ) -> io::Result<()> {
+    ) -> io::Result<Hash> {
         tracing::debug!("building package universe");
-        let packages = self.universe_packages(concurrency, cache).await?;
+        let (packages, hash) = self.universe_packages(concurrency, cache).await?;
         self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
-        Ok(())
+        Ok(hash)
     }
     pub async fn load_source_universe<C: ContentProvider>(
         &mut self,
@@ -1118,32 +1182,7 @@ impl Manifest {
         } else {
             false
         };
-        if updated || local_pkgs_update {
-            self.update_universe_hash()?;
-        }
         Ok(updated || local_pkgs_update)
-    }
-    fn update_universe_hash(&mut self) -> io::Result<()> {
-        let mut hash = blake3::Hasher::default();
-        if let Some(locals) = self.lock.local_pkgs() {
-            let mut local_digest = sha2::Sha256::default();
-            local_digest.write_all(locals.src().as_bytes())?;
-            hash.update(&local_digest.finalize_fixed());
-        }
-        UniverseFiles::new(
-            &self.arch,
-            0,
-            self.file.local_archives(),
-            self.lock.local_archives(),
-        )
-        .package_files()
-        .try_for_each(|pkg| {
-            let (_, _, _, file) = pkg?;
-            hash.update(file.hash.as_ref());
-            Ok::<_, io::Error>(())
-        })?;
-        self.lock.set_universe_hash(hash.into_hash());
-        Ok(())
     }
     pub(crate) async fn update_local_artifacts<C: ContentProvider>(
         &mut self,
@@ -1183,9 +1222,10 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         tracing::debug!("updating locked archive");
-        let mut updated = false;
+        // no-op if no import or import reference is actual
+        let mut updated = self.update_import()?;
         if force_locals || !self.lock_valid {
-            updated = self.update_local_artifacts(cache).await?;
+            updated |= self.update_local_artifacts(cache).await?;
         }
         if force_archives || !self.lock_valid {
             updated |= self
@@ -1209,7 +1249,8 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<()> {
         if self.universe.is_none() {
-            self.make_universe(concurrency, cache).await?;
+            let hash = self.make_universe(concurrency, cache).await?;
+            self.lock.set_universe_hash(hash);
         }
         Ok(())
     }

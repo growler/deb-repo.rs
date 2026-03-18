@@ -65,11 +65,60 @@ prepare_case() {
     reset_dir "${CASE_DIR}"
 }
 
-run_case_rdb() {
+rdebootstrap_debug_enabled() {
+    [[ "${RDEBOOTSTRAP_DEBUG:-0}" == "1" ]]
+}
+
+format_rdebootstrap_command() {
+    local manifest="$1"
+    shift
+    local -a cmd=("rdebootstrap")
+    if rdebootstrap_debug_enabled; then
+        cmd+=(-d)
+    fi
+    cmd+=(-m "${manifest}" "$@")
+    local rendered
+    printf -v rendered '%q ' "${cmd[@]}"
+    printf '%s' "${rendered% }"
+}
+
+run_rdebootstrap_manifest() {
+    local workdir="$1"
+    local manifest="$2"
+    shift 2
     (
-        cd "${CASE_DIR}"
-        "${RDEBOOTSTRAP}" -m "${MANIFEST}" "$@"
+        cd "${workdir}"
+        local -a cmd=("${RDEBOOTSTRAP}")
+        if rdebootstrap_debug_enabled; then
+            cmd+=(-d)
+        fi
+        cmd+=(-m "${manifest}" "$@")
+        "${cmd[@]}"
     )
+}
+
+capture_rdebootstrap_manifest() {
+    local label="$1"
+    local workdir="$2"
+    local manifest="$3"
+    local output_dir="$4"
+    shift 4
+    LAST_STDOUT="${output_dir}/${label}.stdout"
+    LAST_STDERR="${output_dir}/${label}.stderr"
+    if run_rdebootstrap_manifest "${workdir}" "${manifest}" "$@" >"${LAST_STDOUT}" 2>"${LAST_STDERR}"; then
+        LAST_STATUS=0
+    else
+        LAST_STATUS=$?
+    fi
+    if rdebootstrap_debug_enabled && [[ -s "${LAST_STDERR}" ]]; then
+        printf -- '---- %s stderr ----\n' "${label}" >&2
+        cat -- "${LAST_STDERR}" >&2
+    fi
+    return "${LAST_STATUS}"
+}
+
+run_case_rdb() {
+    run_rdebootstrap_manifest "${CASE_DIR}" "${MANIFEST}" "$@"
 }
 
 capture_case_command() {
@@ -92,15 +141,17 @@ capture_case_command() {
 run_case_capture() {
     local label="$1"
     shift
-    capture_case_command "${label}" "${RDEBOOTSTRAP}" -m "${MANIFEST}" "$@"
+    capture_rdebootstrap_manifest "${label}" "${CASE_DIR}" "${MANIFEST}" "${CASE_DIR}" "$@"
 }
 
 run_case_expect_ok() {
     local label="$1"
     shift
     if ! run_case_capture "${label}" "$@"; then
-        tail -n 40 "${LAST_STDERR}" >&2 || true
-        die "command failed (${label}): rdebootstrap -m ${MANIFEST} $*"
+        if ! rdebootstrap_debug_enabled; then
+            tail -n 40 "${LAST_STDERR}" >&2 || true
+        fi
+        die "command failed (${label}): $(format_rdebootstrap_command "${MANIFEST}" "$@")"
     fi
 }
 
@@ -117,7 +168,7 @@ run_case_expect_fail() {
     local label="$1"
     shift
     if run_case_capture "${label}" "$@"; then
-        die "expected command to fail (${label}): rdebootstrap -m ${MANIFEST} $*"
+        die "expected command to fail (${label}): $(format_rdebootstrap_command "${MANIFEST}" "$@")"
     fi
 }
 

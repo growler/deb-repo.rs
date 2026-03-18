@@ -19,7 +19,7 @@ for command in archive deb artifact import require forbid remove stage unstage l
 done
 
 run_case_expect_ok "update_help" update --help
-assert_stdout_contains "--import"
+assert_stdout_lacks "--import"
 
 run_case_expect_ok "include_help" include --help
 assert_stdout_contains "Usage: rdebootstrap require"

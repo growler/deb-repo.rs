@@ -693,9 +693,6 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         /// Do not verify InRelease signatures by default (not recommended)
         #[arg(long = "no-verify", display_order = 0, action)]
         insecure_release: bool,
-        /// Refresh the imported manifest hash and re-resolve against the updated import
-        #[arg(short = 'I', long = "import", action)]
-        refresh_import: bool,
     }
 
     impl<C: Config> Command<C> for Update {
@@ -703,13 +700,10 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let force_archives = self.archives || self.snapshot.is_some();
-                let mut force = force_archives || self.locals || self.refresh_import;
                 let (mut mf, has_valid_lock) =
                     Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                if self.refresh_import {
-                    force |= mf.update_import()?;
-                }
+                let force_archives = self.archives || self.snapshot.is_some();
+                let force = force_archives || self.locals;
                 if has_valid_lock && !force {
                     tracing::debug!("Lock file is up to date, nothing to do");
                     return Ok(());
@@ -744,7 +738,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         path: PathBuf,
 
         /// Spec name to export from the imported manifest (repeatable, at least one required)
-        #[arg(long = "spec", value_name = "SPEC", value_delimiter = ',')]
+        #[arg(
+            long = "spec",
+            value_name = "SPEC",
+            value_delimiter = ',',
+            required = true
+        )]
         specs: Vec<String>,
     }
 
@@ -752,24 +751,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                let import_abs = mf.local_path(&self.path);
-                let (imported, _) = Manifest::from_file(&import_abs, conf.arch()).await?;
-                let imported_specs: Vec<&str> = self
-                    .specs
-                    .iter()
-                    .map(|s| {
-                        if imported.spec_names().any(|name| name == s) {
-                            Ok(s.as_str())
-                        } else {
-                            Err(io::Error::other(format!(
-                                "spec \"{}\" not found in imported manifest {}",
-                                s,
-                                import_abs.display(),
-                            )))
-                        }
-                    })
-                    .collect::<io::Result<Vec<_>>>()?;
-                mf.set_import(&self.path, &imported, imported_specs)?;
+                mf.set_import(&self.path, &self.specs).await?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), conf.fetcher()?).await?;

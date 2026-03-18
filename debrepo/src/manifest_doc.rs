@@ -1023,6 +1023,14 @@ impl LockFile {
     pub(crate) fn universe_hash(&self) -> Option<&Hash> {
         self.universe_hash.as_ref()
     }
+    pub(crate) fn imported_universe_hash(&self) -> Option<&Hash> {
+        self.imported_universe_hash.as_ref()
+    }
+    pub(crate) fn set_imported_universe_hash(&mut self, hash: Hash) {
+        self.imported_universe_hash.replace(hash);
+    }
+    // loads lock file from path. returns None if the lock file 
+    // has outdated manifest hash or outdated imported universe hash (if any)
     pub(crate) async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
         lock_path: P,
         arch: A,

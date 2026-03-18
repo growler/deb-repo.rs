@@ -13,6 +13,24 @@ export RDEBOOTSTRAP
 
 source "${REPO_ROOT}/test/lib.sh"
 
+debug=0
+while getopts ":d" opt; do
+    case "${opt}" in
+        d)
+            debug=1
+            ;;
+        :)
+            die "option requires an argument: -${OPTARG}"
+            ;;
+        \?)
+            die "unknown option: -${OPTARG}"
+            ;;
+    esac
+done
+shift $((OPTIND - 1))
+
+export RDEBOOTSTRAP_DEBUG="${debug}"
+
 require_cmd bash
 require_cmd awk
 require_cmd cargo
@@ -22,6 +40,36 @@ require_cmd gzip
 require_cmd readlink
 require_cmd tar
 
+mapfile -t scenarios < <(find "${REPO_ROOT}/test" -maxdepth 1 -type f -name '[0-9][0-9]*_*.sh' | sort -V)
+if [[ "${#scenarios[@]}" -eq 0 ]]; then
+    die "no integration scenarios found under ${REPO_ROOT}/test"
+fi
+
+if [[ "$#" -gt 0 ]]; then
+    selected_scenarios=()
+    for selector in "$@"; do
+        normalized_selector="$(basename "${selector}" .sh)"
+        matches=()
+        for scenario in "${scenarios[@]}"; do
+            if [[ "$(basename "${scenario}" .sh)" == "${normalized_selector}" ]]; then
+                matches+=("${scenario}")
+            fi
+        done
+        case "${#matches[@]}" in
+            1)
+                selected_scenarios+=("${matches[0]}")
+                ;;
+            0)
+                die "unknown test scenario: ${selector}"
+                ;;
+            *)
+                die "test scenario is ambiguous: ${selector}"
+                ;;
+        esac
+    done
+    scenarios=("${selected_scenarios[@]}")
+fi
+
 rm -rf -- "${TEST_ROOT}"
 mkdir -p "${LOG_DIR}"
 
@@ -30,9 +78,8 @@ if [[ "${RDEBOOTSTRAP_FORCE_BUILD:-0}" == "1" || ! -x "${RDEBOOTSTRAP}" ]]; then
     cargo build -p rdebootstrap --release
 fi
 
-mapfile -t scenarios < <(find "${REPO_ROOT}/test" -maxdepth 1 -type f -name '[0-9][0-9]*_*.sh' | sort -V)
-if [[ "${#scenarios[@]}" -eq 0 ]]; then
-    die "no integration scenarios found under ${REPO_ROOT}/test"
+if [[ "${RDEBOOTSTRAP_DEBUG}" == "1" ]]; then
+    note "rdebootstrap debug logging enabled"
 fi
 
 passes=0
