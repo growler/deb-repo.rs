@@ -112,9 +112,9 @@ Key sections:
 
 - `[[archive]]` — APT repositories with suites, components, optional snapshot
   templates, trusted keys, and priorities.
-- `[import]` — Reuse archives, artifacts, local packages, and selected named
-  specs from another manifest. `path`, `hash`, and non-empty `specs` are
-  required when present.
+- `[import]` — Reuse archives, local packages, and selected named parent specs
+  from another manifest. Imported parent specs keep their own staged artifact
+  references. `path`, `hash`, and non-empty `specs` are required when present.
 - `[[local]]` — Local `.deb` files copied into the cache and treated like repo
   packages.
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
@@ -124,10 +124,11 @@ Key sections:
 
 `rdebootstrap import` writes `[import]`, pins the imported manifest bytes in
 `hash`, and validates the selected named specs. Imported archives are prepended
-to the effective archive list, imported artifacts join the visible artifact
-namespace, and imported `[[local]]` entries join the effective package
-universe. Imported local paths stay anchored to the imported manifest
-directory.
+to the effective archive list, imported `[[local]]` entries join the effective
+package universe, and inherited `stage` entries from imported parent specs keep
+resolving their own imported artifacts. Downstream-local `stage` entries still
+only resolve artifacts defined in the downstream manifest. Imported local paths
+stay anchored to the imported manifest directory.
 
 The downstream lock keeps only downstream-local `archives` and `locals`, plus
 an `imported-universe` fingerprint for imported lock state. `rdebootstrap

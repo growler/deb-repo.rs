@@ -446,12 +446,6 @@ impl Manifest {
         order.push(id);
         Ok(())
     }
-    fn artifact_ref(&self, name: &str) -> Option<(&Manifest, &Artifact)> {
-        self.file
-            .artifact(name)
-            .map(|artifact| (self, artifact))
-            .or_else(|| self.import.as_deref()?.artifact_ref(name))
-    }
     fn artifact_path(&self, artifact: &Artifact) -> Option<PathBuf> {
         match artifact {
             Artifact::Text(_) => None,
@@ -801,23 +795,22 @@ impl Manifest {
         let arch = self.arch.as_str();
         self.ancestors_refs(id)
             .map_ok(|spec| {
+                let manifest = spec.manifest;
                 let (_, spec) = spec.entry();
-                spec.stage.iter().map(String::as_str)
+                spec.stage
+                    .iter()
+                    .map(move |artifact_name| (manifest, artifact_name.as_str()))
             })
             .flatten_ok()
-            .filter_map(move |artifact| {
-                artifact
-                    .and_then(|artifact_name| {
-                        let (manifest, artifact) =
-                            self.artifact_ref(artifact_name).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "missing artifact '{}' in spec stage list",
-                                        artifact_name
-                                    ),
-                                )
-                            })?;
+            .filter_map(move |artifact_ref| {
+                artifact_ref
+                    .and_then(|(manifest, artifact_name)| {
+                        let artifact = manifest.file.artifact(artifact_name).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!("missing artifact '{}' in spec stage list", artifact_name),
+                            )
+                        })?;
                         Ok(
                             if artifact
                                 .arch()
@@ -967,7 +960,7 @@ impl Manifest {
         comment: Option<&str>,
     ) -> io::Result<()> {
         for item in &items {
-            if self.artifact_ref(item).is_none() {
+            if self.file.artifact(item).is_none() {
                 return Err(io::Error::other(format!(
                     "artifact {} not found in manifest",
                     item

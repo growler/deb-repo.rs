@@ -10,11 +10,12 @@ use {
         manifest::Manifest,
         manifest_doc::BuildEnvComments,
         packages::Packages,
-        staging::{HostFileSystem, Stage},
+        staging::{HostFileSystem, Stage, StagingFileSystem},
         transport::TransportProvider,
         Sources,
     },
     std::{
+        future::Future,
         io,
         num::NonZero,
         path::Path,
@@ -50,6 +51,49 @@ fn render_manifest(manifest: &mut Manifest) -> (String, toml_edit::DocumentMut) 
         .parse::<toml_edit::DocumentMut>()
         .expect("parse manifest");
     (text, doc)
+}
+
+fn make_artifact_arg(url: &str, target: &str) -> ArtifactArg {
+    ArtifactArg {
+        mode: None,
+        do_not_unpack: false,
+        target_arch: None,
+        url: url.to_string(),
+        target: Some(target.to_string()),
+    }
+}
+
+fn update_manifest_file(path: &Path, update: impl FnOnce(&mut toml_edit::DocumentMut)) {
+    let text = std::fs::read_to_string(path).expect("read manifest");
+    let mut doc = text
+        .parse::<toml_edit::DocumentMut>()
+        .expect("parse manifest");
+    update(&mut doc);
+    std::fs::write(path, doc.to_string()).expect("write manifest");
+}
+
+async fn create_locked_imported_manifest(dir: &Path, provider: &TestProvider) -> io::Result<()> {
+    let path = dir.join("imported.toml");
+    std::fs::write(dir.join("base.txt"), b"base artifact\n")?;
+    let mut manifest = new_manifest_at(&path);
+    manifest
+        .upsert_artifact_only(
+            &make_artifact_arg("./base.txt", "/opt/import/base.txt"),
+            None,
+            provider,
+        )
+        .await?;
+    manifest.store_manifest_only(&path).await?;
+    update_manifest_file(&path, |doc| {
+        let mut stage = toml_edit::Array::new();
+        stage.push("./base.txt");
+        doc["spec"]["base"]["stage"] = toml_edit::Item::Value(stage.into());
+    });
+    let (mut manifest, _) = Manifest::from_file(&path, ARCH).await?;
+    manifest
+        .resolve(NonZero::new(1).expect("nonzero"), provider)
+        .await?;
+    manifest.store().await
 }
 
 #[test]
@@ -125,6 +169,20 @@ impl ContentProviderGuard<'_> for TestGuard {
     }
 }
 
+struct NoopStage<FS: ?Sized>(std::marker::PhantomData<fn(&FS)>);
+
+impl<FS: StagingFileSystem + ?Sized> Stage for NoopStage<FS> {
+    type Output = ();
+    type Target = FS;
+
+    fn stage<'a>(
+        &'a mut self,
+        _fs: &'a Self::Target,
+    ) -> Pin<Box<dyn Future<Output = io::Result<Self::Output>> + 'a>> {
+        Box::pin(async { Ok(()) })
+    }
+}
+
 struct TestProvider {
     transport: TestTransport,
 }
@@ -169,10 +227,18 @@ impl ContentProvider for TestProvider {
 
     async fn fetch_artifact(
         &self,
-        _artifact: &crate::artifact::Artifact,
-        _base: Option<&Path>,
+        artifact: &crate::artifact::Artifact,
+        base: Option<&Path>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
-        Err(io::Error::other("unused in tests"))
+        if matches!(artifact, crate::artifact::Artifact::Text(_)) {
+            return artifact.local("").await;
+        }
+        if artifact.is_local() {
+            let path = base.expect("local artifact base path");
+            artifact.local(path).await
+        } else {
+            Err(io::Error::other("remote artifacts disabled in tests"))
+        }
     }
 
     async fn ensure_artifact(
@@ -202,10 +268,14 @@ impl ContentProvider for TestProvider {
 
     async fn fetch_universe(
         &self,
-        _archives: UniverseFiles<'_>,
+        archives: UniverseFiles<'_>,
         _concurrency: std::num::NonZero<usize>,
     ) -> io::Result<Vec<Packages>> {
-        Err(io::Error::other("unused in tests"))
+        archives.package_files().try_for_each(|entry| {
+            let _ = entry?;
+            Ok::<_, io::Error>(())
+        })?;
+        Ok(Vec::new())
     }
 
     async fn fetch_universe_stage(
@@ -213,7 +283,9 @@ impl ContentProvider for TestProvider {
         _archives: UniverseFiles<'_>,
         _concurrency: std::num::NonZero<usize>,
     ) -> io::Result<Box<dyn Stage<Target = Self::Target, Output = ()> + Send + 'static>> {
-        Err(io::Error::other("unused in tests"))
+        Ok(Box::new(NoopStage::<Self::Target>(
+            std::marker::PhantomData,
+        )))
     }
 
     async fn fetch_source_universe(
@@ -1292,4 +1364,124 @@ fn update_skips_archive_refresh_when_lock_is_valid() {
     });
 
     assert_eq!(release_fetches.load(Ordering::Relaxed), 0);
+}
+
+#[test]
+fn add_stage_items_rejects_imported_artifacts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let downstream_path = dir.path().join("downstream.toml");
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+    });
+
+    let mut downstream = new_manifest_at(&downstream_path);
+    smol::block_on(async {
+        downstream
+            .set_import(Path::new("imported.toml"), ["base"])
+            .await
+            .expect("set import");
+    });
+
+    let err = downstream
+        .add_stage_items(None, vec!["./base.txt".to_string()], None)
+        .expect_err("downstream manifest must not stage imported artifact directly");
+    assert!(err
+        .to_string()
+        .contains("artifact ./base.txt not found in manifest"));
+}
+
+#[test]
+fn resolve_rejects_downstream_stage_reference_to_imported_artifact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let downstream_path = dir.path().join("downstream.toml");
+    let mut downstream = new_manifest_at(&downstream_path);
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+        downstream
+            .set_import(Path::new("imported.toml"), ["base"])
+            .await
+            .expect("set import");
+        downstream
+            .store_manifest_only(&downstream_path)
+            .await
+            .expect("store downstream manifest");
+    });
+
+    update_manifest_file(&downstream_path, |doc| {
+        let mut stage = toml_edit::Array::new();
+        stage.push("./base.txt");
+        doc["spec"]["stage"] = toml_edit::Item::Value(stage.into());
+    });
+
+    smol::block_on(async {
+        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH)
+            .await
+            .expect("load");
+        let err = loaded
+            .resolve(NonZero::new(1).expect("nonzero"), &provider)
+            .await
+            .expect_err("resolve must reject imported artifact in downstream stage");
+        assert!(err
+            .to_string()
+            .contains("missing artifact './base.txt' in spec stage list"));
+    });
+}
+
+#[test]
+fn stage_local_allows_inherited_imported_artifact_stage() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let downstream_path = dir.path().join("downstream.toml");
+    let root = dir.path().join("root");
+    let mut downstream = new_manifest_at(&downstream_path);
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+        downstream
+            .set_import(Path::new("imported.toml"), ["base"])
+            .await
+            .expect("set import");
+        downstream
+            .store_manifest_only(&downstream_path)
+            .await
+            .expect("store downstream manifest");
+    });
+
+    update_manifest_file(&downstream_path, |doc| {
+        doc["spec"]["extends"] = toml_edit::value("base");
+    });
+
+    smol::block_on(async {
+        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH)
+            .await
+            .expect("load");
+        loaded
+            .resolve(NonZero::new(1).expect("nonzero"), &provider)
+            .await
+            .expect("resolve");
+        let mut fs = HostFileSystem::new(&root, false).await.expect("staging fs");
+        loaded
+            .stage_local(
+                None,
+                &mut fs,
+                NonZero::new(1).expect("nonzero"),
+                &provider,
+                Option::<fn(u64) -> crate::cli::StageProgress>::None,
+            )
+            .await
+            .expect("stage inherited imported artifact");
+    });
+
+    let staged = std::fs::read_to_string(root.join("opt/import/base.txt")).expect("staged file");
+    assert_eq!(staged, "base artifact\n");
 }
