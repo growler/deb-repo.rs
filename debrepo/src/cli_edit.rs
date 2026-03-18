@@ -4,7 +4,7 @@ use {
         cli::{Command, Config},
         content::{ContentProvider, ContentProviderGuard},
         kvlist::KVList,
-        manifest::{lock_path_for, Manifest},
+        manifest::Manifest,
         manifest_doc::BuildEnvComments,
     },
     anyhow::{anyhow, Result},
@@ -12,7 +12,7 @@ use {
     std::{
         collections::HashSet,
         env,
-        io::{self, Write},
+        io::Write,
         num::NonZero,
         path::Path,
         process::{Command as ProcessCommand, Stdio},
@@ -86,40 +86,29 @@ impl<C: Config> Command<C> for Edit {
         let cmd = self.cmd.as_ref();
         let spec = self.opts.spec.as_deref();
         smol::block_on(async move {
-            let manifest_path = conf.manifest().to_path_buf();
-            let lock_path = lock_path_for(&manifest_path, conf.arch());
-            let manifest_backup = smol::fs::read(&manifest_path).await?;
-            let lock_backup = match smol::fs::read(&lock_path).await {
-                Ok(bytes) => Some(bytes),
-                Err(err) if err.kind() == io::ErrorKind::NotFound => None,
-                Err(err) => return Err(err.into()),
-            };
-
+            if cmd.is_none() {
+                // edit manifest is the only command that can work with
+                // stale/unlocked manifest
+                return edit_manifest(conf, &editor).await;
+            }
+            let cmd = cmd.unwrap();
+            let (mut manifest, has_valid_lock) =
+                Manifest::from_file(conf.manifest(), conf.arch()).await?;
+            if !has_valid_lock {
+                return Err(anyhow!("manifest lock is not live; run update first"));
+            }
             match cmd {
-                None => editor.run(&manifest_path)?,
-                Some(EditCommands::Env(_)) => edit_env(conf, &editor, spec).await?,
-                Some(EditCommands::Script(_)) => edit_script(conf, &editor, spec).await?,
-                Some(EditCommands::Artifact(artifact)) => {
-                    edit_artifact(conf, &editor, spec, artifact).await?
+                EditCommands::Env(_) => edit_env(&mut manifest, &editor, spec).await?,
+                EditCommands::Script(_) => edit_script(&mut manifest, &editor, spec).await?,
+                EditCommands::Artifact(artifact) => {
+                    edit_artifact(&mut manifest, &editor, spec, artifact).await?;
                 }
             }
-
-            if let Err(err) = run_update(conf).await {
-                let rollback = rollback_files(
-                    &manifest_path,
-                    &manifest_backup,
-                    &lock_path,
-                    lock_backup.as_deref(),
-                )
-                .await;
-                if let Err(rollback_err) = rollback {
-                    return Err(anyhow!(
-                        "update failed: {err}; rollback failed: {rollback_err}"
-                    ));
-                }
-                return Err(err);
-            }
-
+            let fetcher = conf.fetcher()?;
+            let guard = fetcher.init().await?;
+            manifest.resolve(conf.concurrency(), fetcher).await?;
+            manifest.store().await?;
+            guard.commit().await?;
             Ok(())
         })
     }
@@ -167,8 +156,37 @@ impl EditorCommand {
     }
 }
 
-async fn edit_env<C: Config>(conf: &C, editor: &EditorCommand, spec: Option<&str>) -> Result<()> {
-    let (mut manifest, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+async fn edit_manifest<C: Config>(conf: &C, editor: &EditorCommand) -> Result<()> {
+    let path = smol::fs::canonicalize(conf.manifest()).await?;
+    editor.run(&path)?;
+    let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch())
+        .await
+        .map_err(|err| {
+            anyhow!("failed to load manifest after editing: {err}; manifest may be malformed",)
+        })?;
+    if has_valid_lock {
+        // nothing changed
+        return Ok(());
+    }
+    let fetcher = conf.fetcher()?;
+    let guard = fetcher.init().await?;
+    mf.resolve(conf.concurrency(), fetcher)
+        .await
+        .map_err(|err| {
+            anyhow!("failed to resolve manifest after editing: {err}; manifest may be malformed",)
+        })?;
+    mf.store().await.map_err(|err| {
+        anyhow!("failed to store manifest after editing: {err}; manifest may be malformed",)
+    })?;
+    guard.commit().await?;
+    Ok(())
+}
+
+async fn edit_env(
+    manifest: &mut Manifest,
+    editor: &EditorCommand,
+    spec: Option<&str>,
+) -> Result<()> {
     let env = manifest.spec_build_env(spec)?;
     let comments = manifest.spec_build_env_comments(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".env").tempfile()?;
@@ -177,16 +195,14 @@ async fn edit_env<C: Config>(conf: &C, editor: &EditorCommand, spec: Option<&str
     let contents = std::fs::read_to_string(tmp.path())?;
     let parsed = parse_env_file(&contents)?;
     manifest.set_build_env_with_comments(spec, parsed.env, parsed.comments)?;
-    manifest.store_manifest_only(conf.manifest()).await?;
     Ok(())
 }
 
-async fn edit_script<C: Config>(
-    conf: &C,
+async fn edit_script(
+    manifest: &mut Manifest,
     editor: &EditorCommand,
     spec: Option<&str>,
 ) -> Result<()> {
-    let (mut manifest, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
     let script = manifest.spec_build_script(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".sh").tempfile()?;
     if let Some(script) = script {
@@ -201,17 +217,15 @@ async fn edit_script<C: Config>(
         Some(contents)
     };
     manifest.set_build_script(spec, script)?;
-    manifest.store_manifest_only(conf.manifest()).await?;
     Ok(())
 }
 
-async fn edit_artifact<C: Config>(
-    conf: &C,
+async fn edit_artifact(
+    manifest: &mut Manifest,
     editor: &EditorCommand,
     spec: Option<&str>,
     artifact: &EditArtifact,
 ) -> Result<()> {
-    let (mut manifest, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
     let mut existing_text = None;
     let mut existing_mode = None;
     let mut existing_arch = None;
@@ -242,7 +256,6 @@ async fn edit_artifact<C: Config>(
     if artifact.stage {
         manifest.add_stage_items(spec, vec![artifact.name.clone()], None)?;
     }
-    manifest.store_manifest_only(conf.manifest()).await?;
     Ok(())
 }
 
@@ -336,40 +349,4 @@ fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
         env: KVList::from(items),
         comments,
     })
-}
-
-async fn run_update<C: Config>(conf: &C) -> Result<()> {
-    let fetcher = conf.fetcher()?;
-    let guard = fetcher.init().await?;
-    let (mut manifest, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-    manifest
-        .update(false, false, false, conf.concurrency(), fetcher)
-        .await?;
-    manifest.store().await?;
-    guard.commit().await?;
-    Ok(())
-}
-
-async fn rollback_files(
-    manifest_path: &Path,
-    manifest_backup: &[u8],
-    lock_path: &Path,
-    lock_backup: Option<&[u8]>,
-) -> Result<()> {
-    crate::safe_store(
-        manifest_path,
-        smol::io::Cursor::new(manifest_backup.to_vec()),
-    )
-    .await?;
-    match lock_backup {
-        Some(bytes) => {
-            crate::safe_store(lock_path, smol::io::Cursor::new(bytes.to_vec())).await?;
-        }
-        None => match smol::fs::remove_file(lock_path).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == io::ErrorKind::NotFound => {}
-            Err(err) => return Err(err.into()),
-        },
-    }
-    Ok(())
 }

@@ -361,7 +361,11 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 if let Some(path) = self.artifact.url.strip_prefix('@') {
                     if path.is_empty() {
                         return Err(anyhow!("text artifact path is empty"));
@@ -547,7 +551,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for Stage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 mf.add_stage_items(
                     self.spec.as_deref(),
                     vec![self.artifact.clone()],
@@ -577,7 +585,11 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for Unstage {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 mf.remove_artifact(self.spec.as_deref(), &self.url)?;
                 mf.store().await?;
                 Ok(())

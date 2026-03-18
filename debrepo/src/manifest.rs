@@ -277,6 +277,15 @@ impl Manifest {
         self.lock_valid = false;
         self.lock_updated = true;
     }
+    fn ensure_live_lock(&self) -> io::Result<()> {
+        if self.lock_valid && self.lock.is_uptodate() {
+            Ok(())
+        } else {
+            Err(io::Error::other(
+                "manifest lock is not live; run update first",
+            ))
+        }
+    }
     fn manifest_dir(&self) -> &Path {
         self.path
             .parent()
@@ -585,8 +594,8 @@ impl Manifest {
         self.mark_lock_invalid();
         Ok(true)
     }
-
     pub async fn store(&mut self) -> io::Result<()> {
+        self.ensure_live_lock()?;
         let path = self.path.clone();
         let path = path.as_path();
         let (hash, hash_update) = if let Some(hash) = self.hash.clone() {
@@ -601,13 +610,6 @@ impl Manifest {
         self.path = smol::fs::canonicalize(path).await?;
         Ok(())
     }
-    pub async fn store_manifest_only<P: AsRef<Path>>(&mut self, path: P) -> io::Result<()> {
-        let path = path.as_ref();
-        let hash = self.file.store(path).await?;
-        self.hash = Some(hash);
-        self.path = smol::fs::canonicalize(path).await?;
-        Ok(())
-    }
     pub fn artifact(&self, name: &str) -> Option<&Artifact> {
         self.file.artifact(name)
     }
@@ -615,12 +617,19 @@ impl Manifest {
         self.file.names().map(spec_display_name)
     }
     fn valid_lock(&self, name: &str, idx: usize) -> io::Result<&LockedSpec> {
-        self.lock.get_spec(idx).as_locked().ok_or_else(|| {
-            io::Error::other(format!(
-                "no solution for spec \"{}\", update manifest lock",
+        if idx < self.lock.specs_len() {
+            self.lock.get_spec(idx).as_locked().ok_or_else(|| {
+                io::Error::other(format!(
+                    "no solution for spec \"{}\", update manifest lock",
+                    spec_display_name(name),
+                ))
+            })
+        } else {
+            Err(io::Error::other(format!(
+                "[internal error] missing lock entry for spec {}",
                 spec_display_name(name),
-            ))
-        })
+            )))
+        }
     }
     pub fn add_local_package(
         &mut self,
@@ -873,31 +882,6 @@ impl Manifest {
         }
         Ok(hasher)
     }
-    fn refresh_spec_hashes(&mut self, spec_index: usize) -> io::Result<()> {
-        for idx in self.descendants(spec_index).into_iter() {
-            let package_hashes = {
-                let lock = self.lock.get_spec(idx);
-                if !lock.is_locked() {
-                    None
-                } else {
-                    Some(
-                        lock.installables()
-                            .map(|pkg| pkg.file.hash.clone())
-                            .collect::<Vec<_>>(),
-                    )
-                }
-            };
-            let Some(package_hashes) = package_hashes else {
-                continue;
-            };
-            let mut hasher = self.spec_hasher(idx)?;
-            for hash in package_hashes {
-                hasher.update(hash.as_ref());
-            }
-            self.lock.get_spec_mut(idx).hash = Some(hasher.into_hash());
-        }
-        Ok(())
-    }
     fn invalidate_locked_specs(&mut self, spec: usize) {
         for spec_index in self.descendants(spec).into_iter() {
             self.lock.get_spec_mut(spec_index).invalidate_solution();
@@ -918,7 +902,7 @@ impl Manifest {
         let staged = Artifact::new(artifact, local_base.as_deref(), cache).await?;
         self.file.add_artifact(spec_name, staged, comment)?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -948,7 +932,7 @@ impl Manifest {
         self.mark_file_updated();
         let specs = self.file.spec_indices_with_artifact(&uri);
         for spec_index in specs {
-            self.refresh_spec_hashes(spec_index)?;
+            self.invalidate_locked_specs(spec_index);
         }
         self.mark_lock_dirty();
         Ok(())
@@ -969,7 +953,7 @@ impl Manifest {
         }
         if let Some(spec_index) = self.file.add_stage_items(spec_name, items, comment)? {
             self.mark_file_updated();
-            self.refresh_spec_hashes(spec_index)?;
+            self.invalidate_locked_specs(spec_index);
             self.mark_lock_dirty();
         }
         Ok(())
@@ -982,7 +966,7 @@ impl Manifest {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.remove_artifact(spec_name, artifact.as_ref())?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -1092,7 +1076,7 @@ impl Manifest {
         self.mark_file_updated();
         let specs = self.file.spec_indices_with_artifact(name);
         for spec_index in specs {
-            self.refresh_spec_hashes(spec_index)?;
+            self.invalidate_locked_specs(spec_index);
         }
         self.mark_lock_dirty();
         Ok(())
@@ -1133,7 +1117,7 @@ impl Manifest {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.set_meta_entry(spec_name, name, value)?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -1145,7 +1129,7 @@ impl Manifest {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.set_build_env(spec_name, env)?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -1159,7 +1143,7 @@ impl Manifest {
         self.file
             .set_build_env_with_comments(spec_name, env, &comments)?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -1171,7 +1155,7 @@ impl Manifest {
         let (_, spec_index) = self.file.spec_index_ensure(spec_name)?;
         self.file.set_build_script(spec_name, script)?;
         self.mark_file_updated();
-        self.refresh_spec_hashes(spec_index)?;
+        self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
         Ok(())
     }
