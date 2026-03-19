@@ -90,6 +90,7 @@ jobs:
       - name: Build debian packages
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
+          ./target/debug/rdebootstrap -m debian-build.toml update -A
           make debian-packages DOWNLOADS=1
 
       - name: Cache ubuntu build tree
@@ -102,7 +103,9 @@ jobs:
 
       - name: Build ubuntu packages
         if: startsWith(github.ref, 'refs/tags/v')
-        run: make ubuntu-packages DOWNLOADS=1
+        run: |
+          ./target/debug/rdebootstrap -m ubuntu-build.toml update -A
+          make ubuntu-packages DOWNLOADS=1
 
       - name: Create GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')

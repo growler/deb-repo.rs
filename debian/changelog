@@ -1,3 +1,13 @@
+rdebootstrap (0.1.11) unstable; urgency=medium
+
+  * feat: import allows to import archive and specs definition from
+    another manifest file. The locks are imported, too, making it 
+    possible to share a single locked set of archives between 
+    multiple manifest files. 
+  * cleanup: multiple code cleanups
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Thu, 19 Mar 2026 09:24:13 +0100
+
 rdebootstrap (0.1.10) unstable; urgency=medium
 
   * fix: split lock_updated flat into lock_dirty and lock_update
