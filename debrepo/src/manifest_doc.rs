@@ -86,7 +86,7 @@ impl Import {
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Manifest document with parsed sections.
-pub struct ManifestFile {
+pub(crate) struct ManifestFile {
     #[serde(skip)]
     doc: toml_edit::DocumentMut,
 
@@ -140,7 +140,7 @@ impl ManifestFile {
     pub const MAX_SIZE: u64 = 1024 * 1024; // 1 MiB
 
     // A new empty manifest
-    pub fn new(comment: Option<&str>) -> Self {
+    pub(crate) fn new(comment: Option<&str>) -> Self {
         ManifestFile {
             doc: toml_edit::DocumentMut::new().init_manifest(comment),
             archives: Vec::new(),
@@ -152,7 +152,7 @@ impl ManifestFile {
     }
 
     // A new manifest with archives
-    pub fn new_with_archives(mut archives: Vec<Archive>, comment: Option<&str>) -> Self {
+    pub(crate) fn new_with_archives(mut archives: Vec<Archive>, comment: Option<&str>) -> Self {
         let mut doc = toml_edit::DocumentMut::new().init_manifest(comment);
         doc.push_archives(archives.iter(), None);
         archives.iter_mut().for_each(|s| s.set_base());
@@ -231,7 +231,7 @@ impl ManifestFile {
         Ok((manifest, hash))
     }
 
-    pub async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<Hash> {
+    pub(crate) async fn store<P: AsRef<Path>>(&self, path: P) -> io::Result<Hash> {
         let out = self.doc.to_string();
         let mut r = Hash::hashing_reader::<blake3::Hasher, _>(out.as_bytes());
         crate::safe_store(path.as_ref(), &mut r).await?;
@@ -264,16 +264,16 @@ impl ManifestFile {
         spec_index
     }
     #[allow(dead_code)]
-    pub fn artifacts(&self) -> &'_ [Artifact] {
+    pub(crate) fn artifacts(&self) -> &'_ [Artifact] {
         &self.artifacts
     }
     pub(crate) fn artifacts_mut(&mut self) -> &'_ mut [Artifact] {
         &mut self.artifacts
     }
-    pub fn artifact<'a>(&'a self, name: &str) -> Option<&'a Artifact> {
+    pub(crate) fn artifact<'a>(&'a self, name: &str) -> Option<&'a Artifact> {
         self.artifacts.iter().find(|a| a.uri() == name)
     }
-    pub fn spec_indices_with_artifact(&self, name: &str) -> Vec<usize> {
+    pub(crate) fn spec_indices_with_artifact(&self, name: &str) -> Vec<usize> {
         self.specs
             .iter_values()
             .enumerate()
@@ -316,7 +316,7 @@ impl ManifestFile {
         }
         Ok(())
     }
-    pub fn upsert_artifact_only(
+    pub(crate) fn upsert_artifact_only(
         &mut self,
         artifact: Artifact,
         comment: Option<&str>,
@@ -337,7 +337,7 @@ impl ManifestFile {
             }
         }
     }
-    pub fn upsert_text_artifact(
+    pub(crate) fn upsert_text_artifact(
         &mut self,
         name: &str,
         target: String,
@@ -744,10 +744,10 @@ impl ManifestFile {
         Ok(true)
     }
     /// List of archives defined in this manifest (not including imported ones)
-    pub fn local_archives(&self) -> &'_ [Archive] {
+    pub(crate) fn local_archives(&self) -> &'_ [Archive] {
         &self.archives
     }
-    pub fn local_pkgs(&self) -> &'_ [RepositoryFile] {
+    pub(crate) fn local_pkgs(&self) -> &'_ [RepositoryFile] {
         &self.local_pkgs
     }
     pub(crate) fn update_local_pkgs<I: IntoIterator<Item = Option<RepositoryFile>>>(
@@ -766,7 +766,11 @@ impl ManifestFile {
         }
         updated
     }
-    pub fn add_local_pkg(&mut self, pkg: RepositoryFile, comment: Option<&str>) -> UpdateResult {
+    pub(crate) fn add_local_pkg(
+        &mut self,
+        pkg: RepositoryFile,
+        comment: Option<&str>,
+    ) -> UpdateResult {
         if let Some((i, file)) = self
             .local_pkgs
             .iter_mut()
@@ -785,11 +789,11 @@ impl ManifestFile {
             UpdateResult::Added
         }
     }
-    pub fn remove_local_pkg(&mut self, index: usize) -> RepositoryFile {
+    pub(crate) fn remove_local_pkg(&mut self, index: usize) -> RepositoryFile {
         self.doc.drop_local_pkg(index);
         self.local_pkgs.remove(index)
     }
-    pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> UpdateResult {
+    pub(crate) fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> UpdateResult {
         if let Some((i, src)) = self
             .archives
             .iter_mut()
@@ -808,14 +812,14 @@ impl ManifestFile {
             UpdateResult::Added
         }
     }
-    pub fn remove_archive(&mut self, index: usize) -> Archive {
+    pub(crate) fn remove_archive(&mut self, index: usize) -> Archive {
         self.doc.drop_archive(index);
         self.archives.remove(index)
     }
-    pub fn get_archive(&self, index: usize) -> Option<&'_ Archive> {
+    pub(crate) fn get_archive(&self, index: usize) -> Option<&'_ Archive> {
         self.archives.get(index)
     }
-    pub fn update_archive_snapshots(
+    pub(crate) fn update_archive_snapshots(
         &mut self,
         stamp: SnapshotId,
     ) -> impl Iterator<Item = usize> + '_ {
@@ -842,10 +846,10 @@ impl ManifestFile {
                 }
             })
     }
-    pub fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
+    pub(crate) fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
         self.specs.iter()
     }
-    pub fn names(&self) -> impl Iterator<Item = &'_ str> {
+    pub(crate) fn names(&self) -> impl Iterator<Item = &'_ str> {
         self.specs.iter_keys()
     }
 }
