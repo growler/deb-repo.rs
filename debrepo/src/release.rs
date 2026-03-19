@@ -30,6 +30,14 @@ pub struct Release {
     inner: ReleaseInner,
 }
 
+#[derive(Clone, PartialEq)]
+pub struct ReleaseIndexFile<'a> {
+    pub path: &'a str,
+    pub fetch_path: Option<String>,
+    pub hash: Hash,
+    pub size: u64,
+}
+
 impl Clone for Release {
     fn clone(&self) -> Self {
         Release {
@@ -103,12 +111,24 @@ impl Release {
                 }
             }))
     }
+    fn supports_acquire_by_hash(&self) -> bool {
+        self.field("Acquire-By-Hash")
+            .is_some_and(|value| value.trim_ascii().eq_ignore_ascii_case("yes"))
+    }
+    fn by_hash_path(path: &str, digest: &str) -> String {
+        match path.rsplit_once('/') {
+            Some((dir, _)) => format!("{dir}/by-hash/SHA256/{digest}"),
+            None => format!("by-hash/SHA256/{digest}"),
+        }
+    }
     pub fn package_files<'a, S: AsRef<str>>(
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
         arch: &'a str,
-    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
+    ) -> Result<impl Iterator<Item = Result<ReleaseIndexFile<'a>, ParseError>>, ParseError> {
+        let use_by_hash =
+            self.supports_acquire_by_hash() && hash_name.eq_ignore_ascii_case("SHA256");
         let fetch_all_arch = self
             .field("No-Support-for-Architecture-all")
             .is_none_or(|v| v.trim_ascii() != "Packages");
@@ -122,7 +142,7 @@ impl Release {
                 .flat_map(|arch| {
                     components
                         .iter()
-                        .map(move |c| (c.as_ref(), *arch, None::<(&str, Hash, u64)>))
+                        .map(move |c| (c.as_ref(), *arch, None::<ReleaseIndexFile<'a>>))
                 })
                 .collect::<Vec<_>>(),
             move |mut files, file| {
@@ -134,8 +154,7 @@ impl Release {
                                 if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
                                     rest.strip_prefix("/Packages")
                                 {
-                                    if size < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size)
-                                    {
+                                    if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
                                         let hash =
                                             Hash::from_hex(hash_name, digest).map_err(|err| {
                                                 ParseError::from(format!(
@@ -143,7 +162,13 @@ impl Release {
                                                     digest, err
                                                 ))
                                             })?;
-                                        *entry = Some((path, hash, size));
+                                        *entry = Some(ReleaseIndexFile {
+                                            path,
+                                            fetch_path: use_by_hash
+                                                .then(|| Self::by_hash_path(path, digest)),
+                                            hash,
+                                            size,
+                                        });
                                     }
                                 }
                             }
@@ -154,12 +179,12 @@ impl Release {
             },
         )?;
         Ok(files.into_iter().filter_map(|(comp, arch, entry)| {
-            if let Some((path, hash, size)) = entry {
+            if let Some(file) = entry {
                 // if entry size is zero (empty Packages file), skip it
-                if size == 0 {
+                if file.size == 0 {
                     None
                 } else {
-                    Some(Ok((path, hash, size)))
+                    Some(Ok(file))
                 }
             } else if entry.is_none() {
                 Some(Err(ParseError::from(format!(
@@ -175,11 +200,13 @@ impl Release {
         &'a self,
         components: &'a [S],
         hash_name: &'a str,
-    ) -> Result<impl Iterator<Item = Result<(&'a str, Hash, u64), ParseError>>, ParseError> {
+    ) -> Result<impl Iterator<Item = Result<ReleaseIndexFile<'a>, ParseError>>, ParseError> {
+        let use_by_hash =
+            self.supports_acquire_by_hash() && hash_name.eq_ignore_ascii_case("SHA256");
         let files = self.files(components, hash_name)?.try_fold(
             components
                 .iter()
-                .map(move |c| (c.as_ref(), None::<(&str, Hash, u64)>))
+                .map(move |c| (c.as_ref(), None::<ReleaseIndexFile<'a>>))
                 .collect::<Vec<_>>(),
             move |mut files, file| {
                 let (path, digest, size) = file?;
@@ -189,7 +216,7 @@ impl Release {
                             if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
                                 rest.strip_prefix("/Sources")
                             {
-                                if size < entry.as_ref().map_or(u64::MAX, |(_, _, size)| *size) {
+                                if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
                                     let hash =
                                         Hash::from_hex(hash_name, digest).map_err(|err| {
                                             ParseError::from(format!(
@@ -197,7 +224,13 @@ impl Release {
                                                 digest, err
                                             ))
                                         })?;
-                                    *entry = Some((path, hash, size));
+                                    *entry = Some(ReleaseIndexFile {
+                                        path,
+                                        fetch_path: use_by_hash
+                                            .then(|| Self::by_hash_path(path, digest)),
+                                        hash,
+                                        size,
+                                    });
                                 }
                             }
                         }
@@ -207,12 +240,12 @@ impl Release {
             },
         )?;
         Ok(files.into_iter().filter_map(|(comp, entry)| {
-            if let Some((path, hash, size)) = entry {
+            if let Some(file) = entry {
                 // if entry size is zero (empty Sources file), skip it
-                if size == 0 {
+                if file.size == 0 {
                     None
                 } else {
-                    Some(Ok((path, hash, size)))
+                    Some(Ok(file))
                 }
             } else if entry.is_none() {
                 Some(Err(ParseError::from(format!(

@@ -436,7 +436,13 @@ impl ContentProvider for TestProvider {
         }
     }
 
-    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
+    async fn fetch_index_file(
+        &self,
+        _hash: Hash,
+        _size: u64,
+        _url: &str,
+        _ext: &str,
+    ) -> io::Result<IndexFile> {
         Err(io::Error::other("unused in tests"))
     }
 
@@ -551,7 +557,13 @@ impl ContentProvider for UpdateProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
+    async fn fetch_index_file(
+        &self,
+        _hash: Hash,
+        _size: u64,
+        _url: &str,
+        _ext: &str,
+    ) -> io::Result<IndexFile> {
         Err(io::Error::other("unused in tests"))
     }
 
@@ -646,7 +658,13 @@ impl ContentProvider for UniverseCountProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn fetch_index_file(&self, _hash: Hash, _size: u64, _url: &str) -> io::Result<IndexFile> {
+    async fn fetch_index_file(
+        &self,
+        _hash: Hash,
+        _size: u64,
+        _url: &str,
+        _ext: &str,
+    ) -> io::Result<IndexFile> {
         Err(io::Error::other("unused in tests"))
     }
 

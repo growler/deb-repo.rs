@@ -566,15 +566,25 @@ impl clap::builder::TypedValueParser for ArchiveHashKindValueParser {
 /// Repository file metadata and hashes.
 pub struct RepositoryFile {
     pub(crate) path: String,
+    #[serde(skip)]
+    pub(crate) fetch_path: Option<String>,
     pub(crate) hash: Hash,
     pub(crate) size: u64,
 }
 impl RepositoryFile {
     pub fn new(path: String, hash: Hash, size: u64) -> Self {
-        Self { path, hash, size }
+        Self {
+            path,
+            fetch_path: None,
+            hash,
+            size,
+        }
     }
     pub fn path(&self) -> &str {
         &self.path
+    }
+    pub fn fetch_path(&self) -> &str {
+        self.fetch_path.as_deref().unwrap_or(&self.path)
     }
     pub fn size(&self) -> u64 {
         self.size

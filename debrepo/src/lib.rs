@@ -57,7 +57,7 @@ pub use {
     builder::{BuildJob, Executor},
     manifest::Manifest,
     packages::{Package, PackageOrigin, Packages},
-    release::Release,
+    release::{Release, ReleaseIndexFile},
     sources::{Source, SourceUniverse, Sources},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
     transport::{HttpTransport, TransportProvider},

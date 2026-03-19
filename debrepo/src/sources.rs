@@ -127,6 +127,7 @@ impl<'a> Source<'a> {
                 full_path.push_str(path);
                 Ok(RepositoryFile {
                     path: make_url(&full_path),
+                    fetch_path: None,
                     size,
                     hash,
                 })

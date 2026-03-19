@@ -1592,6 +1592,7 @@ impl Manifest {
                             Ok(LockedPackage {
                                 file: RepositoryFile {
                                     path: path.to_string(),
+                                    fetch_path: None,
                                     size,
                                     hash,
                                 },

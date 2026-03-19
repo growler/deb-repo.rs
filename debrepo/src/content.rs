@@ -80,6 +80,7 @@ pub trait ContentProvider {
         hash: Hash,
         size: u64,
         url: &str,
+        ext: &str,
     ) -> impl Future<Output = io::Result<IndexFile>>;
     fn fetch_release_file(&self, url: &str) -> impl Future<Output = io::Result<IndexFile>>;
     fn fetch_universe(
@@ -182,16 +183,19 @@ impl<'a> UniverseFiles<'a> {
                         .rel
                         .package_files(&archive.components, archive.hash.name(), self.arch)
                         .map(move |file| {
-                            file.map_ok(move |(path, hash, size)| {
+                            file.map_ok(move |file| {
                                 (
                                     manifest_id,
                                     archive_idx,
                                     archive,
-                                    RepositoryFile::new(
-                                        format!("dists/{}/{}", suite_name, path),
-                                        hash,
-                                        size,
-                                    ),
+                                    RepositoryFile {
+                                        path: format!("dists/{}/{}", suite_name, file.path),
+                                        fetch_path: file
+                                            .fetch_path
+                                            .map(|path| format!("dists/{}/{}", suite_name, path)),
+                                        hash: file.hash,
+                                        size: file.size,
+                                    },
                                 )
                             })
                         })
@@ -231,15 +235,18 @@ impl<'a> UniverseFiles<'a> {
                     .rel
                     .source_files(&archive.components, archive.hash.name())
                     .map(move |file| {
-                        file.map_ok(move |(path, hash, size)| {
+                        file.map_ok(move |file| {
                             (
                                 archive_idx,
                                 archive,
-                                RepositoryFile::new(
-                                    format!("dists/{}/{}", suite_name, path),
-                                    hash,
-                                    size,
-                                ),
+                                RepositoryFile {
+                                    path: format!("dists/{}/{}", suite_name, file.path),
+                                    fetch_path: file
+                                        .fetch_path
+                                        .map(|path| format!("dists/{}/{}", suite_name, path)),
+                                    hash: file.hash,
+                                    size: file.size,
+                                },
                             )
                         })
                     })
@@ -434,6 +441,7 @@ impl ContentProvider for HostCache {
         ctrl.set("Size", size.to_string());
         let file = RepositoryFile {
             path: path.to_string(),
+            fetch_path: None,
             hash,
             size,
         };
@@ -543,10 +551,11 @@ impl ContentProvider for HostCache {
         )
         .map_ok(|(manifest_id, archive_id, archive, file)| async move {
             let prio = archive.priority;
-            let url = archive.file_url(file.path());
+            let url = archive.file_url(file.fetch_path());
+            let ext = file.path().to_string();
             tracing::debug!("Fetching Package file from {}", &url);
             let file = self
-                .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
+                .fetch_index_file(file.hash.clone(), file.size, &url, &ext)
                 .await?;
             let pkg = blocking::unblock(move || {
                 Packages::new(
@@ -579,13 +588,16 @@ impl ContentProvider for HostCache {
         let ctrl = archives.apt_sources();
         let mut files = stream::iter(archives.package_files())
             .map_ok(|(_, _, src, file)| async move {
-                let url = src.file_url(file.path());
-                let file = self
-                    .fetch_index_file(file.hash.clone(), file.size, &url)
+                let url = src.file_url(file.fetch_path());
+                let ext = file.path().to_string();
+                let fetched = self
+                    .fetch_index_file(file.hash.clone(), file.size, &url, &ext)
                     .await?;
-                let name = crate::strip_url_scheme(strip_comp_ext(&url)).replace('/', "_");
+                let canonical_url = src.file_url(file.path());
+                let name =
+                    crate::strip_url_scheme(strip_comp_ext(&canonical_url)).replace('/', "_");
                 tracing::debug!("staging index file from {} as {}", &url, &name);
-                Ok((name, file))
+                Ok((name, fetched))
             })
             .try_buffered(concurrency.get())
             .try_collect::<Vec<_>>()
@@ -611,7 +623,13 @@ impl ContentProvider for HostCache {
                 dyn Stage<Target = Self::Target, Output = ()> + Send + 'static,
             >)
     }
-    async fn fetch_index_file(&self, hash: Hash, size: u64, url: &str) -> io::Result<IndexFile> {
+    async fn fetch_index_file(
+        &self,
+        hash: Hash,
+        size: u64,
+        url: &str,
+        ext: &str,
+    ) -> io::Result<IndexFile> {
         if let Some(cache) = self.cache.as_ref() {
             let cache_path = hash.store_name(Some(cache.as_ref()), Some("idx"), 1);
             if let Ok(file) = IndexFile::from_file(&cache_path).await {
@@ -624,7 +642,7 @@ impl ContentProvider for HostCache {
                 .tempfile_in(cache.as_ref())?
                 .into_parts();
             let mut dst: smol::fs::File = dst.into();
-            io::copy(comp_reader(url, &mut src), &mut dst).await?;
+            io::copy(comp_reader(ext, &mut src), &mut dst).await?;
             dst.sync_data().await?;
             smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
             path.persist(&cache_path)?;
@@ -633,7 +651,7 @@ impl ContentProvider for HostCache {
             Ok(file)
         } else {
             let (inp, _) = self.transport.open(url).await?;
-            IndexFile::read(comp_reader(url, hash.verifying_reader(size, inp)).take(MAX_FILE_SIZE))
+            IndexFile::read(comp_reader(ext, hash.verifying_reader(size, inp)).take(MAX_FILE_SIZE))
                 .await
         }
     }
@@ -651,10 +669,11 @@ impl ContentProvider for HostCache {
     ) -> io::Result<Vec<Sources>> {
         stream::iter(archives.source_files())
             .map_ok(|(id, archive, file)| async move {
-                let url = archive.file_url(file.path());
+                let url = archive.file_url(file.fetch_path());
+                let ext = file.path().to_string();
                 tracing::debug!("Fetching Sources file from {}", &url);
                 let file = self
-                    .fetch_index_file(file.hash.clone(), file.size, &archive.file_url(file.path()))
+                    .fetch_index_file(file.hash.clone(), file.size, &url, &ext)
                     .await?;
                 let srcs = blocking::unblock(move || {
                     Sources::new(file, id).map_err(|e| {
@@ -673,5 +692,130 @@ impl ContentProvider for HostCache {
     }
     fn transport(&self) -> &impl TransportProvider {
         &self.transport
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use {
+        super::{
+            strip_comp_ext, ContentProvider, HostCache, HostFileSystem, IndexFile, UniverseFiles,
+        },
+        crate::{
+            auth::AuthProvider,
+            spec::{LockedArchive, LockedSuite},
+            Archive, CompressionLevel, Release,
+        },
+        sha2::{Digest, Sha256},
+        smol::io::AsyncWriteExt,
+        std::{fs, num::NonZero},
+    };
+
+    fn sha256_hex(data: &[u8]) -> String {
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    async fn write_compressed(path: &std::path::Path, ext: &str, data: &[u8]) {
+        let file = smol::fs::File::create(path)
+            .await
+            .expect("create compressed file");
+        let mut writer = crate::packer(ext, file, CompressionLevel::Default);
+        writer.write_all(data).await.expect("write compressed data");
+        writer.close().await.expect("close compressed writer");
+    }
+
+    #[test]
+    fn fetch_universe_stage_uses_by_hash_for_download_and_canonical_name_for_staging() {
+        let repo = tempfile::tempdir().expect("repo tempdir");
+        let stage_root = tempfile::tempdir().expect("stage tempdir");
+        let package_data = b"Package: demo\nVersion: 1\nArchitecture: amd64\n\n";
+        let digest = sha256_hex(package_data);
+        let by_hash_dir = repo
+            .path()
+            .join("dists/stable/main/binary-amd64/by-hash/SHA256");
+        fs::create_dir_all(&by_hash_dir).expect("create by-hash dir");
+        smol::block_on(write_compressed(
+            &by_hash_dir.join(&digest),
+            "Packages.xz",
+            package_data,
+        ));
+
+        let release_text = format!(
+            concat!(
+                "Origin: test\n",
+                "Label: test\n",
+                "Suite: stable\n",
+                "Codename: stable\n",
+                "Architectures: amd64\n",
+                "Components: main\n",
+                "Acquire-By-Hash: yes\n",
+                "No-Support-for-Architecture-all: Packages\n",
+                "SHA256:\n",
+                " {digest} {size} main/binary-amd64/Packages.xz\n",
+            ),
+            digest = digest,
+            size = fs::metadata(by_hash_dir.join(&digest))
+                .expect("compressed index metadata")
+                .len()
+        );
+        let release = Release::try_from(release_text.clone()).expect("parse release");
+
+        let mut archive = Archive::default();
+        archive.url = url::Url::from_directory_path(repo.path())
+            .expect("repo file url")
+            .to_string();
+        archive.allow_insecure = true;
+        archive.suites = vec!["stable".to_string()];
+        archive.components = vec!["main".to_string()];
+
+        let locked = vec![Some(LockedArchive {
+            suites: vec![LockedSuite {
+                path: "dists/stable/Release".to_string(),
+                file: IndexFile::from_string(release_text),
+                rel: release,
+            }],
+        })];
+        let archives = vec![archive];
+        let universe = UniverseFiles::new("amd64", 0, &archives, &locked);
+        let cache = HostCache::new(
+            crate::HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+            Option::<&std::path::Path>::None,
+        );
+
+        smol::block_on(async {
+            let mut stage = cache
+                .fetch_universe_stage(universe, NonZero::new(1).expect("nonzero"))
+                .await
+                .expect("fetch universe stage");
+            let fs = HostFileSystem::new(stage_root.path(), false)
+                .await
+                .expect("staging fs");
+            stage.stage(&fs).await.expect("stage universe");
+        });
+
+        let canonical_url = archives[0].file_url("dists/stable/main/binary-amd64/Packages.xz");
+        let canonical_name =
+            crate::strip_url_scheme(strip_comp_ext(&canonical_url)).replace('/', "_");
+        let by_hash_url = archives[0].file_url(format!(
+            "dists/stable/main/binary-amd64/by-hash/SHA256/{}",
+            digest
+        ));
+        let by_hash_name = crate::strip_url_scheme(strip_comp_ext(&by_hash_url)).replace('/', "_");
+
+        let canonical_path = stage_root
+            .path()
+            .join("var/lib/apt/lists")
+            .join(&canonical_name);
+        let by_hash_path = stage_root
+            .path()
+            .join("var/lib/apt/lists")
+            .join(&by_hash_name);
+
+        assert!(canonical_path.exists());
+        assert!(!by_hash_path.exists());
+        assert_eq!(
+            fs::read_to_string(canonical_path).expect("read staged package index"),
+            String::from_utf8(package_data.to_vec()).expect("package data utf8")
+        );
     }
 }
