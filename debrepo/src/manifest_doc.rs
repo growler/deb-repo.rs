@@ -18,7 +18,7 @@ use {
     serde::{Deserialize, Serialize},
     smol::io::AsyncReadExt,
     std::{
-        collections::HashMap,
+        collections::{HashMap, HashSet},
         io,
         num::NonZero,
         path::{Path, PathBuf},
@@ -126,9 +126,14 @@ pub enum UpdateResult {
 
 #[derive(Default, Clone)]
 /// Parsed build environment comments for a spec.
-pub struct BuildEnvComments {
+pub(crate) struct BuildEnvComments {
     pub prefix: HashMap<String, String>,
     pub inline: HashMap<String, String>,
+}
+
+struct ParsedEnvBlock {
+    env: KVList<String>,
+    comments: BuildEnvComments,
 }
 
 impl ManifestFile {
@@ -452,8 +457,67 @@ impl ManifestFile {
     pub(crate) fn spec_build_env(&self, spec_index: usize) -> io::Result<&KVList<String>> {
         Ok(&self.specs.value_at(spec_index).build_env)
     }
+    pub(crate) fn spec_env_block(&self, spec_index: usize) -> io::Result<String> {
+        let build_env = match self.spec_build_env_table(self.spec_name(spec_index))? {
+            Some(table) => table,
+            None => return Ok(String::new()),
+        };
+        let mut out = String::new();
+        for (key, item) in build_env.iter() {
+            let prefix = build_env
+                .key(key)
+                .and_then(|k| k.leaf_decor().prefix())
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("");
+            if !prefix.is_empty() {
+                out.push_str(prefix);
+                if !prefix.ends_with('\n') {
+                    out.push('\n');
+                }
+            }
+            let value = item
+                .as_value()
+                .and_then(toml_edit::Value::as_str)
+                .ok_or_else(|| {
+                    io::Error::other(format!("build-env entry {key} is not a string"))
+                })?;
+            out.push_str(key);
+            out.push('=');
+            out.push_str(value);
+            let suffix = item
+                .as_value()
+                .and_then(|value| value.decor().suffix())
+                .and_then(|raw| raw.as_str())
+                .unwrap_or("");
+            if suffix.contains('#') {
+                out.push_str(suffix);
+            }
+            out.push('\n');
+        }
+        Ok(out)
+    }
     pub(crate) fn spec_build_script(&self, spec_index: usize) -> io::Result<Option<&str>> {
         Ok(self.specs.value_at(spec_index).build_script.as_deref())
+    }
+    fn spec_build_env_table(&self, spec_name: &str) -> io::Result<Option<&toml_edit::Table>> {
+        let spec_table = self
+            .doc
+            .get("spec")
+            .and_then(toml_edit::Item::as_table)
+            .ok_or_else(|| io::Error::other("spec table missing"))?;
+        let spec_table = if spec_name.is_empty() {
+            spec_table
+        } else {
+            spec_table
+                .get(spec_name)
+                .and_then(toml_edit::Item::as_table)
+                .ok_or_else(|| {
+                    io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
+                })?
+        };
+        Ok(spec_table
+            .get("build-env")
+            .and_then(toml_edit::Item::as_table))
     }
     pub(crate) fn set_build_env(
         &mut self,
@@ -469,6 +533,26 @@ impl ManifestFile {
         comments: &BuildEnvComments,
     ) -> io::Result<()> {
         self.update_build_env(spec_index, env, Some(comments))
+    }
+    pub(crate) fn set_spec_env_block(
+        &mut self,
+        spec_name: &str,
+        block: &str,
+    ) -> io::Result<Option<usize>> {
+        let parsed = parse_env_block(block)?;
+        let spec_index = if parsed.env.is_empty() {
+            match self.spec_index(spec_name) {
+                Some(spec_index) => spec_index,
+                None => return Ok(None),
+            }
+        } else {
+            match self.spec_index(spec_name) {
+                Some(spec_index) => spec_index,
+                None => self.push_empty_spec(spec_name),
+            }
+        };
+        self.set_build_env_with_comments(spec_index, parsed.env, &parsed.comments)?;
+        Ok(Some(spec_index))
     }
     fn update_build_env(
         &mut self,
@@ -576,52 +660,6 @@ impl ManifestFile {
             }
         }
         Ok(())
-    }
-    pub(crate) fn spec_build_env_comments(&self, spec_index: usize) -> io::Result<BuildEnvComments> {
-        let spec_name = self.spec_name(spec_index);
-        let mut out = BuildEnvComments::default();
-        let spec_table = self
-            .doc
-            .get("spec")
-            .and_then(toml_edit::Item::as_table)
-            .ok_or_else(|| io::Error::other("spec table missing"))?;
-        let spec_table = if spec_name.is_empty() {
-            spec_table
-        } else {
-            spec_table
-                .get(spec_name)
-                .and_then(toml_edit::Item::as_table)
-                .ok_or_else(|| {
-                    io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
-                })?
-        };
-        let build_env = match spec_table
-            .get("build-env")
-            .and_then(toml_edit::Item::as_table)
-        {
-            Some(table) => table,
-            None => return Ok(out),
-        };
-        for (key, _) in build_env.iter() {
-            let prefix = build_env
-                .key(key)
-                .and_then(|k| k.leaf_decor().prefix())
-                .and_then(|raw| raw.as_str())
-                .unwrap_or("");
-            if !prefix.is_empty() {
-                out.prefix.insert(key.to_string(), prefix.to_string());
-            }
-            let suffix = build_env
-                .get(key)
-                .and_then(toml_edit::Item::as_value)
-                .and_then(|value| value.decor().suffix())
-                .and_then(|raw| raw.as_str())
-                .unwrap_or("");
-            if !suffix.is_empty() && suffix.contains('#') {
-                out.inline.insert(key.to_string(), suffix.to_string());
-            }
-        }
-        Ok(out)
     }
     pub(crate) fn set_build_script(
         &mut self,
@@ -1614,4 +1652,64 @@ impl ManifestDoc for toml_edit::DocumentMut {
             arr.push_formatted(item);
         }
     }
+}
+
+fn parse_env_block(contents: &str) -> io::Result<ParsedEnvBlock> {
+    let mut seen = HashSet::new();
+    let mut items = Vec::new();
+    let mut comments = BuildEnvComments::default();
+    let mut pending = String::new();
+    for (idx, raw_line) in contents.lines().enumerate() {
+        let trimmed = raw_line.trim();
+        if trimmed.is_empty() {
+            pending.push('\n');
+            continue;
+        }
+        if raw_line.trim_start().starts_with('#') {
+            pending.push_str(raw_line.trim_end());
+            pending.push('\n');
+            continue;
+        }
+        let (key, value_part) = raw_line.split_once('=').ok_or_else(|| {
+            io::Error::other(format!(
+                "invalid env line {}: expected VAR=value",
+                idx.saturating_add(1)
+            ))
+        })?;
+        let key = key.trim();
+        if key.is_empty() {
+            return Err(io::Error::other(format!(
+                "invalid env line {}: empty key",
+                idx + 1
+            )));
+        }
+        if !seen.insert(key.to_string()) {
+            return Err(io::Error::other(format!("duplicate env key '{key}'")));
+        }
+        let mut value = value_part.trim_end();
+        let mut inline = String::new();
+        if let Some(pos) = value_part.find('#') {
+            if pos > 0 && value_part[..pos].chars().last().map(|c| c.is_whitespace()) == Some(true)
+            {
+                let before = &value_part[..pos];
+                let spacing_start = before
+                    .rfind(|c: char| !c.is_whitespace())
+                    .map(|idx| idx + 1)
+                    .unwrap_or(0);
+                let spacing = &before[spacing_start..];
+                inline.push_str(spacing);
+                inline.push_str(value_part[pos..].trim_end());
+                value = value_part[..spacing_start].trim_end();
+            }
+        }
+        let prefix = pending.clone();
+        pending.clear();
+        items.push((key.to_string(), value.trim().to_string()));
+        comments.prefix.insert(key.to_string(), prefix);
+        comments.inline.insert(key.to_string(), inline);
+    }
+    Ok(ParsedEnvBlock {
+        env: KVList::from(items),
+        comments,
+    })
 }

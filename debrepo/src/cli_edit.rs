@@ -3,14 +3,11 @@ use {
         artifact::FileModeArgParser,
         cli::{Command, Config},
         content::{ContentProvider, ContentProviderGuard},
-        kvlist::KVList,
         manifest::Manifest,
-        manifest_doc::BuildEnvComments,
     },
     anyhow::{anyhow, Result},
     clap::{Args, Parser},
     std::{
-        collections::HashSet,
         env,
         io::Write,
         num::NonZero,
@@ -187,14 +184,12 @@ async fn edit_env(
     editor: &EditorCommand,
     spec: Option<&str>,
 ) -> Result<()> {
-    let env = manifest.spec_build_env(spec)?;
-    let comments = manifest.spec_build_env_comments(spec)?;
     let mut tmp = tempfile::Builder::new().suffix(".env").tempfile()?;
-    write_env_file(&mut tmp, &env, &comments)?;
+    write!(tmp, "{}", manifest.spec_env_block(spec)?)?;
+    tmp.flush()?;
     editor.run(tmp.path())?;
     let contents = std::fs::read_to_string(tmp.path())?;
-    let parsed = parse_env_file(&contents)?;
-    manifest.set_build_env_with_comments(spec, parsed.env, parsed.comments)?;
+    manifest.spec_update_env_block(spec, contents)?;
     Ok(())
 }
 
@@ -257,96 +252,4 @@ async fn edit_artifact(
         manifest.add_stage_items(spec, vec![artifact.name.clone()], None)?;
     }
     Ok(())
-}
-
-fn write_env_file(
-    file: &mut tempfile::NamedTempFile,
-    env: &KVList<String>,
-    comments: &BuildEnvComments,
-) -> Result<()> {
-    for (key, value) in env.iter() {
-        if let Some(prefix) = comments.prefix.get(key) {
-            if !prefix.is_empty() {
-                write!(file, "{prefix}")?;
-                if !prefix.ends_with('\n') {
-                    writeln!(file)?;
-                }
-            }
-        }
-        write!(file, "{key}={value}")?;
-        if let Some(inline) = comments.inline.get(key) {
-            if !inline.is_empty() {
-                if inline.chars().next().map(|c| c.is_whitespace()) == Some(true) {
-                    write!(file, "{inline}")?;
-                } else {
-                    write!(file, " {inline}")?;
-                }
-            }
-        }
-        writeln!(file)?;
-    }
-    file.flush()?;
-    Ok(())
-}
-
-struct ParsedEnv {
-    env: KVList<String>,
-    comments: BuildEnvComments,
-}
-
-fn parse_env_file(contents: &str) -> Result<ParsedEnv> {
-    let mut seen = HashSet::new();
-    let mut items = Vec::new();
-    let mut comments = BuildEnvComments::default();
-    let mut pending = String::new();
-    for (idx, raw_line) in contents.lines().enumerate() {
-        let trimmed = raw_line.trim();
-        if trimmed.is_empty() {
-            pending.push('\n');
-            continue;
-        }
-        if raw_line.trim_start().starts_with('#') {
-            pending.push_str(raw_line.trim_end());
-            pending.push('\n');
-            continue;
-        }
-        let (key, value_part) = raw_line.split_once('=').ok_or_else(|| {
-            anyhow!(
-                "invalid env line {}: expected VAR=value",
-                idx.saturating_add(1)
-            )
-        })?;
-        let key = key.trim();
-        if key.is_empty() {
-            return Err(anyhow!("invalid env line {}: empty key", idx + 1));
-        }
-        if !seen.insert(key.to_string()) {
-            return Err(anyhow!("duplicate env key '{}'", key));
-        }
-        let mut value = value_part.trim_end();
-        let mut inline = String::new();
-        if let Some(pos) = value_part.find('#') {
-            if pos > 0 && value_part[..pos].chars().last().map(|c| c.is_whitespace()) == Some(true)
-            {
-                let before = &value_part[..pos];
-                let spacing_start = before
-                    .rfind(|c: char| !c.is_whitespace())
-                    .map(|idx| idx + 1)
-                    .unwrap_or(0);
-                let spacing = &before[spacing_start..];
-                inline.push_str(spacing);
-                inline.push_str(value_part[pos..].trim_end());
-                value = value_part[..spacing_start].trim_end();
-            }
-        }
-        let prefix = pending.clone();
-        pending.clear();
-        items.push((key.to_string(), value.trim().to_string()));
-        comments.prefix.insert(key.to_string(), prefix);
-        comments.inline.insert(key.to_string(), inline);
-    }
-    Ok(ParsedEnv {
-        env: KVList::from(items),
-        comments,
-    })
 }

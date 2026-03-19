@@ -8,10 +8,7 @@ use {
         hash::{Hash, HashAlgo},
         is_url,
         kvlist::KVList,
-        manifest_doc::{
-            spec_display_name, valid_spec_name, BuildEnvComments, LockFile, ManifestFile,
-            UpdateResult,
-        },
+        manifest_doc::{spec_display_name, valid_spec_name, LockFile, ManifestFile, UpdateResult},
         packages::{Package, PackageOrigin},
         spec::{
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
@@ -1122,9 +1119,9 @@ impl Manifest {
         let spec_index = self.get_spec_idx(spec_name)?;
         Ok(self.file.spec_build_env(spec_index)?.clone())
     }
-    pub fn spec_build_env_comments(&self, spec_name: Option<&str>) -> io::Result<BuildEnvComments> {
+    pub fn spec_env_block(&self, spec_name: Option<&str>) -> io::Result<String> {
         let spec_index = self.get_spec_idx(spec_name)?;
-        self.file.spec_build_env_comments(spec_index)
+        self.file.spec_env_block(spec_index)
     }
     pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
         let spec_index = self.get_spec_idx(spec_name)?;
@@ -1180,22 +1177,21 @@ impl Manifest {
         self.mark_lock_dirty();
         Ok(())
     }
-    pub fn set_build_env_with_comments(
+    pub fn spec_update_env_block(
         &mut self,
         spec_name: Option<&str>,
-        env: KVList<String>,
-        comments: BuildEnvComments,
+        block: String,
     ) -> io::Result<()> {
-        let spec_index = if env.is_empty() {
-            match self.lookup_spec_idx(spec_name)? {
-                Some(spec_index) => spec_index,
-                None => return Ok(()),
-            }
-        } else {
-            self.get_or_create_spec_idx(spec_name)?
+        let spec_name = spec_name
+            .map_or_else(|| Ok(""), valid_spec_name)
+            .map_err(io::Error::other)?;
+        let had_spec = self.file.spec_index(spec_name).is_some();
+        let Some(spec_index) = self.file.set_spec_env_block(spec_name, &block)? else {
+            return Ok(());
         };
-        self.file
-            .set_build_env_with_comments(spec_index, env, &comments)?;
+        if !had_spec {
+            self.lock.push_spec(spec_name, Spec::new().locked_spec());
+        }
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
