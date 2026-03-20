@@ -735,6 +735,9 @@ where
                         || Path::new(file.path()).to_path_buf(),
                         |p| Path::new(p).join(file.path()),
                     );
+                    if let Some(parent) = path.parent() {
+                        fs.create_dir_all(parent, 0, 0, 0o755).await?;
+                    }
                     let size = file.size() as usize;
                     let uid = file.uid();
                     let gid = file.gid();
