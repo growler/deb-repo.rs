@@ -498,6 +498,18 @@ impl Manifest {
                 ),
             ));
         }
+        // valid lock means there is universe hash locked,
+        // so this is just to catch unexpected internal errors
+        let imported_universe_hash = imported
+            .lock
+            .universe_hash()
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "[internal error] imported manifest {} lock lacks universe hash",
+                    path.as_ref().display(),
+                ))
+            })?
+            .clone();
         for spec in &specs {
             if !imported.file.specs().any(|(n, _)| n == spec) {
                 return Err(io::Error::new(
@@ -521,6 +533,7 @@ impl Manifest {
             specs,
         );
         self.mark_file_updated();
+        self.lock.set_imported_universe_hash(imported_universe_hash);
         self.lock
             .specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
@@ -1002,6 +1015,10 @@ impl Manifest {
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_index);
         self.mark_lock_dirty();
+        Ok(())
+    }
+    pub fn add_spec(&mut self, spec_name: Option<&str>) -> io::Result<()> {
+        self.get_or_create_spec_idx(spec_name)?;
         Ok(())
     }
     pub fn add_requirements<S, I>(
