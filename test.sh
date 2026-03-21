@@ -36,8 +36,10 @@ require_cmd awk
 require_cmd cargo
 require_cmd cmp
 require_cmd dpkg-deb
+require_cmd find
 require_cmd gzip
 require_cmd readlink
+require_cmd sort
 require_cmd tar
 
 mapfile -t scenarios < <(find "${REPO_ROOT}/test" -maxdepth 1 -type f -name '[0-9][0-9]*_*.sh' | sort -V)
@@ -73,10 +75,8 @@ fi
 rm -rf -- "${TEST_ROOT}"
 mkdir -p "${LOG_DIR}"
 
-if [[ "${RDEBOOTSTRAP_FORCE_BUILD:-0}" == "1" || ! -x "${RDEBOOTSTRAP}" ]]; then
-    note "Building target/release/rdebootstrap"
-    cargo build -p rdebootstrap --release
-fi
+note "Building target/release/rdebootstrap"
+cargo build -p rdebootstrap --release
 
 if [[ "${RDEBOOTSTRAP_DEBUG}" == "1" ]]; then
     note "rdebootstrap debug logging enabled"

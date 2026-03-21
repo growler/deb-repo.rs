@@ -17,6 +17,8 @@ RELATIVE_PACKAGE_NAME="path-relative-local"
 RELATIVE_DEB_NAME="${RELATIVE_PACKAGE_NAME}_0.0.1_amd64.deb"
 RELATIVE_DEB_PATH="./relative-src/${RELATIVE_DEB_NAME}"
 RELATIVE_ARTIFACT_PATH="./relative-src/relative-note.txt"
+RELATIVE_STORED_DEB_PATH="$(manifest_rebased_path "${RELATIVE_DEB_PATH}" "${MANIFEST}" "${COMMAND_DIR}")"
+RELATIVE_STORED_ARTIFACT_PATH="$(manifest_rebased_path "${RELATIVE_ARTIFACT_PATH}" "${MANIFEST}" "${COMMAND_DIR}")"
 
 ABSOLUTE_PACKAGE_NAME="path-absolute-local"
 ABSOLUTE_DEB_NAME="${ABSOLUTE_PACKAGE_NAME}_0.0.1_amd64.deb"
@@ -42,20 +44,20 @@ run_external_expect_ok() {
     fi
 }
 
-printf 'relative artifact v1\n' >"${RELATIVE_DIR}/relative-note.txt"
-printf 'wrong cwd relative artifact\n' >"${COMMAND_DIR}/relative-src/relative-note.txt"
+printf 'manifest dir relative artifact v1\n' >"${RELATIVE_DIR}/relative-note.txt"
+printf 'cwd relative artifact v1\n' >"${COMMAND_DIR}/relative-src/relative-note.txt"
 printf 'absolute artifact v1\n' >"${ABSOLUTE_ARTIFACT_PATH}"
 
 create_local_deb \
     "${RELATIVE_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
-    "relative-package-v1"
+    "manifest-relative-package-v1"
 create_local_deb \
     "${COMMAND_DIR}/relative-src/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
-    "wrong-relative-package"
+    "cwd-relative-package-v1"
 create_local_deb \
     "${ABSOLUTE_DEB_PATH}" \
     "${ABSOLUTE_PACKAGE_NAME}" \
@@ -75,18 +77,18 @@ run_external_expect_ok \
     require "${BASE_PACKAGES[@]}" "${RELATIVE_PACKAGE_NAME}" "${ABSOLUTE_PACKAGE_NAME}"
 run_external_expect_ok "update_initial" update --archives --locals
 
-assert_manifest_contains "[artifact.\"${RELATIVE_ARTIFACT_PATH}\"]"
+assert_manifest_contains "[artifact.\"${RELATIVE_STORED_ARTIFACT_PATH}\"]"
 assert_manifest_contains "[artifact.\"$(abs_path "${ABSOLUTE_ARTIFACT_PATH}")\"]"
-assert_manifest_contains "path = \"${RELATIVE_DEB_PATH}\""
+assert_manifest_contains "path = \"${RELATIVE_STORED_DEB_PATH}\""
 assert_manifest_contains "path = \"$(abs_path "${ABSOLUTE_DEB_PATH}")\""
 
 run_external_expect_ok "build_v1" build --path "${TREE_V1}"
 assert_file_exists "${TREE_V1}"
 
-assert_runtime_file_content "${TREE_V1}" /opt/path-resolution/relative-note.txt "relative artifact v1"
+assert_runtime_file_content "${TREE_V1}" /opt/path-resolution/relative-note.txt "cwd relative artifact v1"
 assert_runtime_file_content "${TREE_V1}" /opt/path-resolution/absolute-note.txt "absolute artifact v1"
 assert_equals \
-    "relative-package-v1" \
+    "cwd-relative-package-v1" \
     "$(run_podman_rootfs "${TREE_V1}" /usr/local/bin/${RELATIVE_PACKAGE_NAME})" \
     "relative local package output v1"
 assert_equals \
@@ -94,13 +96,19 @@ assert_equals \
     "$(run_podman_rootfs "${TREE_V1}" /usr/local/bin/${ABSOLUTE_PACKAGE_NAME})" \
     "absolute local package output v1"
 
-printf 'relative artifact v2\n' >"${RELATIVE_DIR}/relative-note.txt"
+printf 'manifest dir relative artifact v2\n' >"${RELATIVE_DIR}/relative-note.txt"
+printf 'cwd relative artifact v2\n' >"${COMMAND_DIR}/relative-src/relative-note.txt"
 printf 'absolute artifact v2\n' >"${ABSOLUTE_ARTIFACT_PATH}"
 create_local_deb \
     "${RELATIVE_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
-    "relative-package-v2"
+    "manifest-relative-package-v2"
+create_local_deb \
+    "${COMMAND_DIR}/relative-src/${RELATIVE_DEB_NAME}" \
+    "${RELATIVE_PACKAGE_NAME}" \
+    0.0.1 \
+    "cwd-relative-package-v2"
 create_local_deb \
     "${ABSOLUTE_DEB_PATH}" \
     "${ABSOLUTE_PACKAGE_NAME}" \
@@ -111,10 +119,10 @@ run_external_expect_ok "update_locals" update --locals
 run_external_expect_ok "build_v2" build --path "${TREE_V2}"
 assert_file_exists "${TREE_V2}"
 
-assert_runtime_file_content "${TREE_V2}" /opt/path-resolution/relative-note.txt "relative artifact v2"
+assert_runtime_file_content "${TREE_V2}" /opt/path-resolution/relative-note.txt "cwd relative artifact v2"
 assert_runtime_file_content "${TREE_V2}" /opt/path-resolution/absolute-note.txt "absolute artifact v2"
 assert_equals \
-    "relative-package-v2" \
+    "cwd-relative-package-v2" \
     "$(run_podman_rootfs "${TREE_V2}" /usr/local/bin/${RELATIVE_PACKAGE_NAME})" \
     "relative local package output v2"
 assert_equals \

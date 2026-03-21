@@ -10,16 +10,18 @@ SYSTEM_DIR="${CASE_DIR}/system"
 SYSTEM_MANIFEST="${SYSTEM_DIR}/Manifest.toml"
 SYSTEM_LOCK="${SYSTEM_DIR}/Manifest.amd64.lock"
 IMPORTED_TREE="${CASE_DIR}/tree-import-archives-only"
+IMPORT_COMMAND_DIR="${CASE_DIR}/import-command/work"
 INIT_IMPORT_DIR="${CASE_DIR}/init-import"
 INIT_IMPORT_MANIFEST="${INIT_IMPORT_DIR}/Manifest.toml"
 INIT_IMPORT_LOCK="${INIT_IMPORT_DIR}/Manifest.amd64.lock"
+INIT_IMPORT_COMMAND_DIR="${CASE_DIR}/init-import-command/work"
 INIT_IMPORTED_TREE="${CASE_DIR}/tree-init-import-archives-only"
 trap 'cleanup_tree "${IMPORTED_TREE}"; cleanup_tree "${INIT_IMPORTED_TREE}"' EXIT
 
 mkdir -p "${SYSTEM_DIR}"
 cp -- "${MANIFEST}" "${SYSTEM_MANIFEST}"
 cp -- "${LOCK}" "${SYSTEM_LOCK}"
-mkdir -p "${INIT_IMPORT_DIR}"
+mkdir -p "${IMPORT_COMMAND_DIR}" "${INIT_IMPORT_DIR}" "${INIT_IMPORT_COMMAND_DIR}"
 
 run_system_capture() {
     local label="$1"
@@ -38,10 +40,27 @@ run_system_expect_ok() {
     fi
 }
 
+run_import_capture() {
+    local label="$1"
+    shift
+    capture_rdebootstrap_manifest "${label}" "${IMPORT_COMMAND_DIR}" "${MANIFEST}" "${CASE_DIR}" "$@"
+}
+
+run_import_expect_ok() {
+    local label="$1"
+    shift
+    if ! run_import_capture "${label}" "$@"; then
+        if ! rdebootstrap_debug_enabled; then
+            tail -n 40 "${LAST_STDERR}" >&2 || true
+        fi
+        die "import command failed (${label}): $(format_rdebootstrap_command "${MANIFEST}" "$@")"
+    fi
+}
+
 run_init_import_capture() {
     local label="$1"
     shift
-    capture_rdebootstrap_manifest "${label}" "${INIT_IMPORT_DIR}" "${INIT_IMPORT_MANIFEST}" "${CASE_DIR}" "$@"
+    capture_rdebootstrap_manifest "${label}" "${INIT_IMPORT_COMMAND_DIR}" "${INIT_IMPORT_MANIFEST}" "${CASE_DIR}" "$@"
 }
 
 run_init_import_expect_ok() {
@@ -67,9 +86,11 @@ EOF
 
 run_system_expect_ok "system_update" update
 
-run_case_expect_ok "import_add" import ./system/Manifest.toml
+IMPORTED_MANIFEST_INPUT="../../system/Manifest.toml"
+IMPORTED_MANIFEST_PATH="$(manifest_rebased_path "${IMPORTED_MANIFEST_INPUT}" "${MANIFEST}" "${IMPORT_COMMAND_DIR}")"
+run_import_expect_ok "import_add" import "${IMPORTED_MANIFEST_INPUT}"
 assert_manifest_contains "[import]"
-assert_manifest_contains "path = \"./system/Manifest.toml\""
+assert_manifest_contains "path = \"${IMPORTED_MANIFEST_PATH}\""
 assert_manifest_contains "hash = "
 assert_manifest_lacks "specs = "
 
@@ -88,11 +109,13 @@ assert_equals \
     "$(run_podman_rootfs "${IMPORTED_TREE}" /usr/local/bin/archives-only-import)" \
     "archives-only import output"
 
-run_init_import_expect_ok "init_import_create" init --import ../system/Manifest.toml --package archives-only-import
+INIT_IMPORT_INPUT="../../system/Manifest.toml"
+INIT_IMPORTED_MANIFEST_PATH="$(manifest_rebased_path "${INIT_IMPORT_INPUT}" "${INIT_IMPORT_MANIFEST}" "${INIT_IMPORT_COMMAND_DIR}")"
+run_init_import_expect_ok "init_import_create" init --import "${INIT_IMPORT_INPUT}" --package archives-only-import
 assert_file_exists "${INIT_IMPORT_MANIFEST}"
 assert_file_exists "${INIT_IMPORT_LOCK}"
 assert_file_contains "${INIT_IMPORT_MANIFEST}" "[import]"
-assert_file_contains "${INIT_IMPORT_MANIFEST}" "path = \"../system/Manifest.toml\""
+assert_file_contains "${INIT_IMPORT_MANIFEST}" "path = \"${INIT_IMPORTED_MANIFEST_PATH}\""
 assert_file_contains "${INIT_IMPORT_MANIFEST}" "hash = "
 assert_file_lacks "${INIT_IMPORT_MANIFEST}" "specs = "
 assert_file_contains "${INIT_IMPORT_LOCK}" "imported-universe = "

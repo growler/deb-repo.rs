@@ -22,6 +22,8 @@ RELATIVE_PACKAGE_NAME="imported-chain-relative"
 RELATIVE_DEB_NAME="${RELATIVE_PACKAGE_NAME}_0.0.1_amd64.deb"
 RELATIVE_DEB_PATH="../145-chain-owned/${RELATIVE_DEB_NAME}"
 RELATIVE_ARTIFACT_PATH="../145-chain-owned/relative-note.txt"
+RELATIVE_STORED_DEB_PATH="$(manifest_rebased_path "${RELATIVE_DEB_PATH}" "${SYSTEM_MANIFEST}" "${SYSTEM_COMMAND_DIR}")"
+RELATIVE_STORED_ARTIFACT_PATH="$(manifest_rebased_path "${RELATIVE_ARTIFACT_PATH}" "${SYSTEM_MANIFEST}" "${SYSTEM_COMMAND_DIR}")"
 
 ABSOLUTE_PACKAGE_NAME="imported-chain-absolute"
 ABSOLUTE_DEB_NAME="${ABSOLUTE_PACKAGE_NAME}_0.0.1_amd64.deb"
@@ -55,8 +57,8 @@ run_system_expect_ok() {
     fi
 }
 
-printf 'imported relative artifact v1\n' >"${OWNED_DIR}/relative-note.txt"
-printf 'wrong cwd imported relative artifact\n' >"${COMMAND_DECOY_DIR}/relative-note.txt"
+printf 'manifest relative imported artifact v1\n' >"${OWNED_DIR}/relative-note.txt"
+printf 'imported relative artifact v1\n' >"${COMMAND_DECOY_DIR}/relative-note.txt"
 printf 'wrong downstream imported relative artifact\n' >"${DOWNSTREAM_DECOY_DIR}/relative-note.txt"
 printf 'imported absolute artifact v1\n' >"${ABSOLUTE_ARTIFACT_PATH}"
 
@@ -64,12 +66,12 @@ create_local_deb \
     "${OWNED_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
-    "imported-relative-package-v1"
+    "manifest-relative-imported-package-v1"
 create_local_deb \
     "${COMMAND_DECOY_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
-    "wrong-cwd-imported-relative-package"
+    "imported-relative-package-v1"
 create_local_deb \
     "${DOWNSTREAM_DECOY_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
@@ -94,9 +96,9 @@ run_system_expect_ok \
     artifact add --stage -s base "$(abs_path "${ABSOLUTE_ARTIFACT_PATH}")" /opt/import-paths/absolute-note.txt
 run_system_expect_ok "system_update" update --archives --locals
 
-assert_file_contains "${SYSTEM_MANIFEST}" "[artifact.\"${RELATIVE_ARTIFACT_PATH}\"]"
+assert_file_contains "${SYSTEM_MANIFEST}" "[artifact.\"${RELATIVE_STORED_ARTIFACT_PATH}\"]"
 assert_file_contains "${SYSTEM_MANIFEST}" "[artifact.\"$(abs_path "${ABSOLUTE_ARTIFACT_PATH}")\"]"
-assert_file_contains "${SYSTEM_MANIFEST}" "path = \"${RELATIVE_DEB_PATH}\""
+assert_file_contains "${SYSTEM_MANIFEST}" "path = \"${RELATIVE_STORED_DEB_PATH}\""
 assert_file_contains "${SYSTEM_MANIFEST}" "path = \"$(abs_path "${ABSOLUTE_DEB_PATH}")\""
 
 run_case_expect_ok "import_add" import ./system-manifest/Manifest.toml --spec base
@@ -120,10 +122,16 @@ assert_equals \
     "$(run_podman_rootfs "${TREE_V1}" /usr/local/bin/${ABSOLUTE_PACKAGE_NAME})" \
     "imported absolute local package output v1"
 
-printf 'imported relative artifact v2\n' >"${OWNED_DIR}/relative-note.txt"
+printf 'manifest relative imported artifact v2\n' >"${OWNED_DIR}/relative-note.txt"
+printf 'imported relative artifact v2\n' >"${COMMAND_DECOY_DIR}/relative-note.txt"
 printf 'imported absolute artifact v2\n' >"${ABSOLUTE_ARTIFACT_PATH}"
 create_local_deb \
     "${OWNED_DIR}/${RELATIVE_DEB_NAME}" \
+    "${RELATIVE_PACKAGE_NAME}" \
+    0.0.1 \
+    "manifest-relative-imported-package-v2"
+create_local_deb \
+    "${COMMAND_DECOY_DIR}/${RELATIVE_DEB_NAME}" \
     "${RELATIVE_PACKAGE_NAME}" \
     0.0.1 \
     "imported-relative-package-v2"

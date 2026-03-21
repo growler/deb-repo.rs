@@ -1,8 +1,10 @@
-rdebootstrap (0.1.13) UNRELEASED; urgency=medium
+rdebootstrap (0.1.13) unstable; urgency=medium
 
-  * fix: store imported-universe hash in Manifest::set_import
-  * feat: import command now accepts --import other-manifest.toml 
-    instead of archive definition or distro template
+  * fix: Store imported-universe hash in Manifest::set_import.
+  * feat: Import command now accepts --import <other-manifest.toml>
+    instead of an archive definition or a distro template.
+  * feat: Commands that accept relative paths (deb, artifact, import)
+    now resolve those paths relative to the target manifest file.
 
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 21 Mar 2026 09:54:29 +0100
 

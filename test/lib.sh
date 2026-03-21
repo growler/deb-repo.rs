@@ -35,6 +35,93 @@ abs_path() {
     readlink -f -- "$1"
 }
 
+normalize_path() {
+    readlink -m -- "$1"
+}
+
+manifest_dir_for_path() {
+    local manifest="$1"
+    local cwd="$2"
+    local manifest_abs
+
+    if [[ "${manifest}" = /* ]]; then
+        manifest_abs="$(normalize_path "${manifest}")"
+    else
+        manifest_abs="$(normalize_path "${cwd}/${manifest}")"
+    fi
+
+    normalize_path "$(dirname -- "${manifest_abs}")"
+}
+
+relative_path_between() {
+    local path_abs
+    local base_abs
+    local trimmed_path
+    local trimmed_base
+    local -a path_parts=()
+    local -a base_parts=()
+    local -a relative_parts=()
+    local common=0
+    local i
+
+    path_abs="$(normalize_path "$1")"
+    base_abs="$(normalize_path "$2")"
+    trimmed_path="${path_abs#/}"
+    trimmed_base="${base_abs#/}"
+
+    if [[ -n "${trimmed_path}" ]]; then
+        IFS=/ read -r -a path_parts <<<"${trimmed_path}"
+    fi
+    if [[ -n "${trimmed_base}" ]]; then
+        IFS=/ read -r -a base_parts <<<"${trimmed_base}"
+    fi
+
+    while (( common < ${#path_parts[@]} && common < ${#base_parts[@]} )); do
+        if [[ "${path_parts[common]}" != "${base_parts[common]}" ]]; then
+            break
+        fi
+        common=$((common + 1))
+    done
+
+    for ((i = common; i < ${#base_parts[@]}; i++)); do
+        relative_parts+=("..")
+    done
+    for ((i = common; i < ${#path_parts[@]}; i++)); do
+        relative_parts+=("${path_parts[i]}")
+    done
+
+    if [[ "${#relative_parts[@]}" -eq 0 ]]; then
+        printf '.\n'
+    else
+        local joined="${relative_parts[*]}"
+        printf '%s\n' "${joined// /\/}"
+    fi
+}
+
+manifest_rebased_path() {
+    local input_path="$1"
+    local manifest="$2"
+    local cwd="$3"
+    local manifest_dir
+    local cwd_abs
+    local resolved
+
+    if [[ "${input_path}" = /* ]]; then
+        printf '%s\n' "${input_path}"
+        return
+    fi
+
+    cwd_abs="$(normalize_path "${cwd}")"
+    manifest_dir="$(manifest_dir_for_path "${manifest}" "${cwd_abs}")"
+    if [[ "${manifest_dir}" == "${cwd_abs}" ]]; then
+        printf '%s\n' "${input_path}"
+        return
+    fi
+
+    resolved="$(normalize_path "${cwd_abs}/${input_path}")"
+    relative_path_between "${resolved}" "${manifest_dir}"
+}
+
 assert_inside_test_root() {
     local path
     path="$(abs_path "$1")"

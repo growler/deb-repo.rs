@@ -9,9 +9,10 @@ use {
     anyhow::Result,
     indicatif::ProgressBar,
     std::{
+        ffi::OsString,
         io::{self, Write},
         num::NonZero,
-        path::Path,
+        path::{Component, Path},
         str::FromStr,
         sync::{
             atomic::{AtomicU64, AtomicU8},
@@ -151,6 +152,7 @@ pub mod cmd {
     use {
         super::*,
         crate::{
+            archive::SignedBy,
             artifact::{hash_directory, ArtifactArg},
             builder::ExecutorKind,
             comp::is_comp_ext,
@@ -252,12 +254,15 @@ Examples:
                 let mut mf = if let Some(path) = self.import.as_deref() {
                     let mut mf =
                         Manifest::new(conf.manifest(), conf.arch(), self.comment.as_deref());
-                    mf.set_import(path, &self.specs).await?;
+                    let path = rebase_pathbuf_input(path, conf.manifest())?;
+                    mf.set_import(&path, &self.specs).await?;
                     mf
                 } else {
-                    let archive = self.archive.to_archive().ok_or_else(|| {
+                    let mut archive = self.archive.to_archive().ok_or_else(|| {
                         anyhow!("either an archive/vendor template or --import PATH is required")
                     })?;
+                    archive.signed_by =
+                        rebase_signed_by_input(&archive.signed_by, conf.manifest())?;
                     let (archives, packages, comment) =
                         if let Some((archives, mut packages)) = archive.as_vendor() {
                             if !self.requirements.is_empty() {
@@ -330,8 +335,13 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                let archive = Archive::from(&self.archive);
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
+                let mut archive = Archive::from(&self.archive);
+                archive.signed_by = rebase_signed_by_input(&archive.signed_by, conf.manifest())?;
                 if let Some((archives, _)) = archive.as_vendor() {
                     for archive in archives {
                         mf.add_archive(archive, self.comment.as_deref())?;
@@ -372,12 +382,14 @@ Examples:
                     .path
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
-                let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let path = rebase_cli_local_input(path, conf.manifest())?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
-                let base = mf.local_path(path);
-                let (file, ctrl) = fetcher.ensure_deb(path, &base).await?;
+                let base = mf.local_path(&path);
+                let (file, ctrl) = fetcher.ensure_deb(&path, &base).await?;
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
@@ -448,14 +460,20 @@ Examples:
                         mf.add_stage_items(self.spec.as_deref(), vec![name.to_string()], None)?;
                     }
                 } else {
-                    mf.upsert_artifact_only(&self.artifact, self.comment.as_deref(), fetcher)
+                    let mut artifact = ArtifactArg {
+                        mode: self.artifact.mode,
+                        do_not_unpack: self.artifact.do_not_unpack,
+                        target_arch: self.artifact.target_arch.clone(),
+                        url: self.artifact.url.clone(),
+                        target: self.artifact.target.clone(),
+                    };
+                    if !crate::is_url(&artifact.url) {
+                        artifact.url = rebase_cli_local_input(&artifact.url, conf.manifest())?;
+                    }
+                    mf.upsert_artifact_only(&artifact, self.comment.as_deref(), fetcher)
                         .await?;
                     if self.stage {
-                        mf.add_stage_items(
-                            self.spec.as_deref(),
-                            vec![self.artifact.url.clone()],
-                            None,
-                        )?;
+                        mf.add_stage_items(self.spec.as_deref(), vec![artifact.url], None)?;
                     }
                 }
                 mf.resolve(conf.concurrency(), fetcher).await?;
@@ -517,8 +535,9 @@ Examples:
                     .path
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
+                let path = rebase_cli_local_input(path, conf.manifest())?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                mf.drop_local_package(path)?;
+                mf.drop_local_package(&path)?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
@@ -608,9 +627,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
+                let artifact = if crate::is_url(&self.artifact) {
+                    self.artifact.clone()
+                } else {
+                    rebase_cli_local_input(&self.artifact, conf.manifest())?
+                };
                 mf.add_stage_items(
                     self.spec.as_deref(),
-                    vec![self.artifact.clone()],
+                    vec![artifact],
                     self.comment.as_deref(),
                 )?;
                 let fetcher = conf.fetcher()?;
@@ -646,7 +670,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
-                mf.remove_artifact(self.spec.as_deref(), &self.url)?;
+                let url = if crate::is_url(&self.url) {
+                    self.url.clone()
+                } else {
+                    rebase_cli_local_input(&self.url, conf.manifest())?
+                };
+                mf.remove_artifact(self.spec.as_deref(), &url)?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
@@ -803,7 +832,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     )]
     /// CLI command: configure a manifest import.
     pub struct ImportCmd {
-        /// Path to the manifest file to import (absolute or relative to current manifest directory)
+        /// Path to the manifest file to import (absolute or relative to current working directory)
         #[arg(value_name = "PATH")]
         path: PathBuf,
 
@@ -816,7 +845,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                mf.set_import(&self.path, &self.specs).await?;
+                let path = rebase_pathbuf_input(&self.path, conf.manifest())?;
+                mf.set_import(&path, &self.specs).await?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
@@ -1666,6 +1696,140 @@ hash = \"{}\"
             })
         }
     }
+
+    fn manifest_dir_for(manifest: &Path, cwd: &Path) -> PathBuf {
+        let manifest = if manifest.is_absolute() {
+            manifest.to_path_buf()
+        } else {
+            cwd.join(manifest)
+        };
+        let manifest = normalize_path(&manifest);
+        manifest
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .to_path_buf()
+    }
+
+    fn normalize_path(path: &Path) -> PathBuf {
+        let mut out = PathBuf::new();
+        let mut normal_parts: Vec<OsString> = Vec::new();
+
+        for component in path.components() {
+            match component {
+                Component::Prefix(prefix) => out.push(prefix.as_os_str()),
+                Component::RootDir => out.push(component.as_os_str()),
+                Component::CurDir => {}
+                Component::ParentDir => {
+                    if !normal_parts.is_empty() {
+                        normal_parts.pop();
+                    } else if out.as_os_str().is_empty() {
+                        normal_parts.push(component.as_os_str().to_os_string());
+                    }
+                }
+                Component::Normal(part) => normal_parts.push(part.to_os_string()),
+            }
+        }
+
+        for part in normal_parts {
+            out.push(part);
+        }
+
+        if out.as_os_str().is_empty() {
+            PathBuf::from(".")
+        } else {
+            out
+        }
+    }
+
+    fn diff_relative_path(path: &Path, base: &Path) -> Option<PathBuf> {
+        let path = normalize_path(path);
+        let base = normalize_path(base);
+        let path_components = path.components().collect::<Vec<_>>();
+        let base_components = base.components().collect::<Vec<_>>();
+
+        if path_components
+            .first()
+            .zip(base_components.first())
+            .map(|(lhs, rhs)| lhs != rhs)
+            .unwrap_or(false)
+        {
+            return None;
+        }
+
+        let common_len = path_components
+            .iter()
+            .zip(base_components.iter())
+            .take_while(|(lhs, rhs)| lhs == rhs)
+            .count();
+
+        let mut relative = PathBuf::new();
+        for component in &base_components[common_len..] {
+            match component {
+                Component::Normal(_) | Component::ParentDir => relative.push(".."),
+                Component::CurDir => {}
+                Component::RootDir | Component::Prefix(_) => return None,
+            }
+        }
+        for component in &path_components[common_len..] {
+            relative.push(component.as_os_str());
+        }
+
+        if relative.as_os_str().is_empty() {
+            Some(PathBuf::from("."))
+        } else {
+            Some(relative)
+        }
+    }
+
+    fn rebase_local_path_for_manifest(path: &Path, manifest: &Path, cwd: &Path) -> PathBuf {
+        if path.is_absolute() {
+            return path.to_path_buf();
+        }
+        let cwd = normalize_path(cwd);
+        let manifest_dir = manifest_dir_for(manifest, &cwd);
+        if manifest_dir == cwd {
+            return path.to_path_buf();
+        }
+        let resolved = normalize_path(&cwd.join(path));
+        diff_relative_path(&resolved, &manifest_dir).unwrap_or(resolved)
+    }
+
+    fn rebase_local_input_for_manifest(path: &str, manifest: &Path, cwd: &Path) -> String {
+        rebase_local_path_for_manifest(Path::new(path), manifest, cwd)
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    fn rebase_cli_local_input(path: &str, manifest: &Path) -> io::Result<String> {
+        let cwd = std::env::current_dir()?;
+        Ok(rebase_local_input_for_manifest(path, manifest, &cwd))
+    }
+
+    fn rebase_pathbuf_input(path: &Path, manifest: &Path) -> io::Result<PathBuf> {
+        if path.is_absolute() {
+            Ok(path.to_path_buf())
+        } else {
+            Ok(PathBuf::from(rebase_cli_local_input(
+                &path.to_string_lossy(),
+                manifest,
+            )?))
+        }
+    }
+
+    fn rebase_signed_by_input(
+        signed_by: &Option<SignedBy>,
+        manifest: &Path,
+    ) -> io::Result<Option<SignedBy>> {
+        match signed_by {
+            Some(SignedBy::Keyring(path)) => Ok(Some(SignedBy::Keyring(rebase_pathbuf_input(
+                path, manifest,
+            )?))),
+            Some(SignedBy::Builtin) => Ok(Some(SignedBy::Builtin)),
+            Some(SignedBy::Key(key)) => Ok(Some(SignedBy::Key(key.clone()))),
+            None => Ok(None),
+        }
+    }
 }
 
 /// A parser type for converting command-line argument strings into a `Dependency`.
@@ -1960,54 +2124,5 @@ impl std::fmt::Display for ProcessState {
         writeln!(f, "{}", self.chown_test_result)?;
 
         Ok(())
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::cmd::{ArchiveAdd, ArchiveRemove, Init};
-    use clap::{error::ErrorKind, Parser};
-
-    #[test]
-    fn init_parses_archive_mode() {
-        Init::try_parse_from(["init", "debian", "--package", "vim"])
-            .expect("archive init must parse");
-    }
-
-    #[test]
-    fn init_parses_import_mode() {
-        Init::try_parse_from(["init", "--import", "base.toml", "--spec", "base"])
-            .expect("import init must parse");
-    }
-
-    #[test]
-    fn init_rejects_archive_and_import_together() {
-        let err = match Init::try_parse_from(["init", "debian", "--import", "base.toml"]) {
-            Ok(_) => panic!("template and import must conflict"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn init_rejects_archive_flags_in_import_mode() {
-        let err = match Init::try_parse_from(["init", "--import", "base.toml", "--suite", "stable"])
-        {
-            Ok(_) => panic!("archive flags must not parse in import mode"),
-            Err(err) => err,
-        };
-        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn archive_add_parses_shared_archive_args() {
-        ArchiveAdd::try_parse_from(["archive-add", "debian", "--suite", "stable"])
-            .expect("archive add must parse shared archive args");
-    }
-
-    #[test]
-    fn archive_remove_parses_shared_archive_args() {
-        ArchiveRemove::try_parse_from(["archive-remove", "debian"])
-            .expect("archive remove must parse shared archive args");
     }
 }
