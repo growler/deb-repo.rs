@@ -52,7 +52,9 @@ The resulting binary lives at `target/release/rdebootstrap` (or in
 ## Typical Workflow
 
 1. **Create a manifest**\
-   `rdebootstrap init debian --package ca-certificates --package vim`
+   `rdebootstrap init debian --package ca-certificates --package vim`\
+   or bootstrap from another locked manifest:\
+   `rdebootstrap init --import ../system/Manifest.toml --spec base --package vim`
 2. **Iterate on specs**\
    `rdebootstrap archive add https://mirror.example/debian --suite bookworm,bookworm-updates --components main,contrib`\
    `rdebootstrap require --spec desktop openssh-server network-manager`\
@@ -114,7 +116,9 @@ Key sections:
   templates, trusted keys, and priorities.
 - `[import]` — Reuse archives, local packages, and selected named parent specs
   from another manifest. Imported parent specs keep their own staged artifact
-  references. `path`, `hash`, and non-empty `specs` are required when present.
+  references. `path` and `hash` are required when present; `specs` is optional
+  and only needed when exporting imported parent specs for downstream
+  `extends`.
 - `[[local]]` — Local `.deb` files copied into the cache and treated like repo
   packages.
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
@@ -194,7 +198,8 @@ environment such as a valid XDG runtime directory).
 ## CLI Tour
 
 - `init` – bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
-  `devuan`) or explicit archives.
+  `devuan`), explicit archives, or `--import <path>` from another locked
+  manifest.
 - `import` – add or replace `[import]` using another already-locked manifest and
   export selected named parent specs.
 - `edit` – edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,

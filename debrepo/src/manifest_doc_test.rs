@@ -2,6 +2,7 @@ use {
     crate::{
         archive::{Archive, RepositoryFile},
         artifact::{Artifact, ArtifactArg},
+        cli::Command,
         content::{ContentProvider, ContentProviderGuard, DebLocation, UniverseFiles},
         control::MutableControlStanza,
         hash::Hash,
@@ -15,11 +16,12 @@ use {
         version::{Constraint, Dependency, IntoConstraint, IntoDependency},
         Sources,
     },
+    clap::Parser,
     std::{
         future::Future,
         io,
         num::NonZero,
-        path::Path,
+        path::{Path, PathBuf},
         pin::Pin,
         sync::{
             atomic::{AtomicUsize, Ordering},
@@ -482,6 +484,41 @@ impl ContentProvider for TestProvider {
 
     fn transport(&self) -> &impl TransportProvider {
         &self.transport
+    }
+}
+
+struct TestConfig {
+    manifest: PathBuf,
+    cache: TestProvider,
+}
+
+impl TestConfig {
+    fn new(manifest: PathBuf) -> Self {
+        Self {
+            manifest,
+            cache: TestProvider::new(),
+        }
+    }
+}
+
+impl crate::cli::Config for TestConfig {
+    type FS = HostFileSystem;
+    type Cache = TestProvider;
+
+    fn arch(&self) -> &str {
+        ARCH
+    }
+
+    fn manifest(&self) -> &Path {
+        &self.manifest
+    }
+
+    fn concurrency(&self) -> NonZero<usize> {
+        NonZero::new(1).expect("nonzero")
+    }
+
+    fn fetcher(&self) -> io::Result<&Self::Cache> {
+        Ok(&self.cache)
     }
 }
 
@@ -1735,6 +1772,127 @@ fn add_stage_items_rejects_imported_artifacts() {
     assert!(err
         .to_string()
         .contains("artifact ./base.txt not found in manifest"));
+}
+
+#[test]
+fn init_import_creates_manifest_with_import_and_no_local_archives() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let manifest_path = dir.path().join("downstream.toml");
+    let conf = TestConfig::new(manifest_path.clone());
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+    });
+
+    let cmd = crate::cli::cmd::Init::try_parse_from(["init", "--import", "imported.toml"])
+        .expect("parse init");
+    cmd.exec(&conf).expect("init from import");
+
+    smol::block_on(async {
+        let (file, _) = ManifestFile::from_file(&manifest_path)
+            .await
+            .expect("load manifest file");
+        let import = file.import().expect("import section");
+        assert_eq!(import.path(), Path::new("imported.toml"));
+        assert!(import.specs().next().is_none());
+        assert!(file.local_archives().is_empty());
+    });
+    assert!(manifest_path
+        .with_extension(format!("{}.lock", ARCH))
+        .exists());
+}
+
+#[test]
+fn init_import_exports_requested_specs() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let manifest_path = dir.path().join("downstream.toml");
+    let conf = TestConfig::new(manifest_path.clone());
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+    });
+
+    let cmd = crate::cli::cmd::Init::try_parse_from([
+        "init",
+        "--import",
+        "imported.toml",
+        "--spec",
+        "base",
+    ])
+    .expect("parse init");
+    cmd.exec(&conf).expect("init from import");
+
+    update_manifest_file(&manifest_path, |doc| {
+        doc["spec"]["extends"] = toml_edit::value("base");
+    });
+
+    smol::block_on(async {
+        let (mut manifest, _) = Manifest::from_file(&manifest_path, ARCH)
+            .await
+            .expect("load manifest");
+        manifest
+            .resolve(NonZero::new(1).expect("nonzero"), &TestProvider::new())
+            .await
+            .expect("resolve with imported parent");
+    });
+}
+
+#[test]
+fn init_import_rejects_missing_spec() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let provider = TestProvider::new();
+    let manifest_path = dir.path().join("downstream.toml");
+    let conf = TestConfig::new(manifest_path);
+
+    smol::block_on(async {
+        create_locked_imported_manifest(dir.path(), &provider)
+            .await
+            .expect("create imported manifest");
+    });
+
+    let cmd = crate::cli::cmd::Init::try_parse_from([
+        "init",
+        "--import",
+        "imported.toml",
+        "--spec",
+        "missing",
+    ])
+    .expect("parse init");
+    let err = cmd
+        .exec(&conf)
+        .expect_err("missing imported spec must fail");
+    assert!(err
+        .to_string()
+        .contains("imported manifest imported.toml does not contain spec missing"));
+}
+
+#[test]
+fn init_import_requires_locked_manifest() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("downstream.toml");
+    let imported_path = dir.path().join("imported.toml");
+    let conf = TestConfig::new(manifest_path);
+
+    smol::block_on(async {
+        let manifest = new_manifest();
+        manifest
+            .store(&imported_path)
+            .await
+            .expect("store imported manifest");
+    });
+
+    let cmd = crate::cli::cmd::Init::try_parse_from(["init", "--import", "imported.toml"])
+        .expect("parse init");
+    let err = cmd.exec(&conf).expect_err("unlocked import must fail");
+    assert!(err
+        .to_string()
+        .contains("imported manifest imported.toml is not locked; lock if first"));
 }
 
 #[test]

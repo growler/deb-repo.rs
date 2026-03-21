@@ -1,6 +1,6 @@
 use {
     crate::{
-        archive::{Archive, SnapshotId, SnapshotIdArgParser},
+        archive::{Archive, ArchiveArgs, OptionalArchiveArgs, SnapshotId, SnapshotIdArgParser},
         content::ContentProvider,
         packages::{InstallPriority, Package},
         version::{Constraint, Dependency, Version},
@@ -171,13 +171,16 @@ pub mod cmd {
             path::{Path, PathBuf},
         },
     };
+
     #[derive(Parser)]
     #[command(
         about = "Create a new manifest file",
-        long_about = r#"Create a new manifest file from an archive definition.
+        long_about = r#"Create a new manifest file from an archive definition, vendor preset, or imported manifest.
 If a vendor name is provided as the archive URL, default archives and packages are derived from it.
+Use --import PATH to bootstrap from another already-locked manifest instead of defining local archives.
 Examples:
-    rdebootstrap init debian --package mc --package libcom-err2"#
+    rdebootstrap init debian --package mc --package libcom-err2
+    rdebootstrap init --import ../base/Manifest.toml --spec base"#
     )]
     /// CLI command: initialize a new repository manifest.
     pub struct Init {
@@ -202,53 +205,102 @@ Examples:
         )]
         meta: Vec<String>,
 
-        /// Archive definition (URL plus suite/component/snapshot options).
-        /// URL might be a vendor name (debian, ubuntu, devuan).
+        /// Import another already-locked manifest instead of defining local archives
+        #[arg(
+            long = "import",
+            value_name = "PATH",
+            conflicts_with_all = [
+                "url",
+                "arch",
+                "allow_insecure",
+                "signed_by",
+                "snapshots",
+                "snapshot",
+                "suites",
+                "components",
+                "hash",
+                "priority",
+            ]
+        )]
+        import: Option<PathBuf>,
+
+        /// Spec name to export from the imported manifest (repeatable, optional)
+        #[arg(
+            long = "spec",
+            value_name = "SPEC",
+            value_delimiter = ',',
+            requires = "import"
+        )]
+        specs: Vec<String>,
+
         #[command(flatten)]
-        archive: Archive,
+        archive: OptionalArchiveArgs,
 
         /// Do not verify InRelease signatures by default (not recommended)
-        #[arg(long = "no-verify", display_order = 0, action)]
+        #[arg(
+            long = "no-verify",
+            display_order = 0,
+            action,
+            conflicts_with = "import"
+        )]
         insecure_release: bool,
     }
 
     impl<C: Config> Command<C> for Init {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (archives, packages, comment) =
-                    if let Some((archives, mut packages)) = self.archive.as_vendor() {
-                        if !self.requirements.is_empty() {
-                            packages.extend(self.requirements.iter().cloned());
-                            packages = packages.into_iter().unique().collect();
-                        }
-                        (
-                            archives,
-                            packages,
-                            Some(format!("default manifest file for {}", &self.archive.url)),
-                        )
-                    } else {
-                        (vec![self.archive.clone()], self.requirements.clone(), None)
-                    };
-                let fetcher = conf.fetcher()?;
-                let guard = fetcher.init().await?;
-                let mut mf = Manifest::from_archives(
-                    conf.manifest(),
-                    conf.arch(),
-                    archives.iter().cloned(),
-                    self.comment.as_deref().or(comment.as_deref()),
-                );
+                let mut mf = if let Some(path) = self.import.as_deref() {
+                    let mut mf =
+                        Manifest::new(conf.manifest(), conf.arch(), self.comment.as_deref());
+                    mf.set_import(path, &self.specs).await?;
+                    mf
+                } else {
+                    let archive = self.archive.to_archive().ok_or_else(|| {
+                        anyhow!("either an archive/vendor template or --import PATH is required")
+                    })?;
+                    let (archives, packages, comment) =
+                        if let Some((archives, mut packages)) = archive.as_vendor() {
+                            if !self.requirements.is_empty() {
+                                packages.extend(self.requirements.iter().cloned());
+                                packages = packages.into_iter().unique().collect();
+                            }
+                            (
+                                archives,
+                                packages,
+                                Some(format!("default manifest file for {}", &archive.url)),
+                            )
+                        } else {
+                            (vec![archive], self.requirements.clone(), None)
+                        };
+                    let mut mf = Manifest::from_archives(
+                        conf.manifest(),
+                        conf.arch(),
+                        archives.iter().cloned(),
+                        self.comment.as_deref().or(comment.as_deref()),
+                    );
+                    mf.add_requirements(None, packages.iter(), None)?;
+                    mf
+                };
                 for pair in self.meta.chunks_exact(2) {
                     mf.set_spec_meta(None, &pair[0], &pair[1])?;
                 }
-                mf.add_requirements(None, packages.iter(), None)?;
-                mf.update(
-                    true,
-                    false,
-                    self.insecure_release,
-                    conf.concurrency(),
-                    fetcher,
-                )
-                .await?;
+                if self.import.is_some() {
+                    mf.add_requirements(None, self.requirements.iter(), None)?;
+                }
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                if self.import.is_some() {
+                    mf.resolve(conf.concurrency(), fetcher).await?;
+                } else {
+                    mf.update(
+                        true,
+                        false,
+                        self.insecure_release,
+                        conf.concurrency(),
+                        fetcher,
+                    )
+                    .await?;
+                }
                 mf.store().await?;
                 guard.commit().await?;
                 Ok(())
@@ -271,7 +323,7 @@ Examples:
         insecure_release: bool,
 
         #[command(flatten)]
-        archive: Archive,
+        archive: ArchiveArgs,
     }
     impl<C: Config> Command<C> for ArchiveAdd {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -279,12 +331,13 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                if let Some((archives, _)) = self.archive.as_vendor() {
+                let archive = Archive::from(&self.archive);
+                if let Some((archives, _)) = archive.as_vendor() {
                     for archive in archives {
                         mf.add_archive(archive, self.comment.as_deref())?;
                     }
                 } else {
-                    mf.add_archive(self.archive.clone(), self.comment.as_deref())?;
+                    mf.add_archive(archive, self.comment.as_deref())?;
                 }
                 mf.update(false, false, false, conf.concurrency(), fetcher)
                     .await?;
@@ -319,7 +372,10 @@ Examples:
                     .path
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 let base = mf.local_path(path);
                 let (file, ctrl) = fetcher.ensure_deb(path, &base).await?;
                 mf.add_local_package(file, ctrl, self.comment.as_deref())?;
@@ -418,7 +474,7 @@ Examples:
     /// CLI command: remove an archive from the manifest.
     pub struct ArchiveRemove {
         #[command(flatten)]
-        archive: Archive,
+        archive: ArchiveArgs,
     }
     impl<C: Config> Command<C> for ArchiveRemove {
         fn exec(&self, conf: &C) -> Result<()> {
@@ -426,12 +482,13 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                if let Some((archives, _)) = self.archive.as_vendor() {
+                let archive = Archive::from(&self.archive);
+                if let Some((archives, _)) = archive.as_vendor() {
                     for archive in archives {
                         mf.drop_archive(&archive.url)?;
                     }
                 } else {
-                    mf.drop_archive(&self.archive.url)?;
+                    mf.drop_archive(&archive.url)?;
                 }
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
@@ -742,7 +799,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Add or replace an imported manifest",
-        long_about = "Configure a manifest import: validates an already-locked imported manifest, exports selected named specs for downstream extends, and writes [import] to the downstream manifest."
+        long_about = "Configure a manifest import: validates an already-locked imported manifest, optionally exports selected named specs for downstream extends, and writes [import] to the downstream manifest."
     )]
     /// CLI command: configure a manifest import.
     pub struct ImportCmd {
@@ -750,13 +807,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         #[arg(value_name = "PATH")]
         path: PathBuf,
 
-        /// Spec name to export from the imported manifest (repeatable, at least one required)
-        #[arg(
-            long = "spec",
-            value_name = "SPEC",
-            value_delimiter = ',',
-            required = true
-        )]
+        /// Spec name to export from the imported manifest (repeatable, optional)
+        #[arg(long = "spec", value_name = "SPEC", value_delimiter = ',')]
         specs: Vec<String>,
     }
 
@@ -1908,5 +1960,54 @@ impl std::fmt::Display for ProcessState {
         writeln!(f, "{}", self.chown_test_result)?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::cmd::{ArchiveAdd, ArchiveRemove, Init};
+    use clap::{error::ErrorKind, Parser};
+
+    #[test]
+    fn init_parses_archive_mode() {
+        Init::try_parse_from(["init", "debian", "--package", "vim"])
+            .expect("archive init must parse");
+    }
+
+    #[test]
+    fn init_parses_import_mode() {
+        Init::try_parse_from(["init", "--import", "base.toml", "--spec", "base"])
+            .expect("import init must parse");
+    }
+
+    #[test]
+    fn init_rejects_archive_and_import_together() {
+        let err = match Init::try_parse_from(["init", "debian", "--import", "base.toml"]) {
+            Ok(_) => panic!("template and import must conflict"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn init_rejects_archive_flags_in_import_mode() {
+        let err = match Init::try_parse_from(["init", "--import", "base.toml", "--suite", "stable"])
+        {
+            Ok(_) => panic!("archive flags must not parse in import mode"),
+            Err(err) => err,
+        };
+        assert_eq!(err.kind(), ErrorKind::ArgumentConflict);
+    }
+
+    #[test]
+    fn archive_add_parses_shared_archive_args() {
+        ArchiveAdd::try_parse_from(["archive-add", "debian", "--suite", "stable"])
+            .expect("archive add must parse shared archive args");
+    }
+
+    #[test]
+    fn archive_remove_parses_shared_archive_args() {
+        ArchiveRemove::try_parse_from(["archive-remove", "debian"])
+            .expect("archive remove must parse shared archive args");
     }
 }

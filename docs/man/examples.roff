@@ -10,7 +10,15 @@ rdebootstrap update --snapshot 20241007T030925Z
 sudo rdebootstrap build --spec desktop --path ./out
 .EE
 .PP
-Reuse a locked base manifest and export named parent specs:
+Bootstrap from a locked base manifest and export named parent specs:
+.IP
+.EX
+rdebootstrap init --import ../system/Manifest.toml --spec base --spec bootable-base
+rdebootstrap require --spec desktop openssh-server
+rdebootstrap update
+.EE
+.PP
+Add or replace the import section in an existing manifest:
 .IP
 .EX
 rdebootstrap import ../system/Manifest.toml --spec base --spec bootable-base

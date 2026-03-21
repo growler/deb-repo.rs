@@ -151,7 +151,7 @@ impl<'de> serde::de::Deserialize<'de> for SignedBy {
 }
 
 #[derive(Clone)]
-struct ClapSignedByParser;
+pub(crate) struct ClapSignedByParser;
 
 impl clap::builder::TypedValueParser for ClapSignedByParser {
     type Value = SignedBy;
@@ -438,7 +438,7 @@ impl<'de> serde::de::Deserialize<'de> for Snapshot {
 }
 
 #[derive(Clone)]
-struct ClapSnapshotParser;
+pub(crate) struct ClapSnapshotParser;
 
 impl clap::builder::TypedValueParser for ClapSnapshotParser {
     type Value = Snapshot;
@@ -598,36 +598,27 @@ pub fn is_default<T: Default + PartialEq>(t: &T) -> bool {
     t == &T::default()
 }
 
-#[derive(Debug, Args, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
-#[serde(deny_unknown_fields)]
-/// Archive definition with suites and components.
-pub struct Archive {
-    /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
-    #[arg(value_name = "URL")]
-    pub url: String,
-
-    #[clap(skip)]
-    #[serde(skip)]
-    real_url: Option<String>,
-
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+/// Shared archive option flags for CLI commands.
+pub(crate) struct ArchiveOptionsArgs {
     /// Only include the listed architectures as a comma-separated list
     #[arg(long = "only-arch", value_name = "ARCH", value_delimiter = ',')]
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub arch: Vec<String>,
 
     /// Allow unsigned repository metadata (fetch Release instead of InRelease)
     #[arg(short = 'K', long = "allow-insecure", action)]
-    #[serde(default, rename = "allow-insecure", skip_serializing_if = "is_default")]
     pub allow_insecure: bool,
 
     /// Path to a PGP keyring file, or an @path to inline an ASCII-armored public key block
-    #[arg(long = "signed-by", value_name = "@INLINE-KEY|KEYRING", value_parser = ClapSignedByParser)]
-    #[serde(default, rename = "signed-by", skip_serializing_if = "Option::is_none")]
+    #[arg(
+        long = "signed-by",
+        value_name = "@INLINE-KEY|KEYRING",
+        value_parser = ClapSignedByParser
+    )]
     pub signed_by: Option<SignedBy>,
 
     /// Snapshots service template URL
     #[arg(long = "snapshots", value_name = "URL")]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshots: Option<String>,
 
     /// Snapshot ID to use.
@@ -642,7 +633,6 @@ pub struct Archive {
     ///   %Y%m%d
     ///   %Y%m%dT%H%M%S
     #[arg(long = "snapshot", value_name = "SNAPSHOT", value_parser = ClapSnapshotParser)]
-    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snapshot: Option<Snapshot>,
 
     /// Suite or codename; use a comma-separated list for multiple values (e.g. "stable", "noble", "trixie,trixie-updates")
@@ -661,7 +651,6 @@ pub struct Archive {
         value_delimiter = ',',
         value_name = "COMPONENT"
     )]
-    #[serde(alias = "comp", default = "default_components")]
     pub components: Vec<String>,
 
     /// Hash type for verifying repository files
@@ -672,13 +661,124 @@ pub struct Archive {
         value_name = "md5|sha1|sha256|sha512",
         default_value = "sha256",
     )]
-    #[serde(default, skip_serializing_if = "ArchiveHashKind::is_sha256")]
     pub hash: ArchiveHashKind,
 
     /// Archive priority (higher number means higher priority)
     #[arg(long = "priority", value_name = "N")]
+    pub priority: Option<u32>,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+/// Archive CLI arguments with a required URL.
+pub(crate) struct ArchiveArgs {
+    /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
+    #[arg(value_name = "URL")]
+    pub url: String,
+
+    #[command(flatten)]
+    pub options: ArchiveOptionsArgs,
+}
+
+#[derive(Debug, Args, Clone, PartialEq, Eq, Default)]
+/// Archive CLI arguments with an optional URL for commands that support import mode.
+pub(crate) struct OptionalArchiveArgs {
+    /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
+    #[arg(value_name = "URL", required_unless_present = "import")]
+    pub url: Option<String>,
+
+    #[command(flatten)]
+    pub options: ArchiveOptionsArgs,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(deny_unknown_fields)]
+/// Archive definition with suites and components.
+pub struct Archive {
+    /// Repository URL or vendor preset name (e.g. debian, ubuntu, devuan)
+    pub url: String,
+
+    #[serde(skip)]
+    real_url: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub arch: Vec<String>,
+
+    #[serde(default, rename = "allow-insecure", skip_serializing_if = "is_default")]
+    pub allow_insecure: bool,
+
+    #[serde(default, rename = "signed-by", skip_serializing_if = "Option::is_none")]
+    pub signed_by: Option<SignedBy>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshots: Option<String>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot: Option<Snapshot>,
+
+    pub suites: Vec<String>,
+
+    #[serde(alias = "comp", default = "default_components")]
+    pub components: Vec<String>,
+
+    #[serde(default, skip_serializing_if = "ArchiveHashKind::is_sha256")]
+    pub hash: ArchiveHashKind,
+
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub priority: Option<u32>,
+}
+
+impl From<ArchiveArgs> for Archive {
+    fn from(value: ArchiveArgs) -> Self {
+        Archive {
+            url: value.url,
+            arch: value.options.arch,
+            allow_insecure: value.options.allow_insecure,
+            signed_by: value.options.signed_by,
+            snapshots: value.options.snapshots,
+            snapshot: value.options.snapshot,
+            suites: value.options.suites,
+            components: value.options.components,
+            hash: value.options.hash,
+            priority: value.options.priority,
+            ..Default::default()
+        }
+    }
+}
+
+impl From<&ArchiveArgs> for Archive {
+    fn from(value: &ArchiveArgs) -> Self {
+        Archive {
+            url: value.url.clone(),
+            arch: value.options.arch.clone(),
+            allow_insecure: value.options.allow_insecure,
+            signed_by: value.options.signed_by.clone(),
+            snapshots: value.options.snapshots.clone(),
+            snapshot: value.options.snapshot.clone(),
+            suites: value.options.suites.clone(),
+            components: value.options.components.clone(),
+            hash: value.options.hash,
+            priority: value.options.priority,
+            ..Default::default()
+        }
+    }
+}
+
+impl OptionalArchiveArgs {
+    pub(crate) fn to_archive(&self) -> Option<Archive> {
+        self.url.as_ref().map(|url| Archive {
+            url: url.clone(),
+            arch: self.options.arch.clone(),
+            allow_insecure: self.options.allow_insecure,
+            signed_by: self.options.signed_by.clone(),
+            snapshots: self.options.snapshots.clone(),
+            snapshot: self.options.snapshot.clone(),
+            suites: self.options.suites.clone(),
+            components: self.options.components.clone(),
+            hash: self.options.hash,
+            priority: self.options.priority,
+            ..Default::default()
+        })
+    }
 }
 
 impl Archive {

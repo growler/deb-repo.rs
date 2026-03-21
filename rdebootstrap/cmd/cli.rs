@@ -91,7 +91,7 @@ reproducible builds, stages extra artifacts, and builds a root filesystem tree
 inside an isolated sandbox so maintainer scripts run in a controlled environment.
 
 Typical workflow:
-    1) init             - create a manifest with sources and initial packages
+    1) init             - create a manifest from a vendor preset, explicit archive, or --import path
     2) import           - optionally reuse archives, local packages, and named parent specs from another locked manifest
     3) require/forbid   - add package requirements and constraints
     4) update           - refresh archive metadata, import fingerprints, and Manifest.<arch>.lock

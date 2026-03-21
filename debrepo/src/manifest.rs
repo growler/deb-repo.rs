@@ -532,6 +532,7 @@ impl Manifest {
             })?,
             specs,
         );
+        self.import = Some(Box::new(imported));
         self.mark_file_updated();
         self.lock.set_imported_universe_hash(imported_universe_hash);
         self.lock
