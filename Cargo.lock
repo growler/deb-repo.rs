@@ -703,7 +703,7 @@ checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
 
 [[package]]
 name = "debrepo"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",
@@ -743,6 +743,7 @@ dependencies = [
  "smallvec",
  "smol",
  "smol-macros",
+ "smol-tar",
  "static_assertions",
  "tempfile",
  "thiserror",
@@ -1865,13 +1866,12 @@ dependencies = [
 
 [[package]]
 name = "rdebootstrap"
-version = "0.1.13"
+version = "0.1.14"
 dependencies = [
  "anyhow",
  "clap",
  "debrepo",
  "futures",
- "futures-lite 2.6.1",
  "once_cell",
  "smol",
  "tracing",
@@ -2126,6 +2126,18 @@ dependencies = [
  "async-lock",
  "event-listener 5.4.1",
  "futures-lite 2.6.1",
+]
+
+[[package]]
+name = "smol-tar"
+version = "0.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d771b24158712570da4dbb5c2a8d24ab631e029da38ce1a548edd26291599609"
+dependencies = [
+ "async-lock",
+ "futures-lite 2.6.1",
+ "futures-sink",
+ "pin-project-lite",
 ]
 
 [[package]]

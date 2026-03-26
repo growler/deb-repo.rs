@@ -25,6 +25,10 @@ struct EditOptions {
     /// Editor command to use (defaults to $VISUAL or $EDITOR)
     #[arg(long = "edit", value_name = "EDITOR", global = true)]
     edit: Option<String>,
+
+    /// Do not verify InRelease signatures by default (not recommended)
+    #[arg(long = "no-verify", display_order = 0, action)]
+    insecure_release: bool,
 }
 
 #[derive(Parser)]
@@ -86,7 +90,7 @@ impl<C: Config> Command<C> for Edit {
             if cmd.is_none() {
                 // edit manifest is the only command that can work with
                 // stale/unlocked manifest
-                return edit_manifest(conf, &editor).await;
+                return edit_manifest(conf, self.opts.insecure_release, &editor).await;
             }
             let cmd = cmd.unwrap();
             let (mut manifest, has_valid_lock) =
@@ -153,7 +157,11 @@ impl EditorCommand {
     }
 }
 
-async fn edit_manifest<C: Config>(conf: &C, editor: &EditorCommand) -> Result<()> {
+async fn edit_manifest<C: Config>(
+    conf: &C,
+    insecure_release: bool,
+    editor: &EditorCommand,
+) -> Result<()> {
     let path = smol::fs::canonicalize(conf.manifest()).await?;
     editor.run(&path)?;
     let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch())
@@ -167,6 +175,11 @@ async fn edit_manifest<C: Config>(conf: &C, editor: &EditorCommand) -> Result<()
     }
     let fetcher = conf.fetcher()?;
     let guard = fetcher.init().await?;
+    mf.update(false, false, insecure_release, conf.concurrency(), fetcher)
+        .await
+        .map_err(|err| {
+            anyhow!("failed to update manifest after editing: {err}; manifest may be malformed",)
+        })?;
     mf.resolve(conf.concurrency(), fetcher)
         .await
         .map_err(|err| {

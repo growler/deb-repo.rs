@@ -41,7 +41,7 @@ mod spec;
 mod stage;
 mod staging;
 /// TAR archive reader and writer utilities.
-pub mod tar;
+pub use smol_tar as tar;
 mod transport;
 /// Package universe representation and query helpers.
 pub mod universe;

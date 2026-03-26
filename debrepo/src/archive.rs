@@ -919,7 +919,7 @@ impl Archive {
                 }
                 let mut archives = vec![archive];
                 archives.extend(security);
-                Some((archives, vec![]))
+                Some((archives, vec!["debian-keyring".to_string()]))
             }
             "ubuntu" => {
                 const DEFAULT_SUITE: &str = "noble";
@@ -943,7 +943,7 @@ impl Archive {
                         .map(|f| format!("{}{}", s, f))
                         .collect();
                 }
-                Some((vec![archive], vec![]))
+                Some((vec![archive], vec!["ubuntu-keyring".to_string()]))
             }
             "devuan" => {
                 const DEFAULT_SUITE: &str = "daedalus";
