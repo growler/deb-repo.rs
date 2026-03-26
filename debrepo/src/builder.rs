@@ -151,10 +151,13 @@ pub trait Executor {
         Ok(())
     }
     fn prepare_tree(&mut self, _fs: &Self::Filesystem) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+        std::future::ready(Ok(()))
     }
     fn process_changes(&mut self, _fs: &Self::Filesystem) -> impl Future<Output = io::Result<()>> {
-        async { Ok(()) }
+        std::future::ready(Ok(()))
+    }
+    fn cleanup(&mut self, _fs: &Self::Filesystem) -> impl Future<Output = ()> {
+        std::future::ready(())
     }
     fn execute(&mut self, job: BuildJob<Self>) -> impl Future<Output = io::Result<()>>
     where
@@ -196,11 +199,18 @@ pub trait Executor {
     {
         async move {
             self.prepare_tree(fs).await?;
-            self.execute(BuildJob::<Self>::new(
-                essentials, packages, scripts, build_env,
-            ))
-            .await?;
-            self.process_changes(fs).await
+            let execute_result = self
+                .execute(BuildJob::<Self>::new(
+                    essentials, packages, scripts, build_env,
+                ))
+                .await;
+            if execute_result.is_err() {
+                self.cleanup(fs).await;
+                return execute_result;
+            }
+            let process_result = self.process_changes(fs).await;
+            self.cleanup(fs).await;
+            process_result
         }
     }
 }
