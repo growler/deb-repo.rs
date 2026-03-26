@@ -23,7 +23,7 @@ struct EditOptions {
     spec: Option<String>,
 
     /// Editor command to use (defaults to $VISUAL or $EDITOR)
-    #[arg(long = "edit", value_name = "EDITOR", global = true)]
+    #[arg(short = 'e', long = "editor", value_name = "EDITOR", global = true)]
     edit: Option<String>,
 
     /// Do not verify InRelease signatures by default (not recommended)
@@ -127,12 +127,12 @@ impl EditorCommand {
             .or_else(|| env::var("VISUAL").ok())
             .or_else(|| env::var("EDITOR").ok())
             .or_else(|| {
-                std::fs::metadata("/usr/bin/edit")
+                std::fs::metadata("/usr/bin/editor")
                     .map(|md| md.is_file())
                     .is_ok()
-                    .then(|| "/usr/bin/edit".to_string())
+                    .then(|| "/usr/bin/edittor".to_string())
             })
-            .ok_or_else(|| anyhow!("editor not configured and /usr/bin/edit is absent: set $VISUAL/$EDITOR or pass --edit"))?;
+            .ok_or_else(|| anyhow!("editor not configured and /usr/bin/editor is absent: set $VISUAL/$EDITOR or pass --edit"))?;
         let mut parts = editor.split_whitespace();
         let program = parts
             .next()
