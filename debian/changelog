@@ -1,3 +1,11 @@
+rdebootstrap (0.1.15) unstable; urgency=medium
+
+  * chore: better tree caching 
+  * fix: update manifest locks after edit
+  * feat: non-breaking API change, Executor::cleanup
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Thu, 26 Mar 2026 14:30:28 +0100
+
 rdebootstrap (0.1.14) unstable; urgency=medium
 
   * chore: move tar module to a separate crate smol-tar 
