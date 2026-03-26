@@ -9,16 +9,14 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
 
 env:
   CARGO_HOME: ${{ github.workspace }}/target/cargo-home
 
 jobs:
   build:
-
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -73,42 +71,179 @@ jobs:
       - name: Run tests
         run: cargo test
 
+  warm_trees:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/cargo-home/bin
+            target/cargo-home/registry/index
+            target/cargo-home/registry/cache
+            target/cargo-home/git/db
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            build-essential \
+            debhelper \
+            devscripts \
+            libbz2-dev \
+            libcurl4-openssl-dev \
+            libgpg-error-dev \
+            libgpgme-dev \
+            liblz4-dev \
+            liblzma-dev \
+            libssl-dev \
+            libunistring-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            podman
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build rdebootstrap binary
+        run: cargo build -p rdebootstrap
+
+      - name: Build and publish missing OS trees
+        env:
+          GHCR_REPO: ghcr.io/${{ github.repository_owner }}/rdebootstrap-trees
+        run: |
+          set -euo pipefail
+          for distro in debian ubuntu; do
+            spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
+            artifact="${GHCR_REPO}:${distro}-${spec_hash}"
+            if oras manifest fetch "$artifact" >/dev/null 2>&1; then
+              echo "Found ${artifact}, skipping build"
+              continue
+            fi
+
+            make "${distro}-tree" DOWNLOADS=1
+            tarball="target/${distro}-tree-${spec_hash}.tar.zst"
+            tar --zstd -cf "$tarball" -C "target/${distro}-tree" "${spec_hash}"
+            oras push "$artifact" \
+              --artifact-type application/vnd.rdebootstrap.tree.v1 \
+              "${tarball}:application/vnd.rdebootstrap.tree.layer.v1.tar+zstd"
+          done
+
+  package_release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache cargo registry
+        uses: actions/cache@v5
+        with:
+          path: |
+            target/cargo-home/bin
+            target/cargo-home/registry/index
+            target/cargo-home/registry/cache
+            target/cargo-home/git/db
+          key: cargo-${{ hashFiles('Cargo.lock') }}
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            build-essential \
+            debhelper \
+            devscripts \
+            libbz2-dev \
+            libcurl4-openssl-dev \
+            libgpg-error-dev \
+            libgpgme-dev \
+            liblz4-dev \
+            liblzma-dev \
+            libssl-dev \
+            libunistring-dev \
+            libzstd-dev \
+            zlib1g-dev \
+            podman
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build rdebootstrap binary
+        run: cargo build -p rdebootstrap
+
       - name: Package source files
-        if: startsWith(github.ref, 'refs/tags/v')
         run: |
           podman unshare dpkg-buildpackage -us -S -d -tc
           mv ../rdebootstrap_*.{dsc,tar.xz} target
 
-      - name: Cache debian build tree
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/debian-tree
-          key: debian-tree-${{ hashFiles('debian-build.amd64.lock') }}
+      - name: Restore or build OS trees
+        env:
+          GHCR_REPO: ghcr.io/${{ github.repository_owner }}/rdebootstrap-trees
+        run: |
+          set -euo pipefail
+          for distro in debian ubuntu; do
+            spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
+            artifact="${GHCR_REPO}:${distro}-${spec_hash}"
+            tarball="target/${distro}-tree-${spec_hash}.tar.zst"
+            rm -f "$tarball"
+            mkdir -p "target/${distro}-tree"
+
+            if oras pull --output target "$artifact"; then
+              tar --zstd -xf "$tarball" -C "target/${distro}-tree"
+              continue
+            fi
+
+            make "${distro}-tree" DOWNLOADS=1
+            tar --zstd -cf "$tarball" -C "target/${distro}-tree" "${spec_hash}"
+            oras push "$artifact" \
+              --artifact-type application/vnd.rdebootstrap.tree.v1 \
+              "${tarball}:application/vnd.rdebootstrap.tree.layer.v1.tar+zstd"
+          done
 
       - name: Build debian packages
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          ./target/debug/rdebootstrap -m debian-build.toml update -A
-          make debian-packages DOWNLOADS=1
-
-      - name: Cache ubuntu build tree
-        if: startsWith(github.ref, 'refs/tags/v')
-        uses: actions/cache@v5
-        with:
-          path: |
-            target/ubuntu-tree
-          key: ubuntu-build-${{ hashFiles('ubuntu-build.amd64.lock') }}
+        run: make debian-packages DOWNLOADS=1
 
       - name: Build ubuntu packages
-        if: startsWith(github.ref, 'refs/tags/v')
-        run: |
-          ./target/debug/rdebootstrap -m ubuntu-build.toml update -A
-          make ubuntu-packages DOWNLOADS=1
+        run: make ubuntu-packages DOWNLOADS=1
 
       - name: Create GitHub Release
-        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: |
