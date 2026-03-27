@@ -117,11 +117,10 @@ impl PercentProgress {
     }
 
     fn percent(&self, current: u64) -> u8 {
-        if self.inner.total == 0 {
-            100
-        } else {
-            ((current.saturating_mul(100)) / self.inner.total).min(100) as u8
-        }
+        current.saturating_mul(100)
+             .checked_div(self.inner.total)
+             .unwrap_or(100)
+             .min(100) as u8
     }
 
     fn print_thresholds(&self, percent: u8) {

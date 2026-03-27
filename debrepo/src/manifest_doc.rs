@@ -755,7 +755,7 @@ impl ManifestFile {
         it: I,
     ) -> bool {
         let mut updated = false;
-        for ((id, item), file) in self.local_pkgs.iter_mut().enumerate().zip(it.into_iter()) {
+        for ((id, item), file) in self.local_pkgs.iter_mut().enumerate().zip(it) {
             if let Some(file) = file {
                 *item = file;
                 self.doc.update_local_pkg(id, item, None);
