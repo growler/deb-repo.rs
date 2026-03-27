@@ -1898,6 +1898,94 @@ impl Manifest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::manifest_doc::BuildEnvComments;
+
+    fn new_manifest() -> ManifestFile {
+        ManifestFile::new(None)
+    }
+
+    fn render_manifest(manifest: &ManifestFile) -> (String, toml_edit::DocumentMut) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Manifest.toml");
+        smol::block_on(async {
+            manifest.store(&path).await.expect("store manifest");
+        });
+        let text = std::fs::read_to_string(&path).expect("read manifest");
+        let doc = text
+            .parse::<toml_edit::DocumentMut>()
+            .expect("parse manifest");
+        (text, doc)
+    }
+
+    fn add_requirements<S, I>(
+        manifest: &mut ManifestFile,
+        spec_name: Option<&str>,
+        reqs: I,
+        comment: Option<&str>,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        S: crate::version::IntoDependency<String>,
+    {
+        let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+        let reqs = reqs
+            .into_iter()
+            .map(|req| req.into_dependency())
+            .collect::<Result<Vec<_>, _>>()?;
+        manifest.add_requirements(spec_idx, reqs, comment)?;
+        Ok(())
+    }
+
+    fn set_build_env_with_comments(
+        manifest: &mut ManifestFile,
+        spec_name: Option<&str>,
+        env: KVList<String>,
+        comments: BuildEnvComments,
+    ) -> io::Result<()> {
+        let spec_idx = ensure_spec_idx(manifest, spec_name)?;
+        manifest.set_build_env_with_comments(spec_idx, env, &comments)
+    }
+
+    fn ensure_spec_idx(manifest: &mut ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+        let spec_name = spec_name
+            .map_or_else(|| Ok(""), crate::manifest_doc::valid_spec_name)
+            .map_err(io::Error::other)?;
+        if let Some(spec_idx) = manifest.spec_index(spec_name) {
+            return Ok(spec_idx);
+        }
+        Ok(manifest.push_empty_spec(spec_name))
+    }
+
+    fn lookup_spec_idx(manifest: &ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+        let spec_name = spec_name
+            .map_or_else(|| Ok(""), crate::manifest_doc::valid_spec_name)
+            .map_err(io::Error::other)?;
+        manifest
+            .spec_index(spec_name)
+            .ok_or_else(|| io::Error::other("spec not found"))
+    }
+
+    fn make_env(items: &[(&str, &str)]) -> KVList<String> {
+        items
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    fn make_env_comments(prefix: &[(&str, &str)], inline: &[(&str, &str)]) -> BuildEnvComments {
+        let mut comments = BuildEnvComments::default();
+        for (key, value) in prefix {
+            comments
+                .prefix
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        for (key, value) in inline {
+            comments
+                .inline
+                .insert((*key).to_string(), (*value).to_string());
+        }
+        comments
+    }
 
     #[test]
     fn get_or_create_spec_idx_marks_manifest_and_lock_dirty_when_creating() {
@@ -1932,5 +2020,172 @@ mod tests {
         assert!(manifest.lock_updated, "new spec must mark lock updated");
         assert_eq!(manifest.file.spec_name(spec_index), "custom");
         assert_eq!(manifest.lock.specs_len(), 1);
+    }
+
+    #[test]
+    fn set_build_env_default_spec_sets_values_and_comments() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
+
+        let env = make_env(&[("FOO", "bar"), ("BAZ", "qux")]);
+        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
+        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
+
+        let (text, doc) = render_manifest(&manifest);
+        let build_env = doc["spec"]["build-env"]
+            .as_table()
+            .expect("build-env table");
+        assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
+        assert_eq!(build_env.get("BAZ").and_then(|v| v.as_str()), Some("qux"));
+        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
+        assert_eq!(
+            manifest.spec_env_block(spec_idx).expect("env block"),
+            "# prefix-foo\nFOO=bar # inline-foo\nBAZ=qux\n"
+        );
+        assert!(text.contains("prefix-foo"));
+        assert!(text.contains("inline-foo"));
+    }
+
+    #[test]
+    fn set_build_env_default_spec_updates_and_removes_comments() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
+
+        let env = make_env(&[("FOO", "bar")]);
+        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
+        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
+
+        let env = make_env(&[("FOO", "updated")]);
+        set_build_env_with_comments(&mut manifest, None, env, BuildEnvComments::default())
+            .expect("update build env");
+
+        let (text, doc) = render_manifest(&manifest);
+        let build_env = doc["spec"]["build-env"]
+            .as_table()
+            .expect("build-env table");
+        assert_eq!(
+            build_env.get("FOO").and_then(|v| v.as_str()),
+            Some("updated")
+        );
+        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
+        assert_eq!(
+            manifest.spec_env_block(spec_idx).expect("env block"),
+            "FOO=updated\n"
+        );
+        assert!(!text.contains("prefix-foo"));
+        assert!(!text.contains("inline-foo"));
+    }
+
+    #[test]
+    fn set_build_env_default_spec_removes_table_when_empty() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
+
+        let env = make_env(&[("FOO", "bar")]);
+        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
+        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
+
+        set_build_env_with_comments(
+            &mut manifest,
+            None,
+            KVList::new(),
+            BuildEnvComments::default(),
+        )
+        .expect("clear build env");
+
+        let (text, doc) = render_manifest(&manifest);
+        let spec = doc["spec"].as_table().expect("spec table");
+        assert!(spec.get("build-env").is_none());
+        assert!(!text.contains("prefix-foo"));
+    }
+
+    #[test]
+    fn set_build_env_named_spec_sets_values_and_comments() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
+
+        let env = make_env(&[("FOO", "bar")]);
+        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
+        set_build_env_with_comments(&mut manifest, Some("custom"), env, comments)
+            .expect("set build env");
+
+        let (text, doc) = render_manifest(&manifest);
+        let build_env = doc["spec"]["custom"]["build-env"]
+            .as_table()
+            .expect("build-env table");
+        assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
+        let spec_idx = lookup_spec_idx(&manifest, Some("custom")).expect("custom spec index");
+        assert_eq!(
+            manifest.spec_env_block(spec_idx).expect("env block"),
+            "# prefix-foo\nFOO=bar # inline-foo\n"
+        );
+        assert!(text.contains("prefix-foo"));
+    }
+
+    #[test]
+    fn manifest_file_spec_env_block_empty_when_absent() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
+
+        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
+        assert_eq!(manifest.spec_env_block(spec_idx).expect("env block"), "");
+    }
+
+    #[test]
+    fn manifest_file_set_spec_env_block_comment_only_missing_spec_is_noop() {
+        let mut manifest = new_manifest();
+
+        assert_eq!(
+            manifest
+                .set_spec_env_block("custom", "# comment only\n\n")
+                .expect("set env block"),
+            None
+        );
+        assert!(manifest.spec_index("custom").is_none());
+    }
+
+    #[test]
+    fn manifest_file_set_spec_env_block_roundtrips_comments_and_order() {
+        let mut manifest = new_manifest();
+        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
+
+        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
+        let block = "# lead\n\nFOO=bar  # inline\nBAZ=qux\n";
+        manifest
+            .set_spec_env_block("", block)
+            .expect("set env block")
+            .expect("updated spec");
+
+        assert_eq!(manifest.spec_env_block(spec_idx).expect("env block"), block);
+        let env = manifest.spec_build_env(spec_idx).expect("build env");
+        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(env.get("BAZ").map(String::as_str), Some("qux"));
+    }
+
+    #[test]
+    fn manifest_file_set_spec_env_block_rejects_duplicate_keys() {
+        let mut manifest = new_manifest();
+        let err = manifest
+            .set_spec_env_block("", "FOO=bar\nFOO=baz\n")
+            .expect_err("duplicate must fail");
+        assert_eq!(err.to_string(), "duplicate env key 'FOO'");
+    }
+
+    #[test]
+    fn manifest_file_set_spec_env_block_rejects_missing_equals() {
+        let mut manifest = new_manifest();
+        let err = manifest
+            .set_spec_env_block("", "FOO\n")
+            .expect_err("missing equals must fail");
+        assert_eq!(err.to_string(), "invalid env line 1: expected VAR=value");
+    }
+
+    #[test]
+    fn manifest_file_set_spec_env_block_rejects_empty_key() {
+        let mut manifest = new_manifest();
+        let err = manifest
+            .set_spec_env_block("", " =value\n")
+            .expect_err("empty key must fail");
+        assert_eq!(err.to_string(), "invalid env line 1: empty key");
     }
 }

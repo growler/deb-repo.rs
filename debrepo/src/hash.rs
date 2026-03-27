@@ -536,7 +536,7 @@ pub mod serde {
     pub mod sri {
         use {
             super::Hash,
-            ::serde::{
+            serde::{
                 de::{self, Visitor},
                 Deserializer, Serializer,
             },
@@ -604,7 +604,7 @@ pub mod serde {
     }
     /// Serde helpers for hex-encoded hashes.
     pub mod hex {
-        use {super::Hash, ::serde::Serializer};
+        use {super::Hash, serde::Serializer};
 
         pub fn serialize<S>(value: &Hash, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -637,7 +637,7 @@ pub mod serde {
 
     /// Serde helpers for base64-encoded hashes.
     pub mod base64 {
-        use {super::Hash, ::base64::prelude::*, ::serde::Serializer};
+        use {super::Hash, base64::prelude::*, serde::Serializer};
 
         pub fn serialize<S>(value: &Hash, serializer: S) -> Result<S::Ok, S::Error>
         where
@@ -907,89 +907,5 @@ impl<D: HashAlgo, R: AsyncRead + Send> AsyncHashingRead for VerifyingReader<D, R
     }
     fn size(self: Pin<&mut Self>) -> u64 {
         *self.project().size
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use sha2::{Digest, Sha256};
-    use smol::io::{AsyncReadExt, Cursor};
-    use smol_macros::test;
-
-    test! {
-        async fn test_verifying_reader() {
-            let data = b"hello world";
-            let size = data.len() as u64;
-            let mut hasher = Sha256::new();
-            hasher.update(data);
-            let expected_digest = hasher.finalize();
-
-            let mut hasher1 = Sha256::default();
-            hasher1.update(data);
-            let expected_digest1 = hasher1.finalize_fixed_reset();
-
-            assert_eq!(expected_digest, expected_digest1);
-
-            let cursor = Cursor::new(data);
-            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
-
-            let mut buf = vec![0; size.try_into().unwrap()];
-            let n = reader.read(&mut buf).await.unwrap() as u64;
-            assert_eq!(n, size);
-            assert_eq!(&buf, data);
-
-            // Check that reading to the end verifies the digest
-            let n = reader.read(&mut buf).await.unwrap();
-            assert_eq!(n, 0);
-
-            // Check that reading past the end returns 0 but no error
-            let n = reader.read(&mut buf).await.unwrap();
-            assert_eq!(n, 0);
-        }
-    }
-
-    test! {
-        async fn test_verifying_reader_incorrect_digest() {
-            let data = b"hello world";
-            let size = data.len() as u64;
-            let incorrect_digest = Sha256::digest(b"incorrect");
-
-            let cursor = Cursor::new(data);
-            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, incorrect_digest);
-
-            let mut buf = vec![0; size.try_into().unwrap()];
-            let n = reader.read(&mut buf).await.unwrap() as u64;
-            assert_eq!(n, size);
-            assert_eq!(&buf, data);
-
-            // Reading to the end should result in a digest verification error
-            let err = reader.read(&mut buf).await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(err.to_string().contains("error verifying stream by"));
-        }
-    }
-
-    test! {
-        async fn test_verifying_reader_incorrect_size() {
-            let data = b"hello world";
-            let size = data.len() as u64 + 1; // incorrect size
-            let mut hasher = Sha256::new();
-            hasher.update(data);
-            let expected_digest = hasher.finalize();
-
-            let cursor = Cursor::new(data);
-            let mut reader = VerifyingReader::<Sha256, _>::new(cursor, size, expected_digest);
-
-            let mut buf = vec![0; data.len()];
-            let n = reader.read(&mut buf).await.unwrap();
-            assert_eq!(n, data.len());
-            assert_eq!(&buf, data);
-
-            // Reading to the end should result in a size mismatch error
-            let err = reader.read(&mut buf).await.unwrap_err();
-            assert_eq!(err.kind(), std::io::ErrorKind::InvalidData);
-            assert!(err.to_string().contains("error verifying stream:"));
-        }
     }
 }

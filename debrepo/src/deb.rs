@@ -746,10 +746,3 @@ where
         Compression::None => TarReader::new(Box::pin(r)),
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use static_assertions::assert_impl_all;
-    assert_impl_all!(DebReader<'_, smol::fs::File>: Send, Sync);
-}

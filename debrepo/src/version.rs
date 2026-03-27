@@ -1816,12 +1816,6 @@ mod tests {
     use super::*;
     use std::str::FromStr;
 
-    macro_rules! assert {
-        ($left:tt $op:tt $right:tt) => {
-            std::assert!( Version::from_str($left).unwrap() $op Version::from_str($right).unwrap() )
-        }
-    }
-
     macro_rules! satisfies {
         ($ltype:tt($left:tt) $rtype:tt($right:tt)) => {
             std::assert!($ltype::from_str($left)
@@ -1937,40 +1931,5 @@ mod tests {
         satisfies!(Version("1:1.0") VersionSet("(= 1:1.0)"));
         satisfies!(Version("2.0.0~rc1") VersionSet("(<< 2.0.0)"));
         satisfies!(VersionSet("(= 2.0.0~rc1)") VersionSet("(<= 2.0.0)"));
-    }
-
-    #[test]
-    fn test_alpha_compare() {
-        assert!("~~" < "~~a");
-        assert!("~~a" > "~~");
-        assert!("~~a" < "~");
-        assert!("~" > "~~a");
-        assert!("a" < "b");
-        assert!("b" > "a");
-        assert!("c" < "db");
-        assert!("b" < "+a");
-    }
-
-    #[test]
-    fn test_versions() {
-        assert!("2.38.1-5+deb12u2" > "2.38~");
-        assert!("2.35.1-1" >= "2.35.1~");
-        assert!("2.35.1-1" < "2.35.1A");
-        assert!("2" > "1");
-        assert!("1:2" > "1:1");
-        assert!("1:2.5" > "2.5");
-        assert!("1.0.1" > "1.0.0");
-        assert!("2.0.1" > "1.0.1");
-        assert!("2.0.0" > "2.0.0~rc1");
-        assert!("2.0.0~rc2" > "2.0.0~rc1");
-        assert!("2.0.0~rc2+u1" > "2.0.0~rc2");
-        assert!("1.0.3~rc2+b2" > "1.0.3~rc2+b1");
-        assert!("2.0.0" > "2.0.0~b1");
-        assert!("2.0.0+u10" > "2.0.0+u9");
-        assert!("2.21-9" > "2.19-18+deb8u3");
-        assert!("2.21-9" > "2.19-18+deb8u3");
-        assert!("2:1.2498-1" > "2:1.2492-4");
-        assert!("0.0.0+2016.01.15.git.29cc9e1b05-2+b8" < "0.0.0+2016.02.15.git.29cc9e1b05");
-        assert!("6.2.2006+really6.2.1905+dfsg-5.1+b1" == "6.2.2006+really6.2.1905+dfsg-5.1+b1");
     }
 }

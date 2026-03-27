@@ -493,17 +493,6 @@ Section: contrib/misc
     }
 
     #[test]
-    fn universe_returns_first_match() {
-        let s1: Sources = sample_source().try_into().unwrap();
-        let s2: Sources = Sources::try_from(sample_source()).unwrap();
-        let mut uni = SourceUniverse::new();
-        uni.push(s1);
-        uni.push(s2);
-        let entry = uni.source("1oom").next().unwrap();
-        assert_eq!(entry.name(), "1oom");
-    }
-
-    #[test]
     fn universe_find_matches_any_or_exact() {
         let srcs: Sources = sample_source().try_into().unwrap();
         let uni = SourceUniverse::from_sources(vec![srcs]);

@@ -130,7 +130,7 @@ impl EditorCommand {
                 std::fs::metadata("/usr/bin/editor")
                     .map(|md| md.is_file())
                     .is_ok()
-                    .then(|| "/usr/bin/edittor".to_string())
+                    .then(|| "/usr/bin/editor".to_string())
             })
             .ok_or_else(|| anyhow!("editor not configured and /usr/bin/editor is absent: set $VISUAL/$EDITOR or pass --edit"))?;
         let mut parts = editor.split_whitespace();

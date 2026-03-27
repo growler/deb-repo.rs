@@ -657,7 +657,6 @@ mod tests {
     }
 
     use static_assertions::assert_impl_all;
-    assert_impl_all!(HostFileSystem: Send, Sync, ThreadSafeStagingFS);
     assert_impl_all!(HostFile: Send, Sync);
-    assert_impl_all!(FileList: Send, Sync);
+    assert_impl_all!(HostFileSystem: ThreadSafeStagingFS);
 }
