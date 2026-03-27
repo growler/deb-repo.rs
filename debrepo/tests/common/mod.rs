@@ -128,6 +128,7 @@ pub struct TestProvider {
     transport: TestTransport,
     package_source: Option<String>,
     release_fetches: Option<Arc<AtomicUsize>>,
+    release_urls: Option<Arc<Mutex<Vec<String>>>>,
 }
 
 impl TestProvider {
@@ -136,6 +137,7 @@ impl TestProvider {
             transport: TestTransport,
             package_source: None,
             release_fetches: None,
+            release_urls: None,
         }
     }
 
@@ -144,6 +146,7 @@ impl TestProvider {
             transport: TestTransport,
             package_source: Some(source.to_string()),
             release_fetches: None,
+            release_urls: None,
         }
     }
 
@@ -152,6 +155,16 @@ impl TestProvider {
             transport: TestTransport,
             package_source: None,
             release_fetches: Some(release_fetches),
+            release_urls: None,
+        }
+    }
+
+    pub fn with_release_urls(release_urls: Arc<Mutex<Vec<String>>>) -> Self {
+        Self {
+            transport: TestTransport,
+            package_source: None,
+            release_fetches: None,
+            release_urls: Some(release_urls),
         }
     }
 }
@@ -246,9 +259,14 @@ impl ContentProvider for TestProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    async fn fetch_release_file(&self, _url: &str) -> io::Result<IndexFile> {
+    async fn fetch_release_file(&self, url: &str) -> io::Result<IndexFile> {
         if let Some(counter) = &self.release_fetches {
             counter.fetch_add(1, Ordering::Relaxed);
+        }
+        if let Some(urls) = &self.release_urls {
+            urls.lock()
+                .unwrap_or_else(|err| err.into_inner())
+                .push(url.to_string());
         }
         Ok(IndexFile::from_string(
             EMPTY_RELEASE_WITH_PACKAGES.to_string(),

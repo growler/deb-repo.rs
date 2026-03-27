@@ -1,0 +1,7 @@
+Package: fixture-minimal
+Version: 1.0
+Section: misc
+Priority: optional
+Architecture: amd64
+Maintainer: Test Fixture <fixture@example.invalid>
+Description: Minimal deb fixture package

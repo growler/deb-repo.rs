@@ -1,0 +1,9 @@
+Source: rich-fixture
+Section: misc
+Priority: optional
+Maintainer: Test Fixture <fixture@example.invalid>
+Standards-Version: 4.7.0
+
+Package: rich-fixture
+Architecture: amd64
+Description: Rich deb fixture package

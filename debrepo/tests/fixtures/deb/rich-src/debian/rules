@@ -1,0 +1,19 @@
+#!/usr/bin/env -S make -f
+
+build:
+	:
+
+clean:
+	rm -rf debian/rich-fixture debian/files debian/*.debhelper debian/.debhelper ../rich-fixture_1.0_amd64.deb ../rich-fixture_1.0_amd64.buildinfo ../rich-fixture_1.0_amd64.changes
+
+binary binary-arch:
+	mkdir -p debian/rich-fixture/DEBIAN debian/rich-fixture/etc debian/rich-fixture/usr/bin
+	install -m 0644 files/control debian/rich-fixture/DEBIAN/control
+	install -m 0644 files/conffiles debian/rich-fixture/DEBIAN/conffiles
+	install -m 0755 files/postinst debian/rich-fixture/DEBIAN/postinst
+	install -m 0644 files/fixture-rich.conf debian/rich-fixture/etc/fixture-rich.conf
+	install -m 0755 files/fixture-rich debian/rich-fixture/usr/bin/fixture-rich
+	ln -sf ./usr/bin/fixture-rich debian/rich-fixture/usr/bin/fixture-rich-link
+	ln debian/rich-fixture/usr/bin/fixture-rich debian/rich-fixture/usr/bin/fixture-rich-hard
+	dpkg-deb --no-check --root-owner-group -Zxz --build debian/rich-fixture ..
+	echo rich-fixture_1.0_amd64.deb misc optional > debian/files

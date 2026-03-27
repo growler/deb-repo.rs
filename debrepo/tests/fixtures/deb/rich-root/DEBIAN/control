@@ -1,0 +1,8 @@
+Package: fixture-rich
+Version: 1.0
+Section: misc
+Priority: optional
+Architecture: amd64
+Multi-Arch: same
+Maintainer: Test Fixture <fixture@example.invalid>
+Description: Rich deb fixture package

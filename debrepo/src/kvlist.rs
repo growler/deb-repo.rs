@@ -228,3 +228,54 @@ impl<'de, T: Deserialize<'de>> Deserialize<'de> for KVList<T> {
         deserializer.deserialize_map(Visitor::<T>(std::marker::PhantomData))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{KVList, KVListSet};
+
+    #[test]
+    fn kvlist_set_updates_and_appends_for_str_keys() {
+        let mut list = KVList::from(vec![("FOO".to_string(), "one".to_string())]);
+
+        <KVList<String> as KVListSet<&str, String>>::set(&mut list, "FOO", "two".to_string());
+        <KVList<String> as KVListSet<&str, String>>::set(&mut list, "BAR", "three".to_string());
+
+        assert_eq!(
+            list.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("FOO".to_string(), "two".to_string()),
+                ("BAR".to_string(), "three".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn kvlist_set_and_push_cover_string_key_impl() {
+        let mut list = KVList::from(vec![("FOO".to_string(), "one".to_string())]);
+
+        <KVList<String> as KVListSet<String, String>>::set(
+            &mut list,
+            "FOO".to_string(),
+            "two".to_string(),
+        );
+        <KVList<String> as KVListSet<String, String>>::set(
+            &mut list,
+            "BAR".to_string(),
+            "three".to_string(),
+        );
+        <KVList<String> as KVListSet<String, String>>::push(
+            &mut list,
+            "BAZ".to_string(),
+            "four".to_string(),
+        );
+
+        assert_eq!(
+            list.into_iter().collect::<Vec<_>>(),
+            vec![
+                ("FOO".to_string(), "two".to_string()),
+                ("BAR".to_string(), "three".to_string()),
+                ("BAZ".to_string(), "four".to_string()),
+            ]
+        );
+    }
+}
