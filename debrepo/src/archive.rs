@@ -305,6 +305,10 @@ impl clap::builder::TypedValueParser for SnapshotIdArgParser {
         })?;
         if value.eq_ignore_ascii_case("now") {
             Ok(SnapshotId(Utc::now()))
+        } else if value.eq_ignore_ascii_case("today") {
+            let now = Utc::now();
+            let today = now.date_naive().and_hms_opt(0, 0, 0).unwrap();
+            Ok(SnapshotId(DateTime::<Utc>::from_naive_utc_and_offset(today, Utc)))
         } else {
             value.try_into().map_err(|e: String| {
                 let mut err =
