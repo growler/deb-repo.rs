@@ -333,6 +333,10 @@ macro_rules! delegate_block {
                 type D = ::md5::Md5;
                 $block
             }
+            val if val == InnerHash::<sha1::Sha1>::$test() => {
+                type D = ::sha1::Sha1;
+                $block
+            }
             val if val == InnerHash::<sha2::Sha256>::$test() => {
                 type D = ::sha2::Sha256;
                 $block
