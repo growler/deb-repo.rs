@@ -14,6 +14,7 @@ use {
         future::Future,
         io,
         num::NonZero,
+        os::unix::fs::PermissionsExt,
         path::{Path, PathBuf},
         pin::Pin,
         sync::{
@@ -26,6 +27,7 @@ use {
 pub const ARCH: &str = "amd64";
 
 static CWD_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 pub fn one() -> NonZero<usize> {
     NonZero::new(1).expect("nonzero")
@@ -73,6 +75,69 @@ impl Drop for CurrentDirGuard<'_> {
     fn drop(&mut self) {
         std::env::set_current_dir(&self.previous).expect("restore current dir");
     }
+}
+
+pub struct EnvGuard<'a> {
+    saved: Vec<(std::ffi::OsString, Option<std::ffi::OsString>)>,
+    _lock: MutexGuard<'a, ()>,
+}
+
+impl<'a> EnvGuard<'a> {
+    pub fn new() -> Self {
+        Self {
+            saved: Vec::new(),
+            _lock: ENV_LOCK.lock().unwrap_or_else(|err| err.into_inner()),
+        }
+    }
+
+    pub fn set<K, V>(&mut self, key: K, value: V)
+    where
+        K: AsRef<std::ffi::OsStr>,
+        V: AsRef<std::ffi::OsStr>,
+    {
+        let key = key.as_ref().to_os_string();
+        if !self.saved.iter().any(|(saved, _)| saved == &key) {
+            self.saved.push((key.clone(), std::env::var_os(&key)));
+        }
+        unsafe {
+            std::env::set_var(&key, value.as_ref());
+        }
+    }
+
+    pub fn remove<K>(&mut self, key: K)
+    where
+        K: AsRef<std::ffi::OsStr>,
+    {
+        let key = key.as_ref().to_os_string();
+        if !self.saved.iter().any(|(saved, _)| saved == &key) {
+            self.saved.push((key.clone(), std::env::var_os(&key)));
+        }
+        unsafe {
+            std::env::remove_var(&key);
+        }
+    }
+}
+
+impl Drop for EnvGuard<'_> {
+    fn drop(&mut self) {
+        for (key, value) in self.saved.drain(..).rev() {
+            match value {
+                Some(value) => unsafe {
+                    std::env::set_var(&key, value);
+                },
+                None => unsafe {
+                    std::env::remove_var(&key);
+                },
+            }
+        }
+    }
+}
+
+pub fn write_executable(path: &Path, body: &str) {
+    std::fs::write(path, body).expect("write executable");
+    let mut perms = std::fs::metadata(path).expect("metadata").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(path, perms).expect("set permissions");
 }
 
 #[derive(Default)]
