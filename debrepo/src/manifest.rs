@@ -1793,7 +1793,7 @@ impl Manifest {
         name: Option<&str>,
         pb: Option<P>,
     ) -> io::Result<(
-        UniverseFiles<'a>,            // archives
+        Option<UniverseFiles<'a>>,    // archives
         Vec<ResolvedArtifact<'a>>,    // artifacts
         Vec<ResolvedInstallable<'a>>, // installables
         Vec<String>,                  // essentials
@@ -1807,7 +1807,11 @@ impl Manifest {
     {
         let spec_index = self.get_spec_idx(name)?;
         let spec_name = self.file.spec_name(spec_index);
-        let archives = self.archives(0);
+        let archives = self
+            .meta_for_spec(spec_index)?
+            .iter()
+            .any(|(name, value)| *name == "apt-lists" && *value == "stage")
+            .then(|| self.archives(0));
         let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
         let artifacts = self.staging_artifacts(spec_name, spec_index)?;
         let scripts = self
@@ -1860,8 +1864,10 @@ impl Manifest {
         if let Some(pb) = pb {
             pb.finish();
         }
-        let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
-        fs.stage(universe_stage).await?;
+        if let Some(archives) = archives {
+            let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
+            fs.stage(universe_stage).await?;
+        }
         Ok((essentials, other, scripts, build_env))
     }
     pub async fn stage<FS, P, C>(
@@ -1889,8 +1895,10 @@ impl Manifest {
         if let Some(pb) = pb {
             pb.finish();
         }
-        let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
-        fs.stage(universe_stage).await?;
+        if let Some(archives) = archives {
+            let universe_stage = cache.fetch_universe_stage(archives, concurrency).await?;
+            fs.stage(universe_stage).await?;
+        }
         Ok((essentials, other, scripts, build_env))
     }
 }

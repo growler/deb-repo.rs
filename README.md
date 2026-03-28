@@ -124,7 +124,9 @@ Key sections:
 - `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
 - `[spec]` and `[spec.<name>]` — Package requirements/constraints, staged
   artifacts, build-time environment/script, and metadata per spec. Specs can
-  inherit from each other via `extends`.
+  inherit from each other via `extends`. Set `meta = ["apt-lists:stage"]` on a
+  spec when you want staging/build output to also include `manifest.sources`
+  and downloaded APT list files.
 
 `rdebootstrap import` writes `[import]`, pins the imported manifest bytes in
 `hash`, and validates the selected named specs. Imported archives are prepended
@@ -156,6 +158,12 @@ lock is missing or stale.
 Artifacts are declared at the top level as `[artifact."<name>"]` and referenced
 from specs via `stage = ["<name>", ...]`. Use `rdebootstrap artifact add` to
 define them and `rdebootstrap stage` to attach them to specs.
+
+APT source metadata is not staged by default. `rdebootstrap` is commonly used
+to produce OCI images and other read-only filesystem trees where `apt-get
+update` is not expected to work, so staged roots omit `manifest.sources` and
+`/var/lib/apt/lists` unless the spec opts in with `meta = ["apt-lists:stage"]`
+or `rdebootstrap spec meta set apt-lists stage`.
 
 - Artifact `type` is one of: `file`, `tar`, `dir`, `text`.
 - Hashes are serialized in SRI form: `<algo>-<base64>` (for example

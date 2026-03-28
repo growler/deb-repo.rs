@@ -1,0 +1,98 @@
+# .github/workflows/test.yml
+name: Test
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+  schedule:
+    # Run nightly tests daily at midnight UTC
+    - cron: '0 0 * * *'
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: Test (Rust ${{ matrix.rust }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        rust: [1.89.0, stable, beta, nightly]
+        include:
+          - rust: nightly
+            coverage: true
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust }}
+          components: llvm-tools-preview  # Required for llvm-cov
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --all-features
+        env:
+          RUST_BACKTRACE: 1 
+
+      # Coverage - only on nightly using llvm-cov
+      - name: Install cargo-llvm-cov
+        if: matrix.coverage
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Generate coverage report
+        if: matrix.coverage
+        run: cargo llvm-cov --all-features --summary-only --output-path coverage.txt -p debrepo
+        env:
+          RUST_BACKTRACE: 1 
+
+      - name: Report coverage to summary 
+        id: coverage
+        run: |
+          if [ -f coverage.txt ]; then
+            cat coverage.txt | sed -E 's/[[:space:]]{2,}/  /g' | awk '
+              BEGIN { FS = "  "; OFS = " | "; }
+              /^-+$/ { next }
+              {
+                  gsub(/^ +| +$/, "");
+                  line = "| ";
+                  for (i = 1; i <= NF; i++) {
+                      gsub(/^ +| +$/, "", $i);
+                      line = line $i (i == NF ? " |" : " | ");
+                  }
+                  print line;
+              }
+              NR == 1 {
+                  sep = "|";
+                  for (i = 1; i <= NF; i++) sep = sep " --- |";
+                  print sep;
+              }
+            ' >> $GITHUB_STEP_SUMMARY 
+            TOTAL_COV=$(cat coverage.txt | grep "TOTAL" | awk '{print $10}')
+            echo "percentage=$TOTAL_COV" >> $GITHUB_OUTPUT
+            echo "raw=${TOTAL_COV%%%}"
+          else
+            echo "no coverage produced, fail"
+            exit 1
+          fi
+
+      - name: Create coverage badge gist
+        uses: schneegans/dynamic-badges-action@v1.7.0
+        with:
+          auth: ${{ secrets.GIST_TOKEN }}
+          gistID: ${{ vars.COVERAGE_GIST_ID }}
+          filename: coverage.json
+          label: coverage
+          message: ${{ steps.coverage.outputs.percentage }}
+          color: ${{ fromJSON(steps.coverage.outputs.raw) > 80 && 'brightgreen' || fromJSON(steps.coverage.outputs.raw) > 60 && 'yellow' || 'orange' }}
+          namedLogo: rust
+          logoColor: white
+

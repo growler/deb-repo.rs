@@ -548,7 +548,7 @@ fn fetch_index_and_release_files_cover_cache_and_plain_text() {
 }
 
 #[test]
-fn manifest_archive_flow_covers_update_universe_sources_and_stage() {
+fn manifest_archive_flow_stages_apt_lists_when_opted_in() {
     let fixture = fixture_path("rich-xz.deb");
     let cache = host_cache(None);
     let (repo_file, ctrl) =
@@ -579,6 +579,10 @@ fn manifest_archive_flow_covers_update_universe_sources_and_stage() {
     manifest
         .add_requirements(None, [package_name.as_str()], None)
         .expect("add requirements");
+
+    manifest
+        .set_spec_meta(None, "apt-lists", "stage")
+        .expect("set apt-lists meta");
 
     let stage_root = tempfile::tempdir().expect("stage root");
     smol::block_on(async {
@@ -628,6 +632,84 @@ fn manifest_archive_flow_covers_update_universe_sources_and_stage() {
         .expect("read apt lists")
         .next()
         .is_some());
+}
+
+#[test]
+fn manifest_archive_flow_skips_staging_apt_lists_without_opt_in() {
+    let fixture = fixture_path("rich-xz.deb");
+    let cache = host_cache(None);
+    let (repo_file, ctrl) =
+        smol::block_on(cache.ensure_deb("pool/main/f/fixture-rich.deb", &fixture))
+            .expect("ensure fixture deb");
+    let package_name = ctrl.field("Package").expect("package").to_string();
+    let version = ctrl.field("Version").expect("version").to_string();
+    let pkg_index = package_source_from(
+        repo_file.path(),
+        repo_file.size(),
+        repo_file.hash(),
+        &package_name,
+        &version,
+    );
+    let src_index = source_text(
+        "fixture-src",
+        &package_name,
+        &version,
+        "pool/main/f/fixture-src",
+        "fixture-src.dsc",
+    );
+    let (_repo, archive, _) =
+        smol::block_on(build_archive_repo(&pkg_index, &src_index)).expect("build archive repo");
+
+    let dir = tempfile::tempdir().expect("manifest dir");
+    let manifest_path = dir.path().join("Manifest.toml");
+    let mut manifest = Manifest::from_archives(&manifest_path, ARCH, [archive], None);
+    manifest
+        .add_requirements(None, [package_name.as_str()], None)
+        .expect("add requirements");
+
+    let stage_root = tempfile::tempdir().expect("stage root");
+    smol::block_on(async {
+        manifest
+            .update(false, false, true, one(), &cache)
+            .await
+            .expect("update manifest");
+
+        let fs = HostFileSystem::new(stage_root.path(), false)
+            .await
+            .expect("host fs");
+        manifest
+            .stage(
+                None,
+                &fs,
+                one(),
+                &cache,
+                Option::<fn(u64) -> debrepo::cli::StageProgress>::None,
+            )
+            .await
+            .expect("stage manifest");
+    });
+
+    let packages = manifest
+        .packages()
+        .expect("packages iterator")
+        .map(|pkg| pkg.name().to_string())
+        .collect::<Vec<_>>();
+    assert!(packages.contains(&package_name));
+    assert!(stage_root.path().join("usr/bin/fixture-rich").exists());
+    assert!(!stage_root
+        .path()
+        .join("etc/apt/sources.list.d/manifest.sources")
+        .exists());
+
+    let apt_lists = stage_root.path().join("var/lib/apt/lists");
+    assert!(
+        !apt_lists.exists()
+            || apt_lists
+                .read_dir()
+                .expect("read apt lists")
+                .next()
+                .is_none()
+    );
 }
 
 #[test]

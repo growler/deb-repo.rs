@@ -800,3 +800,72 @@ impl SubIdEntry {
             }))
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::SubIdEntry;
+    use std::{io, path::Path};
+
+    fn read_subid_entries(path: &Path) -> io::Result<Vec<(String, u32, u32)>> {
+        SubIdEntry::read_entries(path)?
+            .map(|entry| entry.map(|entry| (entry.name, entry.start, entry.count)))
+            .collect()
+    }
+
+    fn write_subid_file(contents: &str) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::write(dir.path().join("subid"), contents).expect("write subid file");
+        dir
+    }
+
+    #[test]
+    fn read_entries_parses_valid_subid_lines() {
+        let dir = write_subid_file(
+            "alice:100000:65536\n\
+             bob:165536:65536\n",
+        );
+
+        let entries = read_subid_entries(&dir.path().join("subid")).expect("parse entries");
+
+        assert_eq!(
+            entries,
+            vec![
+                ("alice".to_string(), 100000, 65536),
+                ("bob".to_string(), 165536, 65536),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_entries_ignores_comments_blank_lines_and_malformed_records() {
+        let dir = write_subid_file(
+            "\n\
+             # comment\n\
+             alice:100000:65536\n\
+             missing-count:100000\n\
+             bad-start:not-a-number:65536\n\
+             bad-count:100000:not-a-number\n\
+             carol:200000:65536\n",
+        );
+
+        let entries = read_subid_entries(&dir.path().join("subid")).expect("parse entries");
+
+        assert_eq!(
+            entries,
+            vec![
+                ("alice".to_string(), 100000, 65536),
+                ("carol".to_string(), 200000, 65536),
+            ]
+        );
+    }
+
+    #[test]
+    fn read_entries_returns_not_found_for_missing_file() {
+        let err = match SubIdEntry::read_entries("/definitely/missing/subid") {
+            Ok(_) => panic!("expected missing file error"),
+            Err(err) => err,
+        };
+
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
+    }
+}
