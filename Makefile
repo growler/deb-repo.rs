@@ -92,7 +92,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 				. /etc/os-release; \
 				case "$$$$ID" in \
 					debian)  dch_suffix="~bpo$$$${VERSION_ID}+1" ;; \
-					ubuntu)  dch_suffix="~ubuntu$$$${VERSION_ID}.1" ;; \
+					ubuntu)  dch_suffix="-ubuntu$$$${VERSION_ID}.1" ;; \
 					*)       dch_suffix="" ;; \
 				esac; \
 			else \
@@ -103,7 +103,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 				update) \
 					dch -b -m -v "$$$$DCH_NEW_VERSION" -D UNRELEASED "" ;; \
 				new) \
-					dch -m -v "$$$$DCH_NEW_VERSION" -D "$$$$DCH_DIST" "$$$$DCH_MESSAGE" ;; \
+					dch -b -m -v "$$$$DCH_NEW_VERSION" -D "$$$$DCH_DIST" "$$$$DCH_MESSAGE" ;; \
 				*) \
 					echo "Unknown DCH_MODE=$$$$DCH_MODE" >&2; \
 					exit 1 ;; \

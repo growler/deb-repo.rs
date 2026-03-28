@@ -1,4 +1,4 @@
-rdebootstrap (0.1.16) UNRELEASED; urgency=medium
+rdebootstrap (0.1.16) unstable; urgency=medium
 
   * change: do not stage apt-lists by default to avoid updates when mirror 
     indexes drift.
