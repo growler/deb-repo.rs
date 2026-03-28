@@ -60,7 +60,7 @@ jobs:
             zlib1g-dev \
 
       - name: Run tests
-        run: cargo test --all-features
+        run: cargo test -p debrepo -- --nocapture
         env:
           RUST_BACKTRACE: 1 
 
@@ -71,7 +71,7 @@ jobs:
 
       - name: Generate coverage report
         if: matrix.coverage
-        run: cargo llvm-cov --all-features --summary-only --output-path coverage.txt -p debrepo
+        run: cargo llvm-cov --summary-only --output-path coverage.txt -p debrepo
         env:
           RUST_BACKTRACE: 1 
 

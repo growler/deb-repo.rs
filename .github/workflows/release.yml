@@ -6,7 +6,7 @@ on:
       - "v*"
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 env:
@@ -103,7 +103,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build rdebootstrap binary
-        run: cargo build --release -p rdebootstrap --locked
+        run: cargo build -p rdebootstrap --locked
 
       - name: Package source files
         run: |
