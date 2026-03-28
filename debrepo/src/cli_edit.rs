@@ -83,13 +83,13 @@ struct EditArtifact {
 
 impl<C: Config> Command<C> for Edit {
     fn exec(&self, conf: &C) -> Result<()> {
-        let editor = EditorCommand::resolve(self.opts.edit.as_deref())?;
         let cmd = self.cmd.as_ref();
         let spec = self.opts.spec.as_deref();
         smol::block_on(async move {
             if cmd.is_none() {
                 // edit manifest is the only command that can work with
                 // stale/unlocked manifest
+                let editor = EditorCommand::resolve(self.opts.edit.as_deref())?;
                 return edit_manifest(conf, self.opts.insecure_release, &editor).await;
             }
             let cmd = cmd.unwrap();
@@ -98,6 +98,7 @@ impl<C: Config> Command<C> for Edit {
             if !has_valid_lock {
                 return Err(anyhow!("manifest lock is not live; run update first"));
             }
+            let editor = EditorCommand::resolve(self.opts.edit.as_deref())?;
             match cmd {
                 EditCommands::Env(_) => edit_env(&mut manifest, &editor, spec).await?,
                 EditCommands::Script(_) => edit_script(&mut manifest, &editor, spec).await?,

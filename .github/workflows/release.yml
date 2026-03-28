@@ -1,0 +1,194 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+  packages: write
+
+env:
+  CARGO_HOME: ${{ github.workspace }}/target/cargo-home
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.89.0
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config \
+            build-essential \
+            debhelper \
+            devscripts \
+            libbz2-dev \
+            libcurl4-openssl-dev \
+            libgpg-error-dev \
+            libgpgme-dev \
+            liblz4-dev \
+            liblzma-dev \
+            libssl-dev \
+            libunistring-dev \
+            libzstd-dev \
+            podman \
+            zlib1g-dev
+
+      - name: Verify release versions
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag_version="${GITHUB_REF_NAME#v}"
+
+          package_version() {
+            local manifest="$1"
+            awk -F'"' '
+              $0 == "[package]" { in_package = 1; next }
+              /^\[/ && $0 != "[package]" {
+                if (in_package) {
+                  exit
+                }
+              }
+              in_package && $1 ~ /^version = / {
+                print $2
+                exit
+              }
+            ' "${manifest}"
+          }
+
+          debrepo_version="$(package_version debrepo/Cargo.toml)"
+          rdebootstrap_version="$(package_version rdebootstrap/Cargo.toml)"
+          changelog_version="$(dpkg-parsechangelog -SVersion)"
+
+          for value_name in debrepo_version rdebootstrap_version changelog_version; do
+            if [ -z "${!value_name}" ]; then
+              echo "Failed to determine ${value_name}" >&2
+              exit 1
+            fi
+          done
+
+          if [ "${debrepo_version}" != "${tag_version}" ] || \
+             [ "${rdebootstrap_version}" != "${tag_version}" ] || \
+             [ "${changelog_version}" != "${tag_version}" ]; then
+            echo "Release version mismatch:" >&2
+            echo "  tag:          ${tag_version}" >&2
+            echo "  debrepo:      ${debrepo_version}" >&2
+            echo "  rdebootstrap: ${rdebootstrap_version}" >&2
+            echo "  changelog:    ${changelog_version}" >&2
+            exit 1
+          fi
+
+      - name: Run tests
+        run: cargo test --workspace --all-targets --all-features --locked
+        env:
+          RUST_BACKTRACE: 1
+
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build rdebootstrap binary
+        run: cargo build -p rdebootstrap --locked
+
+      - name: Package source files
+        run: |
+          podman unshare dpkg-buildpackage -us -S -d -tc
+          mv ../rdebootstrap_*.dsc ../rdebootstrap_*.tar.xz target/
+
+      - name: Restore or build OS trees
+        env:
+          GHCR_REPO: ghcr.io/${{ github.repository_owner }}/rdebootstrap-trees
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for distro in debian ubuntu; do
+            spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
+            artifact="${GHCR_REPO}:${distro}-${spec_hash}"
+            tarball="target/${distro}-tree-${spec_hash}.tar.zst"
+
+            rm -f "${tarball}"
+            rm -f "target/target/${distro}-tree-${spec_hash}.tar.zst"
+            mkdir -p "target/${distro}-tree"
+
+            if oras pull --output "${PWD}/target" "${artifact}"; then
+              if [ ! -f "${tarball}" ] && [ -f "target/target/${distro}-tree-${spec_hash}.tar.zst" ]; then
+                mv "target/target/${distro}-tree-${spec_hash}.tar.zst" "${tarball}"
+              fi
+              tar --zstd -xf "${tarball}" -C "target/${distro}-tree"
+              continue
+            fi
+
+            make "${distro}-tree" DOWNLOADS=1
+            tar --zstd -cf "${tarball}" -C "target/${distro}-tree" "${spec_hash}"
+            (
+              cd target
+              oras push "${artifact}" \
+                --artifact-type application/vnd.rdebootstrap.tree.v1 \
+                "${tarball##*/}:application/vnd.rdebootstrap.tree.layer.v1.tar+zstd"
+            )
+          done
+
+      - name: Build Debian packages
+        run: make debian-packages DOWNLOADS=1
+
+      - name: Build Ubuntu packages
+        run: make ubuntu-packages DOWNLOADS=1
+
+      - name: Upload package artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-packages-${{ github.ref_name }}
+          if-no-files-found: error
+          path: |
+            target/*.deb
+            target/*.buildinfo
+            target/*.changes
+            target/*.dsc
+            target/*.tar.xz
+
+      - name: Publish debrepo to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        run: cargo publish -p debrepo --locked --token "${CARGO_REGISTRY_TOKEN}"
+
+      - name: Publish rdebootstrap to crates.io
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          for attempt in $(seq 1 10); do
+            if cargo publish -p rdebootstrap --locked --token "${CARGO_REGISTRY_TOKEN}"; then
+              exit 0
+            fi
+
+            if [ "${attempt}" -eq 10 ]; then
+              echo "Failed to publish rdebootstrap after ${attempt} attempts" >&2
+              exit 1
+            fi
+
+            echo "rdebootstrap publish failed on attempt ${attempt}; waiting for debrepo to propagate"
+            sleep 30
+          done

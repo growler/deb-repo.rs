@@ -7,7 +7,7 @@ rdebootstrap (0.1.16) UNRELEASED; urgency=medium
     at "now" may later drift.
   * fix: add more comprehensive unit tests to improve coverage and robustness
 
- -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 28 Mar 2026 18:49:11 +0100
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 28 Mar 2026 19:52:10 +0000
 
 rdebootstrap (0.1.15) unstable; urgency=medium
 

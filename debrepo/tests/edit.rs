@@ -260,9 +260,17 @@ fn edit_subcommands_reject_unlocked_manifests() {
     let conf = TestConfig::new(manifest_path, TestProvider::new());
 
     for argv in [
-        vec!["edit", "env"],
-        vec!["edit", "script"],
-        vec!["edit", "artifact", "note.txt", "--target", "/etc/note.txt"],
+        vec!["edit", "--editor", " ", "env"],
+        vec!["edit", "--editor", " ", "script"],
+        vec![
+            "edit",
+            "--editor",
+            " ",
+            "artifact",
+            "note.txt",
+            "--target",
+            "/etc/note.txt",
+        ],
     ] {
         let err = cmd::Edit::try_parse_from(argv)
             .expect("parse edit command")

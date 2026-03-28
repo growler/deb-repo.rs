@@ -6,29 +6,31 @@ RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
 DOWNLOADS ?= 10
 MANPAGES_DIR := $(CURDIR)/target/man
 DISTROS := debian ubuntu
-debian_suffix := deb
-ubuntu_suffix := ubuntu
+
+define COMPUTE_BASE_VERSION
+command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed." >&2; exit 1; }; \
+full=$$(git describe --tags --match "v*" 2>/dev/null || true); \
+base=$$(printf '%s\n' "$$full" | sed -e 's%^v%%'); \
+debver=$$(dpkg-parsechangelog -SVersion); \
+if [ "$$base" = "$$debver" ]; then \
+	ver="$$debver"; \
+elif [ -z "$$full" ]; then \
+	ver="$$debver~pre-$$(date +%s)+$$(git rev-parse --short HEAD)"; \
+	[ -z "$$(git status --porcelain)" ] || ver="$$ver+untracked"; \
+else \
+	tag=$$(git describe --tags --match "v*" --abbrev=0); \
+	suffix=$${full#$$tag-}; \
+	ver="$$debver~pre-$$suffix"; \
+	[ -z "$$(git status --porcelain)" ] || ver="$$ver+$$(date +%s)+untracked"; \
+fi; \
+printf '%s\n' "$$ver"
+endef
+
+basever = $(strip $(shell $(COMPUTE_BASE_VERSION)))
 
 version:
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
-	$(eval ver=$(shell bash -euo pipefail -c ' \
-	full=$$(git describe --tags --match "v*" 2>/dev/null || true); \
-	base=$$(echo "$$full" | sed -e "s%^v%%"); \
-	debver=$$(dpkg-parsechangelog -SVersion); \
-	if [ "$$base" = "$$debver" ]; then \
-		ver="$$debver"; \
-	elif [ -z "$$full" ]; then \
-		ver="$$debver~pre-$$(date +%s)+$$(git rev-parse --short HEAD)"; \
-		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+untracked"; \
-	else \
-		tag=$$(git describe --tags --match "v*" --abbrev=0); \
-		suffix=$${full#$$tag-}; \
-		ver="$$debver~pre-$$suffix"; \
-		[[ -z "$$(git status --porcelain)" ]] || ver="$$ver+$$(date +%s)+untracked"; \
-	fi; \
-	echo $$ver \
-	'))
-	@echo "Debian version: ${ver}"
+	@echo "Base Debian version: ${basever}"
 
 manpages:
 	@echo "Generating binary manpages" ;\
@@ -65,7 +67,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	echo "Running the package builder"; \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
 	maint=$$$$(dpkg-parsechangelog -SMaintainer); \
-	version="$$(ver)+$($(1)_suffix)1"; \
+	base_version="$$(basever)"; \
 	if [ "$$$$dist" = "UNRELEASED" ]; then \
 		dch_mode=update; \
 	else \
@@ -81,11 +83,22 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 		--env CARGO_HOME=/root/build/cargo-home \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
-		--env DCH_NEW_VERSION="$$$$version" \
+		--env DCH_BASE_VERSION="$$$$base_version" \
 		--env DCH_MESSAGE="$$$$dch_message" \
 		--env DEBEMAIL="$$$$maint" \
 		--rootfs "$$$$TREE:O" \
 		/bin/sh -ec ' \
+			if [ -r /etc/os-release ]; then \
+				. /etc/os-release; \
+				case "$$$$ID" in \
+					debian)  dch_suffix="~bpo$$$${VERSION_ID}+1" ;; \
+					ubuntu)  dch_suffix="~ubuntu$$$${VERSION_ID}.1" ;; \
+					*)       dch_suffix="" ;; \
+				esac; \
+			else \
+				dch_suffix=""; \
+			fi; \
+			DCH_NEW_VERSION="$$$$DCH_BASE_VERSION$$$$dch_suffix"; \
 			case "$$$$DCH_MODE" in \
 				update) \
 					dch -b -m -v "$$$$DCH_NEW_VERSION" -D UNRELEASED "" ;; \
