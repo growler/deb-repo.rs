@@ -1,5 +1,5 @@
 # rdebootstrap
-[![Tests](https://github.com/growler/rdebootstrap.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/rdebootstrap/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/38f16304c1c99d385ef2d8086f16f5e0/raw/coverage.json) [![Docs](https://docs.rs/debrepo/badge.svg)](https://docs.rs/debrepo) [![Crates.io](https://img.shields.io/crates/v/debrepo.svg?maxAge=2592000)](https://crates.io/crates/debrepo)
+[![Tests](https://github.com/growler/rdebootstrap.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/rdebootstrap.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/38f16304c1c99d385ef2d8086f16f5e0/raw/coverage.json) [![Docs](https://docs.rs/debrepo/badge.svg)](https://docs.rs/debrepo) [![Crates.io](https://img.shields.io/crates/v/debrepo.svg?maxAge=2592000)](https://crates.io/crates/debrepo)
 
 `rdebootstrap` is a manifest-driven Debian/Ubuntu bootstrapper written in Rust.
 It resolves packages from user-defined APT archives, locks the full dependency
