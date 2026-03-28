@@ -150,17 +150,17 @@ jobs:
       - name: Build Ubuntu packages
         run: make ubuntu-packages DOWNLOADS=1
 
-      - name: Upload package artifacts
-        uses: actions/upload-artifact@v4
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
         with:
-          name: release-packages-${{ github.ref_name }}
-          if-no-files-found: error
-          path: |
+          files: |
             target/*.deb
-            target/*.buildinfo
-            target/*.changes
             target/*.dsc
             target/*.tar.xz
+            target/*.buildinfo
+            target/*.changes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Publish debrepo to crates.io
         env:
