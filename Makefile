@@ -2,10 +2,12 @@
 
 CARGO ?= cargo
 PODMAN ?= podman
-RDEBOOTSTRAP := $(CURDIR)/target/release/rdebootstrap
+RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
 DOWNLOADS ?= 10
 MANPAGES_DIR := $(CURDIR)/target/man
 DISTROS := debian ubuntu
+
+export CARGO_HOME := $(CURDIR)/target/cargo-home
 
 define COMPUTE_BASE_VERSION
 command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed." >&2; exit 1; }; \
@@ -34,11 +36,10 @@ version:
 
 manpages:
 	@echo "Generating binary manpages" ;\
-	$(CARGO) xtask build-man
+	$(CARGO) run -p xtask --bin build-man
 
 rdebootstrap:
-	@echo "Building rdebootstrap binary" ;\
-	$(CARGO) build -p rdebootstrap --release
+	@$(CARGO) build -p rdebootstrap --release
 
 $(RDEBOOTSTRAP):
 	@$(CARGO) build -p rdebootstrap
@@ -65,6 +66,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Running the package builder"; \
+	mkdir -p $$(CURDIR)/target/$(1); \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
 	maint=$$$$(dpkg-parsechangelog -SMaintainer); \
 	base_version="$$(basever)"; \
@@ -79,8 +81,10 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	$(PODMAN) run --rm --systemd=always \
 		--volume "$$(CURDIR)/target:/root/build" \
 		--volume "$$(CURDIR):/root/build/src" \
+		--volume "$$(CURDIR)/target/$(1):/root/build/src/target" \
+		--volume "$$(CURDIR)/target/cargo-home:/root/build/src/target/cargo-home" \
 		--workdir /root/build/src \
-		--env CARGO_HOME=/root/build/cargo-home \
+		--env CARGO_HOME=/root/build/src/target/cargo-home \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
 		--env DCH_BASE_VERSION="$$$$base_version" \

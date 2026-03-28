@@ -29,7 +29,6 @@ blake3 = { version = "1.8.1", features = ["traits-preview"] }
 blocking = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4.5.48", features = ["derive", "env"] }
-criterion = "0.5.1"
 digest = "0.10"
 futures-lite = "2.3.0"
 futures = { version = "0.3", default-features = false, features = ["std"] }
@@ -38,7 +37,7 @@ gpgme = "0.11"
 hex = "0.4"
 indicatif = "0.18.2"
 isahc = { version = "1", default-features = false, features = ["http2"] }
-itertools = "0.13"
+itertools = "0.14"
 libc = "0.2.175"
 md-5 = "0.10"
 memchr = "2"
@@ -53,7 +52,7 @@ resolvo = "0.10.2"
 rustix = { version = "1", features = ["fs", "pipe", "thread", "mount"] }
 serde_json = "1.0.140"
 serde = { version = "1.0.219", features = ["derive"] }
-sha1 = "0.10.6"
+sha1 = "0.10"
 sha2 = "0.10"
 smallvec = { version = "1.13", features = ["serde", "union"] }
 smol = "2"
@@ -61,7 +60,7 @@ smol-macros = "0.1"
 static_assertions = "1"
 tempfile = "3.15"
 thiserror = "2.0.17"
-toml_edit = { version = "0.22.22", features = ["serde"] }
+toml_edit = { version = "0.25", features = ["serde"] }
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.20", default-features = false, features = ["env-filter", "fmt", "std"] }
 url = { version = "2.5.4", features = ["serde"] }
@@ -71,7 +70,7 @@ version = "0.4.32"
 features = ["futures-io", "bzip2", "gzip", "zstd", "lzma", "lz4", "xz"]
 
 [dev-dependencies]
-criterion = "0.5"
+criterion = "0.8"
 
 [[bench]]
 name = "control"

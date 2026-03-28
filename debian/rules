@@ -13,7 +13,7 @@ override_dh_auto_configure:
 
 override_dh_auto_build:
 	cargo build -p rdebootstrap --release --locked --bin rdebootstrap
-	cargo xtask build-man
+	cargo run -p xtask --locked --bin build-man
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
