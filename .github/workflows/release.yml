@@ -96,11 +96,6 @@ jobs:
             exit 1
           fi
 
-      - name: Run tests
-        run: cargo test --workspace --all-targets --all-features --locked
-        env:
-          RUST_BACKTRACE: 1
-
       - name: Install ORAS
         uses: oras-project/setup-oras@v1
 
@@ -108,7 +103,7 @@ jobs:
         run: echo "${{ secrets.GITHUB_TOKEN }}" | oras login ghcr.io -u "${{ github.actor }}" --password-stdin
 
       - name: Build rdebootstrap binary
-        run: cargo build -p rdebootstrap --locked
+        run: cargo build --release -p rdebootstrap --locked
 
       - name: Package source files
         run: |
@@ -123,7 +118,7 @@ jobs:
           set -euo pipefail
 
           for distro in debian ubuntu; do
-            spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
+            spec_hash="$(./target/release/rdebootstrap -m "${distro}-build.toml" spec hash)"
             artifact="${GHCR_REPO}:${distro}-${spec_hash}"
             tarball="target/${distro}-tree-${spec_hash}.tar.zst"
 

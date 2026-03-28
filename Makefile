@@ -2,7 +2,7 @@
 
 CARGO ?= cargo
 PODMAN ?= podman
-RDEBOOTSTRAP := $(CURDIR)/target/debug/rdebootstrap
+RDEBOOTSTRAP := $(CURDIR)/target/release/rdebootstrap
 DOWNLOADS ?= 10
 MANPAGES_DIR := $(CURDIR)/target/man
 DISTROS := debian ubuntu
