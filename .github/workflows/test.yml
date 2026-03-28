@@ -76,6 +76,7 @@ jobs:
           RUST_BACKTRACE: 1 
 
       - name: Report coverage to summary 
+        if: matrix.coverage
         id: coverage
         run: |
           if [ -f coverage.txt ]; then
@@ -99,13 +100,14 @@ jobs:
             ' >> $GITHUB_STEP_SUMMARY 
             TOTAL_COV=$(cat coverage.txt | grep "TOTAL" | awk '{print $10}')
             echo "percentage=$TOTAL_COV" >> $GITHUB_OUTPUT
-            echo "raw=${TOTAL_COV%%%}"
+            echo "raw=${TOTAL_COV%%%}" >> $GITHUB_OUTPUT
           else
             echo "no coverage produced, fail"
             exit 1
           fi
 
       - name: Create coverage badge gist
+        if: matrix.coverage
         uses: schneegans/dynamic-badges-action@v1.7.0
         with:
           auth: ${{ secrets.GIST_TOKEN }}
@@ -116,4 +118,3 @@ jobs:
           color: ${{ fromJSON(steps.coverage.outputs.raw) > 80 && 'brightgreen' || fromJSON(steps.coverage.outputs.raw) > 60 && 'yellow' || 'orange' }}
           namedLogo: rust
           logoColor: white
-
