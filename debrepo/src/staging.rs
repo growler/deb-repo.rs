@@ -523,6 +523,8 @@ impl FileList {
         let mut list = self.out.lock().unwrap().drain().collect::<Vec<_>>();
         list.sort();
         file.write_all(list.join("\n").as_bytes()).await?;
+        file.flush().await?;
+        file.sync_data().await?;
         Ok(())
     }
 }
