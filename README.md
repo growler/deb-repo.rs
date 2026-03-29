@@ -33,7 +33,7 @@ trees, and then uses those trees to build its own packages for those distributio
 
 - Linux host with user namespaces enabled (required by the sandbox helper).
 - Rust toolchain >= 1.89 (`rustup toolchain install 1.89.0`).
-- A handful of libraries are required; see [debian-build.toml] for the list.
+- A handful of libraries are required; see [debian-build.toml](debian-build.toml) for the list.
 
 ## Installation
 
