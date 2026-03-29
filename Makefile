@@ -7,8 +7,6 @@ DOWNLOADS ?= 10
 MANPAGES_DIR := $(CURDIR)/target/man
 DISTROS := debian ubuntu
 
-export CARGO_HOME := $(CURDIR)/target/cargo-home
-
 define COMPUTE_BASE_VERSION
 command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed." >&2; exit 1; }; \
 full=$$(git describe --tags --match "v*" 2>/dev/null || true); \
@@ -65,6 +63,7 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
 	@TREE="$$(<D)/$$$$(cat "$$<")"; \
+	CARGO_HOME="$$$${CARGO_HOME:-$$$$(cd ~ && pwd)/.cargo}"; \
 	echo "Running the package builder"; \
 	mkdir -p $$(CURDIR)/target/$(1); \
 	dist=$$$$(dpkg-parsechangelog -SDistribution); \
@@ -80,11 +79,10 @@ $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	trap 'mv debian/orig-changelog debian/changelog || true' EXIT; \
 	$(PODMAN) run --rm --systemd=always \
 		--volume "$$(CURDIR)/target:/root/build" \
+		--volume "$$$$CARGO_HOME:/root/.cargo" \
 		--volume "$$(CURDIR):/root/build/src" \
 		--volume "$$(CURDIR)/target/$(1):/root/build/src/target" \
-		--volume "$$(CURDIR)/target/cargo-home:/root/build/src/target/cargo-home" \
 		--workdir /root/build/src \
-		--env CARGO_HOME=/root/build/src/target/cargo-home \
 		--env DCH_MODE="$$$$dch_mode" \
 		--env DCH_DIST="$$$$dist" \
 		--env DCH_BASE_VERSION="$$$$base_version" \

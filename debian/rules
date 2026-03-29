@@ -1,23 +1,21 @@
 #!/usr/bin/make -f
 
 export DEB_BUILD_MAINT_OPTIONS = hardening=+all
-export CARGO_HOME := $(CURDIR)/target/cargo-home
 export CARGO_TARGET_DIR := $(CURDIR)/target
 
 %:
 	dh $@
 
 override_dh_auto_configure:
-	mkdir -p $(CARGO_HOME)
 	cargo fetch --locked
 
 override_dh_auto_build:
-	cargo build -p rdebootstrap --release --locked --bin rdebootstrap
-	cargo run -p xtask --locked --bin build-man
+	cargo build -p rdebootstrap --release --frozen --bin rdebootstrap
+	cargo run -p xtask --frozen --bin build-man
 
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	RUST_BACKTRACE=1 cargo test --locked -p debrepo --lib --tests -- --nocapture
+	RUST_BACKTRACE=1 cargo test --frozen -p debrepo --lib --tests -- --nocapture
 endif
 
 override_dh_auto_install:

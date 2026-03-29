@@ -2,37 +2,38 @@
 [![Tests](https://github.com/growler/rdebootstrap.rs/actions/workflows/test.yml/badge.svg)](https://github.com/growler/rdebootstrap.rs/actions/workflows/test.yml) ![Coverage](https://img.shields.io/endpoint?url=https://gist.githubusercontent.com/growler/38f16304c1c99d385ef2d8086f16f5e0/raw/coverage.json) [![Docs](https://docs.rs/debrepo/badge.svg)](https://docs.rs/debrepo) [![Crates.io](https://img.shields.io/crates/v/debrepo.svg?maxAge=2592000)](https://crates.io/crates/debrepo)
 
 `rdebootstrap` is a manifest-driven Debian/Ubuntu bootstrapper written in Rust.
-It resolves packages from user-defined APT archives, locks the full dependency
+It resolves packages from user-defined APT repositories, locks the full dependency
 graph, stages arbitrary artifacts, and builds a root filesystem tree inside a
-sandbox so maintainer scripts run in a controlled environment. The same engine
-is exposed as the `debrepo` library for embedding in other tooling.
+sandbox so that maintainer scripts run in a controlled environment. The same
+engine is exposed as the `debrepo` library for embedding in other tooling.
+
+The project uses itself to build locked [Debian](debian-build.toml) and [Ubuntu](ubuntu-build.toml)
+trees, and then uses those trees to build its own packages for those distributions.
 
 ## Highlights
 
-- **Declarative input** – `Manifest.toml` lists archives, optional imports,
+- **Declarative input** -- `Manifest.toml` lists archives, optional imports,
   specs, staged files, local `.deb`s, and metadata while
   `Manifest.<arch>.lock` captures the fully resolved set for reproducible
   builds.
-- **Deterministic resolution** – Release and Packages files are fetched with GPG
+- **Deterministic resolution** -- Release and Packages files are fetched with GPG
   verification, optional snapshot pinning, and a solver that locks each spec
   before anything is installed.
-- **Sandboxed builds** – `build` expands packages inside an isolated helper
-  namespace; run as root for production ownership or unprivileged while
-  iterating.
-- **Rich spec tooling** – add/drop requirements and constraints per spec, stage
+- **Sandboxed builds** -- `build` expands packages inside an isolated helper
+  namespace or inside a `podman` container; run as root for production ownership
+  or unprivileged while iterating.
+- **Rich spec tooling** -- add/drop requirements and constraints per spec, stage
   local files or HTTP artifacts, include local packages that ship alongside the
   manifest, and reuse selected parent specs from another locked manifest.
-- **Fast, resumable downloads** – concurrent fetcher (`-n/--downloads`) backed
+- **Fast, resumable downloads** -- concurrent fetcher (`-n/--downloads`) backed
   by a shared cache and optional transport relaxations for air-gapped or test
   environments.
 
 ## Requirements
 
 - Linux host with user namespaces enabled (required by the sandbox helper).
-- Rust toolchain ≥ 1.89 (`rustup toolchain install 1.89.0`).
-- System packages needed by `cargo` plus `gpgme`/`libgpg-error` for Release
-  verification.
-- Optional `sudo` when you need ownership preserved inside the target rootfs.
+- Rust toolchain >= 1.89 (`rustup toolchain install 1.89.0`).
+- A handful of libraries are required; see [debian-build.toml] for the list.
 
 ## Installation
 
@@ -56,20 +57,19 @@ The resulting binary lives at `target/release/rdebootstrap` (or in
    `rdebootstrap init debian --package ca-certificates --package vim`\
    or bootstrap from another locked manifest:\
    `rdebootstrap init --import ../system/Manifest.toml --spec base --package vim`
-2. **Iterate on specs**\
+2. **Add requirements to a spec**\
    `rdebootstrap archive add https://mirror.example/debian --suite bookworm,bookworm-updates --components main,contrib`\
    `rdebootstrap require --spec desktop openssh-server network-manager`\
    `rdebootstrap forbid --spec desktop 'systemd-hwe (= 255.5-1)'`
 3. **Reuse a locked base manifest (optional)**\
    `rdebootstrap import ../system/Manifest.toml --spec base --spec bootable-base`
 4. **Update and lock**\
-   `rdebootstrap update --snapshot 20241007T030925Z` (or `--snapshot now`)\
+   `rdebootstrap update --snapshot 20241007T030925Z` (or `--snapshot today`)\
    This downloads Release/Packages data, solves the specs, and writes
    `Manifest.<arch>.lock`.
 5. **Build a filesystem tree**\
-   `sudo rdebootstrap build --spec desktop --path ./out`\
-   The resulting tree may be used directly with podman (requires the full path
-   because podman enters its own mount namespace):
+   `rdebootstrap build --spec desktop --path ./out`\
+   The resulting tree may be used directly with podman:
    `podman run --rm -it --systemd=always --rootfs "$(pwd)/out" bash -l`
 
 `build` unpacks packages into the target directory, stages artifacts, and runs
@@ -91,39 +91,40 @@ hash = "blake3-..."
 specs = ["base"]
 
 [[archive]]
-url = "https://ftp.debian.org/debian/"
-suites = ["trixie"]
+url = "https://security.debian.org/debian-security/"
+snapshots = "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/"
+suites = ["trixie-security"]
 components = ["main"]
-snapshots = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/"
+
+[[local]]
+path = "target/debian/mytool_0.1.0_amd64.deb"
+hash = "sha256-..."
 
 [artifact."motd"]
 type = "text"
 target = "/etc/motd"
 text = "hello from rdebootstrap\n"
 
-[spec.frontend]
+[spec.backend]
 extends = "base"
-include = ["ca-certificates", "openssh-server"]
+include = ["ca-certificates", "openssh-server", "mytool"]
 stage = ["motd"]
 
-[[local]]
-path = "target/debian/mytool_0.1.0_amd64.deb"
-hash = "sha256-..."
 ```
 
 Key sections:
 
-- `[[archive]]` — APT repositories with suites, components, optional snapshot
+- `[[archive]]` -- APT repositories with suites, components, optional snapshot
   templates, trusted keys, and priorities.
-- `[import]` — Reuse archives, local packages, and selected named parent specs
+- `[import]` -- Reuse archives, local packages, and selected named parent specs
   from another manifest. Imported parent specs keep their own staged artifact
-  references. `path` and `hash` are required when present; `specs` is optional
+  references. `path` and `hash` are required; `specs` is optional
   and only needed when exporting imported parent specs for downstream
   `extends`.
-- `[[local]]` — Local `.deb` files copied into the cache and treated like repo
+- `[[local]]` -- Local `.deb` files copied into the cache and treated like repo
   packages.
-- `[artifact."<name>"]` — Files or URLs to drop into the tree during staging.
-- `[spec]` and `[spec.<name>]` — Package requirements/constraints, staged
+- `[artifact."<name>"]` -- Files or URLs to drop into the tree during staging.
+- `[spec]` and `[spec.<name>]` -- Package requirements/constraints, staged
   artifacts, build-time environment/script, and metadata per spec. Specs can
   inherit from each other via `extends`. Set `meta = ["apt-lists:stage"]` on a
   spec when you want staging/build output to also include `manifest.sources`
@@ -171,13 +172,14 @@ or `rdebootstrap spec meta set apt-lists stage`.
   `blake3-...`, `sha256-...`).
 - When `rdebootstrap` computes an artifact hash (for example via `artifact add`),
   it uses `blake3`.
-- `TARGET_PATH` is treated as an absolute path inside the target filesystem (non-absolute values are
-  auto-prefixed with `/` during staging).
+- `TARGET_PATH` is treated as an absolute path inside the target filesystem
+  (non-absolute values are auto-prefixed with `/` during staging).
   - `{file|text}.ext /path/target` → `/path/target`
   - `{file|text}.ext /path/target/` → `/path/target/file.ext`
 - `file.tar /path/target(/?)` → extracted under `/path/target`
 - `dir /path/target(/?)` → copied under `/path/target`
-- Filename resolution for `{file|text}` artifacts happens during staging; manifests keep the raw
+- Filename resolution for `{file|text}` artifacts happens during staging;
+  manifests keep the raw
   `target` value.
 - Auto-unpack: tar archives and compressed files (`.gz`, `.xz`, `.bz2`, `.zst`,
   `.zstd`) are unpacked by default; use `--no-unpack` to keep them as-is.
@@ -191,10 +193,10 @@ or `rdebootstrap spec meta set apt-lists stage`.
 
 Specs can set:
 
-- `build-env` — key/value environment variables applied to both `dpkg --configure`
+- `build-env` -- key/value environment variables applied to both `dpkg --configure`
   and `build-script`.
-- `build-script` — a bash script executed after package configuration. Scripts
-  from `extends` are executed in order (base → derived).
+- `build-script` -- a bash script executed after package configuration. Scripts
+  from `extends` are executed in order (base -> derived).
 
 Use `rdebootstrap edit env` / `rdebootstrap edit script` to edit these fields.
 
@@ -206,25 +208,24 @@ environment such as a valid XDG runtime directory).
 
 ## CLI Tour
 
-- `init` – bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
+- `init` -- bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
   `devuan`), explicit archives, or `--import <path>` from another locked
   manifest.
-- `import` – add or replace `[import]` using another already-locked manifest and
+- `import` -- add or replace `[import]` using another already-locked manifest and
   export selected named parent specs.
-- `edit` – edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,
+- `edit` -- edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,
   `edit script`).
-- `archive add`, `deb add` – append repositories or register a local `.deb`.
-- `require` / `forbid` – add requirements or version constraints to a spec
-  (`include` / `exclude` remain aliases).
-- `remove` – remove requirements or constraints (`drop` remains an alias).
-- `artifact add`, `stage`, `unstage` – define, add, or remove staged artifacts.
-- `update` – refresh metadata, solve dependencies, and rewrite the lock file
-  (supports `--snapshot`, `--locals` refreshes local packages and local
-  artifacts, and refreshes stored import fingerprints when `[import]` is
-  present).
-- `list`, `search`, `spec`, `package`, `source` – inspect resolved specs and
+- `archive add`, `deb add` -- append repositories or register a local `.deb`.
+- `require` / `forbid` -- add requirements or version constraints to a spec.
+- `remove` -- remove requirements or constraints (`drop` remains an alias).
+- `artifact add` -- define, add, or remove staged artifacts.
+- `spec artifact add` / `remove` -- add or remove an artifact from the spec.
+- `update` -- refresh metadata, solve dependencies, and rewrite the lock file
+  (supports `--snapshot`; `--locals` refreshes local packages, local
+  artifacts, and stored import fingerprints when `[import]` is present).
+- `list`, `search`, `spec`, `package`, `source` -- inspect resolved specs and
   package/source metadata.
-- `build` – expand a spec into a directory, running maintainer scripts within
+- `build` -- expand a spec into a directory, running maintainer scripts within
   the sandbox helper.
 
 ## Authentication
@@ -288,7 +289,8 @@ Verification controls (scoped):
   `allow-insecure = true` in the manifest) fetches `Release` instead of
   `InRelease`.
 
-Run `rdebootstrap <command> --help` for exhaustive usage information.
+Run `rdebootstrap <command> --help` or `man rdebootstrap` for exhaustive usage
+information.
 
 ## Known Rough Edges
 
@@ -297,14 +299,25 @@ Run `rdebootstrap <command> --help` for exhaustive usage information.
 - `-q/--quiet` and `-d/--debug` currently affect only `rdebootstrap` output, not
   the output of `dpkg --configure` or `build-script`.
 
+## A Necessary Explanation
+
+The `debrepo` library is a foundation for an in-house CI/CD system (which is
+still too ugly to release), and that explains certain design choices. For
+example, `debrepo` requires `libgpgme-dev` and `libcurl` instead of pure-Rust
+alternatives because that system uses them anyway, and having two GPG or HTTP
+client implementations in the same binary seemed a bit much.
+
+For the same reason, the library may feel a bit over-engineered (see the
+`StagingFileSystem` trait, for example, or the rather corporatish repo
+authentication). All these excesses are absolutely necessary.
+
 ## Development
 
-- `cargo fmt`, `cargo clippy --all-targets`, and `cargo test` keep the codebase
+- `cargo fmt`, `cargo clippy`, and `cargo test` keep the codebase
   healthy.
 - `cargo bench -p debrepo version` (and other benches under `benches/`) run
   Criterion benchmarks.
-- The crate can also be embedded directly by depending on `debrepo` and driving
-  `Manifest`/`HostCache` from your own host tooling.
+- The crate can also be embedded directly by depending on `debrepo`.
 
 ## License
 

@@ -155,6 +155,7 @@ jobs:
         with:
           files: |
             target/*.deb
+            target/*.debb
             target/*.dsc
             target/*.tar.xz
             target/*.buildinfo
