@@ -118,7 +118,7 @@ jobs:
           set -euo pipefail
 
           for distro in debian ubuntu; do
-            spec_hash="$(./target/release/rdebootstrap -m "${distro}-build.toml" spec hash)"
+            spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
             artifact="${GHCR_REPO}:${distro}-${spec_hash}"
             tarball="target/${distro}-tree-${spec_hash}.tar.zst"
 
