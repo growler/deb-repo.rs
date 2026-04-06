@@ -1260,10 +1260,17 @@ impl Manifest {
                         .with_origin(PackageOrigin::Local { manifest_id }),
                 )
             }
-            let current_packages = cache
+            let mut current_packages = cache
                 .fetch_universe(current.archives(manifest_id), concurrency)
                 .await?;
-            current_packages.iter().for_each(|pkg| {
+            current_packages.iter_mut().for_each(|pkg| {
+                let prio = pkg
+                    .origin()
+                    .archive()
+                    .and_then(|arch| current.file.get_archive(arch as usize))
+                    .and_then(|arch| arch.priority)
+                    .unwrap_or_else(|| pkg.prio());
+                *pkg = pkg.clone().with_prio(prio);
                 hash.update(pkg.src().as_bytes());
             });
             packages.extend(current_packages);
