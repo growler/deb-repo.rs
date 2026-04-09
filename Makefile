@@ -51,7 +51,7 @@ $(CURDIR)/target/$(1)-tree/.spec-id: $(CURDIR)/$(1)-build.toml $(RDEBOOTSTRAP)
 
 $(1)-tree: $(CURDIR)/target/$(1)-tree/.spec-id
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
-	@set -euo pipefail; TREE="$$(<D)/$$$$(cat "$$<")"; \
+	@set -eu; TREE="$$(<D)/$$$$(cat "$$<")"; \
 	echo "Creating the target directory"; \
 	if [ ! -d "$$$$TREE" ]; then \
 		echo "Building the tree"; \
@@ -62,7 +62,7 @@ $(1)-tree: $(CURDIR)/target/$(1)-tree/.spec-id
 $(1)-packages: $(CURDIR)/target/$(1)-tree/.spec-id $(1)-tree version manpages
 	@command -v $(PODMAN) >/dev/null 2>&1 || { echo "podman is required but not installed."; exit 1; }
 	@command -v dpkg-parsechangelog >/dev/null 2>&1 || { echo "dpkg-parsechangelog is required but not installed."; exit 1; }
-	@TREE="$$(<D)/$$$$(cat "$$<")"; \
+	@set -eu; TREE="$$(<D)/$$$$(cat "$$<")"; \
 	CARGO_HOME="$$$${CARGO_HOME:-$$$$(cd ~ && pwd)/.cargo}"; \
 	echo "Running the package builder"; \
 	mkdir -p $$(CURDIR)/target/$(1); \
