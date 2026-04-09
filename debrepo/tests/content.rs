@@ -605,6 +605,7 @@ fn manifest_archive_flow_stages_apt_lists_when_opted_in() {
         manifest
             .stage(
                 None,
+                None,
                 &fs,
                 one(),
                 &cache,
@@ -615,7 +616,7 @@ fn manifest_archive_flow_stages_apt_lists_when_opted_in() {
     });
 
     let packages = manifest
-        .packages()
+        .universe_packages()
         .expect("packages iterator")
         .map(|pkg| pkg.name().to_string())
         .collect::<Vec<_>>();
@@ -680,6 +681,7 @@ fn manifest_archive_flow_skips_staging_apt_lists_without_opt_in() {
         manifest
             .stage(
                 None,
+                None,
                 &fs,
                 one(),
                 &cache,
@@ -690,7 +692,7 @@ fn manifest_archive_flow_skips_staging_apt_lists_without_opt_in() {
     });
 
     let packages = manifest
-        .packages()
+        .universe_packages()
         .expect("packages iterator")
         .map(|pkg| pkg.name().to_string())
         .collect::<Vec<_>>();

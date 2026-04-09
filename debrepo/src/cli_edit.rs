@@ -199,7 +199,7 @@ async fn edit_env(
     spec: Option<&str>,
 ) -> Result<()> {
     let mut tmp = tempfile::Builder::new().suffix(".env").tempfile()?;
-    write!(tmp, "{}", manifest.spec_env_block(spec)?)?;
+    write!(tmp, "{}", manifest.lookup_spec(spec)?.env_block()?)?;
     tmp.flush()?;
     editor.run(tmp.path())?;
     let contents = std::fs::read_to_string(tmp.path())?;
@@ -212,7 +212,10 @@ async fn edit_script(
     editor: &EditorCommand,
     spec: Option<&str>,
 ) -> Result<()> {
-    let script = manifest.spec_build_script(spec)?;
+    let script = manifest
+        .lookup_spec(spec)?
+        .build_script()
+        .map(str::to_string);
     let mut tmp = tempfile::Builder::new().suffix(".sh").tempfile()?;
     if let Some(script) = script {
         write!(tmp, "{script}")?;

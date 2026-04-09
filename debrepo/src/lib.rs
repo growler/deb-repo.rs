@@ -52,7 +52,7 @@ pub use {
     archive::{Archive, RepositoryFile, SignedBy, Snapshot, SnapshotId},
     async_compression::Level as CompressionLevel,
     builder::{BuildJob, Executor},
-    manifest::Manifest,
+    manifest::{Manifest, ResolvedSpecRef, SpecId, StageArtifactRef},
     packages::{Package, PackageOrigin, Packages},
     release::{Release, ReleaseIndexFile},
     sources::{Source, SourceUniverse, Sources},

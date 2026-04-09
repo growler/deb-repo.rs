@@ -1,3 +1,24 @@
+rdebootstrap (0.3.0) unstable; urgency=medium
+
+  * BREAKING CHANGE: the solver now enforces that a child spec 
+    cannot drop packages locked by a parent spec. This change 
+    allows to enable incremental builds in deb-ostree.
+  * BREAKING CHANGE: major and long deserved Manifest API overhaul.
+    Move most of spec-querying methods into a first-class 
+    ResolvedSpecRef type. Simplify and de-duplicate Manifest API.
+  * BREAKING CHANGE: add lock file format versioning.
+  * BREAKING CHANGE: more consistent spec hashing scheme. 
+  * feat: enable incremental builds.
+  * fix: detect and reject duplicate packages with different hashes 
+    during universe construction.
+  * fix: rewrite the installation order to algorithm to distinguish 
+    Pre-Depends from Depends and to provide better batching.
+  * chore: temporarily disable Ubuntu packages builds due to 
+    failing snapshot.ubuntu.com.
+  * chore: new release.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Thu, 09 Apr 2026 09:38:13 +0200
+
 rdebootstrap (0.2.0) unstable; urgency=medium
 
   * Updated README.md 

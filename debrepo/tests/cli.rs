@@ -1227,3 +1227,43 @@ fn cli_additional_command_branches_cover_vendor_sri_and_unlocked_errors() {
             .contains("text artifact path has no filename")
     );
 }
+
+#[test]
+fn cli_parser_error_paths_cover_dependency_validation_and_constraint_utf8() {
+    let cmd = clap::Command::new("parser-test");
+    let dep_arg = clap::Arg::new("dep");
+    let cons_arg = clap::Arg::new("cons");
+
+    // DependencyParser: valid UTF-8 but an unparseable dependency (triggers ValueValidation)
+    let value_err = DependencyParser
+        .parse_ref(&cmd, Some(&dep_arg), OsStr::new("(>= broken"))
+        .expect_err("invalid dependency should fail");
+    assert_eq!(
+        value_err.kind(),
+        clap::error::ErrorKind::ValueValidation,
+        "DependencyParser should report ValueValidation for unparseable input"
+    );
+
+    // ConstraintParser: invalid UTF-8 (triggers InvalidUtf8)
+    let invalid_utf8 = OsString::from_vec(vec![0xff, 0xfe]);
+    let utf8_err = ConstraintParser
+        .parse_ref(&cmd, Some(&cons_arg), invalid_utf8.as_os_str())
+        .expect_err("invalid utf8 constraint should fail");
+    assert_eq!(
+        utf8_err.kind(),
+        clap::error::ErrorKind::InvalidUtf8,
+        "ConstraintParser should report InvalidUtf8 for non-UTF-8 input"
+    );
+
+    // DependencyParser: valid dependency without arg context (no arg)
+    let dep_no_arg = DependencyParser
+        .parse_ref(&cmd, None, OsStr::new("foo"))
+        .expect("parse dependency without arg");
+    assert_eq!(dep_no_arg.to_string(), "foo");
+
+    // ConstraintParser: valid constraint without arg context (no arg)
+    let cons_no_arg = ConstraintParser
+        .parse_ref(&cmd, None, OsStr::new("bar (= 1.0)"))
+        .expect("parse constraint without arg");
+    assert_eq!(cons_no_arg.to_string(), "bar (= 1.0)");
+}

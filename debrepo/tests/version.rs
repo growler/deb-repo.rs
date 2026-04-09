@@ -687,7 +687,7 @@ Version: 1.0
         .collect();
     assert_eq!(
         first_names,
-        vec!["helper:all=1.0", "provider:amd64=1.0", "consumer:amd64=1.0",]
+        vec!["consumer:amd64=1.0", "helper:all=1.0", "provider:amd64=1.0",]
     );
 
     let second = universe

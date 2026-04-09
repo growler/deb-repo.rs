@@ -7,6 +7,7 @@ use {
         version::{self, Constraint, Dependency, Satisfies, Version},
     },
     itertools::Itertools,
+    petgraph::visit::EdgeRef,
     resolvo::{
         Candidates, Condition, ConditionId, ConditionalRequirement, Dependencies,
         DependencyProvider, Interner, KnownDependencies, NameId, Requirement, SolvableId,
@@ -208,22 +209,49 @@ impl<'a> UniverseIndex<'a> {
         let solvable_id: SolvableId = self.solvables.len().into_id();
         let is_required = package.essential() || package.required();
         let arch = self.get_arch_id(&Some(package.architecture()));
-        let name =
-            match self.insert_or_update_name(package.name(), Some((solvable_id, is_required))) {
-                UpdateResult::Updated(id) => id,
-                UpdateResult::Inserted(id) => {
-                    if is_required {
-                        required.push(id)
-                    };
-                    id
-                }
-            };
         let version = package.version()?;
+        let (name_id, inserted) = match self.insert_or_update_name(package.name(), None) {
+            UpdateResult::Inserted(id) => (id, true),
+            UpdateResult::Updated(id) => (id, false),
+        };
+        if !inserted {
+            let duplicate = self.names[name_id]
+                .packages
+                .iter()
+                .find_map(
+                    |pkg| match package.equals_to(self.solvables[pkg.to_index()].package) {
+                        Err((err, val1, val2)) => Some(Err::<(), ParseError>(
+                            format!(
+                                "Package {}={} has two versions with {} mismatch:\n{}\n{}",
+                                package.name(),
+                                package.raw_version(),
+                                err,
+                                val1,
+                                val2
+                            )
+                            .into(),
+                        )),
+                        Ok(true) => Some(Ok(())),
+                        Ok(false) => None,
+                    },
+                )
+                .transpose()?
+                .is_some();
+            if duplicate {
+                return Ok(());
+            }
+        }
+        let name = &mut self.names[name_id];
+        name.packages.push(solvable_id);
+        if is_required {
+            required.push(name_id);
+            name.required.push(solvable_id);
+        }
         self.solvables.push(Solvable {
+            name: name_id,
             pkgs,
             prio,
             arch,
-            name,
             package,
             version,
         });
@@ -337,11 +365,17 @@ impl resolvo::runtime::AsyncRuntime for SmolAsyncRuntime {
 }
 
 /// Dependency solver over a set of package indexes.
+/// Universe comprises a number of [Packages], and
+/// guarantees to contain only a single version of
+/// [Package] with the same name and versin.
 pub struct Universe {
     inner: resolvo::Solver<InnerUniverse, SmolAsyncRuntime>,
 }
 
 impl Universe {
+    /// Ingests a set of [Packages] and returns a package [Universe].
+    /// Will return an error if [Packages] contains duplicate versions of the
+    /// [Package] with same name and version, but different hash values.
     pub fn new(
         arch: impl AsRef<str>,
         from: impl IntoIterator<Item = Packages>,
@@ -459,12 +493,18 @@ impl Universe {
             _ => unreachable!(),
         })
     }
+    // Returns a dependency graph for the given solution.
+    // Edge weight: 1 = Pre-Depends, 0 = Depends.
+    // `solution` is expected to be sorted by PackageId value.
     pub fn dependency_graph(
         &self,
         solution: &mut [PackageId],
-    ) -> petgraph::graph::Graph<PackageId, ()> {
+    ) -> petgraph::graph::Graph<PackageId, u8> {
         self.inner.provider().dependency_graph(solution)
     }
+    // Returns installation order for the given solution, where each inner Vec
+    // contains packages that can be configured in parallel.
+    // `soution` is expected to be sorted by PackageId value.
     pub fn installation_order(&self, solution: &[PackageId]) -> Vec<Vec<PackageId>> {
         self.inner.provider().installation_order(solution)
     }
@@ -618,18 +658,28 @@ impl InnerUniverse {
             eprintln!("  ... and {} more", incoming.len() - 20);
         }
     }
-    fn dependency_graph(&self, solution: &[SolvableId]) -> petgraph::graph::Graph<SolvableId, ()> {
-        let mut g = petgraph::graph::Graph::<SolvableId, ()>::new();
+    // Returns a weighted dependency graph for the given solution.
+    // Edge weight 1 = Pre-Depends (must be in a strictly earlier configure group).
+    // Edge weight 0 = Depends (can share a configure group; dpkg handles ordering).
+    // Edge direction: provider → consumer.
+    // `solution` is expected to be sorted by PackageId value.
+    fn dependency_graph(&self, solution: &[SolvableId]) -> petgraph::graph::Graph<SolvableId, u8> {
+        let mut g = petgraph::graph::Graph::<SolvableId, u8>::new();
         let nodes = solution
             .iter()
             .map(|&pkg| (pkg, g.add_node(pkg)))
             .collect::<HashMap<_, _>>();
         for &pkg in solution {
+            // Count pre-depends entries to determine the split point in requirements.
+            // add_package_dependencies chains pre_depends() then depends(), so the
+            // first pre_dep_count requirements correspond to Pre-Depends entries.
+            let pre_dep_count = self.package(pkg).pre_depends().count();
             let deps = match self.get_dependencies(pkg) {
                 Dependencies::Known(d) => d,
                 _ => unreachable!("solution contains only known dependencies"),
             };
-            for req in deps.requirements {
+            for (i, req) in deps.requirements.into_iter().enumerate() {
+                let weight: u8 = if i < pre_dep_count { 1 } else { 0 };
                 let mut candidates = match req.requirement {
                     Requirement::Single(vs) => itertools::Either::Left(
                         self.get_candidates(self.version_set_name(vs))
@@ -642,7 +692,7 @@ impl InnerUniverse {
                             .flat_map(|c| c.candidates.into_iter()),
                     ),
                 }
-                .filter(|dep| *dep != pkg && solution.contains(dep))
+                .filter(|dep| *dep != pkg && solution.binary_search(dep).is_ok())
                 .collect::<Vec<_>>();
                 candidates.sort_by_key(|&p| {
                     (
@@ -651,33 +701,161 @@ impl InnerUniverse {
                     )
                 });
                 if !candidates.is_empty() {
-                    g.add_edge(nodes[&candidates[0]], nodes[&pkg], ());
+                    g.add_edge(nodes[&candidates[0]], nodes[&pkg], weight);
                 }
             }
         }
         g
     }
+    // Returns installation order for the given solution, where each inner Vec
+    // contains packages that can be configured in a single dpkg --configure call.
+    //
+    // The algorithm:
+    //  1. Essential packages form group 0.
+    //  2. A weighted dependency graph is built: Pre-Depends edges (weight 1) force
+    //     a strict group boundary; Depends edges (weight 0) allow same-group
+    //     placement since dpkg --configure resolves within-group ordering.
+    //  3. Strongly connected components are condensed into single nodes.
+    //  4. Weighted topological levels are computed (level = max over predecessors
+    //     of predecessor_level + edge_weight).
+    //  5. A priority barrier ensures all Required packages are configured before
+    //     any Other package that does not transitively support a Required package.
+    //  6. Packages are grouped by level.
+    //
+    // `solution` is expected to be sorted by PackageId value.
     fn installation_order(&self, solution: &[PackageId]) -> Vec<Vec<PackageId>> {
         let (mut essentials, non_essentials): (Vec<_>, Vec<_>) = solution
             .iter()
             .copied()
             .partition(|s| self.package(*s).essential());
         essentials.sort_by_key(|&p| self.package(p).name());
+        if non_essentials.is_empty() {
+            return vec![essentials];
+        }
         let g = self.dependency_graph(&non_essentials);
-        let condensed = petgraph::algo::condensation(g, true);
-        let order = petgraph::algo::toposort(&condensed, None).unwrap();
-        let mut result = Vec::with_capacity(condensed.node_count() + 1);
+
+        // tarjan_scc returns SCCs in reverse topological order.
+        let sccs = petgraph::algo::scc::tarjan_scc(&g);
+
+        // Map each original NodeIndex to its SCC index.
+        let mut node_to_scc = vec![0usize; g.node_count()];
+        for (scc_idx, scc) in sccs.iter().enumerate() {
+            for &ni in scc {
+                node_to_scc[ni.index()] = scc_idx;
+            }
+        }
+
+        // Build condensed DAG: nodes carry Vec<SolvableId>, edges carry max weight.
+        let scc_count = sccs.len();
+        // Collect SolvableId members for each SCC.
+        let scc_members: Vec<Vec<SolvableId>> = sccs
+            .iter()
+            .map(|scc| scc.iter().map(|&ni| g[ni]).collect())
+            .collect();
+        // Build adjacency with max-weight edges (scc_from → scc_to, weight).
+        let mut condensed_edges: HashMap<(usize, usize), u8> = HashMap::new();
+        for edge in g.edge_references() {
+            let src_scc = node_to_scc[edge.source().index()];
+            let tgt_scc = node_to_scc[edge.target().index()];
+            if src_scc != tgt_scc {
+                let w = condensed_edges.entry((src_scc, tgt_scc)).or_insert(0);
+                *w = (*w).max(*edge.weight());
+            }
+        }
+        // Build predecessor lists for the condensed DAG.
+        let mut predecessors: Vec<Vec<(usize, u8)>> = vec![Vec::new(); scc_count];
+        for (&(src, tgt), &w) in &condensed_edges {
+            predecessors[tgt].push((src, w));
+        }
+
+        // Determine which SCCs contain Required-priority packages.
+        let scc_has_required: Vec<bool> = scc_members
+            .iter()
+            .map(|members| {
+                members
+                    .iter()
+                    .any(|&s| self.package(s).install_priority().rank() <= 1)
+            })
+            .collect();
+
+        // Find all SCCs that transitively support a Required SCC (Required SCCs
+        // themselves plus all their transitive predecessors). These form phase 1
+        // and are exempt from the priority barrier.
+        let mut phase1 = vec![false; scc_count];
+        {
+            // Build successor lists (needed for backward traversal from Required).
+            let mut successors: Vec<Vec<usize>> = vec![Vec::new(); scc_count];
+            for &(src, tgt) in condensed_edges.keys() {
+                successors[tgt].push(src); // src is a predecessor of tgt
+            }
+            // BFS backward from Required SCCs.
+            let mut queue = std::collections::VecDeque::new();
+            for i in 0..scc_count {
+                if scc_has_required[i] {
+                    phase1[i] = true;
+                    queue.push_back(i);
+                }
+            }
+            while let Some(scc) = queue.pop_front() {
+                for &pred in &successors[scc] {
+                    if !phase1[pred] {
+                        phase1[pred] = true;
+                        queue.push_back(pred);
+                    }
+                }
+            }
+        }
+
+        // Compute weighted topological levels.
+        // tarjan_scc returns SCCs in reverse topological order, so iterating
+        // in reverse gives us topological order (predecessors before successors).
+        let mut level = vec![0u32; scc_count];
+        for scc_idx in (0..scc_count).rev() {
+            let mut max_pred_level = 0u32;
+            for &(pred, w) in &predecessors[scc_idx] {
+                max_pred_level = max_pred_level.max(level[pred] + w as u32);
+            }
+            level[scc_idx] = max_pred_level;
+        }
+
+        // Apply priority barrier: Other-only SCCs not supporting any Required SCC
+        // must be at level > max_required_level.
+        let max_required_level = (0..scc_count)
+            .filter(|&i| scc_has_required[i])
+            .map(|i| level[i])
+            .max()
+            .unwrap_or(0);
+        // Bump and propagate in topological order.
+        for scc_idx in (0..scc_count).rev() {
+            if !phase1[scc_idx] {
+                level[scc_idx] = level[scc_idx].max(max_required_level + 1);
+            }
+            // Re-propagate to successors to maintain consistency.
+            let cur_level = level[scc_idx];
+            for (&(src, tgt), &w) in &condensed_edges {
+                if src == scc_idx {
+                    level[tgt] = level[tgt].max(cur_level + w as u32);
+                }
+            }
+        }
+
+        // Group SCCs by level.
+        let max_level = level.iter().copied().max().unwrap_or(0);
+        let mut groups: Vec<Vec<PackageId>> = vec![Vec::new(); max_level as usize + 1];
+        for (scc_idx, members) in scc_members.iter().enumerate() {
+            groups[level[scc_idx] as usize].extend(members.iter().copied());
+        }
+        // Sort within each group: Required before Other, then alphabetically.
+        for group in &mut groups {
+            group.sort_by_key(|&p| {
+                let pkg = self.package(p);
+                (pkg.install_priority().rank(), pkg.name())
+            });
+        }
+        // Build result: essentials first, then non-empty level groups.
+        let mut result = Vec::with_capacity(groups.len() + 1);
         result.push(essentials);
-        result.extend(
-            order
-                .iter()
-                .filter_map(|&gid| condensed.node_weight(gid))
-                .map(|pkgs| {
-                    let mut pkgs = pkgs.clone();
-                    pkgs.sort_by_key(|&p| self.package(p).name());
-                    pkgs
-                }),
-        );
+        result.extend(groups.into_iter().filter(|g| !g.is_empty()));
         result
     }
 }

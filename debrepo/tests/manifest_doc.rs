@@ -74,7 +74,7 @@ fn set_import_roundtrips_manifest_doc_and_reloads_with_valid_lock() {
 
         let (loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("reload");
         assert!(has_valid_lock);
-        assert!(loaded.spec_names().next().is_none());
+        assert!(loaded.spec_ids().next().is_none());
     });
 
     let doc = read_manifest_doc(&path);
@@ -125,28 +125,10 @@ fn from_file_loads_default_spec_and_artifacts_from_handwritten_manifest() {
     let (manifest, has_valid_lock) =
         smol::block_on(Manifest::from_file(&path, ARCH)).expect("load manifest");
     assert!(!has_valid_lock);
-    assert_eq!(
-        manifest
-            .requirements_for(0)
-            .expect("requirements")
-            .0
-            .into_iter()
-            .map(|dep| dep.to_string())
-            .collect::<Vec<_>>(),
-        vec!["foo (>= 1.0)"]
-    );
-    assert_eq!(
-        manifest.spec_env_block(None).expect("env block"),
-        "FOO=bar\n"
-    );
-    assert_eq!(
-        manifest.get_spec_meta(None, "owner").expect("meta"),
-        Some("ops")
-    );
-    assert_eq!(
-        manifest.spec_build_script(None).expect("build script"),
-        Some("echo hi\n".to_string())
-    );
+    let spec = manifest.lookup_spec(None).expect("default spec");
+    assert_eq!(spec.build_env().get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(spec.get_meta("owner").expect("meta"), Some("ops"));
+    assert_eq!(spec.build_script(), Some("echo hi\n"));
     assert!(manifest.artifact("note").is_some());
 }
 

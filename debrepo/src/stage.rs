@@ -26,6 +26,7 @@ pub(crate) struct ResolvedInstallable<'a> {
 // LOCAL
 
 pub async fn stage_local<'a, FS, C>(
+    installed: Option<&ControlFile<'_>>,
     installables: Vec<ResolvedInstallable<'a>>,
     artifacts: Vec<ResolvedArtifact<'a>>,
     fs: &FS,
@@ -38,7 +39,7 @@ where
     C: ContentProvider<Target = FS>,
 {
     stage_debs_local(
-        None,
+        installed,
         installables.as_slice(),
         fs,
         concurrency,
@@ -80,7 +81,7 @@ where
         .await
 }
 
-async fn stage_debs_local<'a, C, FS>(
+pub(crate) async fn stage_debs_local<'a, C, FS>(
     installed: Option<&ControlFile<'_>>,
     packages: &'a [ResolvedInstallable<'a>],
     fs: &FS,
@@ -177,6 +178,7 @@ where
 // THREAD SAFE
 //
 pub async fn stage<'a, FS, C>(
+    installed: Option<&ControlFile<'_>>,
     installables: Vec<ResolvedInstallable<'a>>,
     artifacts: Vec<ResolvedArtifact<'a>>,
     fs: &FS,
@@ -189,7 +191,7 @@ where
     C: ContentProvider<Target = FS>,
 {
     stage_debs(
-        None,
+        installed,
         installables.as_slice(),
         fs,
         concurrency,

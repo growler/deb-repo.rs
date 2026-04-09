@@ -132,10 +132,12 @@ impl<E: Executor> BuildJob<E> {
             )?;
         }
         for group in self.packages.iter() {
-            executor.exec_cmd(
-                "/usr/bin/dpkg",
-                std::iter::once("--configure").chain(group.iter().map(String::as_str)),
-            )?;
+            if !group.is_empty() {
+                executor.exec_cmd(
+                    "/usr/bin/dpkg",
+                    std::iter::once("--configure").chain(group.iter().map(String::as_str)),
+                )?;
+            }
         }
         for script in self.scripts.iter() {
             executor.exec_script(script.clone())?;

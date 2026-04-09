@@ -4,8 +4,9 @@ use {
         artifact::{Artifact, ArtifactArg},
         cli::StageProgress,
         content::{ContentProvider, UniverseFiles},
-        control::{MutableControlFile, MutableControlStanza},
+        control::{ControlFile, MutableControlFile, MutableControlStanza},
         hash::{Hash, HashAlgo},
+        idmap::IntoId,
         is_url,
         kvlist::KVList,
         manifest_doc::{spec_display_name, valid_spec_name, LockFile, ManifestFile, UpdateResult},
@@ -16,7 +17,7 @@ use {
         },
         stage::{ResolvedArtifact, ResolvedInstallable},
         staging::StagingFileSystem,
-        universe::Universe,
+        universe::{PackageId, Universe},
         version::{Constraint, Dependency, IntoConstraint, IntoDependency, ProvidedName},
         Packages, Source, SourceUniverse,
     },
@@ -25,7 +26,9 @@ use {
     itertools::Itertools,
     smol::io,
     std::{
+        cmp::Ordering,
         collections::HashMap,
+        fmt::Write,
         future::Future,
         num::NonZero,
         path::{Path, PathBuf},
@@ -60,14 +63,29 @@ enum DFSNodeState {
     Done,
 }
 
-#[derive(Clone, Copy)]
-struct ManifestSpecRef<'a> {
-    manifest: &'a Manifest,
-    id: usize,
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+/// Local spec identifier within a single manifest.
+pub struct SpecId(u32);
+
+impl SpecId {
+    pub(crate) fn from_index(index: usize) -> Self {
+        Self(index as u32)
+    }
+
+    pub(crate) fn index(self) -> usize {
+        self.0 as usize
+    }
 }
 
-impl<'a> ManifestSpecRef<'a> {
-    fn key(self) -> (*const Manifest, usize) {
+#[derive(Clone, Copy)]
+/// Resolved spec reference within a manifest import tree.
+pub struct ResolvedSpecRef<'a> {
+    manifest: &'a Manifest,
+    id: SpecId,
+}
+
+impl<'a> ResolvedSpecRef<'a> {
+    fn key(self) -> (*const Manifest, SpecId) {
         (self.manifest as *const Manifest, self.id)
     }
 
@@ -76,60 +94,411 @@ impl<'a> ManifestSpecRef<'a> {
             .local_spec_entry(self.id)
             .expect("manifest spec reference must point to an existing spec")
     }
-}
 
-struct SpecIterator<'a> {
-    visited: Vec<(*const Manifest, usize)>,
-    cur: Option<ManifestSpecRef<'a>>,
-}
+    fn raw_name(self) -> &'a str {
+        self.entry().0
+    }
 
-impl<'a> Iterator for SpecIterator<'a> {
-    type Item = io::Result<ManifestSpecRef<'a>>;
+    pub fn id(self) -> SpecId {
+        self.id
+    }
 
-    fn next(&mut self) -> Option<Self::Item> {
-        let current = self.cur?;
-        let (name, spec) = current.entry();
-        if self.visited.contains(&current.key()) {
-            return Some(Err(io::Error::other(format!(
-                "spec extension cycle detected at {}",
-                spec_display_name(name)
-            ))));
-        }
-        self.visited.push(current.key());
-        self.cur = match spec.extends.as_deref() {
-            Some(extends) => match current.manifest.resolve_spec(extends) {
-                Some(parent) => Some(parent),
-                None => {
-                    return Some(Err(io::Error::other(format!(
+    pub fn manifest(self) -> &'a Manifest {
+        self.manifest
+    }
+
+    fn spec(self) -> &'a Spec {
+        self.entry().1
+    }
+
+    pub fn hash(self) -> Option<Hash> {
+        self.manifest.lock.spec(self.id).hash.clone()
+    }
+
+    pub fn locked_hash(self) -> io::Result<Hash> {
+        self.manifest
+            .lock
+            .spec(self.id)
+            .hash
+            .clone()
+            .ok_or_else(|| {
+                io::Error::other(format!(
+                    "no solution for spec {:?}, update manifest lock",
+                    self
+                ))
+            })
+    }
+
+    fn hasher(self) -> io::Result<blake3::Hasher> {
+        let mut hasher = blake3::Hasher::default();
+        let parent_hash = self
+            .parent()?
+            .map(|parent| {
+                parent.hash().clone().ok_or_else(|| {
+                    io::Error::other(format!(
+                        "no solution for spec {:?}, update manifest lock",
+                        parent
+                    ))
+                })
+            })
+            .transpose()?
+            .unwrap_or_else(|| blake3::Hasher::default().into_hash());
+        hasher.update(parent_hash.as_bytes());
+        let script_hash = self.build_script().map_or_else(
+            || blake3::hash(&[]),
+            |script| blake3::hash(script.as_bytes()),
+        );
+        hasher.update(script_hash.as_bytes());
+        let env_hash = self
+            .build_env()
+            .iter()
+            .fold(blake3::Hasher::default(), |mut h, (k, v)| {
+                h.update(k.as_bytes());
+                h.update(b"=");
+                h.update(v.as_bytes());
+                h.update(b"\n");
+                h
+            });
+        hasher.update(env_hash.finalize().as_bytes());
+        let meta_hash = self
+            .meta()
+            .try_fold(blake3::Hasher::default(), |mut h, m| {
+                let (k, v) = m?;
+                h.update(k.as_bytes());
+                h.update(b"=");
+                h.update(v.as_bytes());
+                h.update(b"\n");
+                Ok::<_, io::Error>(h)
+            })?;
+        hasher.update(meta_hash.finalize().as_bytes());
+        let artifacts_hash =
+            self.stage_artifacts()
+                .try_fold(blake3::Hasher::default(), |mut h, a| {
+                    let artifact = a?;
+                    h.update(artifact.artifact.uri().as_bytes());
+                    h.update(b"\n");
+                    h.update(artifact.artifact.hash().as_bytes());
+                    h.update(b"\n");
+                    Ok::<_, io::Error>(h)
+                })?;
+        hasher.update(artifacts_hash.finalize().as_bytes());
+        Ok(hasher)
+    }
+
+    pub fn locked(self) -> io::Result<&'a LockedSpec> {
+        self.manifest.lock.spec(self.id).as_locked().ok_or_else(|| {
+            io::Error::other(format!(
+                "no solution for spec {:?}, update manifest lock",
+                self,
+            ))
+        })
+    }
+
+    pub fn parent(self) -> io::Result<Option<ResolvedSpecRef<'a>>> {
+        self.spec()
+            .extends
+            .as_deref()
+            .map(|name| {
+                self.manifest.resolve_spec(name).ok_or_else(|| {
+                    io::Error::other(format!(
                         "spec {} extends unknown spec {}",
-                        spec_display_name(name),
-                        extends
-                    ))));
+                        self.display_name(),
+                        name
+                    ))
+                })
+            })
+            .transpose()
+    }
+
+    pub fn ancestors(self) -> impl Iterator<Item = io::Result<ResolvedSpecRef<'a>>> {
+        SpecIterator {
+            visited: vec![(self.manifest, self.id)],
+            cur: Some(self),
+        }
+    }
+
+    pub fn name(self) -> Option<&'a str> {
+        (!self.raw_name().is_empty()).then_some(self.raw_name())
+    }
+
+    pub fn display_name(self) -> &'a str {
+        spec_display_name(self.raw_name())
+    }
+    fn installables(self) -> io::Result<impl Iterator<Item = &'a LockedPackage>> {
+        self.locked().map(LockedSpec::installables)
+    }
+    fn effective_max_install_order(self) -> io::Result<u32> {
+        std::iter::once(Ok(self))
+            .chain(self.ancestors())
+            .try_fold(0, |max_order, spec| {
+                let spec = spec?;
+                let spec_max = spec
+                    .locked()?
+                    .installables()
+                    .map(|pkg| pkg.order)
+                    .max()
+                    .unwrap_or(0);
+                Ok(max_order.max(spec_max))
+            })
+    }
+    pub fn packages(self) -> io::Result<Vec<&'a Package<'a>>> {
+        let universe = self.manifest.universe.as_deref().ok_or_else(|| {
+            io::Error::other(format!(
+                "call resolve first to get packages for spec {}",
+                self
+            ))
+        })?;
+        let mut pkgs = Vec::new();
+        for pkg in self.installables()? {
+            let pkg = universe.package(pkg.idx).ok_or_else(|| {
+                io::Error::other(format!(
+                    "universe is missing package {}:{}={} required by spec {:?}",
+                    pkg.name, pkg.arch, pkg.version, self
+                ))
+            })?;
+            pkgs.push(pkg);
+        }
+        Ok(pkgs)
+    }
+    pub fn effective_packages(self) -> io::Result<Vec<&'a Package<'a>>> {
+        let universe = self.manifest.universe.as_deref().ok_or_else(|| {
+            io::Error::other(format!(
+                "call resolve first to get packages for spec {}",
+                self
+            ))
+        })?;
+        std::iter::once(Ok(self))
+            .chain(self.ancestors())
+            .try_fold(Vec::new(), |mut pkgs, spec| {
+                let spec = spec?;
+                for pkg in spec.installables()? {
+                    let pkg = universe.package(pkg.idx).ok_or_else(|| {
+                        io::Error::other(format!(
+                            "universe is missing package {}:{}={} required by spec {:?}",
+                            pkg.name, pkg.arch, pkg.version, spec
+                        ))
+                    })?;
+                    pkgs.push(pkg);
                 }
+                Ok(pkgs)
+            })
+    }
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn staging_installables(
+        self,
+    ) -> io::Result<(Vec<ResolvedInstallable<'a>>, Vec<String>, Vec<Vec<String>>)> {
+        self.installables()?.try_fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(mut installables, mut essentials, mut order), pkg| {
+                if pkg.order == 0 {
+                    essentials.push(pkg.name.clone());
+                } else {
+                    let ord = pkg.order as usize - 1;
+                    if ord >= order.len() {
+                        order.resize(ord + 1, Vec::new());
+                    }
+                    order[ord].push(pkg.name.clone());
+                }
+                installables.push(self.resolved_installable(pkg)?);
+                Ok((installables, essentials, order))
             },
-            None => None,
-        };
-        Some(Ok(current))
+        )
+    }
+    #[allow(clippy::type_complexity)]
+    pub(crate) fn effective_staging_installables(
+        self,
+    ) -> io::Result<(Vec<ResolvedInstallable<'a>>, Vec<String>, Vec<Vec<String>>)> {
+        std::iter::once(Ok(self)).chain(self.ancestors()).try_fold(
+            (Vec::new(), Vec::new(), Vec::new()),
+            |(installables, essentials, order), spec| {
+                let spec = spec?;
+                spec.installables()?.try_fold(
+                    (installables, essentials, order),
+                    |(mut installables, mut essentials, mut order), pkg| {
+                        if pkg.order == 0 {
+                            essentials.push(pkg.name.clone());
+                        } else {
+                            let ord = pkg.order as usize - 1;
+                            if ord >= order.len() {
+                                order.resize(ord + 1, Vec::new());
+                            }
+                            order[ord].push(pkg.name.clone());
+                        }
+                        installables.push(spec.resolved_installable(pkg)?);
+                        Ok((installables, essentials, order))
+                    },
+                )
+            },
+        )
+    }
+    fn resolved_installable(
+        self,
+        package: &'a LockedPackage,
+    ) -> io::Result<ResolvedInstallable<'a>> {
+        self.manifest.resolved_installable(self.raw_name(), package)
+    }
+    pub(crate) fn stage_artifacts(self) -> impl Iterator<Item = io::Result<ResolvedArtifact<'a>>> {
+        self.spec()
+            .stage
+            .iter()
+            .map(move |artifact| {
+                self.manifest.file.artifact(artifact).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "spec {:?} references unknown artifact {}",
+                        self, artifact
+                    ))
+                })
+            })
+            .filter_map_ok(|artifact| {
+                (artifact.arch().is_none() || artifact.arch() == Some(&self.manifest.arch)).then(
+                    || ResolvedArtifact {
+                        base: self.manifest.artifact_path(artifact),
+                        artifact,
+                    },
+                )
+            })
+    }
+    pub(crate) fn effective_stage_artifacts(self) -> io::Result<Vec<ResolvedArtifact<'a>>> {
+        std::iter::once(Ok(self)).chain(self.ancestors()).try_fold(
+            Vec::new(),
+            |mut artifacts, spec| {
+                for artifact in spec?.stage_artifacts() {
+                    artifacts.push(artifact?);
+                }
+                Ok(artifacts)
+            },
+        )
+    }
+
+    pub(crate) fn env_block(self) -> io::Result<String> {
+        self.manifest.file.spec_env_block(self.id)
+    }
+
+    pub fn build_script(self) -> Option<&'a str> {
+        self.spec().build_script.as_deref()
+    }
+
+    pub fn effective_build_script(self) -> io::Result<Vec<String>> {
+        std::iter::once(Ok(self))
+            .chain(self.ancestors())
+            .filter_map_ok(|spec| spec.build_script())
+            .map_ok(|script| script.to_string())
+            .collect::<io::Result<Vec<_>>>()
+            .map(|mut v| {
+                v.reverse();
+                v
+            })
+    }
+
+    pub fn build_env(self) -> &'a KVList<String> {
+        &self.spec().build_env
+    }
+
+    pub fn effective_build_env(self) -> io::Result<Vec<(String, String)>> {
+        std::iter::once(Ok(self))
+            .chain(self.ancestors())
+            .try_fold(Vec::new(), |mut env, spec| {
+                for (k, v) in spec?.build_env().iter() {
+                    if env.iter().any(|(ek, _)| ek == k) {
+                        continue;
+                    }
+                    env.push((k.to_string(), v.to_string()));
+                }
+                Ok::<_, io::Error>(env)
+            })
+    }
+    pub fn get_meta(self, key: &str) -> io::Result<Option<&'a str>> {
+        for spec in std::iter::once(Ok(self)).chain(self.ancestors()) {
+            for m in spec?.meta() {
+                let (k, v) = m?;
+                if k == key {
+                    return Ok(Some(v));
+                }
+            }
+        }
+        Ok(None)
+    }
+    pub fn meta(self) -> impl Iterator<Item = io::Result<(&'a str, &'a str)>> {
+        self.spec()
+            .meta
+            .iter()
+            .map(|s| parse_meta_entry(s).map_err(io::Error::other))
+    }
+    pub fn effective_meta(self) -> io::Result<Vec<(&'a str, &'a str)>> {
+        std::iter::once(Ok(self))
+            .chain(self.ancestors())
+            .try_fold(Vec::new(), |mut meta, spec| {
+                for entry in spec?.meta() {
+                    let (k, v) = entry?;
+                    if meta.iter().any(|(ek, _)| *ek == k) {
+                        continue;
+                    }
+                    meta.push((k, v));
+                }
+                Ok::<_, io::Error>(meta)
+            })
     }
 }
 
-///
-/// Example (simplified):
-/// ```rust,ignore
-/// async fn pin_and_store<T: repo::TransportProvider + ?Sized>(
-///     transport: &T,
-/// ) -> std::io::Result<()> {
-///     let arch = "amd64";
-///     // Load manifest
-///     let mut m = debrepo::Manifest::from_file("Manifest.toml", debrepo::DEFAULT_ARCH).await?;
-///     // Solve dependencies and lock specs
-///     m.resolve(8, transport).await?;
-///     // Persist both Manifest.toml and Manifest.<arch>.lock
-///     m.store().await?;
-///     Ok(())
-/// }
-/// ```
-///
+impl<'a> std::fmt::Display for ResolvedSpecRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.display_name())
+    }
+}
+
+impl<'a> std::fmt::Debug for ResolvedSpecRef<'a> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.manifest.path.display().fmt(f)?;
+        f.write_str(":'")?;
+        f.write_str(self.display_name())?;
+        f.write_char('\'')
+    }
+}
+
+#[derive(Clone)]
+/// Resolved direct stage artifact for a local spec.
+pub struct StageArtifactRef<'a> {
+    artifact: &'a Artifact,
+    base: Option<PathBuf>,
+}
+
+impl<'a> StageArtifactRef<'a> {
+    pub fn artifact(&self) -> &'a Artifact {
+        self.artifact
+    }
+
+    pub fn base(&self) -> Option<&Path> {
+        self.base.as_deref()
+    }
+}
+
+struct SpecIterator<'a> {
+    visited: Vec<(*const Manifest, SpecId)>,
+    cur: Option<ResolvedSpecRef<'a>>,
+}
+
+impl<'a> Iterator for SpecIterator<'a> {
+    type Item = io::Result<ResolvedSpecRef<'a>>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let current = self.cur?;
+        let parent = match current.parent().transpose()? {
+            Ok(spec) => spec,
+            Err(err) => return Some(Err(err)),
+        };
+        if self.visited.contains(&parent.key()) {
+            return Some(Err(io::Error::other(format!(
+                "spec extension cycle detected at {}:{}",
+                parent.manifest.path.display(),
+                parent.display_name()
+            ))));
+        }
+        self.visited.push(parent.key());
+        self.cur = Some(parent);
+        Some(Ok(parent))
+    }
+}
+
 impl Manifest {
     pub const DEFAULT_FILE: &str = "Manifest.toml";
     pub fn new<P: AsRef<Path>, A: ToString>(path: P, arch: A, comment: Option<&str>) -> Self {
@@ -168,8 +537,8 @@ impl Manifest {
         }
     }
     // recursively loads manifest and its imports, returning the top-level manifest and whether it
-    // has a valid lock file. Fails if any import is not locked, however, does not
-    // fail it its own import record is stale.
+    // has a valid lock file. Fails if any import is not locked. Does not fail
+    // it is the requested manifest is not locked.
     fn from_file_rec(
         path: PathBuf,
         arch: String,
@@ -264,16 +633,20 @@ impl Manifest {
         )
         .await
     }
+
     fn mark_file_updated(&mut self) {
         self.hash.take();
     }
+
     fn mark_lock_dirty(&mut self) {
         self.lock_updated = true;
     }
+
     fn mark_lock_invalid(&mut self) {
         self.lock_valid = false;
         self.lock_updated = true;
     }
+
     fn ensure_live_lock(&self) -> io::Result<()> {
         if self.lock_valid && self.lock.is_uptodate() {
             Ok(())
@@ -283,6 +656,7 @@ impl Manifest {
             ))
         }
     }
+
     fn manifest_dir(&self) -> &Path {
         self.path
             .parent()
@@ -306,46 +680,50 @@ impl Manifest {
         self.manifests()
             .find_map(|(id, manifest)| (id == manifest_id).then_some(manifest))
     }
-    fn local_spec_entry(&self, id: usize) -> Option<(&str, &Spec)> {
-        self.file
-            .specs()
-            .enumerate()
-            .find_map(|(idx, entry)| (idx == id).then_some(entry))
+    fn local_spec_entry(&self, id: SpecId) -> Option<(&str, &Spec)> {
+        self.file.spec_entry(id)
     }
-    fn local_spec_ref(&self, id: usize) -> Option<ManifestSpecRef<'_>> {
+
+    pub fn specs(&self) -> impl Iterator<Item = ResolvedSpecRef<'_>> + '_ {
+        self.file
+            .spec_ids()
+            .map(|id| ResolvedSpecRef { manifest: self, id })
+    }
+
+    fn local_spec_ref(&self, id: SpecId) -> Option<ResolvedSpecRef<'_>> {
         self.local_spec_entry(id)
-            .map(|_| ManifestSpecRef { manifest: self, id })
+            .map(|_| ResolvedSpecRef { manifest: self, id })
     }
-    fn resolve_local_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+    fn resolve_local_spec(&self, name: &str) -> Option<ResolvedSpecRef<'_>> {
         self.file
-            .specs()
-            .enumerate()
-            .find_map(|(id, (spec_name, _))| {
-                (spec_name == name).then_some(ManifestSpecRef { manifest: self, id })
-            })
+            .lookup_spec_id(name)
+            .map(|id| ResolvedSpecRef { manifest: self, id })
     }
-    fn resolve_imported_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+    fn resolve_imported_spec(&self, name: &str) -> Option<ResolvedSpecRef<'_>> {
         let import_desc = self.file.import()?;
         if !import_desc.specs().any(|spec| spec == name) {
             return None;
         }
         self.import.as_deref()?.resolve_local_spec(name)
     }
-    fn resolve_spec(&self, name: &str) -> Option<ManifestSpecRef<'_>> {
+    fn resolve_spec(&self, name: &str) -> Option<ResolvedSpecRef<'_>> {
         self.resolve_local_spec(name)
             .or_else(|| self.resolve_imported_spec(name))
     }
-    fn ancestors_refs(&self, id: usize) -> SpecIterator<'_> {
+    fn spec_ref_checked(&self, id: SpecId) -> ResolvedSpecRef<'_> {
+        ResolvedSpecRef { manifest: self, id }
+    }
+    fn ancestor_spec_refs(&self, id: SpecId) -> SpecIterator<'_> {
         SpecIterator {
             visited: Vec::new(),
             cur: self.local_spec_ref(id),
         }
     }
-    pub fn ancestors(&self, id: usize) -> impl Iterator<Item = io::Result<&'_ Spec>> + '_ {
-        self.ancestors_refs(id)
+    fn ancestor_defs(&self, id: SpecId) -> impl Iterator<Item = io::Result<&'_ Spec>> + '_ {
+        self.ancestor_spec_refs(id)
             .map(|spec| spec.map(|spec| spec.entry().1))
     }
-    pub fn descendants(&self, id: usize) -> Vec<usize> {
+    pub fn descendant_spec_ids(&self, id: SpecId) -> Vec<SpecId> {
         let mut result = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(id);
@@ -358,7 +736,7 @@ impl Manifest {
                 .map(|(name, _)| name)
                 .expect("spec index must point to an existing local spec");
             result.push(curr);
-            for (child_id, (_, spec)) in self.file.specs().enumerate() {
+            for (child_id, (_, spec)) in self.file.spec_entries() {
                 if spec.extends.as_deref() == Some(parent_name) {
                     queue.push_back(child_id);
                 }
@@ -367,28 +745,46 @@ impl Manifest {
         result
     }
     #[allow(clippy::type_complexity)]
-    pub fn requirements_for(
+    // Returns:
+    //  (possibly empty) sorted list of packages installed in parent specs
+    //  list of requirements from this spec plus list of packages, installed by parent specs as strict requirements
+    //  list of contstraints from this spec
+    fn requirements_for(
         &self,
-        id: usize,
-    ) -> io::Result<(Vec<Dependency<String>>, Vec<Constraint<String>>)> {
+        id: SpecId,
+    ) -> io::Result<(
+        Vec<PackageId>,
+        Vec<Dependency<String>>,
+        Vec<Constraint<String>>,
+    )> {
+        let current = self
+            .local_spec_ref(id)
+            .ok_or_else(|| io::Error::other(format!("spec id {:?} not found", id)))?;
         let mut reqs = Vec::new();
-        let mut cons = Vec::new();
-        for spec in self.ancestors(id) {
-            let spec = spec?;
-            reqs.extend(spec.include.iter().cloned());
-            cons.extend(spec.exclude.iter().cloned().map(|c| !c));
+        let mut installed = Vec::new();
+        for spec in current.ancestors() {
+            for pkg in spec?.locked()?.installables() {
+                installed.push(pkg.idx.into_id());
+                reqs.push(Dependency::Single(
+                    pkg.try_into().map_err(io::Error::other)?,
+                ));
+            }
         }
-        Ok((reqs, cons))
+        let spec = current.spec();
+        reqs.extend(spec.include.iter().cloned());
+        let cons = spec.exclude.iter().cloned().map(|c| !c).collect();
+        installed.sort();
+        Ok((installed, reqs, cons))
     }
-    pub fn specs_order(&self) -> io::Result<Vec<usize>> {
+    fn specs_order(&self) -> io::Result<Vec<SpecId>> {
         use DFSNodeState::*;
 
-        let spec_count = self.file.specs().count();
-        let mut state = HashMap::<usize, DFSNodeState>::with_capacity(spec_count);
-        let mut stack = Vec::<usize>::with_capacity(spec_count);
-        let mut order = Vec::<usize>::with_capacity(spec_count);
+        let spec_count = self.file.spec_len();
+        let mut state = HashMap::<SpecId, DFSNodeState>::with_capacity(spec_count);
+        let mut stack = Vec::<SpecId>::with_capacity(spec_count);
+        let mut order = Vec::<SpecId>::with_capacity(spec_count);
 
-        for (id, (name, _)) in self.file.specs().enumerate() {
+        for (id, (name, _)) in self.file.spec_entries() {
             if state.get(&id).copied().unwrap_or(Unvisited) == Unvisited {
                 self.dfs(id, name, &mut state, &mut stack, &mut order)?;
             }
@@ -397,11 +793,11 @@ impl Manifest {
     }
     fn dfs<'a>(
         &'a self,
-        id: usize,
+        id: SpecId,
         node: &'a str,
-        state: &mut HashMap<usize, DFSNodeState>,
-        stack: &mut Vec<usize>,
-        order: &mut Vec<usize>,
+        state: &mut HashMap<SpecId, DFSNodeState>,
+        stack: &mut Vec<SpecId>,
+        order: &mut Vec<SpecId>,
     ) -> io::Result<()> {
         use DFSNodeState::*;
 
@@ -438,7 +834,7 @@ impl Manifest {
                     Done => {}
                 }
             } else if self.resolve_imported_spec(name).is_some() {
-                self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
+                self.ancestor_defs(id).collect::<io::Result<Vec<_>>>()?;
             } else {
                 return Err(io::Error::other(format!(
                     "spec {} extends missing ({})",
@@ -469,7 +865,7 @@ impl Manifest {
             .map(|s| s.to_string())
             .map(|s| {
                 let name = valid_spec_name(&s).map_err(io::Error::other)?;
-                if self.file.specs().any(|(n, _)| n == name) {
+                if self.file.contains_spec(name) {
                     Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!(
@@ -511,7 +907,7 @@ impl Manifest {
             })?
             .clone();
         for spec in &specs {
-            if !imported.file.specs().any(|(n, _)| n == spec) {
+            if !imported.file.contains_spec(spec) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -536,7 +932,7 @@ impl Manifest {
         self.mark_file_updated();
         self.lock.set_imported_universe_hash(imported_universe_hash);
         self.lock
-            .specs_mut()
+            .iter_specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
         self.mark_lock_invalid();
         Ok(())
@@ -576,7 +972,7 @@ impl Manifest {
             return Ok(false);
         }
         for spec in import_desc.specs() {
-            if !import.file.specs().any(|(n, _)| n == spec) {
+            if !import.file.contains_spec(spec) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
                     format!(
@@ -600,7 +996,7 @@ impl Manifest {
         }
         self.lock.set_imported_universe_hash(imported_universe_hash);
         self.lock
-            .specs_mut()
+            .iter_specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
         self.mark_lock_invalid();
         Ok(true)
@@ -624,54 +1020,43 @@ impl Manifest {
     pub fn artifact(&self, name: &str) -> Option<&Artifact> {
         self.file.artifact(name)
     }
-    pub fn spec_names(&self) -> impl Iterator<Item = &str> {
-        self.file.names().map(spec_display_name)
+    pub fn spec_ids(&self) -> impl Iterator<Item = SpecId> + '_ {
+        self.file.spec_ids()
     }
+
+    pub fn lookup_spec(&self, spec_name: Option<&str>) -> io::Result<ResolvedSpecRef<'_>> {
+        let spec_name = Self::normalize_spec_name(spec_name)?;
+        self.resolve_local_spec(spec_name).ok_or_else(|| {
+            io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
+        })
+    }
+
     fn normalize_spec_name(spec_name: Option<&str>) -> io::Result<&str> {
         spec_name
             .map_or_else(|| Ok(""), valid_spec_name)
             .map_err(io::Error::other)
     }
-    fn lookup_spec_idx(&self, spec_name: Option<&str>) -> io::Result<Option<usize>> {
-        Ok(self.file.spec_index(Self::normalize_spec_name(spec_name)?))
+    fn local_spec_id(&self, spec_name: Option<&str>) -> io::Result<Option<SpecId>> {
+        Ok(self
+            .file
+            .lookup_spec_id(Self::normalize_spec_name(spec_name)?))
     }
-    fn get_spec_idx(&self, spec_name: Option<&str>) -> io::Result<usize> {
+    fn get_or_create_spec_id(&mut self, spec_name: Option<&str>) -> io::Result<SpecId> {
         let spec_name = Self::normalize_spec_name(spec_name)?;
-        self.file.spec_index(spec_name).ok_or_else(|| {
-            io::Error::other(format!("spec {} not found", spec_display_name(spec_name)))
-        })
-    }
-    fn get_or_create_spec_idx(&mut self, spec_name: Option<&str>) -> io::Result<usize> {
-        let spec_name = Self::normalize_spec_name(spec_name)?;
-        if let Some(spec_index) = self.file.spec_index(spec_name) {
-            return Ok(spec_index);
+        if let Some(spec_id) = self.file.lookup_spec_id(spec_name) {
+            return Ok(spec_id);
         }
-        let file_specs = self.file.specs().count();
-        if self.lock.specs_len() != file_specs {
+        let file_specs = self.file.spec_len();
+        if self.lock.len() != file_specs {
             return Err(io::Error::other(
                 "[internal error] inconsistent spec state between manifest and lock",
             ));
         }
-        let spec_index = self.file.push_empty_spec(spec_name);
+        let spec_id = self.file.push_empty_spec(spec_name);
         self.lock.push_spec(spec_name, Spec::new().locked_spec());
         self.mark_file_updated();
         self.mark_lock_dirty();
-        Ok(spec_index)
-    }
-    fn valid_lock(&self, name: &str, idx: usize) -> io::Result<&LockedSpec> {
-        if idx < self.lock.specs_len() {
-            self.lock.get_spec(idx).as_locked().ok_or_else(|| {
-                io::Error::other(format!(
-                    "no solution for spec \"{}\", update manifest lock",
-                    spec_display_name(name),
-                ))
-            })
-        } else {
-            Err(io::Error::other(format!(
-                "[internal error] missing lock entry for spec {}",
-                spec_display_name(name),
-            )))
-        }
+        Ok(spec_id)
     }
     pub fn add_local_package(
         &mut self,
@@ -692,7 +1077,7 @@ impl Manifest {
         }
         self.mark_file_updated();
         self.lock
-            .specs_mut()
+            .iter_specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
         self.mark_lock_invalid();
         Ok(())
@@ -709,7 +1094,7 @@ impl Manifest {
         }
         self.mark_file_updated();
         self.lock
-            .specs_mut()
+            .iter_specs_mut()
             .for_each(|(_, r)| r.invalidate_solution());
         self.mark_lock_invalid();
         Ok(())
@@ -724,7 +1109,7 @@ impl Manifest {
             Some((i, _)) => {
                 self.file.remove_archive(i);
                 self.lock
-                    .specs_mut()
+                    .iter_specs_mut()
                     .for_each(|(_, r)| r.invalidate_solution());
                 self.mark_file_updated();
                 self.lock.remove_archive(i);
@@ -747,7 +1132,7 @@ impl Manifest {
             Some((i, _)) => {
                 self.file.remove_local_pkg(i);
                 self.lock
-                    .specs_mut()
+                    .iter_specs_mut()
                     .for_each(|(_, r)| r.invalidate_solution());
                 self.mark_file_updated();
                 self.lock.remove_local_package(i)?;
@@ -760,174 +1145,9 @@ impl Manifest {
             )),
         }
     }
-    pub fn installables<'a>(
-        &'a self,
-        name: Option<&'a str>,
-    ) -> io::Result<
-        impl Iterator<Item = io::Result<(Option<&'a Archive>, usize, &'a RepositoryFile)>> + 'a,
-    > {
-        let spec_index = self.get_spec_idx(name)?;
-        let spec_name = self.file.spec_name(spec_index);
-        Ok(self
-            .valid_lock(spec_name, spec_index)?
-            .installables()
-            .map(move |p| {
-                let src =
-                    match p.orig {
-                        PackageOrigin::Unknown => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "package {} in spec {} has unknown origin",
-                                    p.name,
-                                    spec_display_name(spec_name)
-                                ),
-                            ));
-                        }
-                        PackageOrigin::Local { .. } => None,
-                        PackageOrigin::Archive {
-                            manifest_id,
-                            archive_id,
-                        } => {
-                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "invalid manifest id {} in spec {}",
-                                        manifest_id,
-                                        spec_display_name(spec_name)
-                                    ),
-                                )
-                            })?;
-                            Some(manifest.file.get_archive(archive_id as usize).ok_or_else(
-                                || {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "invalid archive index {} for manifest {} in spec {}",
-                                            archive_id,
-                                            manifest_id,
-                                            spec_display_name(spec_name)
-                                        ),
-                                    )
-                                },
-                            )?)
-                        }
-                    };
-                Ok::<_, io::Error>((src, p.order as usize, &p.file))
-            }))
-    }
-    fn scripts_for(&self, id: usize) -> io::Result<Vec<&str>> {
-        let mut scripts = self
-            .ancestors(id)
-            .filter_map_ok(|spec| spec.build_script.as_deref())
-            .collect::<io::Result<Vec<_>>>()?;
-        scripts.reverse();
-        Ok(scripts)
-    }
-    fn build_env_for(&self, id: usize) -> io::Result<Vec<(String, String)>> {
-        let mut env: Vec<(String, String)> = Vec::new();
-        let mut specs = self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
-        specs.reverse();
-        for spec in specs {
-            for (key, value) in spec.build_env.iter() {
-                if let Some((_, existing)) = env.iter_mut().find(|(k, _)| k == key) {
-                    *existing = value.clone();
-                } else {
-                    env.push((key.to_string(), value.clone()));
-                }
-            }
-        }
-        Ok(env)
-    }
-    fn artifacts_for(
-        &self,
-        id: usize,
-    ) -> impl Iterator<Item = io::Result<(&'_ Manifest, &'_ Artifact)>> + '_ {
-        let arch = self.arch.as_str();
-        self.ancestors_refs(id)
-            .map_ok(|spec| {
-                let manifest = spec.manifest;
-                let (_, spec) = spec.entry();
-                spec.stage
-                    .iter()
-                    .map(move |artifact_name| (manifest, artifact_name.as_str()))
-            })
-            .flatten_ok()
-            .filter_map(move |artifact_ref| {
-                artifact_ref
-                    .and_then(|(manifest, artifact_name)| {
-                        let artifact = manifest.file.artifact(artifact_name).ok_or_else(|| {
-                            io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!("missing artifact '{}' in spec stage list", artifact_name),
-                            )
-                        })?;
-                        Ok(
-                            if artifact
-                                .arch()
-                                .is_none_or(|target_arch| target_arch == arch)
-                            {
-                                Some((manifest, artifact))
-                            } else {
-                                None
-                            },
-                        )
-                    })
-                    .transpose()
-            })
-    }
-    fn meta_for_spec(&self, id: usize) -> io::Result<Vec<(&'_ str, &'_ str)>> {
-        let mut meta: Vec<(&str, &str)> = Vec::new();
-        let mut specs = self.ancestors(id).collect::<io::Result<Vec<_>>>()?;
-        specs.reverse();
-        for spec in specs {
-            for entry in &spec.meta {
-                let (key, value) = parse_meta_entry(entry).map_err(io::Error::other)?;
-                if let Some((_, existing)) = meta.iter_mut().find(|(k, _)| *k == key) {
-                    *existing = value;
-                } else {
-                    meta.push((key, value));
-                }
-            }
-        }
-        Ok(meta)
-    }
-    fn spec_hasher(&self, spec_index: usize) -> io::Result<blake3::Hasher> {
-        use digest::FixedOutput;
-        let mut hasher = blake3::Hasher::default();
-        let scripts = self.scripts_for(spec_index)?;
-        for script in scripts {
-            let mut h = blake3::Hasher::default();
-            h.update(script.as_bytes());
-            hasher.update(&h.finalize_fixed());
-        }
-        let build_env = self.build_env_for(spec_index)?;
-        for (key, value) in build_env {
-            let mut h = blake3::Hasher::default();
-            h.update(key.as_bytes());
-            h.update(&[0]);
-            h.update(value.as_bytes());
-            hasher.update(&h.finalize_fixed());
-        }
-        let meta = self.meta_for_spec(spec_index)?;
-        hasher.update(&meta.len().to_be_bytes());
-        for (key, value) in meta {
-            hasher.update(key.as_bytes());
-            hasher.update(&[0]);
-            hasher.update(value.as_bytes());
-        }
-        let artifacts = self
-            .artifacts_for(spec_index)
-            .collect::<io::Result<Vec<_>>>()?;
-        for (_, artifact) in artifacts {
-            artifact.update_spec_hash(&mut hasher);
-        }
-        Ok(hasher)
-    }
-    fn invalidate_locked_specs(&mut self, spec: usize) {
-        for spec_index in self.descendants(spec).into_iter() {
-            self.lock.get_spec_mut(spec_index).invalidate_solution();
+    fn invalidate_locked_specs(&mut self, spec_id: SpecId) {
+        for descendant_id in self.descendant_spec_ids(spec_id) {
+            self.lock.spec_mut(descendant_id).invalidate_solution();
         }
     }
     pub async fn add_artifact<C>(
@@ -942,10 +1162,10 @@ impl Manifest {
     {
         let local_base = (!is_url(&artifact.url)).then(|| self.local_path(&artifact.url));
         let staged = Artifact::new(artifact, local_base.as_deref(), cache).await?;
-        let spec_index = self.get_or_create_spec_idx(spec_name)?;
-        self.file.add_artifact(spec_index, staged, comment)?;
+        let spec_id = self.get_or_create_spec_id(spec_name)?;
+        self.file.add_artifact(spec_id, staged, comment)?;
         self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
+        self.invalidate_locked_specs(spec_id);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -973,9 +1193,9 @@ impl Manifest {
             UpdateResult::Added | UpdateResult::Updated(_) => {}
         }
         self.mark_file_updated();
-        let specs = self.file.spec_indices_with_artifact(&uri);
-        for spec_index in specs {
-            self.invalidate_locked_specs(spec_index);
+        let specs = self.file.spec_ids_with_artifact(&uri);
+        for spec_id in specs {
+            self.invalidate_locked_specs(spec_id);
         }
         self.mark_lock_dirty();
         Ok(())
@@ -998,10 +1218,10 @@ impl Manifest {
                 )));
             }
         }
-        let spec_index = self.get_or_create_spec_idx(spec_name)?;
-        if self.file.add_stage_items(spec_index, items, comment)? {
+        let spec_id = self.get_or_create_spec_id(spec_name)?;
+        if self.file.add_stage_items(spec_id, items, comment)? {
             self.mark_file_updated();
-            self.invalidate_locked_specs(spec_index);
+            self.invalidate_locked_specs(spec_id);
             self.mark_lock_dirty();
         }
         Ok(())
@@ -1011,17 +1231,74 @@ impl Manifest {
         spec_name: Option<&str>,
         artifact: S,
     ) -> io::Result<()> {
-        let spec_index = self.get_spec_idx(spec_name)?;
-        self.file.remove_artifact(spec_index, artifact.as_ref())?;
+        let spec_id = self.lookup_spec(spec_name)?.id;
+        self.file.remove_artifact(spec_id, artifact.as_ref())?;
         self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
+        self.invalidate_locked_specs(spec_id);
         self.mark_lock_dirty();
         Ok(())
     }
     pub fn add_spec(&mut self, spec_name: Option<&str>) -> io::Result<()> {
-        self.get_or_create_spec_idx(spec_name)?;
+        self.get_or_create_spec_id(spec_name)?;
         Ok(())
     }
+
+    fn add_spec_items<S, T, I, Convert, Apply>(
+        &mut self,
+        spec_name: Option<&str>,
+        items: I,
+        comment: Option<&str>,
+        mut convert: Convert,
+        apply: Apply,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        Convert: FnMut(S) -> io::Result<T>,
+        Apply: FnOnce(&mut ManifestFile, SpecId, Vec<T>, Option<&str>) -> io::Result<bool>,
+    {
+        let items = items
+            .into_iter()
+            .map(&mut convert)
+            .collect::<io::Result<Vec<_>>>()?;
+        if items.is_empty() {
+            Self::normalize_spec_name(spec_name)?;
+            return Ok(());
+        }
+        let spec_id = self.get_or_create_spec_id(spec_name)?;
+        if apply(&mut self.file, spec_id, items, comment)? {
+            self.invalidate_locked_specs(spec_id);
+            self.mark_file_updated();
+            self.mark_lock_invalid();
+        }
+        Ok(())
+    }
+
+    fn remove_spec_items<S, T, I, Convert, Apply>(
+        &mut self,
+        spec_name: Option<&str>,
+        items: I,
+        mut convert: Convert,
+        apply: Apply,
+    ) -> io::Result<()>
+    where
+        I: IntoIterator<Item = S>,
+        Convert: FnMut(S) -> io::Result<T>,
+        Apply: FnOnce(&mut ManifestFile, SpecId, &[T]) -> io::Result<bool>,
+    {
+        let items = items
+            .into_iter()
+            .map(&mut convert)
+            .collect::<io::Result<Vec<_>>>()?;
+        let spec_id = self.lookup_spec(spec_name)?.id;
+        if apply(&mut self.file, spec_id, &items)? {
+            self.invalidate_locked_specs(spec_id);
+            self.mark_file_updated();
+            self.mark_lock_invalid();
+            // TODO: drop empty leaf spec
+        }
+        Ok(())
+    }
+
     pub fn add_requirements<S, I>(
         &mut self,
         spec_name: Option<&str>,
@@ -1032,39 +1309,25 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: IntoDependency<String>,
     {
-        let reqs = reqs
-            .into_iter()
-            .map(|s| s.into_dependency())
-            .collect::<Result<Vec<_>, _>>()?;
-        if reqs.is_empty() {
-            Self::normalize_spec_name(spec_name)?;
-            return Ok(());
-        }
-        let spec_index = self.get_or_create_spec_idx(spec_name)?;
-        if self.file.add_requirements(spec_index, reqs, comment)? {
-            self.invalidate_locked_specs(spec_index);
-            self.mark_file_updated();
-            self.mark_lock_invalid();
-        }
-        Ok(())
+        self.add_spec_items(
+            spec_name,
+            reqs,
+            comment,
+            |req| req.into_dependency().map_err(io::Error::other),
+            ManifestFile::add_requirements,
+        )
     }
     pub fn remove_requirements<I, S>(&mut self, spec_name: Option<&str>, reqs: I) -> io::Result<()>
     where
         I: IntoIterator<Item = S>,
         S: IntoDependency<String>,
     {
-        let reqs = reqs
-            .into_iter()
-            .map(|s| s.into_dependency())
-            .collect::<Result<Vec<_>, _>>()?;
-        let spec_index = self.get_spec_idx(spec_name)?;
-        if self.file.remove_requirements(spec_index, reqs.iter())? {
-            self.invalidate_locked_specs(spec_index);
-            self.mark_file_updated();
-            self.mark_lock_invalid();
-            // TODO: drop empty leaf spec
-        }
-        Ok(())
+        self.remove_spec_items(
+            spec_name,
+            reqs,
+            |req| req.into_dependency().map_err(io::Error::other),
+            ManifestFile::remove_requirements,
+        )
     }
     pub fn add_constraints<S, I>(
         &mut self,
@@ -1076,39 +1339,25 @@ impl Manifest {
         I: IntoIterator<Item = S>,
         S: IntoConstraint<String>,
     {
-        let reqs = reqs
-            .into_iter()
-            .map(|s| s.into_constraint())
-            .collect::<Result<Vec<_>, _>>()?;
-        if reqs.is_empty() {
-            Self::normalize_spec_name(spec_name)?;
-            return Ok(());
-        }
-        let spec_index = self.get_or_create_spec_idx(spec_name)?;
-        if self.file.add_constraints(spec_index, reqs, comment)? {
-            self.invalidate_locked_specs(spec_index);
-            self.mark_file_updated();
-            self.mark_lock_invalid();
-        }
-        Ok(())
+        self.add_spec_items(
+            spec_name,
+            reqs,
+            comment,
+            |req| req.into_constraint().map_err(io::Error::other),
+            ManifestFile::add_constraints,
+        )
     }
     pub fn remove_constraints<I, S>(&mut self, spec_name: Option<&str>, cons: I) -> io::Result<()>
     where
         I: IntoIterator<Item = S>,
         S: IntoConstraint<String>,
     {
-        let reqs = cons
-            .into_iter()
-            .map(|s| s.into_constraint())
-            .collect::<Result<Vec<_>, _>>()?;
-        let spec_index = self.get_spec_idx(spec_name)?;
-        if self.file.remove_constraints(spec_index, reqs.iter())? {
-            self.invalidate_locked_specs(spec_index);
-            self.mark_file_updated();
-            self.mark_lock_invalid();
-            // TODO: drop empty leaf spec
-        }
-        Ok(())
+        self.remove_spec_items(
+            spec_name,
+            cons,
+            |req| req.into_constraint().map_err(io::Error::other),
+            ManifestFile::remove_constraints,
+        )
     }
     pub fn upsert_text_artifact(
         &mut self,
@@ -1126,40 +1375,12 @@ impl Manifest {
             UpdateResult::Added | UpdateResult::Updated(_) => {}
         }
         self.mark_file_updated();
-        let specs = self.file.spec_indices_with_artifact(name);
-        for spec_index in specs {
-            self.invalidate_locked_specs(spec_index);
+        let specs = self.file.spec_ids_with_artifact(name);
+        for spec_id in specs {
+            self.invalidate_locked_specs(spec_id);
         }
         self.mark_lock_dirty();
         Ok(())
-    }
-    pub fn spec_build_env(&self, spec_name: Option<&str>) -> io::Result<KVList<String>> {
-        let spec_index = self.get_spec_idx(spec_name)?;
-        Ok(self.file.spec_build_env(spec_index)?.clone())
-    }
-    pub fn spec_env_block(&self, spec_name: Option<&str>) -> io::Result<String> {
-        let spec_index = self.get_spec_idx(spec_name)?;
-        self.file.spec_env_block(spec_index)
-    }
-    pub fn spec_build_script(&self, spec_name: Option<&str>) -> io::Result<Option<String>> {
-        let spec_index = self.get_spec_idx(spec_name)?;
-        Ok(self
-            .file
-            .spec_build_script(spec_index)?
-            .map(|script| script.to_string()))
-    }
-    pub fn get_spec_meta<'a>(
-        &'a self,
-        spec_name: Option<&str>,
-        name: &str,
-    ) -> io::Result<Option<&'a str>> {
-        validate_meta_name(name).map_err(io::Error::other)?;
-        let spec_index = self.get_spec_idx(spec_name)?;
-        let meta = self.meta_for_spec(spec_index)?;
-        Ok(meta
-            .into_iter()
-            .find(|(key, _)| *key == name)
-            .map(|(_, value)| value))
     }
     pub fn set_spec_meta(
         &mut self,
@@ -1169,31 +1390,46 @@ impl Manifest {
     ) -> io::Result<()> {
         validate_meta_name(name).map_err(io::Error::other)?;
         validate_meta_value(value).map_err(io::Error::other)?;
-        let spec_index = self.get_or_create_spec_idx(spec_name)?;
-        self.file.set_meta_entry(spec_index, name, value)?;
+        let spec_id = self.get_or_create_spec_id(spec_name)?;
+        self.file.set_meta_entry(spec_id, name, value)?;
         self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
+        self.invalidate_locked_specs(spec_id);
         self.mark_lock_dirty();
         Ok(())
     }
+
+    fn with_optional_local_spec<F>(
+        &mut self,
+        spec_name: Option<&str>,
+        create: bool,
+        update: F,
+    ) -> io::Result<()>
+    where
+        F: FnOnce(&mut ManifestFile, SpecId) -> io::Result<()>,
+    {
+        let Some(spec_id) = (if create {
+            Some(self.get_or_create_spec_id(spec_name)?)
+        } else {
+            self.local_spec_id(spec_name)?
+        }) else {
+            return Ok(());
+        };
+        update(&mut self.file, spec_id)?;
+        self.mark_file_updated();
+        self.invalidate_locked_specs(spec_id);
+        self.mark_lock_dirty();
+        Ok(())
+    }
+
     pub fn set_build_env(
         &mut self,
         spec_name: Option<&str>,
         env: KVList<String>,
     ) -> io::Result<()> {
-        let spec_index = if env.is_empty() {
-            match self.lookup_spec_idx(spec_name)? {
-                Some(spec_index) => spec_index,
-                None => return Ok(()),
-            }
-        } else {
-            self.get_or_create_spec_idx(spec_name)?
-        };
-        self.file.set_build_env(spec_index, env)?;
-        self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
-        self.mark_lock_dirty();
-        Ok(())
+        let create = !env.is_empty();
+        self.with_optional_local_spec(spec_name, create, |file, spec_id| {
+            file.set_build_env(spec_id, env)
+        })
     }
     pub fn spec_update_env_block(
         &mut self,
@@ -1203,15 +1439,15 @@ impl Manifest {
         let spec_name = spec_name
             .map_or_else(|| Ok(""), valid_spec_name)
             .map_err(io::Error::other)?;
-        let had_spec = self.file.spec_index(spec_name).is_some();
-        let Some(spec_index) = self.file.set_spec_env_block(spec_name, &block)? else {
+        let had_spec = self.file.contains_spec(spec_name);
+        let Some(spec_id) = self.file.set_spec_env_block(spec_name, &block)? else {
             return Ok(());
         };
         if !had_spec {
             self.lock.push_spec(spec_name, Spec::new().locked_spec());
         }
         self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
+        self.invalidate_locked_specs(spec_id);
         self.mark_lock_dirty();
         Ok(())
     }
@@ -1220,19 +1456,10 @@ impl Manifest {
         spec_name: Option<&str>,
         script: Option<String>,
     ) -> io::Result<()> {
-        let spec_index = if script.is_none() {
-            match self.lookup_spec_idx(spec_name)? {
-                Some(spec_index) => spec_index,
-                None => return Ok(()),
-            }
-        } else {
-            self.get_or_create_spec_idx(spec_name)?
-        };
-        self.file.set_build_script(spec_index, script)?;
-        self.mark_file_updated();
-        self.invalidate_locked_specs(spec_index);
-        self.mark_lock_dirty();
-        Ok(())
+        let create = script.is_some();
+        self.with_optional_local_spec(spec_name, create, |file, spec_id| {
+            file.set_build_script(spec_id, script)
+        })
     }
     fn archives(&self, manifest_id: u32) -> UniverseFiles<'_> {
         UniverseFiles::new(
@@ -1242,40 +1469,49 @@ impl Manifest {
             self.lock.local_archives(),
         )
     }
-    async fn universe_packages<C: ContentProvider>(
+    // Loads packages in stable order, starting from the
+    // root Manifest. First, we collect packages for each
+    // Manifest in the chain starting the current one in
+    // reverse order. Then we reverse the whole list
+    async fn load_universe_packages<C: ContentProvider>(
         &self,
         concurrency: NonZero<usize>,
         cache: &C,
     ) -> io::Result<(Vec<Packages>, Hash)> {
         tracing::debug!("preparing universe packages");
-        let mut hash = blake3::Hasher::default();
         let mut packages = Vec::new();
         for (manifest_id, current) in self.manifests() {
+            let mut current_packages = cache
+                .fetch_universe(current.archives(manifest_id), concurrency)
+                .await?;
+            current_packages.iter_mut().for_each(|pkgs| {
+                let prio = pkgs
+                    .origin()
+                    .archive()
+                    .and_then(|arch| current.file.get_archive(arch as usize))
+                    .and_then(|arch| arch.priority)
+                    .unwrap_or_else(|| pkgs.prio());
+                *pkgs = pkgs.clone().with_prio(prio);
+            });
+            packages.extend(current_packages.into_iter().rev());
             if let Some(pkgs) = current.lock.local_pkgs() {
-                hash.update(pkgs.src().as_bytes());
-                // local packages have highest priority
+                // local packages have highest priority.
                 packages.push(
                     pkgs.clone()
                         .with_prio(0)
                         .with_origin(PackageOrigin::Local { manifest_id }),
                 )
             }
-            let mut current_packages = cache
-                .fetch_universe(current.archives(manifest_id), concurrency)
-                .await?;
-            current_packages.iter_mut().for_each(|pkg| {
-                let prio = pkg
-                    .origin()
-                    .archive()
-                    .and_then(|arch| current.file.get_archive(arch as usize))
-                    .and_then(|arch| arch.priority)
-                    .unwrap_or_else(|| pkg.prio());
-                *pkg = pkg.clone().with_prio(prio);
-                hash.update(pkg.src().as_bytes());
-            });
-            packages.extend(current_packages);
         }
-        Ok((packages, hash.into_hash()))
+        packages.reverse();
+        let hash = packages
+            .iter()
+            .fold(blake3::Hasher::default(), |mut hash, pkgs| {
+                hash.update(pkgs.src().as_bytes());
+                hash
+            })
+            .into_hash();
+        Ok((packages, hash))
     }
     async fn make_universe<C: ContentProvider>(
         &mut self,
@@ -1283,7 +1519,7 @@ impl Manifest {
         cache: &C,
     ) -> io::Result<Hash> {
         tracing::debug!("building package universe");
-        let (packages, hash) = self.universe_packages(concurrency, cache).await?;
+        let (packages, hash) = self.load_universe_packages(concurrency, cache).await?;
         self.universe = Some(Box::new(Universe::new(&self.arch, packages)?));
         Ok(hash)
     }
@@ -1465,24 +1701,8 @@ impl Manifest {
         &mut self,
         _cache: &C,
     ) -> io::Result<bool> {
-        let mut updates = Vec::new();
         let base_dir = self.manifest_dir().to_path_buf();
-        for artifact in self.file.artifacts_mut().iter_mut() {
-            if artifact.is_remote() || matches!(artifact, Artifact::Text(_)) {
-                continue;
-            }
-            let old_hash = artifact.hash();
-            let old_size = artifact.size();
-            let path = if Path::new(artifact.uri()).is_absolute() {
-                PathBuf::from(artifact.uri())
-            } else {
-                base_dir.join(artifact.uri())
-            };
-            artifact.hash_local(&path).await?;
-            if artifact.hash() != old_hash || artifact.size() != old_size {
-                updates.push(artifact.clone());
-            }
-        }
+        let updates = self.file.rehash_local_artifacts(&base_dir).await?;
         let updated = !updates.is_empty();
         updates.into_iter().try_for_each(|artifact| {
             self.upsert_artifact_only_inner(artifact, None)?;
@@ -1520,7 +1740,7 @@ impl Manifest {
             self.lock.invalidate_specs();
             self.drop_universe().await;
             self.mark_lock_invalid();
-        } else if self.lock.specs().all(|(_, l)| l.is_locked()) {
+        } else if self.lock.iter_specs().all(|(_, l)| l.is_locked()) {
             tracing::debug!("archives up-to-date, all specs locked, skipping resolve");
             return Ok(());
         }
@@ -1556,27 +1776,54 @@ impl Manifest {
                 })
                 .collect();
             let mut updated = false;
-            for (spec_index, (spec_name, _)) in self.file.specs().enumerate() {
-                if self.lock.get_spec(spec_index).is_locked() {
+            for spec_id in self.specs_order()? {
+                let spec_name = self.file.spec_name_raw(spec_id);
+                if self.lock.spec(spec_id).is_locked() {
                     continue;
                 }
                 tracing::debug!("resolving spec {}", spec_display_name(spec_name));
-                let (reqs, cons) = self.requirements_for(spec_index)?;
-                let mut hasher = self.spec_hasher(spec_index)?;
+                let (installed, reqs, cons) = self.requirements_for(spec_id)?;
+                let mut hasher = self.spec_ref_checked(spec_id).hasher()?;
                 let installables = {
-                    let universe = self.universe.as_mut().map(|u| u.as_mut()).unwrap();
-                    let solvables = universe.solve(reqs, cons).map_err(|conflict| {
-                        io::Error::other(format!(
-                            "failed to solve spec {}:\n{}",
-                            spec_display_name(spec_name),
-                            universe.display_conflict(conflict)
-                        ))
-                    })?;
-                    let sorted = universe.installation_order(&solvables);
+                    let mut solvables = self
+                        .universe
+                        .as_deref_mut()
+                        .map(|universe| {
+                            universe.solve(reqs, cons).map_err(|conflict| {
+                                io::Error::other(format!(
+                                    "failed to solve spec {}:\n{}",
+                                    spec_display_name(spec_name),
+                                    universe.display_conflict(conflict)
+                                ))
+                            })
+                        })
+                        .transpose()?
+                        .unwrap();
+                    let universe = self.universe.as_deref().unwrap();
+                    solvables.sort();
+                    let new_installables =
+                        new_installables(&installed, &solvables).map_err(|failed| {
+                            io::Error::other(format!(
+                                "spec {} requested to remove packages from parent specs: {}",
+                                spec_display_name(spec_name),
+                                failed
+                                    .into_iter()
+                                    .map(|pkg| format!("{}", universe.display_solvable(pkg)))
+                                    .join(",")
+                            ))
+                        })?;
+                    let sorted = universe.installation_order(&new_installables);
+                    let spec = self.spec_ref_checked(spec_id);
+                    let base_install_order = spec
+                        .parent()?
+                        .map(ResolvedSpecRef::effective_max_install_order)
+                        .transpose()?
+                        .unwrap_or(0) as usize;
                     sorted
                         .into_iter()
                         .enumerate()
                         .flat_map(|(order, solvables)| {
+                            let order = if order == 0 { 0 } else { order + base_install_order};
                             solvables.into_iter().map(move |solvable| (order, solvable))
                         })
                         .map(|(order, solvable)| {
@@ -1605,6 +1852,8 @@ impl Manifest {
                                 }
                             };
                             let name = pkg.name().to_string();
+                            let arch = pkg.architecture().to_string();
+                            let version = pkg.raw_version().translate(|v| v.to_string()).to_string();
                             let (path, size, hash) = pkg.repo_file(hash_kind).map_err(|err| {
                                 io::Error::other(format!(
                                     "failed to parse package {} record while processing spec {}: {}",
@@ -1613,6 +1862,12 @@ impl Manifest {
                                     err
                                 ))
                             })?;
+                            hasher.update(name.as_bytes());
+                            hasher.update(b":");
+                            hasher.update(arch.as_bytes());
+                            hasher.update(b"=");
+                            hasher.update(version.as_bytes());
+                            hasher.update(&size.to_le_bytes());
                             hasher.update(hash.as_ref());
                             Ok(LockedPackage {
                                 file: RepositoryFile {
@@ -1622,14 +1877,16 @@ impl Manifest {
                                     hash,
                                 },
                                 idx: solvable.into(),
+                                arch,
                                 order: order as u32,
                                 orig: origin,
                                 name,
+                                version,
                             })
                         })
                         .collect::<io::Result<Vec<_>>>()?
                 };
-                *self.lock.get_spec_mut(spec_index) = LockedSpec {
+                *self.lock.spec_mut(spec_id) = LockedSpec {
                     installables: Some(installables),
                     hash: Some(hasher.into_hash()),
                 };
@@ -1647,157 +1904,83 @@ impl Manifest {
         self.universe.take();
         self.source_universe.take();
     }
-    pub fn packages(&self) -> io::Result<impl Iterator<Item = &'_ Package<'_>>> {
+    pub fn universe_packages(&self) -> io::Result<impl Iterator<Item = &'_ Package<'_>>> {
         self.universe
             .as_ref()
             .map(|u| u.packages())
             .ok_or_else(|| io::Error::other("call resolve first"))
     }
-    pub fn spec_packages<'a>(
-        &'a self,
-        name: Option<&str>,
-    ) -> io::Result<impl Iterator<Item = &'a Package<'a>>> {
-        let spec_index = self.get_spec_idx(name)?;
-        let spec_name = self.file.spec_name(spec_index);
-        let lock = self.valid_lock(spec_name, spec_index)?;
-        let universe = self
-            .universe
-            .as_ref()
-            .map(|u| u.as_ref())
-            .expect("call resolve first");
-        Ok(lock.installables().map(|p| p.idx).map(|i| {
-            universe
-                .package(i)
-                .expect("inconsistent manifest, call resolve first")
-        }))
-    }
-    pub fn spec_hash(&self, name: Option<&str>) -> io::Result<Hash> {
-        let spec_index = self.get_spec_idx(name)?;
-        let spec_name = self.file.spec_name(spec_index);
-        self.valid_lock(spec_name, spec_index)?
-            .hash
-            .as_ref()
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "no solution for spec \"{}\", update manifest lock",
-                    spec_display_name(name.unwrap_or("")),
-                ))
-            })
-            .cloned()
-    }
-    fn staging_artifacts<'a>(
+    fn resolved_installable<'a>(
         &'a self,
         spec_name: &str,
-        spec_index: usize,
-    ) -> io::Result<Vec<ResolvedArtifact<'a>>> {
-        self.artifacts_for(spec_index)
-            .map(|artifact| {
-                artifact.map(|(manifest, artifact)| ResolvedArtifact {
-                    base: manifest.artifact_path(artifact),
-                    artifact,
-                })
-            })
-            .collect::<io::Result<Vec<_>>>()
-            .map_err(|e| {
-                io::Error::new(
-                    e.kind(),
+        package: &'a LockedPackage,
+    ) -> io::Result<ResolvedInstallable<'a>> {
+        let (archive, base) = match package.orig {
+            PackageOrigin::Unknown => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
                     format!(
-                        "failed to get artifacts for spec {}: {}",
-                        spec_display_name(spec_name),
-                        e
+                        "package {} in spec {} has unknown origin",
+                        package.name,
+                        spec_display_name(spec_name)
                     ),
-                )
-            })
-    }
-    #[allow(clippy::type_complexity)]
-    fn staging_installables<'a>(
-        &'a self,
-        spec_name: &str,
-        spec_index: usize,
-    ) -> io::Result<(Vec<ResolvedInstallable<'a>>, Vec<String>, Vec<Vec<String>>)> {
-        let lock = self.valid_lock(spec_name, spec_index)?;
-        let mut essentials = Vec::new();
-        let mut order = Vec::new();
-        let installables =
-            lock.installables()
-                .map(|p| {
-                    let (src, base) = match p.orig {
-                        PackageOrigin::Unknown => {
-                            return Err(io::Error::new(
-                                io::ErrorKind::InvalidData,
-                                format!(
-                                    "package {} in spec {} has unknown origin",
-                                    p.name,
-                                    spec_display_name(spec_name)
-                                ),
-                            ));
-                        }
-                        PackageOrigin::Local { manifest_id } => {
-                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "invalid manifest id {} in spec {}",
-                                        manifest_id,
-                                        spec_display_name(spec_name)
-                                    ),
-                                )
-                            })?;
-                            (None, Some(manifest.local_path(p.file.path())))
-                        }
-                        PackageOrigin::Archive {
+                ));
+            }
+            PackageOrigin::Local { manifest_id } => {
+                let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid manifest id {} in spec {}",
                             manifest_id,
-                            archive_id,
-                        } => {
-                            let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
-                                io::Error::new(
-                                    io::ErrorKind::InvalidData,
-                                    format!(
-                                        "invalid manifest id {} in spec {}",
-                                        manifest_id,
-                                        spec_display_name(spec_name)
-                                    ),
-                                )
-                            })?;
-                            let archive = manifest
-                                .file
-                                .get_archive(archive_id as usize)
-                                .ok_or_else(|| {
-                                    io::Error::new(
-                                        io::ErrorKind::InvalidData,
-                                        format!(
-                                            "invalid archive index {} for manifest {} in spec {}",
-                                            archive_id,
-                                            manifest_id,
-                                            spec_display_name(spec_name)
-                                        ),
-                                    )
-                                })?;
-                            (Some(archive), None)
-                        }
-                    };
-                    if p.order == 0 {
-                        essentials.push(p.name.clone());
-                    } else {
-                        let ord = p.order as usize - 1;
-                        if ord >= order.len() {
-                            order.resize(ord + 1, Vec::new());
-                        }
-                        order[ord].push(p.name.clone());
-                    }
-                    Ok::<_, io::Error>(ResolvedInstallable {
-                        base,
-                        archive: src,
-                        file: &p.file,
-                    })
-                })
-                .collect::<io::Result<Vec<_>>>()?;
-        Ok((installables, essentials, order))
+                            spec_display_name(spec_name)
+                        ),
+                    )
+                })?;
+                (None, Some(manifest.local_path(package.file.path())))
+            }
+            PackageOrigin::Archive {
+                manifest_id,
+                archive_id,
+            } => {
+                let manifest = self.manifest_by_id(manifest_id).ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "invalid manifest id {} in spec {}",
+                            manifest_id,
+                            spec_display_name(spec_name)
+                        ),
+                    )
+                })?;
+                let archive = manifest
+                    .file
+                    .get_archive(archive_id as usize)
+                    .ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "invalid archive index {} for manifest {} in spec {}",
+                                archive_id,
+                                manifest_id,
+                                spec_display_name(spec_name)
+                            ),
+                        )
+                    })?;
+                (Some(archive), None)
+            }
+        };
+        Ok(ResolvedInstallable {
+            archive,
+            base,
+            file: &package.file,
+        })
     }
     #[allow(clippy::type_complexity)]
     fn stage_prepare<'a, P>(
         &'a self,
         name: Option<&str>,
+        incremental: bool,
         pb: Option<P>,
     ) -> io::Result<(
         Option<UniverseFiles<'a>>,    // archives
@@ -1812,21 +1995,28 @@ impl Manifest {
     where
         P: FnOnce(u64) -> StageProgress,
     {
-        let spec_index = self.get_spec_idx(name)?;
-        let spec_name = self.file.spec_name(spec_index);
-        let archives = self
-            .meta_for_spec(spec_index)?
+        let spec = self.lookup_spec(name)?;
+        let spec_meta = spec.effective_meta()?;
+        let archives = spec_meta
             .iter()
             .any(|(name, value)| *name == "apt-lists" && *value == "stage")
             .then(|| self.archives(0));
-        let (installables, essentials, other) = self.staging_installables(spec_name, spec_index)?;
-        let artifacts = self.staging_artifacts(spec_name, spec_index)?;
-        let scripts = self
-            .scripts_for(spec_index)?
-            .into_iter()
-            .map(String::from)
-            .collect();
-        let build_env = self.build_env_for(spec_index)?;
+        let (installables, essentials, other) = if incremental {
+            spec.staging_installables()?
+        } else {
+            spec.effective_staging_installables()?
+        };
+        let artifacts = if incremental {
+            spec.stage_artifacts().collect::<io::Result<Vec<_>>>()?
+        } else {
+            spec.effective_stage_artifacts()?
+        };
+        let scripts: Vec<String> = if incremental {
+            spec.build_script().iter().map(|s| s.to_string()).collect()
+        } else {
+            spec.effective_build_script()?
+        };
+        let build_env = spec.effective_build_env()?;
         let pb = pb.map(|f| {
             let installables_size: u64 = installables.iter().map(|pkg| pkg.file.size).sum();
             let artifacts_size: u64 = artifacts
@@ -1846,9 +2036,15 @@ impl Manifest {
             pb,
         ))
     }
+    // Stages the spec `name` to the filesystem `fs`.
+    // If `installed` is not empty, then assumes that the `fs` contains
+    // installed parent spec and `installed` contains the content
+    // of /var/lib/dpkg/status file of the parent spec. The file itself must
+    // be removed prior to staging.
     pub async fn stage_local<FS, P, C>(
         &self,
         name: Option<&str>,
+        installed: Option<&ControlFile<'_>>,
         fs: &mut FS,
         concurrency: NonZero<usize>,
         cache: &C,
@@ -1865,9 +2061,17 @@ impl Manifest {
         C: ContentProvider<Target = FS>,
     {
         let (archives, artifacts, installables, essentials, other, scripts, build_env, pb) =
-            self.stage_prepare(name, pb)?;
-        crate::stage::stage_local(installables, artifacts, fs, concurrency, cache, pb.clone())
-            .await?;
+            self.stage_prepare(name, installed.is_some(), pb)?;
+        crate::stage::stage_local(
+            installed,
+            installables,
+            artifacts,
+            fs,
+            concurrency,
+            cache,
+            pb.clone(),
+        )
+        .await?;
         if let Some(pb) = pb {
             pb.finish();
         }
@@ -1877,9 +2081,15 @@ impl Manifest {
         }
         Ok((essentials, other, scripts, build_env))
     }
+    // Stages the spec `name` to the filesystem `fs`.
+    // If `installed` is not empty, then assumes that the `fs` contains
+    // installed parent spec and `installed` contains the content
+    // of /var/lib/dpkg/status file of the parent spec. The file itself must
+    // be removed prior to staging.
     pub async fn stage<FS, P, C>(
         &self,
         name: Option<&str>,
+        installed: Option<&ControlFile<'_>>,
         fs: &FS,
         concurrency: NonZero<usize>,
         cache: &C,
@@ -1897,8 +2107,17 @@ impl Manifest {
     {
         tracing::debug!("running stage_");
         let (archives, artifacts, installables, essentials, other, scripts, build_env, pb) =
-            self.stage_prepare(name, pb)?;
-        crate::stage::stage(installables, artifacts, fs, concurrency, cache, pb.clone()).await?;
+            self.stage_prepare(name, installed.is_some(), pb)?;
+        crate::stage::stage(
+            installed,
+            installables,
+            artifacts,
+            fs,
+            concurrency,
+            cache,
+            pb.clone(),
+        )
+        .await?;
         if let Some(pb) = pb {
             pb.finish();
         }
@@ -1910,26 +2129,51 @@ impl Manifest {
     }
 }
 
+fn new_installables<PackageId: Ord + Clone>(
+    installed: &[PackageId],
+    installables: &[PackageId],
+) -> Result<Vec<PackageId>, Vec<PackageId>> {
+    let mut installed_it = installed.iter().peekable();
+    let mut new = Vec::new();
+    let mut unexpected_installed = Vec::new();
+    for installable in installables {
+        loop {
+            match installed_it.peek() {
+                Some(installed_id) => match (*installed_id).cmp(installable) {
+                    Ordering::Less => {
+                        unexpected_installed.push((*installed_id).clone());
+                        installed_it.next();
+                    }
+                    Ordering::Equal => {
+                        installed_it.next();
+                        break;
+                    }
+                    Ordering::Greater => {
+                        new.push(installable.clone());
+                        break;
+                    }
+                },
+                None => {
+                    new.push(installable.clone());
+                    break;
+                }
+            }
+        }
+    }
+    unexpected_installed.extend(installed_it.cloned());
+    if unexpected_installed.is_empty() {
+        Ok(new)
+    } else {
+        Err(unexpected_installed)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::manifest_doc::BuildEnvComments;
 
     fn new_manifest() -> ManifestFile {
         ManifestFile::new(None)
-    }
-
-    fn render_manifest(manifest: &ManifestFile) -> (String, toml_edit::DocumentMut) {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let path = dir.path().join("Manifest.toml");
-        smol::block_on(async {
-            manifest.store(&path).await.expect("store manifest");
-        });
-        let text = std::fs::read_to_string(&path).expect("read manifest");
-        let doc = text
-            .parse::<toml_edit::DocumentMut>()
-            .expect("parse manifest");
-        (text, doc)
     }
 
     fn add_requirements<S, I>(
@@ -1951,55 +2195,23 @@ mod tests {
         Ok(())
     }
 
-    fn set_build_env_with_comments(
-        manifest: &mut ManifestFile,
-        spec_name: Option<&str>,
-        env: KVList<String>,
-        comments: BuildEnvComments,
-    ) -> io::Result<()> {
-        let spec_idx = ensure_spec_idx(manifest, spec_name)?;
-        manifest.set_build_env_with_comments(spec_idx, env, &comments)
-    }
-
-    fn ensure_spec_idx(manifest: &mut ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+    fn ensure_spec_idx(manifest: &mut ManifestFile, spec_name: Option<&str>) -> io::Result<SpecId> {
         let spec_name = spec_name
             .map_or_else(|| Ok(""), crate::manifest_doc::valid_spec_name)
             .map_err(io::Error::other)?;
-        if let Some(spec_idx) = manifest.spec_index(spec_name) {
-            return Ok(spec_idx);
+        if let Some(spec_id) = manifest.lookup_spec_id(spec_name) {
+            return Ok(spec_id);
         }
         Ok(manifest.push_empty_spec(spec_name))
     }
 
-    fn lookup_spec_idx(manifest: &ManifestFile, spec_name: Option<&str>) -> io::Result<usize> {
+    fn lookup_spec_idx(manifest: &ManifestFile, spec_name: Option<&str>) -> io::Result<SpecId> {
         let spec_name = spec_name
             .map_or_else(|| Ok(""), crate::manifest_doc::valid_spec_name)
             .map_err(io::Error::other)?;
         manifest
-            .spec_index(spec_name)
+            .lookup_spec_id(spec_name)
             .ok_or_else(|| io::Error::other("spec not found"))
-    }
-
-    fn make_env(items: &[(&str, &str)]) -> KVList<String> {
-        items
-            .iter()
-            .map(|(k, v)| (k.to_string(), v.to_string()))
-            .collect()
-    }
-
-    fn make_env_comments(prefix: &[(&str, &str)], inline: &[(&str, &str)]) -> BuildEnvComments {
-        let mut comments = BuildEnvComments::default();
-        for (key, value) in prefix {
-            comments
-                .prefix
-                .insert((*key).to_string(), (*value).to_string());
-        }
-        for (key, value) in inline {
-            comments
-                .inline
-                .insert((*key).to_string(), (*value).to_string());
-        }
-        comments
     }
 
     #[test]
@@ -2027,114 +2239,14 @@ mod tests {
         );
 
         let spec_index = manifest
-            .get_or_create_spec_idx(Some("custom"))
+            .get_or_create_spec_id(Some("custom"))
             .expect("create missing spec");
 
-        assert_eq!(spec_index, 0);
+        assert_eq!(spec_index, SpecId::from_index(0));
         assert!(manifest.hash.is_none(), "new spec must dirty manifest");
         assert!(manifest.lock_updated, "new spec must mark lock updated");
-        assert_eq!(manifest.file.spec_name(spec_index), "custom");
-        assert_eq!(manifest.lock.specs_len(), 1);
-    }
-
-    #[test]
-    fn set_build_env_default_spec_sets_values_and_comments() {
-        let mut manifest = new_manifest();
-        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
-
-        let env = make_env(&[("FOO", "bar"), ("BAZ", "qux")]);
-        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
-
-        let (text, doc) = render_manifest(&manifest);
-        let build_env = doc["spec"]["build-env"]
-            .as_table()
-            .expect("build-env table");
-        assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
-        assert_eq!(build_env.get("BAZ").and_then(|v| v.as_str()), Some("qux"));
-        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
-        assert_eq!(
-            manifest.spec_env_block(spec_idx).expect("env block"),
-            "# prefix-foo\nFOO=bar # inline-foo\nBAZ=qux\n"
-        );
-        assert!(text.contains("prefix-foo"));
-        assert!(text.contains("inline-foo"));
-    }
-
-    #[test]
-    fn set_build_env_default_spec_updates_and_removes_comments() {
-        let mut manifest = new_manifest();
-        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
-
-        let env = make_env(&[("FOO", "bar")]);
-        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
-
-        let env = make_env(&[("FOO", "updated")]);
-        set_build_env_with_comments(&mut manifest, None, env, BuildEnvComments::default())
-            .expect("update build env");
-
-        let (text, doc) = render_manifest(&manifest);
-        let build_env = doc["spec"]["build-env"]
-            .as_table()
-            .expect("build-env table");
-        assert_eq!(
-            build_env.get("FOO").and_then(|v| v.as_str()),
-            Some("updated")
-        );
-        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
-        assert_eq!(
-            manifest.spec_env_block(spec_idx).expect("env block"),
-            "FOO=updated\n"
-        );
-        assert!(!text.contains("prefix-foo"));
-        assert!(!text.contains("inline-foo"));
-    }
-
-    #[test]
-    fn set_build_env_default_spec_removes_table_when_empty() {
-        let mut manifest = new_manifest();
-        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
-
-        let env = make_env(&[("FOO", "bar")]);
-        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-        set_build_env_with_comments(&mut manifest, None, env, comments).expect("set build env");
-
-        set_build_env_with_comments(
-            &mut manifest,
-            None,
-            KVList::new(),
-            BuildEnvComments::default(),
-        )
-        .expect("clear build env");
-
-        let (text, doc) = render_manifest(&manifest);
-        let spec = doc["spec"].as_table().expect("spec table");
-        assert!(spec.get("build-env").is_none());
-        assert!(!text.contains("prefix-foo"));
-    }
-
-    #[test]
-    fn set_build_env_named_spec_sets_values_and_comments() {
-        let mut manifest = new_manifest();
-        add_requirements(&mut manifest, Some("custom"), ["base"], None).expect("add requirements");
-
-        let env = make_env(&[("FOO", "bar")]);
-        let comments = make_env_comments(&[("FOO", "# prefix-foo\n")], &[("FOO", " # inline-foo")]);
-        set_build_env_with_comments(&mut manifest, Some("custom"), env, comments)
-            .expect("set build env");
-
-        let (text, doc) = render_manifest(&manifest);
-        let build_env = doc["spec"]["custom"]["build-env"]
-            .as_table()
-            .expect("build-env table");
-        assert_eq!(build_env.get("FOO").and_then(|v| v.as_str()), Some("bar"));
-        let spec_idx = lookup_spec_idx(&manifest, Some("custom")).expect("custom spec index");
-        assert_eq!(
-            manifest.spec_env_block(spec_idx).expect("env block"),
-            "# prefix-foo\nFOO=bar # inline-foo\n"
-        );
-        assert!(text.contains("prefix-foo"));
+        assert_eq!(manifest.file.spec_name_raw(spec_index), "custom");
+        assert_eq!(manifest.lock.len(), 1);
     }
 
     #[test]
@@ -2144,63 +2256,5 @@ mod tests {
 
         let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
         assert_eq!(manifest.spec_env_block(spec_idx).expect("env block"), "");
-    }
-
-    #[test]
-    fn manifest_file_set_spec_env_block_comment_only_missing_spec_is_noop() {
-        let mut manifest = new_manifest();
-
-        assert_eq!(
-            manifest
-                .set_spec_env_block("custom", "# comment only\n\n")
-                .expect("set env block"),
-            None
-        );
-        assert!(manifest.spec_index("custom").is_none());
-    }
-
-    #[test]
-    fn manifest_file_set_spec_env_block_roundtrips_comments_and_order() {
-        let mut manifest = new_manifest();
-        add_requirements(&mut manifest, None, ["base"], None).expect("add requirements");
-
-        let spec_idx = lookup_spec_idx(&manifest, None).expect("default spec index");
-        let block = "# lead\n\nFOO=bar  # inline\nBAZ=qux\n";
-        manifest
-            .set_spec_env_block("", block)
-            .expect("set env block")
-            .expect("updated spec");
-
-        assert_eq!(manifest.spec_env_block(spec_idx).expect("env block"), block);
-        let env = manifest.spec_build_env(spec_idx).expect("build env");
-        assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
-        assert_eq!(env.get("BAZ").map(String::as_str), Some("qux"));
-    }
-
-    #[test]
-    fn manifest_file_set_spec_env_block_rejects_duplicate_keys() {
-        let mut manifest = new_manifest();
-        let err = manifest
-            .set_spec_env_block("", "FOO=bar\nFOO=baz\n")
-            .expect_err("duplicate must fail");
-        assert_eq!(err.to_string(), "duplicate env key 'FOO'");
-    }
-
-    #[test]
-    fn manifest_file_set_spec_env_block_rejects_missing_equals() {
-        let mut manifest = new_manifest();
-        let err = manifest
-            .set_spec_env_block("", "FOO\n")
-            .expect_err("missing equals must fail");
-        assert_eq!(err.to_string(), "invalid env line 1: expected VAR=value");
-    }
-
-    #[test]
-    fn manifest_file_set_spec_env_block_rejects_empty_key() {
-        let mut manifest = new_manifest();
-        let err = manifest
-            .set_spec_env_block("", " =value\n")
-            .expect_err("empty key must fail");
-        assert_eq!(err.to_string(), "invalid env line 1: empty key");
     }
 }

@@ -62,7 +62,7 @@ fn find_solution_id(universe: &Universe, solution: &[PackageId], name: &str) -> 
         .unwrap()
 }
 
-fn node_index_for(graph: &Graph<PackageId, ()>, id: PackageId) -> NodeIndex {
+fn node_index_for(graph: &Graph<PackageId, u8>, id: PackageId) -> NodeIndex {
     graph.node_indices().find(|idx| graph[*idx] == id).unwrap()
 }
 
@@ -221,6 +221,224 @@ SHA256: {SHA256_B}
     assert_eq!(
         solve_display(&mut universe, &[], &[]),
         vec!["reqdup:amd64=1.0"]
+    );
+}
+
+#[test]
+fn universe_installation_order_prefers_required_packages_and_ignores_input_permutation() {
+    let mut universe = Universe::new(
+        "amd64",
+        [packages(
+            &format!(
+                "\
+Package: locales
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/locales_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+
+Package: mawk
+Architecture: amd64
+Version: 1.0
+Priority: required
+Provides: awk
+Filename: pool/mawk_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+"
+            ),
+            500,
+        )],
+    )
+    .unwrap();
+
+    let solution = solve_ids(&mut universe, &["locales"], &[]);
+    let ordered: Vec<_> = universe
+        .installation_order(&solution)
+        .into_iter()
+        .flatten()
+        .map(|id| format!("{}", universe.display_solvable(id)))
+        .collect();
+    let permuted: Vec<_> = universe
+        .installation_order(&solution.iter().copied().rev().collect::<Vec<_>>())
+        .into_iter()
+        .flatten()
+        .map(|id| format!("{}", universe.display_solvable(id)))
+        .collect();
+
+    assert_eq!(ordered, vec!["mawk:amd64=1.0", "locales:amd64=1.0"]);
+    assert_eq!(permuted, ordered);
+}
+
+#[test]
+fn universe_installation_order_batches_same_rank_ready_packages() {
+    let mut universe = Universe::new(
+        "amd64",
+        [packages(
+            &format!(
+                "\
+Package: alpha
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/alpha_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+
+Package: beta
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/beta_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+"
+            ),
+            500,
+        )],
+    )
+    .unwrap();
+
+    let solution = solve_ids(&mut universe, &["alpha", "beta"], &[]);
+    let grouped: Vec<Vec<_>> = universe
+        .installation_order(&solution)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|id| format!("{}", universe.display_solvable(id)))
+                .collect()
+        })
+        .collect();
+
+    assert_eq!(
+        grouped,
+        vec![vec![], vec!["alpha:amd64=1.0", "beta:amd64=1.0"]]
+    );
+}
+
+#[test]
+fn universe_installation_order_groups_depends_in_same_batch() {
+    let mut universe = Universe::new(
+        "amd64",
+        [packages(
+            &format!(
+                "\
+Package: consumer
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Depends: alpha (= 1.0)
+Filename: pool/consumer_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+
+Package: alpha
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/alpha_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+
+Package: gamma
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/gamma_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_C}
+"
+            ),
+            500,
+        )],
+    )
+    .unwrap();
+
+    let solution = solve_ids(&mut universe, &["consumer", "gamma"], &[]);
+    let grouped: Vec<Vec<_>> = universe
+        .installation_order(&solution)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|id| format!("{}", universe.display_solvable(id)))
+                .collect()
+        })
+        .collect();
+
+    // Depends edges (weight 0) allow same-group placement; dpkg --configure
+    // handles within-group ordering. All three share a single group.
+    assert_eq!(
+        grouped,
+        vec![
+            vec![],
+            vec!["alpha:amd64=1.0", "consumer:amd64=1.0", "gamma:amd64=1.0"]
+        ]
+    );
+}
+
+#[test]
+fn universe_installation_order_splits_on_pre_depends() {
+    let mut universe = Universe::new(
+        "amd64",
+        [packages(
+            &format!(
+                "\
+Package: consumer
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Pre-Depends: alpha (= 1.0)
+Filename: pool/consumer_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+
+Package: alpha
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/alpha_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+
+Package: gamma
+Architecture: amd64
+Version: 1.0
+Priority: standard
+Filename: pool/gamma_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_C}
+"
+            ),
+            500,
+        )],
+    )
+    .unwrap();
+
+    let solution = solve_ids(&mut universe, &["consumer", "gamma"], &[]);
+    let grouped: Vec<Vec<_>> = universe
+        .installation_order(&solution)
+        .into_iter()
+        .map(|group| {
+            group
+                .into_iter()
+                .map(|id| format!("{}", universe.display_solvable(id)))
+                .collect()
+        })
+        .collect();
+
+    // Pre-Depends edges (weight 1) force a strict group boundary.
+    // alpha and gamma are at level 0; consumer is at level 1.
+    assert_eq!(
+        grouped,
+        vec![
+            vec![],
+            vec!["alpha:amd64=1.0", "gamma:amd64=1.0"],
+            vec!["consumer:amd64=1.0"],
+        ]
     );
 }
 

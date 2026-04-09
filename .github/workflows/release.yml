@@ -117,7 +117,7 @@ jobs:
         run: |
           set -euo pipefail
 
-          for distro in debian ubuntu; do
+          for distro in debian; do # ubuntu
             spec_hash="$(./target/debug/rdebootstrap -m "${distro}-build.toml" spec hash)"
             artifact="${GHCR_REPO}:${distro}-${spec_hash}"
             tarball="target/${distro}-tree-${spec_hash}.tar.zst"
@@ -147,8 +147,8 @@ jobs:
       - name: Build Debian packages
         run: make debian-packages DOWNLOADS=1
 
-      - name: Build Ubuntu packages
-        run: make ubuntu-packages DOWNLOADS=1
+      # - name: Build Ubuntu packages
+      #   run: make ubuntu-packages DOWNLOADS=1
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2

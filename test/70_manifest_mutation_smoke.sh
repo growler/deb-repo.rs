@@ -11,11 +11,11 @@ create_local_deb "${CASE_DIR}/${PKG_NAME}" mutation-local 0.0.1 "mutation-local-
 
 run_case_expect_ok \
     "archive_add" \
-    archive add -c "ubuntu archive" https://archive.ubuntu.com/ubuntu/ --suite noble --components main
+    archive add -c "extra debian mirror" https://deb.debian.org/debian/ --suite trixie --components main
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 
 run_case_expect_ok "require_comment" require -c "desktop tooling" curl
 assert_manifest_comment_attached_to_list_item "desktop tooling" '"curl"'
@@ -24,9 +24,9 @@ run_case_expect_ok "forbid_comment" forbid -c "systemd guard" 'systemd (<< 255)'
 assert_manifest_comment_attached_to_list_item "systemd guard" '"systemd (<< 255)"'
 
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 assert_manifest_comment_attached_to_list_item "desktop tooling" '"curl"'
 
 run_case_expect_ok "artifact_add" artifact add -c "notice artifact" ./note.txt /etc/mutation/notice.txt
@@ -45,9 +45,9 @@ assert_manifest_comment_attached_to_block \
     "path = \"./${PKG_NAME}\""
 
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 assert_manifest_comment_attached_to_list_item "desktop tooling" '"curl"'
 assert_manifest_comment_attached_to_list_item "systemd guard" '"systemd (<< 255)"'
 assert_manifest_comment_attached_to_block \
@@ -61,9 +61,9 @@ assert_manifest_lacks "# desktop tooling"
 assert_manifest_lacks_comment_attached_to_list_item "desktop tooling" '"curl"'
 assert_manifest_lacks "\"curl\""
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 assert_manifest_comment_attached_to_list_item "systemd guard" '"systemd (<< 255)"'
 assert_manifest_comment_attached_to_block \
     "notice artifact" \
@@ -80,9 +80,9 @@ assert_manifest_lacks "# systemd guard"
 assert_manifest_lacks_comment_attached_to_list_item "systemd guard" '"systemd (<< 255)"'
 assert_manifest_lacks "\"systemd (<< 255)\""
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 assert_manifest_comment_attached_to_block \
     "notice artifact" \
     '[artifact."./note.txt"]' \
@@ -106,9 +106,9 @@ assert_manifest_lacks_comment_attached_to_block \
 assert_manifest_lacks_comment_attached_to_list_item "stage note" '"./note.txt"'
 assert_manifest_lacks "[artifact.\"./note.txt\"]"
 assert_manifest_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
+    'url = "https://deb.debian.org/debian/"'
 assert_manifest_comment_attached_to_block \
     "local package" \
     "[[local]]" \
@@ -117,20 +117,20 @@ assert_manifest_comment_attached_to_block \
 run_case_expect_fail "unstage_missing" unstage ./note.txt
 assert_stderr_contains "artifact ./note.txt not found in spec"
 
-run_case_expect_ok "archive_remove" archive remove https://archive.ubuntu.com/ubuntu/
-assert_manifest_lacks "# ubuntu archive"
+run_case_expect_ok "archive_remove" archive remove https://deb.debian.org/debian/
+assert_manifest_lacks "# extra debian mirror"
 assert_manifest_lacks_comment_attached_to_block \
-    "ubuntu archive" \
+    "extra debian mirror" \
     "[[archive]]" \
-    'url = "https://archive.ubuntu.com/ubuntu/"'
-assert_manifest_lacks "https://archive.ubuntu.com/ubuntu/"
+    'url = "https://deb.debian.org/debian/"'
+assert_manifest_lacks "https://deb.debian.org/debian/"
 assert_manifest_comment_attached_to_block \
     "local package" \
     "[[local]]" \
     "path = \"./${PKG_NAME}\""
 
-run_case_expect_fail "archive_remove_missing" archive remove https://archive.ubuntu.com/ubuntu/
-assert_stderr_contains "archive https://archive.ubuntu.com/ubuntu/ not found"
+run_case_expect_fail "archive_remove_missing" archive remove https://deb.debian.org/debian/
+assert_stderr_contains "archive https://deb.debian.org/debian/ not found"
 
 run_case_expect_ok "deb_remove" deb remove "./${PKG_NAME}"
 assert_manifest_lacks "# local package"

@@ -806,6 +806,65 @@ mod tests {
     use super::SubIdEntry;
     use std::{io, path::Path};
 
+    #[test]
+    fn helper_exit_status_accessors_and_traits() {
+        use super::HelperExitStatus;
+
+        let success = HelperExitStatus(0);
+        assert!(success.is_success());
+        assert_eq!(success.code(), 0);
+        assert_eq!(format!("{}", success), "0");
+        assert_eq!(i32::from(success), 0);
+
+        let failure = HelperExitStatus(42);
+        assert!(!failure.is_success());
+        assert_eq!(failure.code(), 42);
+        assert_eq!(format!("{}", failure), "42");
+        assert_eq!(i32::from(failure), 42);
+
+        let negative = HelperExitStatus(-1);
+        assert!(!negative.is_success());
+        assert_eq!(format!("{}", negative), "-1");
+        assert_eq!(i32::from(negative), -1);
+    }
+
+    #[test]
+    fn mkdirat_if_not_exist_creates_and_ignores_eexist() {
+        use rustix::fs::{openat, Mode, OFlags, CWD};
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let dfd = openat(
+            CWD,
+            dir.path(),
+            OFlags::RDONLY | OFlags::DIRECTORY,
+            Mode::empty(),
+        )
+        .expect("open tempdir");
+
+        super::mkdirat_if_not_exist(&dfd, "testdir", Mode::from_raw_mode(0o755))
+            .expect("first mkdir");
+        assert!(dir.path().join("testdir").is_dir());
+
+        // second call should succeed (EEXIST is silenced)
+        super::mkdirat_if_not_exist(&dfd, "testdir", Mode::from_raw_mode(0o755))
+            .expect("second mkdir (eexist)");
+    }
+
+    #[test]
+    fn set_cloexec_toggles_flag_on_pipe_fd() {
+        use rustix::io::{fcntl_getfd, FdFlags};
+
+        let (r, _w) = rustix::pipe::pipe().expect("pipe");
+
+        super::set_cloexec(&r, true).expect("set cloexec true");
+        let flags = fcntl_getfd(&r).expect("getfd");
+        assert!(flags.contains(FdFlags::CLOEXEC));
+
+        super::set_cloexec(&r, false).expect("set cloexec false");
+        let flags = fcntl_getfd(&r).expect("getfd");
+        assert!(!flags.contains(FdFlags::CLOEXEC));
+    }
+
     fn read_subid_entries(path: &Path) -> io::Result<Vec<(String, u32, u32)>> {
         SubIdEntry::read_entries(path)?
             .map(|entry| entry.map(|entry| (entry.name, entry.start, entry.count)))

@@ -1,6 +1,6 @@
 [package]
 name = "debrepo"
-version = "0.2.0"
+version = "0.3.0"
 rust-version = "1.89"
 edition = "2021"
 description = "Library for manifest-driven Debian/Ubuntu bootstrap and APT archive resolution."

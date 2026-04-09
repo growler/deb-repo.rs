@@ -9,7 +9,7 @@ use {
         artifact::{Artifact, ArtifactArg},
         cli::StageProgress,
         content::{ContentProvider, DebLocation, IndexFile, UniverseFiles},
-        control::MutableControlStanza,
+        control::{ControlFile, MutableControlStanza},
         deb::{DebReader, DebStage},
         hash::{Hash, HashingReader},
         Dependency, HostFileSystem, Manifest, PackageOrigin, Packages, RepositoryFile, Sources,
@@ -76,6 +76,322 @@ SHA256: {hash}
         size = file.size(),
         hash = file.hash().to_hex(),
     )
+}
+
+fn spec_id(manifest: &Manifest, name: Option<&str>) -> debrepo::SpecId {
+    manifest.lookup_spec(name).expect("spec id").id()
+}
+
+#[test]
+fn resolved_spec_apis_cover_parent_env_and_direct_stage_items() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(dir.path().join("base.txt"), b"base artifact\n").expect("write base artifact");
+    std::fs::write(dir.path().join("child.txt"), b"child artifact\n")
+        .expect("write child artifact");
+    let provider = FixtureProvider::local();
+
+    smol::block_on(async {
+        let mut manifest = Manifest::new(&path, ARCH, None);
+        manifest
+            .set_build_env(
+                Some("base"),
+                [
+                    ("FOO".to_string(), "base".to_string()),
+                    ("BAR".to_string(), "base".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .expect("set base env");
+        manifest
+            .set_build_env(
+                Some("child"),
+                [
+                    ("FOO".to_string(), "child".to_string()),
+                    ("BAZ".to_string(), "child".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .expect("set child env");
+        manifest
+            .add_artifact(
+                Some("base"),
+                &ArtifactArg {
+                    mode: None,
+                    do_not_unpack: false,
+                    target_arch: None,
+                    url: "base.txt".to_string(),
+                    target: Some("/opt/base.txt".to_string()),
+                },
+                None,
+                &provider,
+            )
+            .await
+            .expect("add base artifact");
+        manifest
+            .add_artifact(
+                Some("child"),
+                &ArtifactArg {
+                    mode: None,
+                    do_not_unpack: false,
+                    target_arch: None,
+                    url: "child.txt".to_string(),
+                    target: Some("/opt/child.txt".to_string()),
+                },
+                None,
+                &provider,
+            )
+            .await
+            .expect("add child artifact");
+        manifest
+            .upsert_text_artifact(
+                "child-arm",
+                "/opt/child-arm.txt".to_string(),
+                "skip me\n".to_string(),
+                None,
+                Some("arm64".to_string()),
+            )
+            .expect("add filtered artifact");
+        manifest
+            .add_stage_items(Some("child"), vec!["child-arm".to_string()], None)
+            .expect("stage filtered artifact");
+        manifest
+            .resolve(one(), &provider)
+            .await
+            .expect("resolve manifest");
+        manifest.store().await.expect("store manifest");
+    });
+
+    update_manifest_file(&path, |doc| {
+        doc["spec"]["child"]["extends"] = toml_edit::value("base");
+    });
+
+    let (manifest, has_valid_lock) =
+        smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    assert!(!has_valid_lock);
+
+    let child = manifest.lookup_spec(Some("child")).expect("child spec");
+    let parent = child.parent().expect("direct parent").expect("parent ref");
+    assert_eq!(child.name(), Some("child"));
+    assert_eq!(parent.name(), Some("base"));
+    assert_eq!(
+        child.effective_build_env().expect("effective env"),
+        vec![
+            ("FOO".to_string(), "child".to_string()),
+            ("BAZ".to_string(), "child".to_string()),
+            ("BAR".to_string(), "base".to_string()),
+        ]
+    );
+    let doc = read_manifest_doc(&path);
+    assert_eq!(
+        doc["spec"]["child"]["stage"]
+            .as_array()
+            .expect("direct stage items")
+            .iter()
+            .filter_map(|item| item.as_str())
+            .collect::<Vec<_>>(),
+        vec!["child.txt", "child-arm"]
+    );
+    assert_eq!(
+        manifest
+            .artifact("child.txt")
+            .expect("child artifact")
+            .target(),
+        Some("/opt/child.txt")
+    );
+    assert_eq!(
+        manifest.artifact("child-arm").expect("arm artifact").arch(),
+        Some("arm64")
+    );
+}
+
+#[test]
+fn locked_spec_hash_changes_when_installable_identity_changes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path_a = dir.path().join("a.toml");
+    let path_b = dir.path().join("b.toml");
+    let pkg_a_path = dir.path().join("minimal-none.deb");
+    let pkg_b_path = dir.path().join("minimal-xz.deb");
+    std::fs::copy(fixture_path("minimal-none.deb"), &pkg_a_path).expect("copy first deb");
+    std::fs::copy(fixture_path("minimal-xz.deb"), &pkg_b_path).expect("copy second deb");
+    let provider = FixtureProvider::local();
+
+    let installable_state = |path: &Path, repo_path: &str, pkg_path: &Path| {
+        smol::block_on(async {
+            let (file, ctrl) = provider
+                .ensure_deb(repo_path, pkg_path)
+                .await
+                .expect("prepare deb");
+            let pkg_name = ctrl.field("Package").expect("package").to_string();
+
+            let mut manifest = Manifest::new(path, ARCH, None);
+            manifest.add_spec(None).expect("add spec");
+            manifest
+                .add_local_package(file, ctrl, None)
+                .expect("add local package");
+            manifest
+                .add_requirements(None, [pkg_name.as_str()], None)
+                .expect("require package");
+            manifest
+                .resolve(one(), &provider)
+                .await
+                .expect("resolve manifest");
+            let spec = manifest.lookup_spec(None).expect("default spec");
+            let installable = spec
+                .locked()
+                .expect("locked spec")
+                .installables()
+                .next()
+                .expect("installable");
+            (
+                installable.name.clone(),
+                installable.file.hash().to_hex(),
+                spec.locked_hash().expect("spec hash").to_hex(),
+            )
+        })
+    };
+
+    let installable_a = installable_state(&path_a, "minimal-none.deb", &pkg_a_path);
+    let installable_b = installable_state(&path_b, "minimal-xz.deb", &pkg_b_path);
+    assert_eq!(installable_a.0, installable_b.0);
+    assert_ne!(installable_a.1, installable_b.1);
+    assert_ne!(installable_a.2, installable_b.2);
+}
+
+#[test]
+fn incremental_stage_local_stages_child_installables_and_merges_status() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let root = dir.path().join("root");
+    let base_pkg_path = dir.path().join("base.deb");
+    let child_pkg_path = dir.path().join("child.deb");
+    std::fs::write(
+        &path,
+        concat!("[spec.base]\n", "[spec.child]\n", "extends = \"base\"\n",),
+    )
+    .expect("write manifest");
+    std::fs::copy(fixture_path("minimal-none.deb"), &base_pkg_path).expect("copy base deb");
+    std::fs::copy(fixture_path("rich-xz.deb"), &child_pkg_path).expect("copy child deb");
+    let provider = FixtureProvider::local();
+
+    let mut manifest = smol::block_on(async {
+        let (manifest, _) = Manifest::from_file(&path, ARCH)
+            .await
+            .expect("load manifest");
+        manifest
+    });
+    smol::block_on(async {
+        let (base_file, base_ctrl) = provider
+            .ensure_deb("base.deb", &base_pkg_path)
+            .await
+            .expect("prepare base deb");
+        let base_name = base_ctrl
+            .field("Package")
+            .expect("base package")
+            .to_string();
+
+        let (child_file, child_ctrl) = provider
+            .ensure_deb("child.deb", &child_pkg_path)
+            .await
+            .expect("prepare child deb");
+        let child_name = child_ctrl
+            .field("Package")
+            .expect("child package")
+            .to_string();
+
+        manifest
+            .add_local_package(base_file, base_ctrl, None)
+            .expect("add base package");
+        manifest
+            .add_local_package(child_file, child_ctrl, None)
+            .expect("add child package");
+        manifest
+            .add_requirements(Some("base"), [base_name.as_str()], None)
+            .expect("require base package");
+        manifest
+            .add_requirements(Some("child"), [child_name.as_str()], None)
+            .expect("require child package");
+        manifest
+            .resolve(one(), &provider)
+            .await
+            .expect("resolve manifest");
+    });
+
+    let base = manifest.lookup_spec(Some("base")).expect("base spec");
+    let child = manifest.lookup_spec(Some("child")).expect("child spec");
+    let base_name = base
+        .locked()
+        .expect("locked base")
+        .installables()
+        .next()
+        .expect("base installable")
+        .name
+        .clone();
+    let child_installable = child
+        .locked()
+        .expect("locked child")
+        .installables()
+        .next()
+        .expect("child installable");
+    let child_name = child_installable.name.clone();
+    let (expected_essentials, expected_groups) = if child_installable.order == 0 {
+        (vec![child_name.clone()], Vec::new())
+    } else {
+        let mut groups = vec![Vec::new(); child_installable.order as usize];
+        groups[child_installable.order as usize - 1].push(child_name.clone());
+        (Vec::new(), groups)
+    };
+
+    smol::block_on(async {
+        let mut fs = HostFileSystem::new(&root, false).await.expect("host fs");
+        manifest
+            .stage_local(
+                Some("base"),
+                None,
+                &mut fs,
+                one(),
+                &provider,
+                Some(StageProgress::percent),
+            )
+            .await
+            .expect("stage base spec");
+        let installed_text =
+            std::fs::read_to_string(root.join("var/lib/dpkg/status")).expect("read base status");
+        let installed = ControlFile::parse(&installed_text).expect("parse installed status");
+        std::fs::remove_file(root.join("var/lib/dpkg/status")).expect("remove stale status");
+        let (essentials, groups, scripts, build_env) = manifest
+            .stage_local(
+                Some("child"),
+                Some(&installed),
+                &mut fs,
+                one(),
+                &provider,
+                Some(StageProgress::percent),
+            )
+            .await
+            .expect("incremental stage child spec");
+        assert_eq!(essentials, expected_essentials);
+        assert_eq!(groups, expected_groups);
+        assert!(scripts.is_empty());
+        assert!(build_env.is_empty());
+    });
+
+    let status = std::fs::read_to_string(root.join("var/lib/dpkg/status")).expect("read status");
+    let status = ControlFile::parse(&status).expect("parse staged status");
+    assert_eq!(status.stanzas().count(), 2);
+    assert_eq!(
+        status
+            .stanzas()
+            .map(|stanza| stanza.field("Package").expect("package").to_string())
+            .collect::<Vec<_>>(),
+        {
+            let mut names = vec![base_name, child_name];
+            names.sort();
+            names
+        }
+    );
 }
 
 struct FixtureProvider {
@@ -1068,26 +1384,17 @@ fn manifest_setters_create_missing_spec_consistently() {
         .set_build_script(Some("custom"), Some("echo hello\n".to_string()))
         .expect("set build script");
 
-    assert_eq!(manifest.spec_names().collect::<Vec<_>>(), vec!["custom"]);
     assert_eq!(
         manifest
-            .get_spec_meta(Some("custom"), "owner")
-            .expect("get meta"),
-        Some("ops")
+            .specs()
+            .map(|spec| spec.display_name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["custom".to_string()]
     );
-    assert_eq!(
-        manifest
-            .spec_env_block(Some("custom"))
-            .expect("get env block"),
-        "FOO=bar\n"
-    );
-    assert_eq!(
-        manifest
-            .spec_build_script(Some("custom"))
-            .expect("get build script")
-            .as_deref(),
-        Some("echo hello\n")
-    );
+    let spec = manifest.lookup_spec(Some("custom")).expect("custom spec");
+    assert_eq!(spec.get_meta("owner").expect("get meta"), Some("ops"));
+    assert_eq!(spec.build_env().get("FOO").map(String::as_str), Some("bar"));
+    assert_eq!(spec.build_script(), Some("echo hello\n"));
 }
 
 #[test]
@@ -1095,16 +1402,18 @@ fn manifest_spec_env_block_renders_comments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     let mut manifest = Manifest::new(&path, ARCH, None);
+    let provider = TestProvider::new();
 
     let block = "# prefix-foo\n\nFOO=bar # inline-foo\nBAZ=qux\n".to_string();
     manifest
         .spec_update_env_block(None, block.clone())
         .expect("update env block");
+    smol::block_on(persist_manifest(&mut manifest, &provider)).expect("persist");
+    let text = std::fs::read_to_string(&path).expect("read manifest");
 
-    assert_eq!(
-        manifest.spec_env_block(None).expect("render env block"),
-        block
-    );
+    assert!(text.contains("# prefix-foo"));
+    assert!(text.contains("FOO = \"bar\" # inline-foo"));
+    assert!(text.contains("BAZ = \"qux\""));
 }
 
 #[test]
@@ -1112,16 +1421,130 @@ fn manifest_spec_update_env_block_updates_values_and_comments() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     let mut manifest = Manifest::new(&path, ARCH, None);
+    let provider = TestProvider::new();
     let block = "# prefix-foo\n\nFOO=bar # inline-foo\nBAZ=qux\n".to_string();
 
     manifest
         .spec_update_env_block(None, block.clone())
         .expect("update env block");
+    smol::block_on(persist_manifest(&mut manifest, &provider)).expect("persist");
+    let spec = manifest.lookup_spec(None).expect("default spec");
+    let text = std::fs::read_to_string(&path).expect("read manifest");
 
     assert_eq!(
-        manifest.spec_env_block(None).expect("render env block"),
-        block
+        spec.build_env()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAZ".to_string(), "qux".to_string()),
+        ]
     );
+    assert!(text.contains("# prefix-foo"));
+    assert!(text.contains("FOO = \"bar\" # inline-foo"));
+}
+
+#[test]
+fn manifest_spec_update_env_block_named_spec_renders_comments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let mut manifest = Manifest::new(&path, ARCH, None);
+    let provider = TestProvider::new();
+
+    let block = "# prefix-foo\n\nFOO=bar # inline-foo\nBAZ=qux\n".to_string();
+    manifest
+        .spec_update_env_block(Some("custom"), block)
+        .expect("update env block");
+    smol::block_on(persist_manifest(&mut manifest, &provider)).expect("persist");
+
+    let text = std::fs::read_to_string(&path).expect("read manifest");
+    let doc = read_manifest_doc(&path);
+    let spec = manifest.lookup_spec(Some("custom")).expect("custom spec");
+
+    assert_eq!(
+        spec.build_env()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAZ".to_string(), "qux".to_string()),
+        ]
+    );
+    assert_eq!(
+        doc["spec"]["custom"]["build-env"]["FOO"].as_str(),
+        Some("bar")
+    );
+    assert_eq!(
+        doc["spec"]["custom"]["build-env"]["BAZ"].as_str(),
+        Some("qux")
+    );
+    assert!(text.contains("# prefix-foo"));
+    assert!(text.contains("FOO = \"bar\" # inline-foo"));
+}
+
+#[test]
+fn manifest_spec_update_env_block_update_removes_comments() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let mut manifest = Manifest::new(&path, ARCH, None);
+    let provider = TestProvider::new();
+
+    manifest
+        .spec_update_env_block(None, "# prefix-foo\n\nFOO=bar # inline-foo\n".to_string())
+        .expect("set env block");
+    manifest
+        .spec_update_env_block(None, "FOO=updated\n".to_string())
+        .expect("update env block");
+    smol::block_on(persist_manifest(&mut manifest, &provider)).expect("persist");
+
+    let text = std::fs::read_to_string(&path).expect("read manifest");
+    let doc = read_manifest_doc(&path);
+    let spec = manifest.lookup_spec(None).expect("default spec");
+
+    assert_eq!(
+        spec.build_env()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect::<Vec<_>>(),
+        vec![("FOO".to_string(), "updated".to_string())]
+    );
+    assert_eq!(doc["spec"]["build-env"]["FOO"].as_str(), Some("updated"));
+    assert!(!text.contains("prefix-foo"));
+    assert!(!text.contains("inline-foo"));
+}
+
+#[test]
+fn manifest_spec_update_env_block_comment_only_missing_spec_is_noop() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = Manifest::new(dir.path().join("Manifest.toml"), ARCH, None);
+
+    manifest
+        .spec_update_env_block(Some("custom"), "# comment only\n\n".to_string())
+        .expect("comment-only env block is a no-op");
+
+    assert!(manifest.spec_ids().next().is_none());
+    assert!(manifest.lookup_spec(Some("custom")).is_err());
+}
+
+#[test]
+fn manifest_spec_update_env_block_rejects_invalid_input() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mut manifest = Manifest::new(dir.path().join("Manifest.toml"), ARCH, None);
+
+    let cases = [
+        ("FOO=bar\nFOO=baz\n", "duplicate env key 'FOO'"),
+        ("FOO\n", "invalid env line 1: expected VAR=value"),
+        (" =value\n", "invalid env line 1: empty key"),
+    ];
+
+    for (block, expected) in cases {
+        let err = manifest
+            .spec_update_env_block(None, block.to_string())
+            .expect_err("invalid env block must fail");
+        assert_eq!(err.to_string(), expected);
+    }
 }
 
 #[test]
@@ -1146,11 +1569,9 @@ fn manifest_spec_update_env_block_empty_removes_build_env() {
         .spec_update_env_block(None, String::new())
         .expect("clear env block");
 
-    assert_eq!(manifest.spec_env_block(None).expect("render env block"), "");
-    assert_eq!(
-        manifest.get_spec_meta(None, "owner").expect("get owner"),
-        Some("ops")
-    );
+    let spec = manifest.lookup_spec(None).expect("default spec");
+    assert!(spec.build_env().is_empty());
+    assert_eq!(spec.get_meta("owner").expect("get owner"), Some("ops"));
 }
 
 #[test]
@@ -1181,8 +1602,8 @@ fn manifest_missing_spec_noops_do_not_create_spec() {
         .add_stage_items(Some("custom"), Vec::new(), None)
         .expect("empty stage items are a no-op");
 
-    assert!(manifest.spec_names().next().is_none());
-    assert!(manifest.spec_build_script(Some("custom")).is_err());
+    assert!(manifest.spec_ids().next().is_none());
+    assert!(manifest.lookup_spec(Some("custom")).is_err());
 }
 
 #[test]
@@ -1310,9 +1731,8 @@ fn resolve_rejects_downstream_stage_reference_to_imported_artifact() {
             .resolve(one(), &provider)
             .await
             .expect_err("resolve must reject imported artifact in downstream stage");
-        assert!(err
-            .to_string()
-            .contains("missing artifact './base.txt' in spec stage list"));
+        assert!(err.to_string().contains("./base.txt"));
+        assert!(err.to_string().contains("unknown artifact"));
     });
 }
 
@@ -1350,6 +1770,7 @@ fn stage_local_allows_inherited_imported_artifact_stage() {
             .expect("staging fs");
         loaded
             .stage_local(
+                None,
                 None,
                 &mut fs,
                 one(),
@@ -1417,7 +1838,7 @@ fn stale_import_requires_update_before_store_and_refreshes_on_update() {
             .await
             .expect("reload downstream");
         assert!(has_valid_lock);
-        assert!(reloaded.spec_names().next().is_none());
+        assert!(reloaded.spec_ids().next().is_none());
     });
 }
 
@@ -1504,7 +1925,7 @@ fn from_file_rejects_circular_imports() {
 }
 
 #[test]
-fn spec_graph_public_apis_cover_order_ancestors_and_requirements() {
+fn spec_graph_public_apis_cover_order_and_ancestors() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("Manifest.toml");
     std::fs::write(
@@ -1541,40 +1962,82 @@ fn spec_graph_public_apis_cover_order_ancestors_and_requirements() {
         smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
     assert!(!has_valid_lock);
     assert_eq!(
-        manifest.spec_names().collect::<Vec<_>>(),
-        vec!["base", "mid", "leaf"]
+        manifest
+            .specs()
+            .map(|spec| spec.display_name().to_string())
+            .collect::<Vec<_>>(),
+        vec!["base".to_string(), "mid".to_string(), "leaf".to_string()]
     );
-    assert_eq!(manifest.descendants(0), vec![0, 1, 2]);
+    assert_eq!(
+        manifest.descendant_spec_ids(spec_id(&manifest, Some("base"))),
+        vec![
+            spec_id(&manifest, Some("base")),
+            spec_id(&manifest, Some("mid")),
+            spec_id(&manifest, Some("leaf"))
+        ]
+    );
     assert_eq!(
         manifest
-            .ancestors(2)
-            .map(|item| {
-                item.and_then(|spec| {
-                    spec.include
-                        .first()
-                        .cloned()
-                        .map(|dep| dep.to_string())
-                        .ok_or_else(|| io::Error::other("missing include"))
-                })
-            })
+            .lookup_spec(Some("leaf"))
+            .expect("leaf spec")
+            .ancestors()
+            .map(|item| item.map(|spec| spec.display_name().to_string()))
             .collect::<io::Result<Vec<_>>>()
             .expect("ancestors"),
-        vec!["leaf-pkg", "mid-pkg", "base-pkg"],
+        vec!["mid", "base"],
     );
-    let (reqs, cons) = manifest.requirements_for(2).expect("requirements");
-    assert_eq!(
-        reqs.into_iter()
-            .map(|dep| dep.to_string())
-            .collect::<Vec<_>>(),
-        vec!["leaf-pkg", "mid-pkg", "base-pkg"]
-    );
-    assert_eq!(
-        cons.into_iter()
-            .map(|con| con.to_string())
-            .collect::<Vec<_>>(),
-        vec!["!leaf-blocked", "!mid-blocked", "!base-blocked"]
-    );
-    assert_eq!(manifest.specs_order().expect("order"), vec![0, 1, 2]);
+}
+
+#[test]
+fn child_spec_cannot_exclude_a_locked_parent_package() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let base_pkg_path = dir.path().join("base.deb");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.child]\n",
+            "extends = \"base\"\n",
+            "\n",
+            "[spec.base]\n",
+        ),
+    )
+    .expect("write manifest");
+    std::fs::copy(fixture_path("minimal-none.deb"), &base_pkg_path).expect("copy base deb");
+    let provider = FixtureProvider::local();
+
+    let mut manifest = smol::block_on(async {
+        let (manifest, _) = Manifest::from_file(&path, ARCH)
+            .await
+            .expect("load manifest");
+        manifest
+    });
+
+    let base_name = smol::block_on(async {
+        let (base_file, base_ctrl) = provider
+            .ensure_deb("base.deb", &base_pkg_path)
+            .await
+            .expect("prepare base deb");
+        let base_name = base_ctrl
+            .field("Package")
+            .expect("base package")
+            .to_string();
+        manifest
+            .add_local_package(base_file, base_ctrl, None)
+            .expect("add base package");
+        manifest
+            .add_requirements(Some("base"), [base_name.as_str()], None)
+            .expect("require base package");
+        manifest
+            .add_constraints(Some("child"), [base_name.as_str()], None)
+            .expect("exclude parent package in child");
+        base_name
+    });
+
+    let err = smol::block_on(async { manifest.resolve(one(), &provider).await })
+        .expect_err("child must not be able to drop parent package");
+    assert!(err.to_string().contains("failed to solve spec child"));
+    assert!(err.to_string().contains(&base_name));
 }
 
 #[test]
@@ -1617,30 +2080,17 @@ fn unresolved_manifest_public_methods_report_missing_resolution_state() {
     let mut manifest = Manifest::new(&path, ARCH, None);
     manifest.add_spec(None).expect("add default spec");
 
-    let packages_err = match manifest.packages() {
-        Ok(_) => panic!("packages requires resolve"),
-        Err(err) => err,
-    };
+    let spec = manifest.lookup_spec(None).expect("default spec");
+    let packages_err = spec
+        .effective_packages()
+        .expect_err("packages require resolve");
     assert!(packages_err.to_string().contains("call resolve first"));
 
-    let spec_packages_err = match manifest.spec_packages(None) {
-        Ok(_) => panic!("spec packages require a locked solution"),
-        Err(err) => err,
-    };
-    assert!(spec_packages_err
-        .to_string()
-        .contains("update manifest lock"));
+    let spec_locked_err = spec.locked().expect_err("locked spec requires solution");
+    assert!(spec_locked_err.to_string().contains("update manifest lock"));
 
-    let installables_err = match manifest.installables(None) {
-        Ok(_) => panic!("installables require a locked solution"),
-        Err(err) => err,
-    };
-    assert!(installables_err
-        .to_string()
-        .contains("update manifest lock"));
-
-    let spec_hash_err = manifest
-        .spec_hash(None)
+    let spec_hash_err = spec
+        .locked_hash()
         .expect_err("spec hash requires a locked solution");
     assert!(spec_hash_err.to_string().contains("update manifest lock"));
 }
@@ -1703,36 +2153,37 @@ fn local_package_resolution_exposes_packages_installables_stage_and_spec_hash() 
 
     assert_eq!(
         manifest
-            .packages()
+            .universe_packages()
             .expect("packages")
             .map(|pkg| pkg.name())
             .collect::<Vec<_>>(),
         vec![package_name.as_str()]
     );
+    let spec = manifest.lookup_spec(None).expect("default spec");
     assert_eq!(
-        manifest
-            .spec_packages(None)
+        spec.effective_packages()
             .expect("spec packages")
+            .into_iter()
             .map(|pkg| pkg.name())
             .collect::<Vec<_>>(),
         vec![package_name.as_str()]
     );
-    let installables = manifest
-        .installables(None)
-        .expect("installables")
-        .collect::<io::Result<Vec<_>>>()
-        .expect("collect installables");
+    let installables = spec
+        .locked()
+        .expect("locked spec")
+        .installables()
+        .collect::<Vec<_>>();
     assert_eq!(installables.len(), 1);
-    assert!(installables[0].0.is_none());
-    let install_order = installables[0].1;
-    assert_eq!(installables[0].2.path(), "pkg.deb");
+    assert_eq!(installables[0].file.path(), "pkg.deb");
+    let install_order = installables[0].order;
 
-    let first_hash = manifest.spec_hash(None).expect("spec hash");
+    let first_hash = spec.locked_hash().expect("spec hash");
 
     smol::block_on(async {
         let mut fs = HostFileSystem::new(&root, false).await.expect("host fs");
         let (essentials, other, scripts, build_env) = manifest
             .stage_local(
+                None,
                 None,
                 &mut fs,
                 one(),
@@ -1781,7 +2232,11 @@ fn local_package_resolution_exposes_packages_installables_stage_and_spec_hash() 
             .await
             .expect("re-resolve");
     });
-    let second_hash = manifest.spec_hash(None).expect("updated hash");
+    let second_hash = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .locked_hash()
+        .expect("updated hash");
     assert_ne!(first_hash.to_hex(), second_hash.to_hex());
 }
 
@@ -1901,20 +2356,28 @@ fn archive_backed_manifest_covers_from_archives_installables_stage_and_sources()
     assert_eq!(source_fetches.load(Ordering::Relaxed), 1);
 
     let installables = manifest
-        .installables(None)
-        .expect("installables")
-        .collect::<io::Result<Vec<_>>>()
-        .expect("collect installables");
+        .lookup_spec(None)
+        .expect("default spec")
+        .locked()
+        .expect("locked spec")
+        .installables()
+        .collect::<Vec<_>>();
     assert_eq!(installables.len(), 1);
-    assert!(installables[0].0.is_some());
-    let install_order = installables[0].1;
-    assert_eq!(installables[0].2.path(), archive_file.path());
+    let install_order = installables[0].order;
+    assert_eq!(installables[0].file.path(), archive_file.path());
 
     let root = dir.path().join("archive-root");
     smol::block_on(async {
         let fs = HostFileSystem::new(&root, false).await.expect("host fs");
         let (essentials, other, scripts, build_env) = manifest
-            .stage(None, &fs, one(), &provider, Some(StageProgress::percent))
+            .stage(
+                None,
+                None,
+                &fs,
+                one(),
+                &provider,
+                Some(StageProgress::percent),
+            )
             .await
             .expect("stage archive package");
         if install_order == 0 {

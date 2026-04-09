@@ -54,10 +54,20 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
     let (manifest, has_valid_lock) =
         smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
     assert!(has_valid_lock);
+    let spec = manifest.lookup_spec(None).expect("default spec");
     assert_eq!(
-        manifest.spec_env_block(None).expect("env block"),
-        "FOO=bar\n# keep comment\nBAR=baz\n"
+        spec.build_env()
+            .iter()
+            .map(|(key, value)| (key.to_string(), value.clone()))
+            .collect::<Vec<_>>(),
+        vec![
+            ("FOO".to_string(), "bar".to_string()),
+            ("BAR".to_string(), "baz".to_string()),
+        ]
     );
+    assert!(std::fs::read_to_string(&manifest_path)
+        .expect("read manifest")
+        .contains("# keep comment"));
 
     let editor_script = dir.path().join("edit-script.sh");
     write_executable(
@@ -73,8 +83,11 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
         smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
     assert!(has_valid_lock);
     assert_eq!(
-        manifest.spec_build_script(None).expect("build script"),
-        Some("#!/bin/sh\necho edited-script\n".to_string())
+        manifest
+            .lookup_spec(None)
+            .expect("default spec")
+            .build_script(),
+        Some("#!/bin/sh\necho edited-script\n")
     );
 
     let clear_script = dir.path().join("clear-script.sh");
@@ -88,7 +101,10 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
         smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
     assert!(has_valid_lock);
     assert_eq!(
-        manifest.spec_build_script(None).expect("build script"),
+        manifest
+            .lookup_spec(None)
+            .expect("default spec")
+            .build_script(),
         None
     );
 }

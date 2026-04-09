@@ -40,7 +40,11 @@ where
 #[test]
 fn kvlist_accessors_preserve_order_and_lookup() {
     let manifest = manifest_with_env(&[("FOO", "bar"), ("BAR", "baz"), ("BAZ", "qux")]);
-    let env = manifest.spec_build_env(None).expect("build env");
+    let env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
 
     assert!(!env.is_empty());
     assert_eq!(env.len(), 3);
@@ -76,7 +80,11 @@ fn kvlist_accessors_preserve_order_and_lookup() {
 #[test]
 fn kvlist_mutation_helpers_update_in_place() {
     let manifest = manifest_with_env(&[("FOO", "bar"), ("BAR", "baz"), ("BAZ", "qux")]);
-    let mut env = manifest.spec_build_env(None).expect("build env");
+    let mut env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
 
     for (key, value) in env.iter_mut() {
         if key == "FOO" {
@@ -107,7 +115,11 @@ fn kvlist_mutation_helpers_update_in_place() {
 #[test]
 fn kvlist_consuming_helpers_remove_and_drain_in_order() {
     let manifest = manifest_with_env(&[("FOO", "bar"), ("BAR", "baz"), ("BAZ", "qux")]);
-    let mut env = manifest.spec_build_env(None).expect("build env");
+    let mut env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
 
     let removed = env.remove_at(1);
     assert_eq!(removed, ("BAR".to_string(), "baz".to_string()));
@@ -121,7 +133,11 @@ fn kvlist_consuming_helpers_remove_and_drain_in_order() {
         ]
     );
 
-    let mut env = manifest.spec_build_env(None).expect("build env");
+    let mut env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
     let taken = std::mem::take(&mut env);
     assert!(env.is_empty());
     assert_eq!(
@@ -137,7 +153,11 @@ fn kvlist_consuming_helpers_remove_and_drain_in_order() {
 #[test]
 fn kvlist_display_debug_and_serde_roundtrip() {
     let manifest = manifest_with_env(&[("FOO", "bar"), ("BAR", "baz")]);
-    let env = manifest.spec_build_env(None).expect("build env");
+    let env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
 
     assert_eq!(format!("{env}"), "FOO: bar\nBAR: baz\n");
     let debug = format!("{env:?}");
@@ -164,7 +184,11 @@ fn kvlist_display_debug_and_serde_roundtrip() {
 #[test]
 fn kvlist_deserialize_rejects_duplicate_keys_and_non_maps() {
     let manifest = manifest_with_env(&[("FOO", "bar")]);
-    let env = manifest.spec_build_env(None).expect("build env");
+    let env = manifest
+        .lookup_spec(None)
+        .expect("default spec")
+        .build_env()
+        .clone();
 
     let decoded = decode_like(&env, r#"{"FOO":"bar","BAR":"baz"}"#).expect("decode");
     assert_eq!(decoded.key_at(0), "FOO");

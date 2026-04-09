@@ -505,7 +505,7 @@ Conflicts: beta
 ");
 
 test_solution!(absent_2
-[ "alpha" ] => [ "beta:amd64=1.0", "alpha:amd64=1.0" ],
+[ "alpha" ] => [ "alpha:amd64=1.0", "beta:amd64=1.0" ],
 "Package: alpha
 Architecture: amd64
 Version: 1.0
@@ -531,7 +531,7 @@ Depends: alpha (>= 1.5~alpha4~)
 ");
 
 test_solution!(dep_break
-[ "alpha" ] => [ "beta:amd64=2.38.1-5+deb12u2", "alpha:amd64=2.38.1-5+deb12u2" ],
+[ "alpha" ] => [ "alpha:amd64=2.38.1-5+deb12u2", "beta:amd64=2.38.1-5+deb12u2" ],
 "Package: alpha
 Architecture: amd64
 Version: 2.38.1-5+deb12u2
@@ -544,7 +544,7 @@ Breaks: alpha (<= 2.38~)
 ");
 
 test_solution!(dep_range
-[ "keyboard-configuration" ] => [ "xkb-data:all=2.35.1-1", "keyboard-configuration:all=1.221" ],
+[ "keyboard-configuration" ] => [ "keyboard-configuration:all=1.221", "xkb-data:all=2.35.1-1" ],
 "Package: keyboard-configuration
 Version: 1.221
 Architecture: all
@@ -556,7 +556,7 @@ Architecture: all
 ");
 
 test_solution!(dep_chain
-[ "alpha" ] => [ "beta:amd64=1.0", "alpha:amd64=1.0" ],
+[ "alpha" ] => [ "alpha:amd64=1.0", "beta:amd64=1.0" ],
 "Package: alpha
 Architecture: amd64
 Version: 1.0
@@ -569,10 +569,10 @@ Version: 1.0
 
 test_solution!(or_witness_cycle_avoided
 [ "alpha", "zeta" ] => [
-    "beta:amd64=1.0",
-    "zeta:amd64=1.0",
     "alpha:amd64=1.0",
+    "beta:amd64=1.0",
     "xis:amd64=1.0",
+    "zeta:amd64=1.0",
 ],
 "Package: alpha
 Architecture: amd64

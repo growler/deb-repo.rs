@@ -83,6 +83,7 @@ pub trait ContentProvider {
         ext: &str,
     ) -> impl Future<Output = io::Result<IndexFile>>;
     fn fetch_release_file(&self, url: &str) -> impl Future<Output = io::Result<IndexFile>>;
+    /// Returns [Packages] in order, defined by archives
     fn fetch_universe(
         &self,
         archives: UniverseFiles<'_>,

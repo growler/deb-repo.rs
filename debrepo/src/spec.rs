@@ -1,10 +1,11 @@
 use {
     crate::{
         content::{ContentProvider, IndexFile},
+        control::ParseError,
         hash::Hash,
         kvlist::KVList,
         packages::PackageOrigin,
-        version::{Constraint, Dependency},
+        version::{Constraint, Dependency, Version, VersionSet},
         Archive, Release, RepositoryFile,
     },
     async_compression::{
@@ -195,9 +196,31 @@ pub struct LockedPackage {
     pub orig: PackageOrigin,
     pub idx: u32,
     pub name: String,
+    pub arch: String,
+    pub version: String,
     pub order: u32,
     #[serde(flatten)]
     pub file: RepositoryFile,
+}
+
+impl TryFrom<&LockedPackage> for Constraint<String> {
+    type Error = ParseError;
+
+    fn try_from(pkg: &LockedPackage) -> Result<Self, Self::Error> {
+        Ok(Constraint::new(
+            Some(pkg.arch.clone()),
+            pkg.name.clone(),
+            VersionSet::Exactly(Version::try_from(pkg.version.as_str())?),
+        ))
+    }
+}
+
+impl TryFrom<LockedPackage> for Constraint<String> {
+    type Error = ParseError;
+
+    fn try_from(pkg: LockedPackage) -> Result<Self, Self::Error> {
+        (&pkg).try_into()
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
@@ -279,6 +302,48 @@ mod tests {
                 archive_id: 9
             }
         );
+    }
+
+    #[test]
+    fn locked_package_try_into_constraint_builds_exact_dependency() {
+        let pkg = LockedPackage {
+            orig: PackageOrigin::Local { manifest_id: 0 },
+            idx: 7,
+            name: "foo".to_string(),
+            arch: "amd64".to_string(),
+            version: "1.2.3-1".to_string(),
+            order: 0,
+            file: RepositoryFile {
+                path: "pool/main/f/foo.deb".to_string(),
+                fetch_path: None,
+                size: 1,
+                hash: Hash::default(),
+            },
+        };
+
+        let constraint: Constraint<String> = (&pkg).try_into().unwrap();
+        assert_eq!(constraint.to_string(), "foo:amd64 (= 1.2.3-1)");
+    }
+
+    #[test]
+    fn locked_package_try_into_constraint_rejects_invalid_version() {
+        let pkg = LockedPackage {
+            orig: PackageOrigin::Local { manifest_id: 0 },
+            idx: 7,
+            name: "foo".to_string(),
+            arch: "amd64".to_string(),
+            version: "bad version".to_string(),
+            order: 0,
+            file: RepositoryFile {
+                path: "pool/main/f/foo.deb".to_string(),
+                fetch_path: None,
+                size: 1,
+                hash: Hash::default(),
+            },
+        };
+
+        let err: Result<Constraint<String>, _> = pkg.try_into();
+        assert!(err.is_err());
     }
 }
 

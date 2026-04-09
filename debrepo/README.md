@@ -89,11 +89,13 @@ println!("package = {:?}", control.package_name());
 - `HttpTransport` (+ caching helpers): fetch repository content over HTTP(S).
 - `deb::DebReader`: async `.deb` reader for control/data payloads.
 - `tar`: simple async tar reader/writer for common cases.
-- `universe::Universe`: combine multiple `Packages` inputs and solve with
-  `resolvo`.
+- `universe::Universe`: combine multiple `Packages` inputs, solve with
+  `resolvo`, and compute Pre-Depends-aware installation order with
+  duplicate detection.
 - `StagingFileSystem`: stage files into a target filesystem layout.
 - `Manifest` / lockfile support: manifest + lockfile structures used by
-  `rdebootstrap`, including optional manifest imports and downstream
+  `rdebootstrap`, including hierarchical spec resolution via
+  `ResolvedSpecRef` / `SpecId`, optional manifest imports, and downstream
   `imported-universe` lock tracking.
 
 Full API docs are on https://docs.rs/debrepo.

@@ -157,3 +157,120 @@ fn build_client(skip_verify: bool, ca_cert: Option<PathBuf>) -> std::io::Result<
 fn to_io_error(err: impl ToString) -> std::io::Error {
     std::io::Error::other(err.to_string())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::Auth;
+
+    fn secret(
+        kind: &str,
+        login: Option<&str>,
+        password: Option<&str>,
+        token: Option<&str>,
+        cert: Option<&str>,
+        key: Option<&str>,
+    ) -> VaultSecret {
+        VaultSecret {
+            kind: kind.to_string(),
+            login: login.map(str::to_string),
+            password: password.map(str::to_string),
+            token: token.map(str::to_string),
+            cert: cert.map(str::to_string),
+            key: key.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn vault_secret_into_auth_covers_all_types_and_errors() {
+        // basic — happy path
+        let auth = secret("basic", Some("alice"), Some("s3cret"), None, None, None)
+            .into_auth()
+            .expect("basic auth");
+        assert_eq!(
+            auth,
+            Some(Auth::Basic {
+                login: "alice".into(),
+                password: "s3cret".into()
+            })
+        );
+
+        // basic — missing login
+        let err = secret("basic", None, Some("s3cret"), None, None, None)
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("missing login"));
+
+        // basic — missing password
+        let err = secret("basic", Some("alice"), None, None, None, None)
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("missing password"));
+
+        // token — happy path
+        let auth = secret("token", None, None, Some("tok123"), None, None)
+            .into_auth()
+            .expect("token auth");
+        assert_eq!(
+            auth,
+            Some(Auth::Token {
+                token: "tok123".into()
+            })
+        );
+
+        // token — missing token
+        let err = secret("token", None, None, None, None, None)
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("missing token"));
+
+        // mtls — happy path
+        let auth = secret("mtls", None, None, None, Some("CERT"), Some("KEY"))
+            .into_auth()
+            .expect("mtls auth");
+        assert_eq!(
+            auth,
+            Some(Auth::Cert {
+                cert: b"CERT".to_vec(),
+                key: Some(b"KEY".to_vec()),
+                password: None,
+            })
+        );
+
+        // mtls — missing cert
+        let err = secret("mtls", None, None, None, None, Some("KEY"))
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("missing cert"));
+
+        // mtls — missing key
+        let err = secret("mtls", None, None, None, Some("CERT"), None)
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("missing key"));
+
+        // unsupported type
+        let err = secret("oauth2", None, None, None, None, None)
+            .into_auth()
+            .unwrap_err();
+        assert!(err.to_string().contains("unsupported auth type"));
+    }
+
+    #[test]
+    fn build_client_covers_no_verify_and_no_cert_branches() {
+        // skip_verify=false, ca_cert=None
+        let client = build_client(false, None);
+        assert!(client.is_ok(), "build_client(false, None) should succeed");
+
+        // skip_verify=true, ca_cert=None
+        let client = build_client(true, None);
+        assert!(client.is_ok(), "build_client(true, None) should succeed");
+
+        // skip_verify=false, ca_cert=Some(nonexistent) — still succeeds (cert is lazy)
+        let client = build_client(false, Some("/nonexistent/cert.pem".into()));
+        assert!(
+            client.is_ok(),
+            "build_client with nonexistent cert should still build"
+        );
+    }
+}

@@ -3,7 +3,7 @@ use std::{
     cell::UnsafeCell,
     collections::HashMap,
     hash::{Hash, Hasher},
-    ops::Index,
+    ops::{Index, IndexMut},
 };
 
 pub trait IntoId<Id> {
@@ -341,6 +341,21 @@ where
         unsafe {
             let arena = &*self.arena.get();
             &arena[bi][ii]
+        }
+    }
+}
+
+impl<IdType, Value> IndexMut<IdType> for IdMap<IdType, Value>
+where
+    Value: Hash + Eq,
+    IdType: Copy + ToIndex,
+{
+    fn index_mut(&mut self, index: IdType) -> &mut Self::Output {
+        let bi = index.to_index() / BLOCK_SIZE;
+        let ii = index.to_index() % BLOCK_SIZE;
+        unsafe {
+            let arena = &mut *self.arena.get();
+            &mut arena[bi][ii]
         }
     }
 }

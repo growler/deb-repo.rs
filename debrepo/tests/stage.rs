@@ -352,6 +352,7 @@ fn stage_local_archive_manifest_stages_artifact_and_status_file() {
         manifest
             .stage_local(
                 None,
+                None,
                 &mut fs,
                 one(),
                 &provider,
@@ -382,7 +383,14 @@ fn stage_threadsafe_local_manifest_stages_artifact_and_status_file() {
     smol::block_on(async {
         let fs = HostFileSystem::new(&root, false).await.expect("host fs");
         manifest
-            .stage(None, &fs, one(), &provider, Some(StageProgress::percent))
+            .stage(
+                None,
+                None,
+                &fs,
+                one(),
+                &provider,
+                Some(StageProgress::percent),
+            )
             .await
             .expect("thread-safe stage");
     });
@@ -408,7 +416,7 @@ fn stage_threadsafe_wraps_fetch_deb_errors() {
     let err = smol::block_on(async {
         let fs = HostFileSystem::new(&root, false).await.expect("host fs");
         manifest
-            .stage::<_, fn(u64) -> StageProgress, _>(None, &fs, one(), &provider, None)
+            .stage::<_, fn(u64) -> StageProgress, _>(None, None, &fs, one(), &provider, None)
             .await
             .expect_err("thread-safe stage must fail")
     });
@@ -430,7 +438,7 @@ fn stage_threadsafe_wraps_stage_errors() {
     let err = smol::block_on(async {
         let fs = HostFileSystem::new(&root, false).await.expect("host fs");
         manifest
-            .stage::<_, fn(u64) -> StageProgress, _>(None, &fs, one(), &provider, None)
+            .stage::<_, fn(u64) -> StageProgress, _>(None, None, &fs, one(), &provider, None)
             .await
             .expect_err("thread-safe stage must fail")
     });

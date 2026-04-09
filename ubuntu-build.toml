@@ -4,7 +4,7 @@ url = "https://archive.ubuntu.com/ubuntu/"
 snapshots = "https://snapshot.ubuntu.com/ubuntu/@SNAPSHOTID@/"
 suites = ["noble", "noble-updates", "noble-backports", "noble-security"]
 components = ["main", "universe"]
-snapshot = "20260319T084100Z"
+snapshot = "20260409T000000Z"
 
 [spec]
 include = [

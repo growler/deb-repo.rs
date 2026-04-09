@@ -533,6 +533,38 @@ impl<'a> Package<'a> {
     pub fn fields(&self) -> impl Iterator<Item = ControlField<'a>> {
         ControlParser::new(self.src).map(|f| f.unwrap())
     }
+    pub fn equals_to<'b>(
+        &self,
+        other: &Package<'b>,
+    ) -> std::result::Result<bool, (&'static str, &'a str, &'b str)> {
+        if self.name != other.name || self.version != other.version {
+            return Ok(false);
+        }
+        if let Some((this, that)) = self
+            .field("SHA512")
+            .and_then(|this| other.field("SHA512").map(|that| (this, that)))
+        {
+            if this != that {
+                return Err(("SHA512 digest", this, that));
+            } else {
+                return Ok(true);
+            }
+        }
+        if let Some((this, that)) = self
+            .field("SHA256")
+            .and_then(|this| other.field("SHA256").map(|that| (this, that)))
+        {
+            if this != that {
+                return Err(("SHA256 digiest", this, that));
+            } else {
+                return Ok(true);
+            }
+        }
+        if self.src == other.src {
+            return Ok(true);
+        }
+        Err(("package description", self.src, other.src))
+    }
     pub fn try_parse_from(
         parser: &mut ControlParser<'a>,
     ) -> Result<Option<Package<'a>>, ParseError> {

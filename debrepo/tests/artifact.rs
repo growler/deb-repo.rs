@@ -945,3 +945,123 @@ fn directory_hash_cli_path_supports_all_algorithms() {
         .expect("hash directory");
     }
 }
+
+#[test]
+fn artifact_dispatch_covers_tar_size_and_dir_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("Manifest.toml");
+
+    // Tar artifact — exercise size() dispatch
+    let tar = load_artifact(
+        &manifest_path,
+        "archive.tar",
+        &format!(
+            "type = \"tar\"\ntarget = \"/opt/archive\"\nsize = 42\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_eq!(tar.size(), 42);
+    assert_eq!(tar.target(), Some("/opt/archive"));
+
+    // Dir artifact — exercise target() dispatch
+    let tree = load_artifact(
+        &manifest_path,
+        "tree",
+        &format!(
+            "type = \"dir\"\ntarget = \"/opt/tree\"\nsize = 99\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_eq!(tree.target(), Some("/opt/tree"));
+    assert_eq!(tree.size(), 99);
+}
+
+#[test]
+fn update_spec_hash_varies_with_arch_and_absent_target() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("Manifest.toml");
+
+    // Tar without arch vs with arch
+    let tar_no_arch = load_artifact(
+        &manifest_path,
+        "archive.tar",
+        &format!(
+            "type = \"tar\"\ntarget = \"/opt/out\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    let tar_with_arch = load_artifact(
+        &manifest_path,
+        "archive.tar",
+        &format!(
+            "type = \"tar\"\ntarget = \"/opt/out\"\narch = \"amd64\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_ne!(spec_digest(&tar_no_arch), spec_digest(&tar_with_arch));
+
+    // Tar with target vs without target
+    let tar_no_target = load_artifact(
+        &manifest_path,
+        "archive.tar",
+        &format!("type = \"tar\"\nsize = 0\nhash = \"{}\"", zero_sri()),
+    );
+    assert_ne!(spec_digest(&tar_no_arch), spec_digest(&tar_no_target));
+
+    // Tree without arch vs with arch
+    let tree_no_arch = load_artifact(
+        &manifest_path,
+        "tree",
+        &format!(
+            "type = \"dir\"\ntarget = \"/opt/tree\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    let tree_with_arch = load_artifact(
+        &manifest_path,
+        "tree",
+        &format!(
+            "type = \"dir\"\ntarget = \"/opt/tree\"\narch = \"arm64\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_ne!(spec_digest(&tree_no_arch), spec_digest(&tree_with_arch));
+
+    // Tree without target
+    let tree_no_target = load_artifact(
+        &manifest_path,
+        "tree",
+        &format!("type = \"dir\"\nsize = 0\nhash = \"{}\"", zero_sri()),
+    );
+    assert_ne!(spec_digest(&tree_no_arch), spec_digest(&tree_no_target));
+
+    // File without arch vs with arch
+    let file_no_arch = load_artifact(
+        &manifest_path,
+        "file.txt",
+        &format!(
+            "type = \"file\"\ntarget = \"/opt/file.txt\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    let file_with_arch = load_artifact(
+        &manifest_path,
+        "file.txt",
+        &format!(
+            "type = \"file\"\ntarget = \"/opt/file.txt\"\narch = \"amd64\"\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_ne!(spec_digest(&file_no_arch), spec_digest(&file_with_arch));
+
+    // File with custom mode
+    let file_with_mode = load_artifact(
+        &manifest_path,
+        "file.txt",
+        &format!(
+            "type = \"file\"\ntarget = \"/opt/file.txt\"\nmode = 0o755\nsize = 0\nhash = \"{}\"",
+            zero_sri()
+        ),
+    );
+    assert_ne!(spec_digest(&file_no_arch), spec_digest(&file_with_mode));
+}

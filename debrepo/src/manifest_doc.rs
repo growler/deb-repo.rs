@@ -9,6 +9,7 @@ use {
         artifact::Artifact,
         hash::Hash,
         kvlist::{KVList, KVListSet},
+        manifest::SpecId,
         packages::Packages,
         spec::*,
         version::{Constraint, Dependency},
@@ -244,61 +245,111 @@ impl ManifestFile {
             archives: self.local_archives().iter().map(|_| None).collect(),
             local_pkgs: Packages::default(),
             specs: self
-                .specs()
+                .spec_entries_raw()
                 .map(|(n, s)| (n.to_string(), s.locked_spec()))
                 .collect(),
             universe_hash: None,
             imported_universe_hash,
         }
     }
-    pub(crate) fn spec_index(&self, spec_name: &str) -> Option<usize> {
-        self.specs.iter().position(|(n, _)| n == spec_name)
+    pub(crate) fn spec_len(&self) -> usize {
+        self.specs.len()
     }
-    pub(crate) fn spec_name(&self, spec_index: usize) -> &str {
-        self.specs.key_at(spec_index)
+    pub(crate) fn spec_ids(&self) -> impl Iterator<Item = SpecId> + '_ {
+        (0..self.specs.len()).map(SpecId::from_index)
     }
-    pub(crate) fn push_empty_spec(&mut self, spec_name: &str) -> usize {
-        let spec_index = self.specs.len();
+    pub(crate) fn lookup_spec_id(&self, spec_name: &str) -> Option<SpecId> {
+        self.specs
+            .iter()
+            .position(|(n, _)| n == spec_name)
+            .map(SpecId::from_index)
+    }
+
+    pub(crate) fn contains_spec(&self, spec_name: &str) -> bool {
+        self.lookup_spec_id(spec_name).is_some()
+    }
+
+    pub(crate) fn spec_name_raw(&self, spec_id: SpecId) -> &str {
+        self.specs.key_at(spec_id.index())
+    }
+
+    pub(crate) fn spec_entry(&self, spec_id: SpecId) -> Option<(&str, &Spec)> {
+        (spec_id.index() < self.specs.len()).then(|| {
+            (
+                self.spec_name_raw(spec_id),
+                self.specs.value_at(spec_id.index()),
+            )
+        })
+    }
+    pub(crate) fn push_empty_spec(&mut self, spec_name: &str) -> SpecId {
+        let spec_id = SpecId::from_index(self.specs.len());
         self.specs.push(spec_name, Spec::new());
         self.doc.get_spec_table_mut(spec_name);
-        spec_index
+        spec_id
     }
     #[allow(dead_code)]
     pub(crate) fn artifacts(&self) -> &'_ [Artifact] {
         &self.artifacts
     }
-    pub(crate) fn artifacts_mut(&mut self) -> &'_ mut [Artifact] {
-        &mut self.artifacts
+
+    pub(crate) async fn rehash_local_artifacts(
+        &mut self,
+        base_dir: &Path,
+    ) -> io::Result<Vec<Artifact>> {
+        let mut updates = Vec::new();
+        for artifact in &mut self.artifacts {
+            if artifact.is_remote() || matches!(artifact, Artifact::Text(_)) {
+                continue;
+            }
+            let old_hash = artifact.hash();
+            let old_size = artifact.size();
+            let path = if Path::new(artifact.uri()).is_absolute() {
+                PathBuf::from(artifact.uri())
+            } else {
+                base_dir.join(artifact.uri())
+            };
+            artifact.hash_local(&path).await?;
+            if artifact.hash() != old_hash || artifact.size() != old_size {
+                updates.push(artifact.clone());
+            }
+        }
+        Ok(updates)
     }
+
     pub(crate) fn artifact<'a>(&'a self, name: &str) -> Option<&'a Artifact> {
         self.artifacts.iter().find(|a| a.uri() == name)
     }
-    pub(crate) fn spec_indices_with_artifact(&self, name: &str) -> Vec<usize> {
+    pub(crate) fn spec_ids_with_artifact(&self, name: &str) -> Vec<SpecId> {
         self.specs
             .iter_values()
             .enumerate()
-            .filter_map(|(idx, spec)| spec.stage.iter().any(|item| item == name).then_some(idx))
+            .filter_map(|(idx, spec)| {
+                spec.stage
+                    .iter()
+                    .any(|item| item == name)
+                    .then_some(SpecId::from_index(idx))
+            })
             .collect()
     }
     pub(crate) fn add_artifact(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         artifact: Artifact,
         comment: Option<&str>,
     ) -> io::Result<()> {
-        let spec_name = self.spec_name(spec_index).to_string();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
         if !self
             .specs
-            .value_at(spec_index)
+            .value_at(spec_id.index())
             .stage
             .iter()
             .any(|a| a == artifact.uri())
         {
             self.specs
-                .value_mut_at(spec_index)
+                .value_mut_at(spec_id.index())
                 .stage
                 .push(artifact.uri().to_string());
-            self.doc.add_spec_entry_item(
+            self.doc.push_decorated_items(
                 spec_name.as_str(),
                 "stage",
                 std::iter::once(artifact.uri()),
@@ -373,11 +424,11 @@ impl ManifestFile {
     }
     pub(crate) fn remove_artifact(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         artifact_uri: &str,
     ) -> io::Result<()> {
-        let spec_name = self.spec_name(spec_index).to_string();
-        let spec = self.specs.value_mut_at(spec_index);
+        let spec_name = self.spec_name_raw(spec_id).to_string();
+        let spec = self.specs.value_mut_at(spec_id.index());
         match spec.stage.iter().position(|a| a == artifact_uri) {
             Some(i) => {
                 spec.stage.remove(i);
@@ -396,7 +447,7 @@ impl ManifestFile {
             .specs
             .iter_values()
             .enumerate()
-            .filter(|(i, _)| *i != spec_index)
+            .filter(|(i, _)| *i != spec_id.index())
             .all(|(_, s)| s.stage.iter().all(|a| a != artifact_uri))
         {
             if let Some(idx) = self.artifacts.iter().position(|a| a.uri() == artifact_uri) {
@@ -408,57 +459,44 @@ impl ManifestFile {
     }
     pub(crate) fn add_requirements(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         reqs: Vec<Dependency<String>>,
         comment: Option<&str>,
     ) -> io::Result<bool> {
-        self.add_spec_list_items(spec_index, "include", reqs, comment, |spec| {
-            &mut spec.include
-        })
+        self.add_spec_list_items(spec_id, "include", reqs, comment, |spec| &mut spec.include)
     }
     pub(crate) fn add_stage_items(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         items: Vec<String>,
         comment: Option<&str>,
     ) -> io::Result<bool> {
-        self.add_spec_list_items(spec_index, "stage", items, comment, |spec| &mut spec.stage)
+        self.add_spec_list_items(spec_id, "stage", items, comment, |spec| &mut spec.stage)
     }
-    pub(crate) fn remove_requirements<'a, I>(
+    pub(crate) fn remove_requirements(
         &mut self,
-        spec_index: usize,
-        reqs: I,
-    ) -> io::Result<bool>
-    where
-        I: IntoIterator<Item = &'a Dependency<String>> + 'a,
-    {
-        self.remove_spec_list_item(spec_index, "include", reqs, |spec| &mut spec.include)
+        spec_id: SpecId,
+        reqs: &[Dependency<String>],
+    ) -> io::Result<bool> {
+        self.remove_spec_list_item(spec_id, "include", reqs.iter(), |spec| &mut spec.include)
     }
     pub(crate) fn add_constraints(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         cons: Vec<Constraint<String>>,
         comment: Option<&str>,
     ) -> io::Result<bool> {
-        self.add_spec_list_items(spec_index, "exclude", cons, comment, |spec| {
-            &mut spec.exclude
-        })
+        self.add_spec_list_items(spec_id, "exclude", cons, comment, |spec| &mut spec.exclude)
     }
-    pub(crate) fn remove_constraints<'a, I>(
+    pub(crate) fn remove_constraints(
         &mut self,
-        spec_index: usize,
-        reqs: I,
-    ) -> io::Result<bool>
-    where
-        I: IntoIterator<Item = &'a Constraint<String>> + 'a,
-    {
-        self.remove_spec_list_item(spec_index, "exclude", reqs, |spec| &mut spec.exclude)
+        spec_id: SpecId,
+        reqs: &[Constraint<String>],
+    ) -> io::Result<bool> {
+        self.remove_spec_list_item(spec_id, "exclude", reqs.iter(), |spec| &mut spec.exclude)
     }
-    pub(crate) fn spec_build_env(&self, spec_index: usize) -> io::Result<&KVList<String>> {
-        Ok(&self.specs.value_at(spec_index).build_env)
-    }
-    pub(crate) fn spec_env_block(&self, spec_index: usize) -> io::Result<String> {
-        let build_env = match self.spec_build_env_table(self.spec_name(spec_index))? {
+    pub(crate) fn spec_env_block(&self, spec_id: SpecId) -> io::Result<String> {
+        let build_env = match self.spec_build_env_table(self.spec_name_raw(spec_id))? {
             Some(table) => table,
             None => return Ok(String::new()),
         };
@@ -496,9 +534,6 @@ impl ManifestFile {
         }
         Ok(out)
     }
-    pub(crate) fn spec_build_script(&self, spec_index: usize) -> io::Result<Option<&str>> {
-        Ok(self.specs.value_at(spec_index).build_script.as_deref())
-    }
     fn spec_build_env_table(&self, spec_name: &str) -> io::Result<Option<&toml_edit::Table>> {
         let spec_table = self
             .doc
@@ -519,49 +554,45 @@ impl ManifestFile {
             .get("build-env")
             .and_then(toml_edit::Item::as_table))
     }
-    pub(crate) fn set_build_env(
-        &mut self,
-        spec_index: usize,
-        env: KVList<String>,
-    ) -> io::Result<()> {
-        self.update_build_env(spec_index, env, None)
+    pub(crate) fn set_build_env(&mut self, spec_id: SpecId, env: KVList<String>) -> io::Result<()> {
+        self.update_build_env(spec_id, env, None)
     }
     pub(crate) fn set_build_env_with_comments(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         env: KVList<String>,
         comments: &BuildEnvComments,
     ) -> io::Result<()> {
-        self.update_build_env(spec_index, env, Some(comments))
+        self.update_build_env(spec_id, env, Some(comments))
     }
     pub(crate) fn set_spec_env_block(
         &mut self,
         spec_name: &str,
         block: &str,
-    ) -> io::Result<Option<usize>> {
+    ) -> io::Result<Option<SpecId>> {
         let parsed = parse_env_block(block)?;
-        let spec_index = if parsed.env.is_empty() {
-            match self.spec_index(spec_name) {
-                Some(spec_index) => spec_index,
+        let spec_id = if parsed.env.is_empty() {
+            match self.lookup_spec_id(spec_name) {
+                Some(spec_id) => spec_id,
                 None => return Ok(None),
             }
         } else {
-            match self.spec_index(spec_name) {
-                Some(spec_index) => spec_index,
+            match self.lookup_spec_id(spec_name) {
+                Some(spec_id) => spec_id,
                 None => self.push_empty_spec(spec_name),
             }
         };
-        self.set_build_env_with_comments(spec_index, parsed.env, &parsed.comments)?;
-        Ok(Some(spec_index))
+        self.set_build_env_with_comments(spec_id, parsed.env, &parsed.comments)?;
+        Ok(Some(spec_id))
     }
     fn update_build_env(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         env: KVList<String>,
         comments: Option<&BuildEnvComments>,
     ) -> io::Result<()> {
-        let spec_name = self.spec_name(spec_index).to_string();
-        self.specs.value_mut_at(spec_index).build_env = env.clone();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
+        self.specs.value_mut_at(spec_id.index()).build_env = env.clone();
         if env.is_empty() {
             self.doc
                 .remove_spec_table_entry(spec_name.as_str(), "build-env");
@@ -617,13 +648,13 @@ impl ManifestFile {
     }
     pub(crate) fn set_meta_entry(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         name: &str,
         value: &str,
     ) -> io::Result<()> {
-        let spec_name = self.spec_name(spec_index).to_string();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
         let entry = format!("{}:{}", name, value);
-        let spec = self.specs.value_mut_at(spec_index);
+        let spec = self.specs.value_mut_at(spec_id.index());
         let mut found = None;
         for (idx, item) in spec.meta.iter().enumerate() {
             if let Ok((item_name, _)) = parse_meta_entry(item) {
@@ -663,11 +694,11 @@ impl ManifestFile {
     }
     pub(crate) fn set_build_script(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         script: Option<String>,
     ) -> io::Result<()> {
-        let spec_name = self.spec_name(spec_index).to_string();
-        self.specs.value_mut_at(spec_index).build_script = script.clone();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
+        self.specs.value_mut_at(spec_id.index()).build_script = script.clone();
         if let Some(script) = script {
             let entry =
                 self.doc
@@ -683,7 +714,7 @@ impl ManifestFile {
     }
     fn remove_spec_list_item<'a, 'b, I, T, F>(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         kind: &str,
         items: I,
         f: F,
@@ -693,9 +724,9 @@ impl ManifestFile {
         I: IntoIterator<Item = &'b T> + 'b,
         T: PartialEq + Serialize + 'b,
     {
-        let spec_name = self.spec_name(spec_index).to_string();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
         let removed = {
-            let spec = self.specs.value_mut_at(spec_index);
+            let spec = self.specs.value_mut_at(spec_id.index());
             let list = f(spec);
             let mut removed = Vec::new();
             for item in items.into_iter() {
@@ -717,7 +748,7 @@ impl ManifestFile {
     }
     fn add_spec_list_items<T, F>(
         &mut self,
-        spec_index: usize,
+        spec_id: SpecId,
         kind: &str,
         items: Vec<T>,
         comment: Option<&str>,
@@ -728,7 +759,7 @@ impl ManifestFile {
         T: PartialEq + Serialize,
     {
         let mut items = {
-            let spec = self.specs.value_mut_at(spec_index);
+            let spec = self.specs.value_mut_at(spec_id.index());
             items
                 .into_iter()
                 .filter(|item| f(spec).iter().all(|i| i != item))
@@ -737,10 +768,10 @@ impl ManifestFile {
         if items.is_empty() {
             return Ok(false);
         }
-        let spec_name = self.spec_name(spec_index).to_string();
+        let spec_name = self.spec_name_raw(spec_id).to_string();
         self.doc
             .push_decorated_items(spec_name.as_str(), kind, &items, comment);
-        f(self.specs.value_mut_at(spec_index)).append(&mut items);
+        f(self.specs.value_mut_at(spec_id.index())).append(&mut items);
         Ok(true)
     }
     /// List of archives defined in this manifest (not including imported ones)
@@ -846,11 +877,14 @@ impl ManifestFile {
                 }
             })
     }
-    pub(crate) fn specs(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
-        self.specs.iter()
+    pub(crate) fn spec_entries(&self) -> impl Iterator<Item = (SpecId, (&'_ str, &'_ Spec))> + '_ {
+        self.specs
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| (SpecId::from_index(idx), entry))
     }
-    pub(crate) fn names(&self) -> impl Iterator<Item = &'_ str> {
-        self.specs.iter_keys()
+    pub(crate) fn spec_entries_raw(&self) -> impl Iterator<Item = (&'_ str, &'_ Spec)> {
+        self.specs.iter()
     }
 }
 
@@ -872,6 +906,7 @@ pub(crate) struct LockFile {
 }
 
 impl LockFile {
+    pub const FORMAT_VERSION: u64 = 1;
     pub const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
     pub(crate) fn new() -> Self {
         LockFile {
@@ -902,6 +937,7 @@ impl LockFile {
     }
     // loads lock file from path. returns None if the lock file
     // has outdated manifest hash or outdated imported universe hash (if any)
+    // or if format version does not match
     pub(crate) async fn from_file<P: AsRef<Path>, A: AsRef<str>>(
         lock_path: P,
         arch: A,
@@ -929,6 +965,7 @@ impl LockFile {
                 struct LockFileWithHash {
                     #[serde(rename = "timestamp")]
                     _timestamp: DateTime<Utc>,
+                    format: Option<u64>,
                     arch: String,
                     manifest: Hash,
                     #[serde(rename = "universe")]
@@ -964,6 +1001,7 @@ impl LockFile {
                         if &lock.manifest == manifest_hash
                             && lock.arch.as_str() == arch.as_ref()
                             && lock.imported_universe_hash.as_ref() == imported_universe_hash
+                            && lock.format == Some(Self::FORMAT_VERSION)
                         {
                             Some(LockFile {
                                 universe_hash: Some(lock.universe_hash),
@@ -994,6 +1032,7 @@ impl LockFile {
         #[serde(deny_unknown_fields)]
         struct LockFileWithHash<'a> {
             timestamp: DateTime<Utc>,
+            format: u64,
             arch: &'a str,
             manifest: &'a Hash,
             #[serde(flatten)]
@@ -1002,6 +1041,7 @@ impl LockFile {
         let lock_path = lock_path.as_ref();
         let lock = LockFileWithHash {
             timestamp: Utc::now(),
+            format: Self::FORMAT_VERSION,
             arch,
             manifest: hash,
             file: self,
@@ -1065,13 +1105,13 @@ impl LockFile {
     pub(crate) fn set_universe_hash(&mut self, hash: Hash) {
         self.universe_hash = Some(hash);
     }
-    pub fn specs_len(&self) -> usize {
+    pub fn len(&self) -> usize {
         self.specs.len()
     }
-    pub fn specs(&mut self) -> impl Iterator<Item = (&'_ str, &'_ LockedSpec)> {
+    pub fn iter_specs(&self) -> impl Iterator<Item = (&'_ str, &'_ LockedSpec)> {
         self.specs.iter()
     }
-    pub fn specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut LockedSpec)> {
+    pub fn iter_specs_mut(&mut self) -> impl Iterator<Item = (&'_ str, &'_ mut LockedSpec)> {
         self.specs.iter_mut()
     }
     pub fn invalidate_specs(&mut self) {
@@ -1079,11 +1119,11 @@ impl LockFile {
             .iter_mut()
             .for_each(|(_, s)| s.invalidate_solution());
     }
-    pub fn get_spec(&self, id: usize) -> &'_ LockedSpec {
-        &self.specs[id]
+    pub fn spec(&self, id: SpecId) -> &'_ LockedSpec {
+        &self.specs[id.index()]
     }
-    pub fn get_spec_mut(&mut self, id: usize) -> &'_ mut LockedSpec {
-        &mut self.specs[id]
+    pub fn spec_mut(&mut self, id: SpecId) -> &'_ mut LockedSpec {
+        &mut self.specs[id.index()]
     }
     pub fn push_spec(&mut self, name: &str, spec: LockedSpec) {
         self.specs.push(name, spec);
@@ -1310,13 +1350,6 @@ fn spec_entry_order(key: &str) -> u8 {
     }
 }
 
-fn spec_items() -> toml_edit::Item {
-    let mut arr = toml_edit::Array::new();
-    arr.set_trailing("\n");
-    arr.set_trailing_comma(true);
-    arr.into()
-}
-
 pub(crate) trait ManifestDoc {
     fn init_manifest(self, comment: Option<&str>) -> Self;
     fn upsert_import(&mut self, import: &Import);
@@ -1369,37 +1402,6 @@ pub(crate) trait ManifestDoc {
         let table = self.get_spec_table_mut(spec_name);
         if table.contains_key(entry) {
             table.remove(entry);
-        }
-    }
-    fn add_spec_entry_item<T: Serialize, I: Iterator<Item = T>, C: AsRef<str>>(
-        &mut self,
-        spec_name: &str,
-        entry: &str,
-        items: I,
-        comment: Option<C>,
-    ) {
-        let arr = self
-            .get_spec_table_entry_mut(spec_name, entry, spec_items)
-            .as_array_mut()
-            .expect("a list of spec items");
-
-        let mut comment = comment.map(|comment| {
-            comment
-                .as_ref()
-                .split('\n')
-                .map(|s| format!("\n    # {s}"))
-                .join("")
-        });
-        for item in items.into_iter() {
-            let mut item = item
-                .serialize(toml_edit::ser::ValueSerializer::new())
-                .expect("failed to serialize item");
-            if let Some(comment) = comment.take() {
-                item.decor_mut().set_prefix(format!("{comment}\n    "));
-            } else {
-                item.decor_mut().set_prefix("\n    ".to_string());
-            }
-            arr.push_formatted(item);
         }
     }
     fn update_artifact<C: AsRef<str>>(&mut self, artifact: &Artifact, comment: Option<C>) {

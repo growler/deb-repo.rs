@@ -159,7 +159,6 @@ pub mod cmd {
             content::{ContentProviderGuard, HostCache},
             hash::{Hash, HashAlgo},
             manifest::Manifest,
-            manifest_doc::spec_display_name,
             staging::HostFileSystem,
             version::ProvidedName,
         },
@@ -892,7 +891,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     })
                     .collect::<Result<Vec<_>>>()?;
                 let mut pkgs = mf
-                    .packages()?
+                    .universe_packages()?
                     .filter(|p| {
                         res.is_empty()
                             || res.iter().any(|re| {
@@ -920,6 +919,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         Forbid(SpecForbid),
         Remove(SpecRemove),
         Artifact(SpecArtifact),
+        InstallOrder(SpecInstallOrder),
     }
 
     #[derive(Parser)]
@@ -940,7 +940,42 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 SpecCommands::Forbid(cmd) => cmd.exec(conf),
                 SpecCommands::Remove(cmd) => cmd.exec(conf),
                 SpecCommands::Artifact(cmd) => cmd.exec(conf),
+                SpecCommands::InstallOrder(cmd) => cmd.exec(conf),
             }
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "List packages installation order for a spec", hide = true)]
+    /// CLI command: List spec installation order
+    pub struct SpecInstallOrder {
+        /// Spec name (omit to use the default spec)
+        #[arg(short = 's', long = "spec", value_name = "SPEC")]
+        spec: Option<String>,
+        /// Flat the spec hierarchy and list all effective packages, including inherited
+        #[arg(long = "flat", action)]
+        flat: bool,
+    }
+
+    impl<C: Config> Command<C> for SpecInstallOrder {
+        fn exec(&self, conf: &C) -> Result<()> {
+            smol::block_on(async move {
+                let (mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
+                let spec = mf.lookup_spec(self.spec.as_deref())?;
+                let (_, essentials, other) = if self.flat {
+                    spec.effective_staging_installables()?
+                } else {
+                    spec.staging_installables()?
+                };
+                std::iter::once(essentials)
+                    .chain(other)
+                    .for_each(|group| println!("{}", group.iter().join(" ")));
+                Ok(())
+            })
         }
     }
 
@@ -976,8 +1011,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                for name in mf.spec_names() {
-                    println!("{}", name);
+                for spec in mf.specs() {
+                    println!("{}", spec.display_name());
                 }
                 Ok(())
             })
@@ -1102,7 +1137,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                match mf.get_spec_meta(self.spec.as_deref(), &self.name)? {
+                let spec = mf.lookup_spec(self.spec.as_deref())?;
+                match spec.get_meta(&self.name)? {
                     Some(value) => {
                         println!("{}", value);
                         Ok(())
@@ -1110,7 +1146,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     None => Err(anyhow!(
                         "meta {} not found in spec {}",
                         self.name,
-                        spec_display_name(self.spec.as_deref().unwrap_or(""))
+                        spec.display_name()
                     )),
                 }
             })
@@ -1174,8 +1210,12 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecHash {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                let hash = mf.spec_hash(self.spec.as_deref())?;
+                let (mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
+                let hash = mf.lookup_spec(self.spec.as_deref())?.locked_hash()?;
                 if self.sri {
                     println!("{}", hash.to_sri());
                 } else {
@@ -1206,7 +1246,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
-                let pkg = mf.packages()?.find(|p| self.package == p.name());
+                let pkg = mf.universe_packages()?.find(|p| self.package == p.name());
                 if let Some(pkg) = pkg {
                     std::io::stdout().lock().write_all(pkg.src().as_bytes())?;
                     Ok(())
@@ -1590,6 +1630,9 @@ hash = \"{}\"
         /// List packages for the target spec (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
+        /// Flat the spec hierarchy and list all effective packages, including inherited
+        #[arg(long = "flat", action)]
+        flat: bool,
     }
 
     impl<C: Config> Command<C> for List {
@@ -1597,13 +1640,19 @@ hash = \"{}\"
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
-                let mut pkgs = mf
-                    .spec_packages(self.spec.as_deref())?
-                    .filter(|p| !self.only_essential || p.essential())
-                    .collect::<Vec<_>>();
+                let spec = mf.lookup_spec(self.spec.as_deref())?;
+                let mut pkgs = if self.flat {
+                    spec.effective_packages()?
+                } else {
+                    spec.packages()?
+                };
                 pkgs.sort_by_key(|&pkg| pkg.name());
                 let out = pretty_print_packages(pkgs, false)?;
                 std::io::stdout().lock().write_all(&out)?;
@@ -1651,7 +1700,7 @@ hash = \"{}\"
                             err
                         )
                     })?;
-                let (manifest, _) = Manifest::from_file(conf.manifest(), conf.arch())
+                let (manifest, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch())
                     .await
                     .map_err(|err| {
                         anyhow!(
@@ -1660,6 +1709,9 @@ hash = \"{}\"
                             err
                         )
                     })?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
                 let pb = if conf.log_level() == 0 {
                     let use_tty = std::io::stderr().is_terminal();
                     Some(move |size| {
@@ -1686,7 +1738,14 @@ hash = \"{}\"
                     self.path.display()
                 );
                 let (essentials, other, scripts, build_env) = manifest
-                    .stage(self.spec.as_deref(), &fs, conf.concurrency(), fetcher, pb)
+                    .stage(
+                        self.spec.as_deref(),
+                        None,
+                        &fs,
+                        conf.concurrency(),
+                        fetcher,
+                        pb,
+                    )
                     .await?;
                 builder
                     .build(&fs, essentials, other, scripts, build_env)
@@ -1828,6 +1887,99 @@ hash = \"{}\"
             Some(SignedBy::Builtin) => Ok(Some(SignedBy::Builtin)),
             Some(SignedBy::Key(key)) => Ok(Some(SignedBy::Key(key.clone()))),
             None => Ok(None),
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use std::path::{Path, PathBuf};
+
+        #[test]
+        fn normalize_path_handles_curdir_parentdir_and_empty_collapse() {
+            // CurDir components are stripped
+            assert_eq!(
+                normalize_path(Path::new("./foo/./bar")),
+                PathBuf::from("foo/bar")
+            );
+
+            // ParentDir pops normal components
+            assert_eq!(
+                normalize_path(Path::new("foo/../bar")),
+                PathBuf::from("bar")
+            );
+
+            // Multiple ParentDir
+            assert_eq!(
+                normalize_path(Path::new("foo/bar/../../baz")),
+                PathBuf::from("baz")
+            );
+
+            // Collapses to "."
+            assert_eq!(normalize_path(Path::new("foo/..")), PathBuf::from("."));
+
+            // CurDir alone
+            assert_eq!(normalize_path(Path::new(".")), PathBuf::from("."));
+
+            // ParentDir with nothing to pop goes through
+            assert_eq!(normalize_path(Path::new("../foo")), PathBuf::from("../foo"));
+        }
+
+        #[test]
+        fn diff_relative_path_edge_cases() {
+            // Same path → "."
+            assert_eq!(
+                diff_relative_path(Path::new("foo/bar"), Path::new("foo/bar")),
+                Some(PathBuf::from("."))
+            );
+
+            // Divergent first components (relative vs absolute)
+            assert_eq!(
+                diff_relative_path(Path::new("/abs/path"), Path::new("rel/path")),
+                None,
+            );
+        }
+
+        #[test]
+        fn rebase_local_path_for_manifest_short_circuits_absolute() {
+            let abs = Path::new("/absolute/path/file.txt");
+            let manifest = Path::new("/some/manifest.toml");
+            let cwd = Path::new("/working");
+            let result = rebase_local_path_for_manifest(abs, manifest, cwd);
+            assert_eq!(result, PathBuf::from("/absolute/path/file.txt"));
+        }
+
+        #[test]
+        fn rebase_signed_by_covers_builtin_and_key() {
+            let manifest = Path::new("/tmp/manifest.toml");
+
+            let builtin =
+                rebase_signed_by_input(&Some(SignedBy::Builtin), manifest).expect("builtin");
+            assert_eq!(builtin, Some(SignedBy::Builtin));
+
+            let key = rebase_signed_by_input(
+                &Some(SignedBy::Key("-----BEGIN PGP PUBLIC KEY BLOCK-----".into())),
+                manifest,
+            )
+            .expect("key");
+            assert_eq!(
+                key,
+                Some(SignedBy::Key("-----BEGIN PGP PUBLIC KEY BLOCK-----".into()))
+            );
+
+            let none = rebase_signed_by_input(&None, manifest).expect("none");
+            assert_eq!(none, None);
+        }
+
+        #[test]
+        fn manifest_dir_for_joins_cwd_for_relative_manifest() {
+            // relative manifest is joined with cwd
+            let dir = manifest_dir_for(Path::new("manifest.toml"), Path::new("/cwd"));
+            assert_eq!(dir, PathBuf::from("/cwd"));
+
+            // absolute manifest ignores cwd
+            let dir = manifest_dir_for(Path::new("/etc/manifest.toml"), Path::new("/cwd"));
+            assert_eq!(dir, PathBuf::from("/etc"));
         }
     }
 }

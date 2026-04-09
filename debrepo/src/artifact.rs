@@ -1766,7 +1766,21 @@ mod tree {
 
 #[cfg(test)]
 mod tests {
-    use super::{stage_dir_target, stage_file_target, stage_text_target};
+    use super::{
+        normalize_target_absolute, stage_dir_target, stage_file_target, stage_text_target,
+    };
+
+    #[test]
+    fn normalize_target_rejects_empty_and_prefixes_relative() {
+        let err = normalize_target_absolute("").unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::InvalidInput);
+
+        let abs = normalize_target_absolute("/foo").unwrap();
+        assert_eq!(abs.as_ref(), "/foo");
+
+        let rel = normalize_target_absolute("bar").unwrap();
+        assert_eq!(rel.as_ref(), "/bar");
+    }
 
     #[test]
     fn stage_file_target_appends_filename_for_trailing_slash() {
