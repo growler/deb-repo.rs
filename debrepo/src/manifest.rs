@@ -175,10 +175,7 @@ impl<'a> ResolvedSpecRef<'a> {
             self.stage_artifacts()
                 .try_fold(blake3::Hasher::default(), |mut h, a| {
                     let artifact = a?;
-                    h.update(artifact.artifact.uri().as_bytes());
-                    h.update(b"\n");
-                    h.update(artifact.artifact.hash().as_bytes());
-                    h.update(b"\n");
+                    artifact.artifact.update_spec_hash(&mut h);
                     Ok::<_, io::Error>(h)
                 })?;
         hasher.update(artifacts_hash.finalize().as_bytes());
