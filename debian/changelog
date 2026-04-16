@@ -1,3 +1,11 @@
+rdebootstrap (0.3.1) unstable; urgency=medium
+
+  * fix: use artifact hashing function (I forgot I made one).
+    without this, chaning artifact target directory or 
+    artifact mode didn't change the spec hash
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Thu, 16 Apr 2026 11:52:58 +0200
+
 rdebootstrap (0.3.0) unstable; urgency=medium
 
   * BREAKING CHANGE: the solver now enforces that a child spec 
