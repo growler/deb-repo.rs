@@ -918,6 +918,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         Require(SpecRequire),
         Forbid(SpecForbid),
         Remove(SpecRemove),
+        Extend(SpecExtend),
         Artifact(SpecArtifact),
         InstallOrder(SpecInstallOrder),
     }
@@ -939,6 +940,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 SpecCommands::Require(cmd) => cmd.exec(conf),
                 SpecCommands::Forbid(cmd) => cmd.exec(conf),
                 SpecCommands::Remove(cmd) => cmd.exec(conf),
+                SpecCommands::Extend(cmd) => cmd.exec(conf),
                 SpecCommands::Artifact(cmd) => cmd.exec(conf),
                 SpecCommands::InstallOrder(cmd) => cmd.exec(conf),
             }
@@ -1177,6 +1179,48 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
                 mf.set_spec_meta(self.spec.as_deref(), &self.name, &self.value)?;
+                let fetcher = conf.fetcher()?;
+                let guard = fetcher.init().await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
+                mf.store().await?;
+                guard.commit().await?;
+                Ok(())
+            })
+        }
+    }
+
+    #[derive(Parser)]
+    #[command(about = "Set or clear a spec's parent")]
+    /// CLI command: set or clear the extends field of a spec.
+    pub struct SpecExtend {
+        /// Spec name (omit to use the default spec)
+        #[arg(short = 's', long = "spec", value_name = "SPEC")]
+        spec: Option<String>,
+        /// Remove the extends relationship
+        #[arg(long = "clear", conflicts_with = "parent")]
+        clear: bool,
+        /// Parent spec name
+        #[arg(value_name = "PARENT")]
+        parent: Option<String>,
+    }
+
+    impl<C: Config> Command<C> for SpecExtend {
+        fn exec(&self, conf: &C) -> Result<()> {
+            if self.parent.is_none() && !self.clear {
+                return Err(anyhow!("either a parent spec name or --clear is required"));
+            }
+            smol::block_on(async move {
+                let (mut mf, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                if !has_valid_lock {
+                    return Err(anyhow!("manifest lock is not live; run update first"));
+                }
+                let parent = if self.clear {
+                    None
+                } else {
+                    self.parent.as_deref()
+                };
+                mf.set_extends(self.spec.as_deref(), parent)?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;

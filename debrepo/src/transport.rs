@@ -70,10 +70,15 @@ trait OptionalExt: Sized {
 
 impl OptionalExt for HttpClientBuilder {}
 
-fn build_client(insecure: bool, force_http11: bool) -> HttpClient {
+fn build_client(
+    insecure: bool,
+    force_http11: bool,
+    timeout: Option<std::time::Duration>,
+) -> HttpClient {
     HttpClient::builder()
         .redirect_policy(RedirectPolicy::Limit(10))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(timeout.unwrap_or_else(|| std::time::Duration::from_secs(30)))
+        .low_speed_timeout(65536, std::time::Duration::from_secs(30))
         .optional(force_http11, |b| {
             b.version_negotiation(VersionNegotiation::http11())
         })
@@ -95,20 +100,27 @@ pub struct HttpTransport {
     auth: AuthProvider,
     insecure: bool,
     force_http11: bool,
+    timeout: Option<std::time::Duration>,
 }
 
 impl HttpTransport {
-    pub fn new(auth: AuthProvider, insecure: bool, force_http11: bool) -> Self {
+    pub fn new(
+        auth: AuthProvider,
+        insecure: bool,
+        force_http11: bool,
+        timeout: Option<std::time::Duration>,
+    ) -> Self {
         Self {
             insecure,
             force_http11,
             auth,
             client: once_cell::sync::OnceCell::new(),
+            timeout,
         }
     }
     fn client(&self) -> &HttpClient {
         self.client
-            .get_or_init(|| build_client(self.insecure, self.force_http11))
+            .get_or_init(|| build_client(self.insecure, self.force_http11, self.timeout))
     }
 }
 

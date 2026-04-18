@@ -71,3 +71,34 @@ run_case_expect_ok "spec_artifact_remove" spec artifact remove -s desktop ./desk
 assert_manifest_lacks "# desktop stage"
 assert_manifest_lacks_comment_attached_to_list_item "desktop stage" '"./desktop-note.txt"'
 assert_manifest_lacks "[artifact.\"./desktop-note.txt\"]"
+
+# --- spec extend ---
+
+# create a backend spec and set it to extend desktop
+run_case_expect_ok "spec_extend_set" spec extend -s backend desktop
+assert_manifest_contains 'extends = "desktop"'
+
+# hash changes after setting extends
+run_case_expect_ok "spec_hash_before_extend" spec hash backend
+hash_before_extend="$(tr -d '\n' <"${LAST_STDOUT}")"
+
+run_case_expect_ok "spec_extend_change" spec extend -s backend desktop
+run_case_expect_ok "spec_hash_after_extend" spec hash backend
+hash_after_extend="$(tr -d '\n' <"${LAST_STDOUT}")"
+
+# clear extends
+run_case_expect_ok "spec_extend_clear" spec extend -s backend --clear
+assert_manifest_lacks 'extends = "desktop"'
+
+# hash changes after clearing extends
+run_case_expect_ok "spec_hash_after_clear" spec hash backend
+hash_after_clear="$(tr -d '\n' <"${LAST_STDOUT}")"
+assert_not_equals "${hash_before_extend}" "${hash_after_clear}" "backend spec hash after clear"
+
+# error: extend nonexistent spec
+run_case_expect_fail "spec_extend_missing" spec extend -s backend no-such-spec
+assert_stderr_contains "not found"
+
+# error: self-extend
+run_case_expect_fail "spec_extend_self" spec extend -s backend backend
+assert_stderr_contains "cannot extend itself"

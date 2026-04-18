@@ -73,6 +73,7 @@ impl deb_cli::Config for App {
                     AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?,
                     self.insecure,
                     self.http11,
+                    self.timeout.map(std::time::Duration::from_secs),
                 ),
                 self.cache_dir.as_deref(),
             ))
@@ -146,6 +147,10 @@ pub struct App {
     /// Force HTTP/1.1 for transport requests
     #[arg(long = "http1.1", global = true, display_order = 0, action)]
     pub http11: bool,
+
+    /// HTTP transport timeout in seconds (default 30 seconds)
+    #[arg(long = "timeout", global = true, display_order = 0)]
+    pub timeout: Option<u64>,
 
     /// Auth source (file:<path>, <path>, or vault:<mount>/<path>); defaults to auth.toml next to the manifest if present
     #[arg(short = 'a', long = "auth", value_name = "AUTH", display_order = 0)]

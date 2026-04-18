@@ -713,7 +713,7 @@ mod tests {
     };
 
     fn sha256_hex(data: &[u8]) -> String {
-        format!("{:x}", Sha256::digest(data))
+        hex::encode(Sha256::digest(data))
     }
 
     async fn write_compressed(path: &std::path::Path, ext: &str, data: &[u8]) {
@@ -779,7 +779,12 @@ mod tests {
         let archives = vec![archive];
         let universe = UniverseFiles::new("amd64", 0, &archives, &locked);
         let cache = HostCache::new(
-            crate::HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+            crate::HttpTransport::new(
+                AuthProvider::new::<&str>(None).expect("auth"),
+                false,
+                false,
+                None,
+            ),
             Option::<&std::path::Path>::None,
         );
 

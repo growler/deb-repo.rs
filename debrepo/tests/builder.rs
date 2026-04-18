@@ -22,7 +22,12 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn new_host_cache() -> HostCache {
     HostCache::new(
-        HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+        HttpTransport::new(
+            AuthProvider::new::<&str>(None).expect("auth"),
+            false,
+            false,
+            None,
+        ),
         Option::<&Path>::None,
     )
 }

@@ -46,7 +46,12 @@ impl TestConfig {
         Self {
             manifest: PathBuf::from("Manifest.toml"),
             cache: HostCache::new(
-                HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+                HttpTransport::new(
+                    AuthProvider::new::<&str>(None).expect("auth"),
+                    false,
+                    false,
+                    None,
+                ),
                 None::<&Path>,
             ),
             concurrency: NonZero::new(1).expect("nonzero"),

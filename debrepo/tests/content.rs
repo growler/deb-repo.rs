@@ -25,13 +25,18 @@ fn fixture_path(name: &str) -> PathBuf {
 
 fn host_cache(cache: Option<&Path>) -> HostCache {
     HostCache::new(
-        debrepo::HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+        debrepo::HttpTransport::new(
+            AuthProvider::new::<&str>(None).expect("auth"),
+            false,
+            false,
+            None,
+        ),
         cache,
     )
 }
 
 fn sha256_hex(data: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(data))
+    hex::encode(Sha256::digest(data))
 }
 
 fn sha256_sri(data: &[u8]) -> String {

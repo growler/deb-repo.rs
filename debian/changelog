@@ -1,3 +1,11 @@
+rdebootstrap (0.3.2) unstable; urgency=medium
+
+  * feat: spec extend command
+  * feat: HTTP timeout option
+  * chore: cargo update
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 18 Apr 2026 12:24:47 +0200
+
 rdebootstrap (0.3.1) unstable; urgency=medium
 
   * fix: use artifact hashing function (I forgot I made one).

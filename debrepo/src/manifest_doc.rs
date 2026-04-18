@@ -692,6 +692,24 @@ impl ManifestFile {
         }
         Ok(())
     }
+    pub(crate) fn set_extends(
+        &mut self,
+        spec_id: SpecId,
+        parent: Option<String>,
+    ) -> io::Result<()> {
+        let spec_name = self.spec_name_raw(spec_id).to_string();
+        self.specs.value_mut_at(spec_id.index()).extends = parent.clone();
+        if let Some(parent) = parent {
+            let entry = self
+                .doc
+                .get_spec_table_entry_mut(spec_name.as_str(), "extends", || toml_edit::value(""));
+            *entry = toml_edit::value(parent);
+        } else {
+            self.doc
+                .remove_spec_table_entry(spec_name.as_str(), "extends");
+        }
+        Ok(())
+    }
     pub(crate) fn set_build_script(
         &mut self,
         spec_id: SpecId,

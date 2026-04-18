@@ -47,8 +47,12 @@ fn file_transport_returns_body_and_size() {
     let path = dir.path().join("payload.txt");
     let bytes = b"transport file payload\n";
     fs::write(&path, bytes).expect("write payload");
-    let transport =
-        HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false);
+    let transport = HttpTransport::new(
+        AuthProvider::new::<&str>(None).expect("auth"),
+        false,
+        false,
+        None,
+    );
 
     let (body, size) =
         smol::block_on(read_opened(&transport, &file_url(&path))).expect("open file");
@@ -58,8 +62,12 @@ fn file_transport_returns_body_and_size() {
 
 #[test]
 fn invalid_urls_and_unsupported_scheme_return_expected_errors() {
-    let transport =
-        HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false);
+    let transport = HttpTransport::new(
+        AuthProvider::new::<&str>(None).expect("auth"),
+        false,
+        false,
+        None,
+    );
 
     let err = smol::block_on(open_err(&transport, "relative/path"));
     assert!(err
@@ -85,7 +93,7 @@ token = "transport-token"
 "#,
     );
     let auth = AuthProvider::new(Some(auth_path.to_string_lossy())).expect("auth provider");
-    let transport = HttpTransport::new(auth, false, false);
+    let transport = HttpTransport::new(auth, false, false, None);
 
     let err = smol::block_on(open_err(&transport, &closed_local_url("http", "/token")));
     assert!(!err.to_string().contains("failed to build request"));
@@ -104,7 +112,7 @@ password = "secret"
 "#,
     );
     let auth = AuthProvider::new(Some(auth_path.to_string_lossy())).expect("auth provider");
-    let transport = HttpTransport::new(auth, false, false);
+    let transport = HttpTransport::new(auth, false, false, None);
 
     let err = smol::block_on(open_err(&transport, &closed_local_url("http", "/basic")));
     assert!(!err.to_string().contains("failed to build request"));
@@ -131,7 +139,7 @@ cert = "{}"
         ),
     );
     let auth = AuthProvider::new(Some(auth_path.to_string_lossy())).expect("auth provider");
-    let transport = HttpTransport::new(auth, false, false);
+    let transport = HttpTransport::new(auth, false, false, None);
 
     let http_err = smol::block_on(open_err(&transport, "http://127.0.0.1/resource"));
     assert!(http_err
@@ -156,7 +164,7 @@ token = "line1\nline2"
 "#,
     );
     let auth = AuthProvider::new(Some(auth_path.to_string_lossy())).expect("auth provider");
-    let transport = HttpTransport::new(auth, false, false);
+    let transport = HttpTransport::new(auth, false, false, None);
 
     let err = smol::block_on(open_err(&transport, "http://127.0.0.1/request-build"));
     assert!(err
@@ -166,7 +174,12 @@ token = "line1\nline2"
 
 #[test]
 fn client_builder_optional_branches_are_exercised_without_binding_loopback() {
-    let transport = HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), true, true);
+    let transport = HttpTransport::new(
+        AuthProvider::new::<&str>(None).expect("auth"),
+        true,
+        true,
+        None,
+    );
 
     let err = smol::block_on(open_err(&transport, &closed_local_url("http", "/forced")));
     assert!(!err.to_string().contains("failed to build request"));

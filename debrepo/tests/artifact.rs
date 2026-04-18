@@ -47,7 +47,12 @@ fn file_url(path: &Path) -> String {
 
 fn host_cache(cache: Option<&Path>) -> HostCache {
     HostCache::new(
-        debrepo::HttpTransport::new(AuthProvider::new::<&str>(None).expect("auth"), false, false),
+        debrepo::HttpTransport::new(
+            AuthProvider::new::<&str>(None).expect("auth"),
+            false,
+            false,
+            None,
+        ),
         cache,
     )
 }

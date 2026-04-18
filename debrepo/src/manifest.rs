@@ -1458,6 +1458,35 @@ impl Manifest {
             file.set_build_script(spec_id, script)
         })
     }
+    pub fn set_extends(
+        &mut self,
+        spec_name: Option<&str>,
+        parent_name: Option<&str>,
+    ) -> io::Result<()> {
+        let child_name = Self::normalize_spec_name(spec_name)?;
+        if let Some(parent) = parent_name {
+            valid_spec_name(parent).map_err(io::Error::other)?;
+            if parent == child_name {
+                return Err(io::Error::other(format!(
+                    "spec {} cannot extend itself",
+                    spec_display_name(child_name),
+                )));
+            }
+            if self.resolve_spec(parent).is_none() {
+                return Err(io::Error::other(format!(
+                    "extends target spec '{}' not found",
+                    parent,
+                )));
+            }
+        }
+        let spec_id = self.get_or_create_spec_id(spec_name)?;
+        self.file
+            .set_extends(spec_id, parent_name.map(String::from))?;
+        self.mark_file_updated();
+        self.invalidate_locked_specs(spec_id);
+        self.mark_lock_dirty();
+        Ok(())
+    }
     fn archives(&self, manifest_id: u32) -> UniverseFiles<'_> {
         UniverseFiles::new(
             &self.arch,
