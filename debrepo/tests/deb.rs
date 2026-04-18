@@ -291,7 +291,7 @@ fn reader_skips_unconsumed_control_payload_before_reading_data() -> io::Result<(
 
         let mut data = match deb.next().await.expect("data entry").expect("data success") {
             DebEntry::Data(data) => data,
-            DebEntry::Control(_) => panic!("expected data entry"),
+            DebEntry::Control(_) | DebEntry::Signature(..) => panic!("expected data entry"),
         };
 
         let mut paths = Vec::new();

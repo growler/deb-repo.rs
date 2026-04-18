@@ -59,10 +59,11 @@ enum State {
     Content,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, PartialEq)]
 enum EntryKind {
     Control,
     Data,
+    Signature(Box<str>),
 }
 
 pin_project! {
@@ -237,7 +238,7 @@ where
                                 format!("invalid header: {:?}", &this.hdr),
                             )
                         })?;
-                        let name = name.find(' ').map_or(name, |n| &name[..n]);
+                        let name = name.trim_end_matches([' ', '/']);
                         *this.state = State::Content;
                         *this.size = size;
                         *this.padding = (size & 1) as u8;
@@ -261,6 +262,8 @@ where
                     } else if name.starts_with("data.tar") {
                         let ext_range = "data.tar".len()..name.len();
                         return Poll::Ready(Some(Ok((EntryKind::Data, ext_range))));
+                    } else if let Some(sigrole) = name.strip_prefix("_gpg") {
+                        return Poll::Ready(Some(Ok((EntryKind::Signature(sigrole.into()), 0..0))));
                     } else {
                         return Poll::Ready(Some(Err(io::Error::new(
                             io::ErrorKind::InvalidData,
@@ -299,6 +302,12 @@ where
     R: AsyncRead + Send + 'a,
 {
     inner: Arc<Mutex<Pin<Box<DebReaderInner<'a, R>>>>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct DebPackageSignature {
+    pub role: Box<str>,
+    pub sig: Box<[u8]>,
 }
 
 struct DebEntryReaderInner<'a, R>
@@ -427,6 +436,15 @@ where
         maybe_ctrl.ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "no control file"))
     }
     pub async fn extract_to<FS>(&mut self, fs: &FS) -> Result<MutableControlStanza>
+    where
+        FS: StagingFileSystem + ?Sized,
+    {
+        self.extract_signed_to(fs).await.map(|(control, _)| control)
+    }
+    pub async fn extract_signed_to<FS>(
+        &mut self,
+        fs: &FS,
+    ) -> Result<(MutableControlStanza, Vec<DebPackageSignature>)>
     where
         FS: StagingFileSystem + ?Sized,
     {
@@ -615,6 +633,26 @@ where
                 fs.hardlink(link.link(), link.path()).await?;
             }
         }
+        let signatures = {
+            self.map(|entry| match entry? {
+                DebEntry::Signature(name, reader) => Ok((name, reader)),
+                _ => Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "unexpected entry after control and data tarballs",
+                )),
+            })
+            .then(|result| async {
+                let (name, mut reader) = result?;
+                let mut buf = Vec::new();
+                reader.read_to_end(&mut buf).await?;
+                Ok::<_, io::Error>(DebPackageSignature {
+                    role: name,
+                    sig: buf.into_boxed_slice(),
+                })
+            })
+            .try_collect()
+            .await?
+        };
         {
             let mut target_name = std::ffi::OsString::from(pkg);
             if let Some(arch) = multiarch {
@@ -652,7 +690,7 @@ where
             ctrl.set("Controlfiles", ctrl_files_list);
         }
         tracing::debug!(target: "deb", "finished extracting package {}", ctrl.package_name().unwrap());
-        Ok(ctrl)
+        Ok((ctrl, signatures))
     }
 }
 
@@ -720,6 +758,12 @@ where
         Poll::Ready(Some(Ok(match entry_kind {
             EntryKind::Control => DebEntry::Control(entry_reader(Arc::clone(&this.inner), comp)),
             EntryKind::Data => DebEntry::Data(entry_reader(Arc::clone(&this.inner), comp)),
+            EntryKind::Signature(name) => DebEntry::Signature(
+                name,
+                Box::pin(DebEntryReaderInner {
+                    inner: Arc::clone(&this.inner),
+                }),
+            ),
         })))
     }
 }
@@ -727,6 +771,7 @@ where
 pub enum DebEntry<'a> {
     Control(TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>),
     Data(TarReader<'a, Pin<Box<dyn AsyncRead + Send + 'a>>>),
+    Signature(Box<str>, Pin<Box<dyn AsyncRead + Send + 'a>>),
 }
 
 fn entry_reader<'a, R>(

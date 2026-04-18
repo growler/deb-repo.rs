@@ -1,3 +1,11 @@
+rdebootstrap (0.3.3) unstable; urgency=medium
+
+  * fix: debrepo deb::DebReader support for POSIX/SysV ar format
+  * feat: debrepo deb::DebReader support for in-package signatures
+    (no verification yet)
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sat, 18 Apr 2026 21:51:28 +0200
+
 rdebootstrap (0.3.2) unstable; urgency=medium
 
   * feat: spec extend command
