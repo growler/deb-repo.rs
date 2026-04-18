@@ -212,7 +212,6 @@ fn deblocation_display_and_hostcache_init_commit_cover_public_helpers() {
 #[test]
 fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
     let fixture = fixture_path("rich-xz.deb");
-    let fixture_dir = fixture.parent().expect("fixture dir");
     let fixture_name = fixture
         .file_name()
         .and_then(|name| name.to_str())
@@ -250,8 +249,10 @@ fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
     });
     assert!(local_root.path().join("usr/bin/fixture-rich").exists());
 
+    let remote_dir = tempfile::tempdir().expect("remote dir");
+    fs::copy(&fixture, remote_dir.path().join(fixture_name)).expect("copy fixture for remote");
+    let remote_base = dir_url(remote_dir.path());
     let remote_root = tempfile::tempdir().expect("remote root");
-    let remote_base = dir_url(fixture_dir);
     smol::block_on(async {
         let stage = cache
             .fetch_deb(
@@ -295,9 +296,8 @@ fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
         .store_name(Some(cache_dir.path()), Some("deb"), 1);
     assert!(deb_cache_path.exists());
 
-    let removed = fixture_dir.join(fixture_name);
-    let backup = fixture_dir.join("rich-xz.deb.content-backup");
-    fs::rename(&removed, &backup).expect("backup fixture");
+    // Remove the remote source to verify fetch_deb serves from cache alone.
+    fs::remove_file(remote_dir.path().join(fixture_name)).expect("remove remote fixture copy");
     let cache_hit_root = tempfile::tempdir().expect("cache hit root");
     smol::block_on(async {
         let stage = cached
@@ -315,7 +315,6 @@ fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
             .await
             .expect("stage cached deb");
     });
-    fs::rename(&backup, &removed).expect("restore fixture");
     assert!(cache_hit_root.path().join("usr/bin/fixture-rich").exists());
 }
 
