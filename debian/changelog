@@ -1,3 +1,10 @@
+rdebootstrap (0.3.4) unstable; urgency=medium
+
+  * fix: debrepo deb::DebReader supports lz4
+  * fix: debrepo deb::DebReader limit the max size of gpg signature by 1MiB.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 19 Apr 2026 10:41:37 +0200
+
 rdebootstrap (0.3.3) unstable; urgency=medium
 
   * fix: debrepo deb::DebReader support for POSIX/SysV ar format

@@ -8,7 +8,7 @@ use {
         StagingFileSystem,
     },
     async_compression::futures::bufread::{
-        BzDecoder, GzipDecoder, LzmaDecoder, XzDecoder, ZstdDecoder,
+        BzDecoder, GzipDecoder, Lz4Decoder, LzmaDecoder, XzDecoder, ZstdDecoder,
     },
     async_lock::Mutex,
     core::task::{self, Context, Poll},
@@ -80,6 +80,8 @@ pin_project! {
         total: u64,
         // Deb entry header
         hdr: [u8; AR_HEADER_SIZE as usize],
+        // Skip buffer
+        skip: Option<Box<[u8]>>,
         // Source of the data
         #[pin]
         source: R,
@@ -99,6 +101,7 @@ where
             read: 0,
             total: 0,
             hdr: [0u8; AR_HEADER_SIZE as usize],
+            skip: None,
             source: r,
             _marker: std::marker::PhantomData,
         }
@@ -186,19 +189,28 @@ where
                     *this.read = 0;
                 }
                 State::Content => {
-                    #[allow(unused_assignments)]
+                    // skipping content
                     if self.size > self.read {
-                        // skipping content
-                        let mut smoll_buf = None;
-                        let mut large_buf = None;
-                        let buf = if self.size - self.read < 8192 {
-                            smoll_buf = Some([0u8; 8192]);
-                            smoll_buf.as_mut().unwrap()
-                        } else {
-                            large_buf = Some(vec![0u8; 256 * 1024]);
-                            large_buf.as_mut().unwrap().as_mut_slice()
-                        };
-                        while ready_opt!(self.as_mut().poll_read(ctx, &mut buf[..])) != 0 {}
+                        let mut this = self.as_mut().project();
+                        let buf = this.skip.get_or_insert_with(|| Box::new([0u8; 65536]));
+                        loop {
+                            let remain = (*this.size + *this.padding as u64) - *this.read;
+                            if remain == 0 {
+                                break;
+                            }
+                            let size = std::cmp::min(remain, buf.len() as u64);
+                            match ready_opt!(this
+                                .source
+                                .as_mut()
+                                .poll_read(ctx, &mut buf[..size as usize]))
+                            {
+                                0 => break,
+                                n => {
+                                    *this.read += n as u64;
+                                    *this.total += n as u64;
+                                }
+                            }
+                        }
                     }
                     let this = self.as_mut().project();
                     *this.state = State::Header;
@@ -228,7 +240,7 @@ where
                     if self.read == 0 {
                         return Poll::Ready(None);
                     }
-                    let (size_with_padding, name) = {
+                    let (size, size_with_padding, name) = {
                         let this = self.as_mut().project();
                         let size = parse_size(&this.hdr[48..58])?;
                         let size_with_padding = size + (size & 1);
@@ -243,7 +255,7 @@ where
                         *this.size = size;
                         *this.padding = (size & 1) as u8;
                         *this.read = 0;
-                        (size_with_padding, name)
+                        (size, size_with_padding, name)
                     };
                     if name == "debian-binary" {
                         if size_with_padding > AR_HEADER_SIZE {
@@ -263,6 +275,15 @@ where
                         let ext_range = "data.tar".len()..name.len();
                         return Poll::Ready(Some(Ok((EntryKind::Data, ext_range))));
                     } else if let Some(sigrole) = name.strip_prefix("_gpg") {
+                        if size > 1024 * 1024 {
+                            return Poll::Ready(Some(Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "debian package signature entry \"{}\" is too large ({})",
+                                    name, size
+                                ),
+                            ))));
+                        }
                         return Poll::Ready(Some(Ok((EntryKind::Signature(sigrole.into()), 0..0))));
                     } else {
                         return Poll::Ready(Some(Err(io::Error::new(
@@ -339,6 +360,7 @@ enum Compression {
     Xz,
     Bz2,
     Lzma,
+    Lz4,
     Zstd,
 }
 
@@ -349,6 +371,7 @@ impl Compression {
             b".xz" => Compression::Xz,
             b".bz2" => Compression::Bz2,
             b".lzma" => Compression::Lzma,
+            b".lz4" => Compression::Lz4,
             b".zst" | b".zstd" => Compression::Zstd,
             _ => Compression::None,
         }
@@ -787,6 +810,7 @@ where
         Compression::Gzip => TarReader::new(Box::pin(GzipDecoder::new(BufReader::new(r)))),
         Compression::Bz2 => TarReader::new(Box::pin(BzDecoder::new(BufReader::new(r)))),
         Compression::Lzma => TarReader::new(Box::pin(LzmaDecoder::new(BufReader::new(r)))),
+        Compression::Lz4 => TarReader::new(Box::pin(Lz4Decoder::new(BufReader::new(r)))),
         Compression::Zstd => TarReader::new(Box::pin(ZstdDecoder::new(BufReader::new(r)))),
         Compression::None => TarReader::new(Box::pin(r)),
     }
