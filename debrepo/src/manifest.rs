@@ -1524,7 +1524,7 @@ impl Manifest {
                 // local packages have highest priority.
                 packages.push(
                     pkgs.clone()
-                        .with_prio(0)
+                        .with_prio(u32::MAX)
                         .with_origin(PackageOrigin::Local { manifest_id }),
                 )
             }

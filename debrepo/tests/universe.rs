@@ -757,3 +757,111 @@ SHA256: {SHA256_A}
         smol::block_on(async { universe.package_file(solution[0], "MD5sum").await }).unwrap_err();
     assert!(err.to_string().contains("lacks field MD5sum"), "{err}");
 }
+
+/// Local packages are assigned `u32::MAX` priority in `load_universe_packages`
+/// so that they always beat archive packages (default prio 500) in the solver's
+/// candidate sort.  This test verifies the solver picks the local version even
+/// when its Debian version is higher than the archive version.
+#[test]
+fn local_package_overrides_archive_when_version_is_higher() {
+    let solved = with_trace(|| {
+        let mut universe = Universe::new(
+            "amd64",
+            [
+                // upstream archive (default prio 500) ships version 1.0
+                packages(
+                    &format!(
+                        "\
+Package: hello
+Architecture: amd64
+Version: 1.0
+Filename: pool/hello_1.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+"
+                    ),
+                    500,
+                ),
+                // local .deb (prio u32::MAX) ships version 2.0
+                packages(
+                    &format!(
+                        "\
+Package: hello
+Architecture: amd64
+Version: 2.0
+Filename: pool/hello_2.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+"
+                    ),
+                    u32::MAX,
+                ),
+            ],
+        )
+        .unwrap();
+
+        solve_display(&mut universe, &["hello"], &[])
+    });
+
+    assert!(
+        solved.contains(&"hello:amd64=2.0".to_string()),
+        "expected local version 2.0, got: {solved:?}"
+    );
+    assert!(
+        !solved.contains(&"hello:amd64=1.0".to_string()),
+        "archive version 1.0 should not appear: {solved:?}"
+    );
+}
+
+/// Same scenario but the local version is *lower* than the archive version.
+/// Local packages must still win because their priority (u32::MAX) dominates.
+#[test]
+fn local_package_overrides_archive_even_when_version_is_lower() {
+    let solved = with_trace(|| {
+        let mut universe = Universe::new(
+            "amd64",
+            [
+                // upstream archive (default prio 500) ships version 3.0
+                packages(
+                    &format!(
+                        "\
+Package: hello
+Architecture: amd64
+Version: 3.0
+Filename: pool/hello_3.0_amd64.deb
+Size: 1
+SHA256: {SHA256_A}
+"
+                    ),
+                    500,
+                ),
+                // local .deb (prio u32::MAX) ships version 2.0
+                packages(
+                    &format!(
+                        "\
+Package: hello
+Architecture: amd64
+Version: 2.0
+Filename: pool/hello_2.0_amd64.deb
+Size: 1
+SHA256: {SHA256_B}
+"
+                    ),
+                    u32::MAX,
+                ),
+            ],
+        )
+        .unwrap();
+
+        solve_display(&mut universe, &["hello"], &[])
+    });
+
+    assert!(
+        solved.contains(&"hello:amd64=2.0".to_string()),
+        "expected local version 2.0, got: {solved:?}"
+    );
+    assert!(
+        !solved.contains(&"hello:amd64=3.0".to_string()),
+        "archive version 3.0 should not appear: {solved:?}"
+    );
+}
