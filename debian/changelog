@@ -1,3 +1,10 @@
+rdebootstrap (0.3.5) unstable; urgency=high
+
+  * fix: the local .deb should have an absolute precedence over archives 
+  * fix: use File artifact hash for spec hash
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 20 Apr 2026 20:03:09 +0200
+
 rdebootstrap (0.3.4) unstable; urgency=medium
 
   * fix: debrepo deb::DebReader supports lz4
