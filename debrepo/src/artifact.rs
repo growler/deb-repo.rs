@@ -987,6 +987,7 @@ impl File {
         let mode = self.mode.map_or(0o644, |m| m.get() & 0o7777);
         mode.hash_into(hasher);
         self.unpack.unwrap_or(true).hash_into(hasher);
+        self.hash.as_bytes().hash_into(hasher);
     }
     async fn local<P: AsRef<Path>, FS: StagingFileSystem + ?Sized + 'static>(
         &self,
