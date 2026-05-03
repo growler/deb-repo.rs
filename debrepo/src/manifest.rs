@@ -131,19 +131,39 @@ impl<'a> ResolvedSpecRef<'a> {
 
     fn hasher(self) -> io::Result<blake3::Hasher> {
         let mut hasher = blake3::Hasher::default();
-        let parent_hash = self
-            .parent()?
-            .map(|parent| {
-                parent.hash().clone().ok_or_else(|| {
+        // For 0 or 1 parent the input is exactly the legacy form so that
+        // existing single-parent lock hashes remain stable.  For 2+ parents
+        // we prepend a marker followed by the parent count and each parent
+        // hash in declaration order.
+        let parents = self.parent_refs()?;
+        match parents.len() {
+            0 => {
+                hasher.update(blake3::Hasher::default().into_hash().as_bytes());
+            }
+            1 => {
+                let parent = parents[0];
+                let parent_hash = parent.hash().ok_or_else(|| {
                     io::Error::other(format!(
                         "no solution for spec {:?}, update manifest lock",
                         parent
                     ))
-                })
-            })
-            .transpose()?
-            .unwrap_or_else(|| blake3::Hasher::default().into_hash());
-        hasher.update(parent_hash.as_bytes());
+                })?;
+                hasher.update(parent_hash.as_bytes());
+            }
+            n => {
+                hasher.update(b"multi-parent\0");
+                hasher.update(&(n as u32).to_le_bytes());
+                for parent in &parents {
+                    let parent_hash = parent.hash().ok_or_else(|| {
+                        io::Error::other(format!(
+                            "no solution for spec {:?}, update manifest lock",
+                            parent
+                        ))
+                    })?;
+                    hasher.update(parent_hash.as_bytes());
+                }
+            }
+        }
         let script_hash = self.build_script().map_or_else(
             || blake3::hash(&[]),
             |script| blake3::hash(script.as_bytes()),
@@ -191,10 +211,25 @@ impl<'a> ResolvedSpecRef<'a> {
         })
     }
 
+    /// Returns the primary (first listed) parent of this spec, if any.
+    ///
+    /// For multi-parent specs this is the first entry in the `extends`
+    /// list.  Most callers should prefer [`Self::parents`] or
+    /// [`Self::ancestors`] which are DAG-aware.
     pub fn parent(self) -> io::Result<Option<ResolvedSpecRef<'a>>> {
+        let parents = self.parent_refs()?;
+        Ok(parents.into_iter().next())
+    }
+
+    /// Returns the direct parents of this spec in declaration order.
+    pub fn parents(self) -> io::Result<Vec<ResolvedSpecRef<'a>>> {
+        self.parent_refs()
+    }
+
+    pub(crate) fn parent_refs(self) -> io::Result<Vec<ResolvedSpecRef<'a>>> {
         self.spec()
             .extends
-            .as_deref()
+            .iter()
             .map(|name| {
                 self.manifest.resolve_spec(name).ok_or_else(|| {
                     io::Error::other(format!(
@@ -204,14 +239,15 @@ impl<'a> ResolvedSpecRef<'a> {
                     ))
                 })
             })
-            .transpose()
+            .collect()
     }
 
+    /// Iterator over all unique ancestors (excluding `self`) in
+    /// topological order: a spec appears after all of its descendants.
+    /// Diamond ancestors are visited exactly once.  Tie-breaking among
+    /// independent ancestors follows the declaration order of `extends`.
     pub fn ancestors(self) -> impl Iterator<Item = io::Result<ResolvedSpecRef<'a>>> {
-        SpecIterator {
-            visited: vec![(self.manifest, self.id)],
-            cur: Some(self),
-        }
+        AncestorIter::new(self)
     }
 
     pub fn name(self) -> Option<&'a str> {
@@ -224,19 +260,26 @@ impl<'a> ResolvedSpecRef<'a> {
     fn installables(self) -> io::Result<impl Iterator<Item = &'a LockedPackage>> {
         self.locked().map(LockedSpec::installables)
     }
+
+    /// Self and all ancestors in topological order (`self` first).
+    pub(crate) fn chain(self) -> io::Result<Vec<ResolvedSpecRef<'a>>> {
+        let mut chain = vec![self];
+        for ancestor in self.ancestors() {
+            chain.push(ancestor?);
+        }
+        Ok(chain)
+    }
+
     fn effective_max_install_order(self) -> io::Result<u32> {
-        std::iter::once(Ok(self))
-            .chain(self.ancestors())
-            .try_fold(0, |max_order, spec| {
-                let spec = spec?;
-                let spec_max = spec
-                    .locked()?
-                    .installables()
-                    .map(|pkg| pkg.order)
-                    .max()
-                    .unwrap_or(0);
-                Ok(max_order.max(spec_max))
-            })
+        self.chain()?.into_iter().try_fold(0, |max_order, spec| {
+            let spec_max = spec
+                .locked()?
+                .installables()
+                .map(|pkg| pkg.order)
+                .max()
+                .unwrap_or(0);
+            Ok(max_order.max(spec_max))
+        })
     }
     pub fn packages(self) -> io::Result<Vec<&'a Package<'a>>> {
         let universe = self.manifest.universe.as_deref().ok_or_else(|| {
@@ -264,21 +307,26 @@ impl<'a> ResolvedSpecRef<'a> {
                 self
             ))
         })?;
-        std::iter::once(Ok(self))
-            .chain(self.ancestors())
-            .try_fold(Vec::new(), |mut pkgs, spec| {
-                let spec = spec?;
-                for pkg in spec.installables()? {
-                    let pkg = universe.package(pkg.idx).ok_or_else(|| {
-                        io::Error::other(format!(
-                            "universe is missing package {}:{}={} required by spec {:?}",
-                            pkg.name, pkg.arch, pkg.version, spec
-                        ))
-                    })?;
-                    pkgs.push(pkg);
+        // With multi-parent inheritance two independent ancestors can
+        // each lock the same package; dedup by package idx so the
+        // effective view counts each package exactly once.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        let mut pkgs: Vec<&'a Package<'a>> = Vec::new();
+        for spec in self.chain()? {
+            for pkg in spec.installables()? {
+                if !seen.insert(pkg.idx) {
+                    continue;
                 }
-                Ok(pkgs)
-            })
+                let resolved = universe.package(pkg.idx).ok_or_else(|| {
+                    io::Error::other(format!(
+                        "universe is missing package {}:{}={} required by spec {:?}",
+                        pkg.name, pkg.arch, pkg.version, spec
+                    ))
+                })?;
+                pkgs.push(resolved);
+            }
+        }
+        Ok(pkgs)
     }
     #[allow(clippy::type_complexity)]
     pub(crate) fn staging_installables(
@@ -305,13 +353,19 @@ impl<'a> ResolvedSpecRef<'a> {
     pub(crate) fn effective_staging_installables(
         self,
     ) -> io::Result<(Vec<ResolvedInstallable<'a>>, Vec<String>, Vec<Vec<String>>)> {
-        std::iter::once(Ok(self)).chain(self.ancestors()).try_fold(
+        // Dedup by package idx as in `effective_packages`: with multi-parent
+        // inheritance, two independent ancestors may each lock the same
+        // package; staging the same .deb twice would be wrong.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+        self.chain()?.into_iter().try_fold(
             (Vec::new(), Vec::new(), Vec::new()),
             |(installables, essentials, order), spec| {
-                let spec = spec?;
                 spec.installables()?.try_fold(
                     (installables, essentials, order),
                     |(mut installables, mut essentials, mut order), pkg| {
+                        if !seen.insert(pkg.idx) {
+                            return Ok((installables, essentials, order));
+                        }
                         if pkg.order == 0 {
                             essentials.push(pkg.name.clone());
                         } else {
@@ -356,15 +410,29 @@ impl<'a> ResolvedSpecRef<'a> {
             })
     }
     pub(crate) fn effective_stage_artifacts(self) -> io::Result<Vec<ResolvedArtifact<'a>>> {
-        std::iter::once(Ok(self)).chain(self.ancestors()).try_fold(
-            Vec::new(),
-            |mut artifacts, spec| {
-                for artifact in spec?.stage_artifacts() {
-                    artifacts.push(artifact?);
+        // Walk self + ancestors in topological order (self first).  Diamond
+        // ancestors are visited once thanks to AncestorIter.  In addition
+        // we dedup by artifact identity so that an artifact referenced
+        // via two distinct paths in the spec graph is staged only once.
+        //
+        // Identity here is the pointer to the underlying `Artifact`
+        // value, which uniquely identifies the artifact within its
+        // owning manifest (whether local or imported).  Two artifacts
+        // that happen to share a URI string but live in different
+        // manifests are distinct and both must be staged.
+        let mut artifacts: Vec<ResolvedArtifact<'a>> = Vec::new();
+        let mut seen: std::collections::HashSet<*const Artifact> = std::collections::HashSet::new();
+        for spec in self.chain()? {
+            for artifact in spec.stage_artifacts() {
+                let artifact = artifact?;
+                let key = artifact.artifact as *const Artifact;
+                if !seen.insert(key) {
+                    continue;
                 }
-                Ok(artifacts)
-            },
-        )
+                artifacts.push(artifact);
+            }
+        }
+        Ok(artifacts)
     }
 
     pub(crate) fn env_block(self) -> io::Result<String> {
@@ -376,15 +444,19 @@ impl<'a> ResolvedSpecRef<'a> {
     }
 
     pub fn effective_build_script(self) -> io::Result<Vec<String>> {
-        std::iter::once(Ok(self))
-            .chain(self.ancestors())
-            .filter_map_ok(|spec| spec.build_script())
-            .map_ok(|script| script.to_string())
-            .collect::<io::Result<Vec<_>>>()
-            .map(|mut v| {
-                v.reverse();
-                v
-            })
+        // Topological order, ancestors first, this spec's script last.
+        // Each unique ancestor contributes its script at most once.
+        //
+        // Within a level of the DAG, declaration order in `extends`
+        // breaks ties so the result is fully deterministic and matches
+        // user intent.
+        let chain = self.chain()?;
+        let order = root_first_order(&chain)?;
+        let scripts: Vec<String> = order
+            .into_iter()
+            .filter_map(|spec| spec.build_script().map(|s| s.to_string()))
+            .collect();
+        Ok(scripts)
     }
 
     pub fn build_env(self) -> &'a KVList<String> {
@@ -392,28 +464,94 @@ impl<'a> ResolvedSpecRef<'a> {
     }
 
     pub fn effective_build_env(self) -> io::Result<Vec<(String, String)>> {
-        std::iter::once(Ok(self))
-            .chain(self.ancestors())
-            .try_fold(Vec::new(), |mut env, spec| {
-                for (k, v) in spec?.build_env().iter() {
-                    if env.iter().any(|(ek, _)| ek == k) {
-                        continue;
+        // Self's keys always win.  Among ancestors, if two distinct
+        // ancestors define the same key with different values, that is
+        // a hard error unless `self` redeclares the key.
+        let mut env: Vec<(String, String)> = Vec::new();
+        // Map: key -> (value, source spec name) for keys seen so far.
+        // Used to detect inter-ancestor conflicts.
+        let mut sources: HashMap<String, (String, String)> = HashMap::new();
+        let chain = self.chain()?;
+        // Self first
+        for (k, v) in self.build_env().iter() {
+            env.push((k.to_string(), v.to_string()));
+            sources.insert(
+                k.to_string(),
+                (v.to_string(), self.display_name().to_string()),
+            );
+        }
+        // Then ancestors in topological order
+        for spec in chain.iter().skip(1) {
+            for (k, v) in spec.build_env().iter() {
+                match sources.get(k) {
+                    Some((existing, source)) => {
+                        // self redeclares this key (already in `env`):
+                        // it is the source; ancestor disagreement OK.
+                        if source.as_str() == self.display_name() {
+                            continue;
+                        }
+                        if existing != v {
+                            return Err(io::Error::other(format!(
+                                "spec {} inherits conflicting build-env entry {}: {:?} from {} vs {:?} from {} (define it in {} to override)",
+                                self.display_name(),
+                                k,
+                                existing,
+                                source,
+                                v,
+                                spec.display_name(),
+                                self.display_name(),
+                            )));
+                        }
                     }
-                    env.push((k.to_string(), v.to_string()));
-                }
-                Ok::<_, io::Error>(env)
-            })
-    }
-    pub fn get_meta(self, key: &str) -> io::Result<Option<&'a str>> {
-        for spec in std::iter::once(Ok(self)).chain(self.ancestors()) {
-            for m in spec?.meta() {
-                let (k, v) = m?;
-                if k == key {
-                    return Ok(Some(v));
+                    None => {
+                        env.push((k.to_string(), v.to_string()));
+                        sources.insert(
+                            k.to_string(),
+                            (v.to_string(), spec.display_name().to_string()),
+                        );
+                    }
                 }
             }
         }
-        Ok(None)
+        Ok(env)
+    }
+    pub fn get_meta(self, key: &str) -> io::Result<Option<&'a str>> {
+        // Mirrors `effective_meta` semantics: self overrides ancestors;
+        // diverging ancestor values for an ancestor-only key are rejected.
+        for m in self.meta() {
+            let (k, v) = m?;
+            if k == key {
+                return Ok(Some(v));
+            }
+        }
+        let chain = self.chain()?;
+        // (value, source spec display name)
+        let mut found: Option<(&'a str, String)> = None;
+        for spec in chain.into_iter().skip(1) {
+            for m in spec.meta() {
+                let (k, v) = m?;
+                if k != key {
+                    continue;
+                }
+                if let Some((existing, ref prev_name)) = found {
+                    if existing != v {
+                        return Err(io::Error::other(format!(
+                            "spec {} inherits conflicting meta entry {}: {:?} from {} vs {:?} from {} (define it in {} to override)",
+                            self.display_name(),
+                            key,
+                            existing,
+                            prev_name,
+                            v,
+                            spec.display_name(),
+                            self.display_name(),
+                        )));
+                    }
+                } else {
+                    found = Some((v, spec.display_name().to_string()));
+                }
+            }
+        }
+        Ok(found.map(|(v, _)| v))
     }
     pub fn meta(self) -> impl Iterator<Item = io::Result<(&'a str, &'a str)>> {
         self.spec()
@@ -422,18 +560,45 @@ impl<'a> ResolvedSpecRef<'a> {
             .map(|s| parse_meta_entry(s).map_err(io::Error::other))
     }
     pub fn effective_meta(self) -> io::Result<Vec<(&'a str, &'a str)>> {
-        std::iter::once(Ok(self))
-            .chain(self.ancestors())
-            .try_fold(Vec::new(), |mut meta, spec| {
-                for entry in spec?.meta() {
-                    let (k, v) = entry?;
-                    if meta.iter().any(|(ek, _)| *ek == k) {
-                        continue;
+        let mut meta: Vec<(&'a str, &'a str)> = Vec::new();
+        // key -> (value, source-spec display name) for conflict detection
+        let mut sources: HashMap<&'a str, (&'a str, String)> = HashMap::new();
+        let self_name = self.display_name().to_string();
+        for entry in self.meta() {
+            let (k, v) = entry?;
+            meta.push((k, v));
+            sources.insert(k, (v, self_name.clone()));
+        }
+        let chain = self.chain()?;
+        for spec in chain.into_iter().skip(1) {
+            for entry in spec.meta() {
+                let (k, v) = entry?;
+                match sources.get(k) {
+                    Some((existing, source)) => {
+                        if source.as_str() == self_name.as_str() {
+                            continue;
+                        }
+                        if *existing != v {
+                            return Err(io::Error::other(format!(
+                                "spec {} inherits conflicting meta entry {}: {:?} from {} vs {:?} from {} (define it in {} to override)",
+                                self.display_name(),
+                                k,
+                                existing,
+                                source,
+                                v,
+                                spec.display_name(),
+                                self.display_name(),
+                            )));
+                        }
                     }
-                    meta.push((k, v));
+                    None => {
+                        meta.push((k, v));
+                        sources.insert(k, (v, spec.display_name().to_string()));
+                    }
                 }
-                Ok::<_, io::Error>(meta)
-            })
+            }
+        }
+        Ok(meta)
     }
 }
 
@@ -469,31 +634,193 @@ impl<'a> StageArtifactRef<'a> {
     }
 }
 
-struct SpecIterator<'a> {
-    visited: Vec<(*const Manifest, SpecId)>,
-    cur: Option<ResolvedSpecRef<'a>>,
+/// DAG-aware iterator over the unique ancestors of a spec.
+///
+/// Yields each ancestor at most once in topological order: an ancestor
+/// appears after every spec that depends on it.  Among independent
+/// ancestors the order follows the declaration order of the `extends`
+/// list of the most recent common descendant (a stable, predictable
+/// tie-break).
+///
+/// Cycles and missing parents are surfaced as `io::Error` items.
+struct AncestorIter<'a> {
+    /// Resolved ancestors collected ahead of time, in topological order.
+    /// `None` means an error was observed during precomputation; the
+    /// stored error is yielded on the next `next()` call.
+    plan: Result<Vec<ResolvedSpecRef<'a>>, Option<io::Error>>,
+    pos: usize,
 }
 
-impl<'a> Iterator for SpecIterator<'a> {
+impl<'a> AncestorIter<'a> {
+    fn new(start: ResolvedSpecRef<'a>) -> Self {
+        match collect_ancestors(start) {
+            Ok(plan) => Self {
+                plan: Ok(plan),
+                pos: 0,
+            },
+            Err(err) => Self {
+                plan: Err(Some(err)),
+                pos: 0,
+            },
+        }
+    }
+}
+
+impl<'a> Iterator for AncestorIter<'a> {
     type Item = io::Result<ResolvedSpecRef<'a>>;
 
     fn next(&mut self) -> Option<Self::Item> {
-        let current = self.cur?;
-        let parent = match current.parent().transpose()? {
-            Ok(spec) => spec,
-            Err(err) => return Some(Err(err)),
-        };
-        if self.visited.contains(&parent.key()) {
-            return Some(Err(io::Error::other(format!(
-                "spec extension cycle detected at {}:{}",
-                parent.manifest.path.display(),
-                parent.display_name()
-            ))));
+        match &mut self.plan {
+            Ok(plan) => {
+                if self.pos >= plan.len() {
+                    None
+                } else {
+                    let item = plan[self.pos];
+                    self.pos += 1;
+                    Some(Ok(item))
+                }
+            }
+            Err(slot) => slot.take().map(Err),
         }
-        self.visited.push(parent.key());
-        self.cur = Some(parent);
-        Some(Ok(parent))
     }
+}
+
+/// Reorder a self-first chain (start at index 0, ancestors after) so
+/// that roots come first, descendants last, with declaration order in
+/// `extends` preserved among siblings at the same DAG level.  Suitable
+/// for build-script execution where ancestors must run before their
+/// descendants.
+fn root_first_order<'a>(chain: &[ResolvedSpecRef<'a>]) -> io::Result<Vec<ResolvedSpecRef<'a>>> {
+    if chain.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut pos: HashMap<(*const Manifest, SpecId), usize> = HashMap::new();
+    for (i, spec) in chain.iter().enumerate() {
+        pos.insert(spec.key(), i);
+    }
+    // Compute level for each node: level(self) = 0, level(p) =
+    // max(level(child) + 1) over every child c whose extends list
+    // includes p.  Iterate the chain repeatedly until levels stabilize
+    // -- in practice one self-first pass suffices because chain order
+    // already ensures children come before their parents.
+    let mut level: Vec<u32> = vec![0; chain.len()];
+    for (i, spec) in chain.iter().enumerate() {
+        let child_level = level[i];
+        for parent in spec.parent_refs()? {
+            if let Some(&j) = pos.get(&parent.key()) {
+                let target = child_level + 1;
+                if level[j] < target {
+                    level[j] = target;
+                }
+            }
+        }
+    }
+    let mut indices: Vec<usize> = (0..chain.len()).collect();
+    // Sort by (level descending, original chain position ascending).
+    // Original chain positions encode declaration order: among the
+    // direct parents of a node, the parent declared first appears
+    // earlier in the chain.
+    indices.sort_by(|&a, &b| level[b].cmp(&level[a]).then_with(|| a.cmp(&b)));
+    Ok(indices.into_iter().map(|i| chain[i]).collect())
+}
+
+/// Compute the topological order of unique ancestors of `start`,
+/// excluding `start` itself.  The order has immediate parents first and
+/// deeper ancestors last (Kahn's algorithm on the spec DAG).  Ties among
+/// independent ancestors break by the declaration order of the `extends`
+/// list of the node that enqueued them.  Diamond ancestors are visited
+/// exactly once.  Cycles and missing parents return an error.
+fn collect_ancestors<'a>(start: ResolvedSpecRef<'a>) -> io::Result<Vec<ResolvedSpecRef<'a>>> {
+    use DFSNodeState::*;
+    type Key = (*const Manifest, SpecId);
+
+    // 1. Discover the reachable subgraph and detect cycles using DFS.
+    let mut state: HashMap<Key, DFSNodeState> = HashMap::new();
+    let mut subgraph: HashMap<Key, (ResolvedSpecRef<'a>, Vec<ResolvedSpecRef<'a>>)> =
+        HashMap::new();
+    let mut path: Vec<ResolvedSpecRef<'a>> = Vec::new();
+
+    fn discover<'a>(
+        node: ResolvedSpecRef<'a>,
+        start: ResolvedSpecRef<'a>,
+        state: &mut HashMap<(*const Manifest, SpecId), DFSNodeState>,
+        path: &mut Vec<ResolvedSpecRef<'a>>,
+        subgraph: &mut HashMap<
+            (*const Manifest, SpecId),
+            (ResolvedSpecRef<'a>, Vec<ResolvedSpecRef<'a>>),
+        >,
+    ) -> io::Result<()> {
+        state.insert(node.key(), Visited);
+        path.push(node);
+        let parents = node.parent_refs()?;
+        for parent in &parents {
+            match state.get(&parent.key()).copied().unwrap_or(Unvisited) {
+                Done => {}
+                Visited => {
+                    let cycle: Vec<String> = path
+                        .iter()
+                        .skip_while(|s| s.key() != parent.key())
+                        .chain(std::iter::once(parent))
+                        .map(|s| s.display_name().to_string())
+                        .collect();
+                    return Err(io::Error::other(format!(
+                        "spec extension cycle detected at {}: {}",
+                        start.display_name(),
+                        cycle.join(" -> "),
+                    )));
+                }
+                Unvisited => {
+                    discover(*parent, start, state, path, subgraph)?;
+                }
+            }
+        }
+        path.pop();
+        state.insert(node.key(), Done);
+        subgraph.insert(node.key(), (node, parents));
+        Ok(())
+    }
+
+    discover(start, start, &mut state, &mut path, &mut subgraph)?;
+
+    // 2. Build child counts for the subgraph reachable from `start`.
+    //    `child_count[n]` is the number of nodes m within the subgraph
+    //    whose `extends` list directly references `n`.  A node can only
+    //    be emitted once all such m have been emitted, so that
+    //    descendants always come before their ancestors.
+    let mut child_count: HashMap<Key, usize> = subgraph.keys().map(|k| (*k, 0usize)).collect();
+    for (_, parents) in subgraph.values() {
+        for parent in parents {
+            *child_count.entry(parent.key()).or_insert(0) += 1;
+        }
+    }
+
+    // 3. Kahn's algorithm with a FIFO queue.  Siblings enter the queue
+    //    in declaration order (the order they appear in their child's
+    //    `extends`), giving a stable, predictable result.  `start` has
+    //    child_count == 0 and seeds the queue.
+    let mut order: Vec<ResolvedSpecRef<'a>> = Vec::with_capacity(subgraph.len());
+    let mut queue: std::collections::VecDeque<ResolvedSpecRef<'a>> =
+        std::collections::VecDeque::new();
+    queue.push_back(start);
+    while let Some(node) = queue.pop_front() {
+        order.push(node);
+        if let Some((_, parents)) = subgraph.get(&node.key()) {
+            for parent in parents.clone() {
+                let count = child_count
+                    .get_mut(&parent.key())
+                    .expect("subgraph node tracked");
+                *count = count.saturating_sub(1);
+                if *count == 0 {
+                    queue.push_back(parent);
+                }
+            }
+        }
+    }
+
+    // Drop `start` from the front so callers receive only ancestors.
+    debug_assert!(!order.is_empty() && order[0].key() == start.key());
+    order.remove(0);
+    Ok(order)
 }
 
 impl Manifest {
@@ -710,17 +1037,9 @@ impl Manifest {
     fn spec_ref_checked(&self, id: SpecId) -> ResolvedSpecRef<'_> {
         ResolvedSpecRef { manifest: self, id }
     }
-    fn ancestor_spec_refs(&self, id: SpecId) -> SpecIterator<'_> {
-        SpecIterator {
-            visited: Vec::new(),
-            cur: self.local_spec_ref(id),
-        }
-    }
-    fn ancestor_defs(&self, id: SpecId) -> impl Iterator<Item = io::Result<&'_ Spec>> + '_ {
-        self.ancestor_spec_refs(id)
-            .map(|spec| spec.map(|spec| spec.entry().1))
-    }
     pub fn descendant_spec_ids(&self, id: SpecId) -> Vec<SpecId> {
+        // BFS over reverse-DAG edges within this manifest.  Visits each
+        // descendant exactly once even with diamond inheritance.
         let mut result = Vec::new();
         let mut queue = std::collections::VecDeque::new();
         queue.push_back(id);
@@ -734,7 +1053,7 @@ impl Manifest {
                 .expect("spec index must point to an existing local spec");
             result.push(curr);
             for (child_id, (_, spec)) in self.file.spec_entries() {
-                if spec.extends.as_deref() == Some(parent_name) {
+                if spec.extends.iter().any(|p| p == parent_name) {
                     queue.push_back(child_id);
                 }
             }
@@ -743,9 +1062,11 @@ impl Manifest {
     }
     #[allow(clippy::type_complexity)]
     // Returns:
-    //  (possibly empty) sorted list of packages installed in parent specs
-    //  list of requirements from this spec plus list of packages, installed by parent specs as strict requirements
-    //  list of contstraints from this spec
+    //  (possibly empty) sorted, deduplicated list of package ids installed by
+    //  any ancestor spec (the union across all parents in a multi-parent DAG);
+    //  list of requirements from this spec plus one strict-version requirement
+    //  for every unique ancestor-installed package;
+    //  list of constraints from this spec.
     fn requirements_for(
         &self,
         id: SpecId,
@@ -759,8 +1080,14 @@ impl Manifest {
             .ok_or_else(|| io::Error::other(format!("spec id {:?} not found", id)))?;
         let mut reqs = Vec::new();
         let mut installed = Vec::new();
+        // Track which package indices we've already added so a diamond
+        // ancestor's installables aren't pushed twice.
+        let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
         for spec in current.ancestors() {
             for pkg in spec?.locked()?.installables() {
+                if !seen.insert(pkg.idx) {
+                    continue;
+                }
                 installed.push(pkg.idx.into_id());
                 reqs.push(Dependency::Single(
                     pkg.try_into().map_err(io::Error::other)?,
@@ -801,11 +1128,13 @@ impl Manifest {
         state.insert(id, Visited);
         stack.push(id);
 
-        if let Some(name) = self
+        let parents: Vec<String> = self
             .local_spec_entry(id)
-            .and_then(|(_, spec)| spec.extends.as_deref())
-        {
-            if let Some(parent) = self.resolve_local_spec(name) {
+            .map(|(_, spec)| spec.extends.clone())
+            .unwrap_or_default();
+
+        for name in parents {
+            if let Some(parent) = self.resolve_local_spec(&name) {
                 match state.get(&parent.id).copied().unwrap_or(Unvisited) {
                     Unvisited => {
                         let extends_name = parent.entry().0;
@@ -820,7 +1149,7 @@ impl Manifest {
                             .iter()
                             .filter_map(|&spec_id| {
                                 self.local_spec_entry(spec_id)
-                                    .map(|(name, _)| spec_display_name(name).to_string())
+                                    .map(|(n, _)| spec_display_name(n).to_string())
                             })
                             .collect();
                         return Err(io::Error::other(format!(
@@ -830,8 +1159,9 @@ impl Manifest {
                     }
                     Done => {}
                 }
-            } else if self.resolve_imported_spec(name).is_some() {
-                self.ancestor_defs(id).collect::<io::Result<Vec<_>>>()?;
+            } else if self.resolve_imported_spec(&name).is_some() {
+                // Imported spec; nothing to traverse locally but the
+                // existence is confirmed via resolve_imported_spec.
             } else {
                 return Err(io::Error::other(format!(
                     "spec {} extends missing ({})",
@@ -1458,18 +1788,28 @@ impl Manifest {
             file.set_build_script(spec_id, script)
         })
     }
-    pub fn set_extends(
-        &mut self,
-        spec_name: Option<&str>,
-        parent_name: Option<&str>,
-    ) -> io::Result<()> {
-        let child_name = Self::normalize_spec_name(spec_name)?;
-        if let Some(parent) = parent_name {
+    /// Replace the parent set of `spec_name` with `parents`.
+    ///
+    /// Pass an empty slice to clear the `extends` relationship.  Each
+    /// parent must be a valid, existing spec name (local or imported)
+    /// and distinct from `spec_name`.  The resulting graph is checked
+    /// for cycles before any change is committed.
+    pub fn set_extends(&mut self, spec_name: Option<&str>, parents: &[&str]) -> io::Result<()> {
+        let child_name = Self::normalize_spec_name(spec_name)?.to_string();
+        // Validate each candidate parent up front.
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for parent in parents {
             valid_spec_name(parent).map_err(io::Error::other)?;
-            if parent == child_name {
+            if !seen.insert(parent) {
+                return Err(io::Error::other(format!(
+                    "duplicate parent spec '{}' in extends list",
+                    parent
+                )));
+            }
+            if *parent == child_name.as_str() {
                 return Err(io::Error::other(format!(
                     "spec {} cannot extend itself",
-                    spec_display_name(child_name),
+                    spec_display_name(child_name.as_str()),
                 )));
             }
             if self.resolve_spec(parent).is_none() {
@@ -1480,8 +1820,22 @@ impl Manifest {
             }
         }
         let spec_id = self.get_or_create_spec_id(spec_name)?;
-        self.file
-            .set_extends(spec_id, parent_name.map(String::from))?;
+        let new_parents: Vec<String> = parents.iter().map(|s| s.to_string()).collect();
+        // Snapshot previous parents so we can roll back if cycle
+        // detection fails on the new graph.
+        let prev_parents = self
+            .file
+            .spec_entry(spec_id)
+            .expect("spec just created")
+            .1
+            .extends
+            .clone();
+        self.file.set_extends(spec_id, new_parents)?;
+        if let Err(err) = self.specs_order() {
+            // Roll back to previous state.
+            let _ = self.file.set_extends(spec_id, prev_parents);
+            return Err(err);
+        }
         self.mark_file_updated();
         self.invalidate_locked_specs(spec_id);
         self.mark_lock_dirty();
@@ -1830,7 +2184,7 @@ impl Manifest {
                     let new_installables =
                         new_installables(&installed, &solvables).map_err(|failed| {
                             io::Error::other(format!(
-                                "spec {} requested to remove packages from parent specs: {}",
+                                "spec {} requested to remove packages from ancestor specs: {}",
                                 spec_display_name(spec_name),
                                 failed
                                     .into_iter()
@@ -1840,11 +2194,13 @@ impl Manifest {
                         })?;
                     let sorted = universe.installation_order(&new_installables);
                     let spec = self.spec_ref_checked(spec_id);
-                    let base_install_order = spec
-                        .parent()?
-                        .map(ResolvedSpecRef::effective_max_install_order)
-                        .transpose()?
-                        .unwrap_or(0) as usize;
+                    // Maximum install-order seen anywhere in the ancestor
+                    // DAG.  Multi-parent specs add their new packages on
+                    // top of the union of all parents' orders.
+                    let base_install_order =
+                        spec.parents()?.into_iter().try_fold(0u32, |acc, parent| {
+                            Ok::<_, io::Error>(acc.max(parent.effective_max_install_order()?))
+                        })? as usize;
                     sorted
                         .into_iter()
                         .enumerate()

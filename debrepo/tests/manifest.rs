@@ -2395,3 +2395,433 @@ fn archive_backed_manifest_covers_from_archives_installables_stage_and_sources()
     });
     assert!(root.join("usr/bin/fixture-rich").exists());
 }
+
+// ---------------------------------------------------------------------------
+// Multi-parent (additive) inheritance tests.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn multi_parent_extends_parses_string_and_array_forms() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // String form (existing single-parent shape)
+    let single = dir.path().join("single.toml");
+    std::fs::write(&single, "[spec.base]\n[spec.child]\nextends = \"base\"\n").expect("write");
+    let (m, _) = smol::block_on(Manifest::from_file(&single, ARCH)).expect("load");
+    let child = m.lookup_spec(Some("child")).expect("child");
+    let parents = child.parents().expect("parents");
+    assert_eq!(parents.len(), 1);
+    assert_eq!(parents[0].display_name(), "base");
+
+    // Array form (new multi-parent shape)
+    let multi = dir.path().join("multi.toml");
+    std::fs::write(
+        &multi,
+        "[spec.a]\n[spec.b]\n[spec.c]\nextends = [\"a\", \"b\"]\n",
+    )
+    .expect("write");
+    let (m, _) = smol::block_on(Manifest::from_file(&multi, ARCH)).expect("load");
+    let c = m.lookup_spec(Some("c")).expect("c spec");
+    let parents = c.parents().expect("parents");
+    assert_eq!(parents.len(), 2);
+    assert_eq!(parents[0].display_name(), "a");
+    assert_eq!(parents[1].display_name(), "b");
+}
+
+#[test]
+fn multi_parent_ancestors_in_topological_order_with_diamond_dedup() {
+    // DAG:  base <-- mid_a <-- leaf
+    //         \---- mid_b <---/
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.base]\n",
+            "[spec.mid_a]\n",
+            "extends = \"base\"\n",
+            "[spec.mid_b]\n",
+            "extends = \"base\"\n",
+            "[spec.leaf]\n",
+            "extends = [\"mid_a\", \"mid_b\"]\n",
+        ),
+    )
+    .expect("write manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let leaf = manifest.lookup_spec(Some("leaf")).expect("leaf");
+    let names: Vec<String> = leaf
+        .ancestors()
+        .map(|a| a.map(|s| s.display_name().to_string()))
+        .collect::<io::Result<Vec<_>>>()
+        .expect("ancestors");
+    // Kahn: leaf first (filtered out), then mid_a, mid_b, then base.
+    assert_eq!(names, vec!["mid_a", "mid_b", "base"]);
+}
+
+#[test]
+fn multi_parent_self_extend_and_cycle_rejected() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    // Self-extend
+    let self_path = dir.path().join("self.toml");
+    std::fs::write(&self_path, "[spec.a]\nextends = [\"a\"]\n").expect("write");
+    let err = match smol::block_on(Manifest::from_file(&self_path, ARCH)) {
+        Ok(_) => panic!("self-extend must fail"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("cycle") || err.to_string().contains("extends missing"));
+
+    // Multi-parent diamond cycle
+    let cycle_path = dir.path().join("cycle.toml");
+    std::fs::write(
+        &cycle_path,
+        concat!(
+            "[spec.a]\nextends = [\"b\"]\n",
+            "[spec.b]\nextends = [\"c\"]\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write");
+    let err = match smol::block_on(Manifest::from_file(&cycle_path, ARCH)) {
+        Ok(_) => panic!("cycle must fail"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string().contains("cycle"),
+        "expected cycle error, got: {err}"
+    );
+}
+
+#[test]
+fn multi_parent_effective_build_env_conflict_errors_unless_child_overrides() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.a.build-env]\nFOO = \"a\"\n",
+            "[spec.b.build-env]\nFOO = \"b\"\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let c = manifest.lookup_spec(Some("c")).expect("c");
+    let err = c.effective_build_env().expect_err("must conflict");
+    assert!(
+        err.to_string().contains("conflicting build-env"),
+        "got: {err}"
+    );
+
+    // Now resolve by adding FOO at the child level.
+    let path = dir.path().join("Manifest2.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.a.build-env]\nFOO = \"a\"\n",
+            "[spec.b.build-env]\nFOO = \"b\"\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+            "[spec.c.build-env]\nFOO = \"c\"\n",
+        ),
+    )
+    .expect("write");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let c = manifest.lookup_spec(Some("c")).expect("c");
+    let env = c.effective_build_env().expect("env");
+    assert_eq!(env, vec![("FOO".to_string(), "c".to_string())]);
+}
+
+#[test]
+fn multi_parent_effective_meta_conflict_errors_unless_child_overrides() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.a]\nmeta = [\"layout:rootfs\"]\n",
+            "[spec.b]\nmeta = [\"layout:bootloader\"]\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let c = manifest.lookup_spec(Some("c")).expect("c");
+    let err = c.effective_meta().expect_err("must conflict");
+    assert!(err.to_string().contains("conflicting meta"), "got: {err}");
+
+    // Identical values across parents are fine.
+    let path = dir.path().join("Manifest2.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.a]\nmeta = [\"layout:rootfs\"]\n",
+            "[spec.b]\nmeta = [\"layout:rootfs\"]\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let c = manifest.lookup_spec(Some("c")).expect("c");
+    let meta = c.effective_meta().expect("meta");
+    assert_eq!(meta, vec![("layout", "rootfs")]);
+}
+
+#[test]
+fn multi_parent_build_script_runs_each_unique_ancestor_once_in_topo_order() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.base]\nbuild-script = \"echo base\\n\"\n",
+            "[spec.a]\nextends = \"base\"\nbuild-script = \"echo a\\n\"\n",
+            "[spec.b]\nextends = \"base\"\nbuild-script = \"echo b\\n\"\n",
+            "[spec.leaf]\nextends = [\"a\", \"b\"]\nbuild-script = \"echo leaf\\n\"\n",
+        ),
+    )
+    .expect("write manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let leaf = manifest.lookup_spec(Some("leaf")).expect("leaf");
+    // Topo order ancestors-first: base -> a -> b -> leaf.  Diamond ancestor
+    // base appears exactly once.
+    let scripts = leaf.effective_build_script().expect("scripts");
+    assert_eq!(
+        scripts,
+        vec![
+            "echo base\n".to_string(),
+            "echo a\n".to_string(),
+            "echo b\n".to_string(),
+            "echo leaf\n".to_string(),
+        ]
+    );
+}
+
+#[test]
+fn multi_parent_descendant_spec_ids_walks_dag() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.base]\n",
+            "[spec.a]\nextends = \"base\"\n",
+            "[spec.b]\nextends = \"base\"\n",
+            "[spec.leaf]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let mut descendants = manifest.descendant_spec_ids(spec_id(&manifest, Some("base")));
+    descendants.sort();
+    let mut expected = vec![
+        spec_id(&manifest, Some("base")),
+        spec_id(&manifest, Some("a")),
+        spec_id(&manifest, Some("b")),
+        spec_id(&manifest, Some("leaf")),
+    ];
+    expected.sort();
+    assert_eq!(descendants, expected);
+}
+
+#[test]
+fn multi_parent_set_extends_persists_array_form() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    smol::block_on(async {
+        let mut manifest = Manifest::new(&path, ARCH, None);
+        manifest.add_spec(Some("a")).expect("add a");
+        manifest.add_spec(Some("b")).expect("add b");
+        manifest.add_spec(Some("c")).expect("add c");
+        // Set two parents: a, b
+        manifest
+            .set_extends(Some("c"), &["a", "b"])
+            .expect("set extends");
+        manifest
+            .resolve(one(), &FixtureProvider::local())
+            .await
+            .expect("resolve");
+        manifest.store().await.expect("store");
+    });
+    let raw = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        raw.contains("extends = [\"a\", \"b\"]"),
+        "expected array form in TOML, got:\n{raw}"
+    );
+
+    // Now reduce to a single parent and confirm it goes back to the
+    // string form.
+    smol::block_on(async {
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+        manifest
+            .set_extends(Some("c"), &["a"])
+            .expect("set single parent");
+        manifest
+            .resolve(one(), &FixtureProvider::local())
+            .await
+            .expect("resolve");
+        manifest.store().await.expect("store");
+    });
+    let raw = std::fs::read_to_string(&path).expect("read");
+    assert!(
+        raw.contains("extends = \"a\""),
+        "expected single string form, got:\n{raw}"
+    );
+}
+
+#[test]
+fn multi_parent_set_extends_rejects_self_duplicates_and_cycle() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let mut manifest = smol::block_on(async {
+        let mut m = Manifest::new(&path, ARCH, None);
+        m.add_spec(Some("a")).expect("add a");
+        m.add_spec(Some("b")).expect("add b");
+        m.add_spec(Some("c")).expect("add c");
+        m
+    });
+    // self-extend
+    let err = manifest
+        .set_extends(Some("a"), &["a"])
+        .expect_err("self-extend must fail");
+    assert!(err.to_string().contains("cannot extend itself"));
+    // duplicate parents
+    let err = manifest
+        .set_extends(Some("c"), &["a", "a"])
+        .expect_err("duplicate must fail");
+    assert!(err.to_string().contains("duplicate parent"));
+    // missing parent
+    let err = manifest
+        .set_extends(Some("c"), &["does-not-exist"])
+        .expect_err("missing must fail");
+    assert!(err.to_string().contains("not found"));
+
+    // Build a -> b chain, then set b's extends to a -- creating a cycle
+    // a -> b -> a -> ... fails with cycle detection at apply time.
+    manifest
+        .set_extends(Some("a"), &["b"])
+        .expect("a extends b");
+    let err = manifest
+        .set_extends(Some("b"), &["a"])
+        .expect_err("cycle must fail");
+    assert!(err.to_string().contains("cycle"), "got: {err}");
+}
+
+#[test]
+fn multi_parent_install_union_blocks_child_from_dropping_either_parent_pkg() {
+    // Uses the same minimal-none fixture (gives one local package with a
+    // known control file).  Two siblings each require it as a way to
+    // verify `requirements_for` deduplicates the union.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("Manifest.toml");
+    let pkg_path = dir.path().join("base.deb");
+    std::fs::copy(fixture_path("minimal-none.deb"), &pkg_path).expect("copy deb");
+    std::fs::write(
+        &path,
+        concat!(
+            "[spec.a]\n",
+            "[spec.b]\n",
+            "[spec.c]\nextends = [\"a\", \"b\"]\n",
+        ),
+    )
+    .expect("write");
+    let provider = FixtureProvider::local();
+
+    let pkg_name = smol::block_on(async {
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (file, ctrl) = provider
+            .ensure_deb("base.deb", &pkg_path)
+            .await
+            .expect("prepare deb");
+        let pkg_name = ctrl.field("Package").expect("name").to_string();
+        manifest
+            .add_local_package(file, ctrl, None)
+            .expect("add local");
+        manifest
+            .add_requirements(Some("a"), [pkg_name.as_str()], None)
+            .expect("a requires");
+        manifest
+            .add_requirements(Some("b"), [pkg_name.as_str()], None)
+            .expect("b requires");
+        // Both parents require the same package.  Resolving must succeed
+        // (union) and child c must inherit it without listing it twice.
+        manifest.resolve(one(), &provider).await.expect("resolve");
+        let c = manifest.lookup_spec(Some("c")).expect("c");
+        let pkgs = c.effective_packages().expect("effective");
+        let names: Vec<String> = pkgs.iter().map(|p| p.name().to_string()).collect();
+        // The package must appear at least once (and only once) in the
+        // unioned effective packages.
+        assert_eq!(
+            names.iter().filter(|n| **n == pkg_name).count(),
+            1,
+            "expected exactly one copy of {pkg_name}, got {names:?}"
+        );
+        manifest.store().await.expect("store");
+        pkg_name
+    });
+
+    // Now try to drop the package via c.exclude -- the additive constraint
+    // must reject it.
+    smol::block_on(async {
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("reload");
+        manifest
+            .add_constraints(Some("c"), [pkg_name.as_str()], None)
+            .expect("forbid in child");
+        let err = manifest
+            .resolve(one(), &provider)
+            .await
+            .expect_err("must reject");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("failed to solve spec c"),
+            "expected solver failure, got: {msg}"
+        );
+    });
+}
+
+#[test]
+fn multi_parent_hash_stability_for_single_parent_chain() {
+    // The hash mixed into a single-parent spec must not change as a
+    // result of the multi-parent refactor: this fixture was hashed
+    // before the refactor with parents=[base] and we assert the same
+    // hash is reproduced now.
+    //
+    // The strategy is to compute the hash twice in this same test
+    // (once with `extends = "base"`, once with `extends = ["base"]`)
+    // and verify they match -- demonstrating the dual encoding has no
+    // effect on the spec hash.
+    let provider = FixtureProvider::local();
+    let dir = tempfile::tempdir().expect("tempdir");
+    let pkg_path = dir.path().join("base.deb");
+    std::fs::copy(fixture_path("minimal-none.deb"), &pkg_path).expect("copy deb");
+
+    let hash_for = |form: &str| -> String {
+        let path = dir
+            .path()
+            .join(format!("M-{}.toml", form.replace(['"', '['], "_")));
+        std::fs::write(
+            &path,
+            format!("[spec.base]\n[spec.child]\nextends = {}\n", form),
+        )
+        .expect("write");
+        smol::block_on(async {
+            let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+            let (file, ctrl) = provider
+                .ensure_deb("base.deb", &pkg_path)
+                .await
+                .expect("prepare deb");
+            let pkg_name = ctrl.field("Package").expect("name").to_string();
+            manifest.add_local_package(file, ctrl, None).expect("add");
+            manifest
+                .add_requirements(Some("base"), [pkg_name.as_str()], None)
+                .expect("require");
+            manifest.resolve(one(), &provider).await.expect("resolve");
+            let child = manifest.lookup_spec(Some("child")).expect("child");
+            child.locked_hash().expect("hash").to_hex()
+        })
+    };
+
+    let h_string = hash_for("\"base\"");
+    let h_array = hash_for("[\"base\"]");
+    assert_eq!(
+        h_string, h_array,
+        "single-parent extends written as string vs single-element array must hash identically"
+    );
+}

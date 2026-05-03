@@ -692,21 +692,34 @@ impl ManifestFile {
         }
         Ok(())
     }
-    pub(crate) fn set_extends(
-        &mut self,
-        spec_id: SpecId,
-        parent: Option<String>,
-    ) -> io::Result<()> {
+    pub(crate) fn set_extends(&mut self, spec_id: SpecId, parents: Vec<String>) -> io::Result<()> {
         let spec_name = self.spec_name_raw(spec_id).to_string();
-        self.specs.value_mut_at(spec_id.index()).extends = parent.clone();
-        if let Some(parent) = parent {
-            let entry = self
-                .doc
-                .get_spec_table_entry_mut(spec_name.as_str(), "extends", || toml_edit::value(""));
-            *entry = toml_edit::value(parent);
-        } else {
-            self.doc
-                .remove_spec_table_entry(spec_name.as_str(), "extends");
+        self.specs.value_mut_at(spec_id.index()).extends = parents.clone();
+        match parents.len() {
+            0 => {
+                self.doc
+                    .remove_spec_table_entry(spec_name.as_str(), "extends");
+            }
+            1 => {
+                let entry =
+                    self.doc
+                        .get_spec_table_entry_mut(spec_name.as_str(), "extends", || {
+                            toml_edit::value("")
+                        });
+                *entry = toml_edit::value(parents.into_iter().next().unwrap());
+            }
+            _ => {
+                let mut arr = toml_edit::Array::new();
+                for parent in parents {
+                    arr.push(parent);
+                }
+                let entry =
+                    self.doc
+                        .get_spec_table_entry_mut(spec_name.as_str(), "extends", || {
+                            toml_edit::value("")
+                        });
+                *entry = toml_edit::Item::Value(toml_edit::Value::Array(arr));
+            }
         }
         Ok(())
     }
@@ -1160,8 +1173,13 @@ where
 
     let mut map = serializer.serialize_map(Some(list.len()))?;
     if let Some((_, def)) = list.iter().find(|(k, _)| k.is_empty()) {
-        if let Some(extends) = def.extends.as_deref() {
-            map.serialize_entry("extends", extends)?;
+        if !def.extends.is_empty() {
+            // Emit a single string for one parent to keep TOML stable for
+            // existing manifests; otherwise emit an array.
+            #[derive(serde::Serialize)]
+            #[serde(transparent)]
+            struct ExtendsField<'a>(#[serde(with = "crate::spec::extends_serde")] &'a [String]);
+            map.serialize_entry("extends", &ExtendsField(&def.extends))?;
         }
         if !def.include.is_empty() {
             map.serialize_entry("include", &def.include)?;
@@ -1219,7 +1237,7 @@ where
 
             #[derive(Default)]
             struct DefaultAcc {
-                extends: Option<String>,
+                extends: Option<Vec<String>>,
                 include: Option<Vec<Dependency<String>>>,
                 exclude: Option<Vec<Constraint<String>>>,
                 stage: Option<Vec<String>>,
@@ -1242,7 +1260,14 @@ where
             while let Some(key) = access.next_key::<String>()? {
                 match key.as_str() {
                     "extends" => {
-                        let v = access.next_value::<String>()?;
+                        // Accept either a string (single parent) or an array
+                        // of strings (multi-parent additive inheritance).
+                        #[derive(serde::Deserialize)]
+                        #[serde(transparent)]
+                        struct ExtendsField(
+                            #[serde(with = "crate::spec::extends_serde")] Vec<String>,
+                        );
+                        let v = access.next_value::<ExtendsField>()?.0;
                         set_once!(def.extends, v, "extends");
                     }
                     "include" => {
@@ -1289,7 +1314,7 @@ where
                 || def.meta.is_some()
             {
                 let default_spec = Spec {
-                    extends: def.extends,
+                    extends: def.extends.unwrap_or_default(),
                     include: def.include.unwrap_or_default(),
                     exclude: def.exclude.unwrap_or_default(),
                     stage: def.stage.unwrap_or_default(),

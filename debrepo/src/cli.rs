@@ -1190,24 +1190,46 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     }
 
     #[derive(Parser)]
-    #[command(about = "Set or clear a spec's parent")]
-    /// CLI command: set or clear the extends field of a spec.
+    #[command(
+        about = "Set, modify or clear a spec's parents",
+        long_about = "Manage the `extends` list of a spec.\n\
+            \n\
+            With one or more positional PARENT arguments, the entire parent set is \
+            replaced.  Use --add to append, --remove to drop a single parent without \
+            otherwise touching the list, and --clear to remove the relationship \
+            entirely.  Multi-parent inheritance is strictly additive: a child spec \
+            cannot remove packages, build-env entries, meta entries, or stage \
+            artifacts contributed by any ancestor."
+    )]
+    /// CLI command: set, modify, or clear the extends list of a spec.
     pub struct SpecExtend {
         /// Spec name (omit to use the default spec)
         #[arg(short = 's', long = "spec", value_name = "SPEC")]
         spec: Option<String>,
-        /// Remove the extends relationship
-        #[arg(long = "clear", conflicts_with = "parent")]
+        /// Remove the extends relationship entirely
+        #[arg(long = "clear", conflicts_with_all = ["parents", "add", "remove"])]
         clear: bool,
-        /// Parent spec name
+        /// Append PARENT to the existing parent list (repeatable)
+        #[arg(long = "add", value_name = "PARENT", conflicts_with_all = ["parents", "remove"])]
+        add: Vec<String>,
+        /// Remove PARENT from the existing parent list (repeatable)
+        #[arg(long = "remove", value_name = "PARENT", conflicts_with_all = ["parents", "add"])]
+        remove: Vec<String>,
+        /// Parent spec name(s) -- replaces the existing parent list
         #[arg(value_name = "PARENT")]
-        parent: Option<String>,
+        parents: Vec<String>,
     }
 
     impl<C: Config> Command<C> for SpecExtend {
         fn exec(&self, conf: &C) -> Result<()> {
-            if self.parent.is_none() && !self.clear {
-                return Err(anyhow!("either a parent spec name or --clear is required"));
+            if self.parents.is_empty()
+                && self.add.is_empty()
+                && self.remove.is_empty()
+                && !self.clear
+            {
+                return Err(anyhow!(
+                    "specify one or more PARENT arguments, --add, --remove, or --clear"
+                ));
             }
             smol::block_on(async move {
                 let (mut mf, has_valid_lock) =
@@ -1215,12 +1237,52 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
-                let parent = if self.clear {
-                    None
+                let new_parents: Vec<String> = if self.clear {
+                    Vec::new()
+                } else if !self.add.is_empty() || !self.remove.is_empty() {
+                    // Start from the spec's current parent list and apply
+                    // add/remove deltas.  Either set may be empty, but the
+                    // top-level guard above ensures at least one is given.
+                    let current = mf
+                        .lookup_spec(self.spec.as_deref())
+                        .ok()
+                        .map(|spec| {
+                            spec.parents()
+                                .map(|parents| {
+                                    parents
+                                        .into_iter()
+                                        .map(|p| {
+                                            p.name().map(|n| n.to_string()).unwrap_or_default()
+                                        })
+                                        .collect::<Vec<_>>()
+                                })
+                                .unwrap_or_default()
+                        })
+                        .unwrap_or_default();
+                    let mut next: Vec<String> =
+                        current.into_iter().filter(|p| !p.is_empty()).collect();
+                    for parent in &self.remove {
+                        match next.iter().position(|p| p == parent) {
+                            Some(idx) => {
+                                next.remove(idx);
+                            }
+                            None => {
+                                return Err(anyhow!("spec does not currently extend '{}'", parent));
+                            }
+                        }
+                    }
+                    for parent in &self.add {
+                        if next.iter().any(|p| p == parent) {
+                            return Err(anyhow!("'{}' is already a parent", parent));
+                        }
+                        next.push(parent.clone());
+                    }
+                    next
                 } else {
-                    self.parent.as_deref()
+                    self.parents.clone()
                 };
-                mf.set_extends(self.spec.as_deref(), parent)?;
+                let parent_refs: Vec<&str> = new_parents.iter().map(String::as_str).collect();
+                mf.set_extends(self.spec.as_deref(), &parent_refs)?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 mf.resolve(conf.concurrency(), fetcher).await?;

@@ -1,3 +1,9 @@
+rdebootstrap (0.3.6) unstable; urgency=medium
+
+  * Allow specs to extend multiple parents; inheritance remains strictly additive. 
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 03 May 2026 18:27:41 +0200
+
 rdebootstrap (0.3.5) unstable; urgency=high
 
   * fix: the local .deb should have an absolute precedence over archives 

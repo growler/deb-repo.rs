@@ -102,3 +102,37 @@ assert_stderr_contains "not found"
 # error: self-extend
 run_case_expect_fail "spec_extend_self" spec extend -s backend backend
 assert_stderr_contains "cannot extend itself"
+
+# --- multi-parent extend ---
+
+# add additional specs to extend so we can exercise the multi-parent shape
+run_case_expect_ok "spec_add_extras" spec require -s extras -c "extras packages" curl
+run_case_expect_ok "spec_add_foo" spec require -s foo bash
+
+# set two parents at once: array form is persisted
+run_case_expect_ok "spec_extend_multi_set" spec extend -s backend desktop extras
+assert_manifest_contains 'extends = ["desktop", "extras"]'
+
+# --add appends a parent
+run_case_expect_ok "spec_extend_add_existing" spec extend -s backend --add foo
+assert_manifest_contains 'extends = ["desktop", "extras", "foo"]'
+
+# --remove drops a single parent
+run_case_expect_ok "spec_extend_remove" spec extend -s backend --remove extras
+assert_manifest_contains 'extends = ["desktop", "foo"]'
+
+# --remove down to a single parent re-emits the string form
+run_case_expect_ok "spec_extend_remove_to_one" spec extend -s backend --remove foo
+assert_manifest_contains 'extends = "desktop"'
+
+# error: duplicate parent in positional list
+run_case_expect_fail "spec_extend_dup" spec extend -s backend desktop desktop
+assert_stderr_contains "duplicate parent"
+
+# error: --add an existing parent
+run_case_expect_fail "spec_extend_add_dup" spec extend -s backend --add desktop
+assert_stderr_contains "already a parent"
+
+# error: --remove a non-parent
+run_case_expect_fail "spec_extend_remove_missing" spec extend -s backend --remove never-was
+assert_stderr_contains "does not currently extend"

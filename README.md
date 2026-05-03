@@ -126,9 +126,10 @@ Key sections:
 - `[artifact."<name>"]` -- Files or URLs to drop into the tree during staging.
 - `[spec]` and `[spec.<name>]` -- Package requirements/constraints, staged
   artifacts, build-time environment/script, and metadata per spec. Specs can
-  inherit from each other via `extends`. Set `meta = ["apt-lists:stage"]` on a
-  spec when you want staging/build output to also include `manifest.sources`
-  and downloaded APT list files.
+  inherit from one or more other specs via `extends` (see *Spec inheritance*
+  below). Set `meta = ["apt-lists:stage"]` on a spec when you want
+  staging/build output to also include `manifest.sources` and downloaded APT
+  list files.
 
 `rdebootstrap import` writes `[import]`, pins the imported manifest bytes in
 `hash`, and validates the selected named specs. Imported archives are prepended
@@ -189,6 +190,61 @@ or `rdebootstrap spec meta set apt-lists stage`.
   and write it to `target` during staging. `rdebootstrap artifact add @file`
   creates a text artifact from a UTF-8 file (target path required).
 
+## Spec Inheritance
+
+A spec may extend any number of other specs.  Inheritance is **strictly
+additive**: a child spec cannot remove a package, build-env entry, meta
+entry, or stage artifact contributed by any ancestor.  This keeps lock
+semantics monotone and conflict-free even with diamond ancestors.
+
+The `extends` field accepts either a single string (the original
+single-parent shape) or an array of strings:
+
+```toml
+[spec.tools]
+include = ["tar"]
+
+[spec.extras]
+include = ["rsync"]
+
+[spec.frontend]
+extends = ["tools", "extras"]   # multi-parent
+include = ["openssh-server"]
+```
+
+Order matters in two places: the entries of `extends` are processed in
+declaration order (used as a tie-break in the topological order of
+ancestors), and the first listed parent is the *primary* parent --
+downstream consumers like `deb-ostree` use it as the OSTree commit's
+parent reference, with remaining parents overlaid additively.
+
+Conflict policy:
+
+- `build-env` -- the child always overrides ancestors.  If two distinct
+  ancestors set the same key to different values *and* the child does
+  not redeclare it, the conflict is reported as a hard error at
+  resolve/build time.  Identical values across ancestors are fine.
+- `meta` -- same policy as `build-env`.
+- `stage` artifacts -- merged in topological order.  The same artifact
+  reachable via multiple ancestors is staged exactly once; artifacts
+  with the same URI string but defined in different manifests (e.g.,
+  imported vs. local) are distinct and both are staged.
+- packages -- a child's `exclude` cannot drop a package locked by any
+  ancestor; the solver fails with `requested to remove packages from
+  ancestor specs: <list>`.
+
+Use `rdebootstrap spec extend` to manage parents:
+
+```text
+rdebootstrap spec extend -s frontend tools extras       # replace list
+rdebootstrap spec extend -s frontend --add foo          # append
+rdebootstrap spec extend -s frontend --remove extras    # drop one
+rdebootstrap spec extend -s frontend --clear            # remove all
+```
+
+Single-parent manifests are unaffected: `extends = "base"` keeps its
+existing TOML form and produces identical lock hashes.
+
 ## Build Environment and Scripts
 
 Specs can set:
@@ -196,7 +252,9 @@ Specs can set:
 - `build-env` -- key/value environment variables applied to both `dpkg --configure`
   and `build-script`.
 - `build-script` -- a bash script executed after package configuration. Scripts
-  from `extends` are executed in order (base -> derived).
+  from ancestors are executed in topological order (base scripts first,
+  then derived).  Each unique ancestor contributes its script at most
+  once; sibling ancestors run in `extends` declaration order.
 
 Use `rdebootstrap edit env` / `rdebootstrap edit script` to edit these fields.
 

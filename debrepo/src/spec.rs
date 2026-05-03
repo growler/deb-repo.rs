@@ -25,12 +25,106 @@ use {
     },
 };
 
+/// Parents of a spec, deserialized from either a TOML string or array of
+/// strings.
+///
+/// `extends = "base"` and `extends = ["base"]` are equivalent.  The first
+/// form is preserved on serialization as long as the parent set has at most
+/// one entry, keeping single-parent manifests byte-for-byte stable.
+pub mod extends_serde {
+    use {
+        serde::{
+            de::{self, SeqAccess, Visitor},
+            Deserializer, Serializer,
+        },
+        std::fmt,
+    };
+
+    pub fn serialize<S>(parents: &[String], serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        match parents.len() {
+            0 => unreachable!("extends should be skipped when empty"),
+            1 => serializer.serialize_str(&parents[0]),
+            _ => {
+                use serde::ser::SerializeSeq;
+                let mut seq = serializer.serialize_seq(Some(parents.len()))?;
+                for parent in parents {
+                    seq.serialize_element(parent)?;
+                }
+                seq.end()
+            }
+        }
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct ExtendsVisitor;
+
+        impl<'de> Visitor<'de> for ExtendsVisitor {
+            type Value = Vec<String>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a parent spec name or an array of parent spec names")
+            }
+
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(vec![v.to_string()])
+            }
+
+            fn visit_string<E>(self, v: String) -> Result<Self::Value, E>
+            where
+                E: de::Error,
+            {
+                Ok(vec![v])
+            }
+
+            fn visit_seq<A>(self, mut seq: A) -> Result<Self::Value, A::Error>
+            where
+                A: SeqAccess<'de>,
+            {
+                let mut parents = Vec::with_capacity(seq.size_hint().unwrap_or(0));
+                while let Some(parent) = seq.next_element::<String>()? {
+                    if parents.iter().any(|p: &String| p == &parent) {
+                        return Err(de::Error::custom(format!(
+                            "duplicate parent spec in extends: {}",
+                            parent
+                        )));
+                    }
+                    parents.push(parent);
+                }
+                Ok(parents)
+            }
+        }
+
+        deserializer.deserialize_any(ExtendsVisitor)
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 #[serde(deny_unknown_fields)]
 /// Build specification for a repository suite.
 pub struct Spec {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub extends: Option<String>,
+    /// List of parent specs this spec extends.
+    ///
+    /// Encoded in TOML as either a single string (`extends = "base"`) or an
+    /// array of strings (`extends = ["base", "extras"]`).  Empty means no
+    /// parent.  Multi-parent inheritance is strictly additive: a child may
+    /// not cause a package, build env entry, meta entry, or stage artifact
+    /// from any ancestor to be removed or silently overridden.
+    #[serde(
+        default,
+        rename = "extends",
+        with = "extends_serde",
+        skip_serializing_if = "Vec::is_empty"
+    )]
+    pub extends: Vec<String>,
 
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub include: Vec<Dependency<String>>,
@@ -62,7 +156,7 @@ pub struct Spec {
 impl Spec {
     pub fn new() -> Self {
         Self {
-            extends: None,
+            extends: Vec::new(),
             include: Vec::new(),
             exclude: Vec::new(),
             stage: Vec::new(),
@@ -71,6 +165,7 @@ impl Spec {
             build_script: None,
         }
     }
+
     pub fn locked_spec(&self) -> LockedSpec {
         LockedSpec {
             hash: None,

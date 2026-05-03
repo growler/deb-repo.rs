@@ -722,7 +722,7 @@ checksum = "ef8ae57c4978a2acd8b869ce6b9ca1dfe817bff704c220209fdef2c0b75a01b9"
 
 [[package]]
 name = "debrepo"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "async-channel",
@@ -1826,7 +1826,7 @@ dependencies = [
 
 [[package]]
 name = "rdebootstrap"
-version = "0.3.5"
+version = "0.3.6"
 dependencies = [
  "anyhow",
  "clap",

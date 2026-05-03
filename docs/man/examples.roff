@@ -28,6 +28,16 @@ rdebootstrap update
 Downstream specs may then set \fBextends = "base"\fR or
 \fBextends = "bootable-base"\fR in \fBManifest.toml\fR.
 .PP
+Compose a child spec from multiple parents (additive only):
+.IP
+.EX
+rdebootstrap spec extend --spec frontend tools extras
+# or, in Manifest.toml directly:
+#   [spec.frontend]
+#   extends = ["tools", "extras"]
+rdebootstrap update
+.EE
+.PP
 Use with podman:
 .IP
 .EX
