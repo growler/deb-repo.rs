@@ -1,5 +1,5 @@
 use {
-    debrepo::{auth::AuthProvider, HttpTransport, TransportProvider},
+    debrepo::{auth::AuthProvider, HttpTransport},
     smol::io::AsyncReadExt,
     std::{
         fs,

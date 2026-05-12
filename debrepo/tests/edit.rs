@@ -51,8 +51,12 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
         .exec(&conf)
         .expect("edit env");
 
-    let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
+    let (manifest, has_valid_lock) = smol::block_on(Manifest::from_file(
+        &manifest_path,
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(has_valid_lock);
     let spec = manifest.lookup_spec(None).expect("default spec");
     assert_eq!(
@@ -79,8 +83,12 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
         .exec(&conf)
         .expect("edit script");
 
-    let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
+    let (manifest, has_valid_lock) = smol::block_on(Manifest::from_file(
+        &manifest_path,
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(has_valid_lock);
     assert_eq!(
         manifest
@@ -97,8 +105,12 @@ fn edit_env_and_script_cover_editor_resolution_and_updates() {
         .exec(&conf)
         .expect("clear script");
 
-    let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
+    let (manifest, has_valid_lock) = smol::block_on(Manifest::from_file(
+        &manifest_path,
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(has_valid_lock);
     assert_eq!(
         manifest
@@ -153,8 +165,12 @@ fn edit_artifact_creates_updates_and_rejects_non_text_artifacts() {
         vec!["note.txt"]
     );
 
-    let (_, has_valid_lock) =
-        smol::block_on(Manifest::from_file("Manifest.toml", ARCH)).expect("reload manifest");
+    let (_, has_valid_lock) = smol::block_on(Manifest::from_file(
+        "Manifest.toml",
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(has_valid_lock);
     let doc = read_manifest_doc(&manifest_path);
     let artifact = doc["artifact"]["note.txt"]
@@ -191,8 +207,12 @@ fn edit_artifact_creates_updates_and_rejects_non_text_artifacts() {
     .exec(&conf)
     .expect("update artifact");
 
-    let (_, has_valid_lock) =
-        smol::block_on(Manifest::from_file("Manifest.toml", ARCH)).expect("reload manifest");
+    let (_, has_valid_lock) = smol::block_on(Manifest::from_file(
+        "Manifest.toml",
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(has_valid_lock);
     let doc = read_manifest_doc(&manifest_path);
     let artifact = doc["artifact"]["note.txt"]
@@ -252,8 +272,12 @@ fn edit_manifest_refreshes_stale_lock_and_reports_editor_failures() {
         .exec(&conf)
         .expect("edit manifest");
 
-    let (_, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&manifest_path, ARCH)).expect("reload manifest");
+    let (_, has_valid_lock) = smol::block_on(Manifest::from_file(
+        &manifest_path,
+        ARCH,
+        &TestProvider::new(),
+    ))
+    .expect("reload manifest");
     assert!(
         has_valid_lock,
         "manifest edit should refresh the stale lock"

@@ -118,9 +118,10 @@ Key sections:
   templates, trusted keys, and priorities.
 - `[import]` -- Reuse archives, local packages, and selected named parent specs
   from another manifest. Imported parent specs keep their own staged artifact
-  references. `path` and `hash` are required; `specs` is optional
-  and only needed when exporting imported parent specs for downstream
-  `extends`.
+  references. Either `path` (local-filesystem import) or a nested `git` table
+  (git-sourced import) is required, plus `hash`; `specs` is optional and only
+  needed when exporting imported parent specs for downstream `extends`. See
+  *Git-sourced imports* below.
 - `[[local]]` -- Local `.deb` files copied into the cache and treated like repo
   packages.
 - `[artifact."<name>"]` -- Files or URLs to drop into the tree during staging.
@@ -144,6 +145,116 @@ an `imported-universe` fingerprint for imported lock state. `rdebootstrap
 update` refreshes stale import metadata, re-solves specs when the imported
 manifest or imported lock changed, and `build` refuses to run if the resulting
 lock is missing or stale.
+
+## Git-sourced Imports
+
+`[import.git]` references a manifest hosted in a git repository.  The same
+manifest works for developers (typically using SSH) and for CI pipelines
+(typically using HTTPS with a token), because the manifest never names a
+transport — only the protocol-agnostic `host/path` plus a resolved commit
+SHA.  The transport is part of the URL stored in the manifest.
+
+```toml
+[import]
+hash  = "blake3-..."          # blake3 of the imported manifest file's bytes
+specs = ["base"]
+
+[import.git]
+remote = "https://gitlab.com/myorg/system-manifests"  # full URL with scheme
+rev    = "5b1f9c2a4d3e0f8b7a6c9d2e1f0a3b4c5d6e7f80"    # always a 40-hex SHA
+ref    = "release-2024.10"    # optional: branch or tag tracked by `update`
+path   = "system/Manifest.toml"   # in-repo path of the imported manifest
+```
+
+Add or replace a git import.  `--import` is a single argument that accepts
+either a local manifest path or a `git+<scheme>://` URL:
+
+```bash
+# Local path (relative or absolute)
+rdebootstrap import ../base/Manifest.toml --spec base
+rdebootstrap import file:///srv/manifests/base.toml --spec base
+
+# Git-hosted manifest
+rdebootstrap import 'git+https://gitlab.com/myorg/repo.git?rev=v1.2.3#system/Manifest.toml' --spec base
+rdebootstrap import 'git+http://internal.example/myorg/repo?ref=stable#system/Manifest.toml' --spec base
+rdebootstrap import 'git+ssh://git@gitlab.com/myorg/repo.git?ref=main#system/Manifest.toml'
+
+# Local git checkout / bare repo (no network)
+rdebootstrap import 'git+file:///srv/git/myorg-repo.git?rev=<sha>#system/Manifest.toml'
+
+# `init --import` accepts the same shapes when bootstrapping a fresh manifest.
+```
+
+Only the six forms above are accepted.  Older shorthand spellings
+(`git@host:path`, plain `https://`/`ssh://` without the `git+` prefix,
+bare `host/path?rev=...#...`) are rejected up-front.
+
+`rdebootstrap update --locals` re-resolves a recorded `ref` (branch or tag)
+against the upstream repository and re-pins `rev` if upstream has moved.
+
+### Authentication
+
+The transport is encoded in the remote URL; there is no separate transport
+selector.  Use `git+ssh://` or `git+https://` to choose:
+
+```bash
+# SSH (uses system ssh — ~/.ssh/config, ssh-agent, smart cards)
+rdebootstrap import 'git+ssh://git@gitlab.com/myorg/repo?ref=main#system/Manifest.toml'
+
+# HTTPS (credentials come from auth.toml)
+rdebootstrap import 'git+https://gitlab.com/myorg/repo?ref=main#system/Manifest.toml'
+```
+
+For HTTPS git, `[[auth]]` entries in `auth.toml` keyed by hostname supply
+credentials.  The same entry format used for HTTP archive fetches applies:
+
+```toml
+# Bearer / token auth (e.g. GitLab deploy token, GitHub PAT)
+[[auth]]
+host = "gitlab.com"
+token.env = "CI_JOB_TOKEN"
+
+# Basic auth
+[[auth]]
+host = "internal.example"
+login = "myuser"
+password.env = "MY_SECRET"
+
+# Client certificate (HTTPS mutual TLS)
+[[auth]]
+host = "secure.example"
+cert = "client.crt"   # path relative to auth.toml, or PEM inline
+key  = "client.key"
+```
+
+Credentials are injected via `GIT_CONFIG_*` environment variables
+(`http.extraHeader` for Basic/Token, `http.sslCert`/`http.sslKey` for Cert)
+so secrets never appear on `git`'s argv.
+
+SSH credentials are never written into `auth.toml`; SSH delegates entirely to
+the system `ssh` invoked by subprocess `git`, which honours `~/.ssh/config`,
+`ssh-agent`, smart cards, and `gpg-agent --enable-ssh-support`.
+
+To remap a URL to a different base — for example to substitute HTTPS for SSH
+in a CI environment — use git's own mechanism:
+
+```bash
+git config --global url."https://gitlab.com/".insteadOf "ssh://git@gitlab.com/"
+# or set GIT_CONFIG_GLOBAL to point at a config file with the same directive.
+```
+
+### Requirements and caching
+
+- `git >= 2.30` must be on `PATH`.
+- A bare clone is kept under `<cache>/git/<sha256(url)>/repo.git`.
+  Per-rev subtree extracts go to `<cache>/git/<sha256>/revs/<sha>/`.
+- Partial clone (`--filter=blob:none`) is used so only the imported
+  manifest, its lock, and any `[[local]]`/local-artifact blobs the
+  manifest references are actually fetched.
+
+The downstream lock file mirrors the resolved commit in
+`imported-git-rev = "<sha>"`; mismatch with `[import.git].rev` invalidates
+the lock.
 
 ## Cache and Fetching
 
@@ -267,10 +378,10 @@ environment such as a valid XDG runtime directory).
 ## CLI Tour
 
 - `init` -- bootstrap a manifest from vendor presets (`debian`, `ubuntu`,
-  `devuan`), explicit archives, or `--import <path>` from another locked
-  manifest.
-- `import` -- add or replace `[import]` using another already-locked manifest and
-  export selected named parent specs.
+  `devuan`), explicit archives, or `--import <PATH-OR-URL>` from another
+  already-locked manifest (local path or `git+<scheme>://` URL).
+- `import` -- add or replace `[import]` using another already-locked manifest
+  (local path or git URL) and export selected named parent specs.
 - `edit` -- edit the manifest (`rdebootstrap edit`) or spec metadata (`edit env`,
   `edit script`).
 - `archive add`, `deb add` -- append repositories or register a local `.deb`.

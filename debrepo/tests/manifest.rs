@@ -11,9 +11,10 @@ use {
         content::{ContentProvider, DebLocation, IndexFile, UniverseFiles},
         control::{ControlFile, MutableControlStanza},
         deb::{DebReader, DebStage},
+        git::{GitRepo, MaterializedGitRepo},
         hash::{Hash, HashingReader},
         Dependency, HostFileSystem, Manifest, PackageOrigin, Packages, RepositoryFile, Sources,
-        Stage, TransportProvider,
+        Stage,
     },
     smol::io::AsyncRead,
     std::{
@@ -169,7 +170,7 @@ fn resolved_spec_apis_cover_parent_env_and_direct_stage_items() {
     });
 
     let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     assert!(!has_valid_lock);
 
     let child = manifest.lookup_spec(Some("child")).expect("child spec");
@@ -277,7 +278,7 @@ fn incremental_stage_local_stages_child_installables_and_merges_status() {
     let provider = FixtureProvider::local();
 
     let mut manifest = smol::block_on(async {
-        let (manifest, _) = Manifest::from_file(&path, ARCH)
+        let (manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
             .await
             .expect("load manifest");
         manifest
@@ -551,8 +552,16 @@ impl ContentProvider for FixtureProvider {
         Ok(self.source_universe.clone())
     }
 
-    fn transport(&self) -> &impl TransportProvider {
-        self.inner.transport()
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.inner.fetch_git_repo(repo).await
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.inner.materialize_git_paths(m, paths).await
     }
 }
 
@@ -583,7 +592,9 @@ fn store_uses_manifest_owned_path_when_lock_is_live() {
         create_locked_imported_manifest(dir.path(), &provider)
             .await
             .expect("create locked manifest");
-        let (mut manifest, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (mut manifest, has_valid_lock) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("load");
         assert!(has_valid_lock);
         manifest.store().await.expect("store");
     });
@@ -1659,7 +1670,9 @@ fn update_skips_archive_refresh_when_lock_is_valid() {
     let provider = TestProvider::with_release_counter(Arc::clone(&release_fetches));
 
     smol::block_on(async {
-        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("load");
         assert!(has_valid_lock);
         loaded
             .update(false, false, true, one(), &provider)
@@ -1685,7 +1698,7 @@ fn add_stage_items_rejects_imported_artifacts() {
     let mut downstream = Manifest::new(&downstream_path, ARCH, None);
     smol::block_on(async {
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
     });
@@ -1710,7 +1723,7 @@ fn resolve_rejects_downstream_stage_reference_to_imported_artifact() {
         let mut downstream = Manifest::new(&downstream_path, ARCH, None);
         downstream.add_spec(None).expect("add default spec");
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
         downstream.resolve(one(), &provider).await.expect("resolve");
@@ -1724,7 +1737,7 @@ fn resolve_rejects_downstream_stage_reference_to_imported_artifact() {
     });
 
     smol::block_on(async {
-        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH)
+        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH, &TestProvider::new())
             .await
             .expect("load");
         let err = loaded
@@ -1749,7 +1762,7 @@ fn stage_local_allows_inherited_imported_artifact_stage() {
         let mut downstream = Manifest::new(&downstream_path, ARCH, None);
         downstream.add_spec(None).expect("add default spec");
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
         downstream.resolve(one(), &provider).await.expect("resolve");
@@ -1761,7 +1774,7 @@ fn stage_local_allows_inherited_imported_artifact_stage() {
     });
 
     smol::block_on(async {
-        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH)
+        let (mut loaded, _) = Manifest::from_file(&downstream_path, ARCH, &TestProvider::new())
             .await
             .expect("load");
         loaded.resolve(one(), &provider).await.expect("resolve");
@@ -1799,15 +1812,16 @@ fn stale_import_requires_update_before_store_and_refreshes_on_update() {
 
         let mut downstream = Manifest::new(&downstream_path, ARCH, None);
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
         downstream.resolve(one(), &provider).await.expect("resolve");
         downstream.store().await.expect("store downstream");
 
-        let (mut imported, has_valid_lock) = Manifest::from_file(&imported_path, ARCH)
-            .await
-            .expect("load imported");
+        let (mut imported, has_valid_lock) =
+            Manifest::from_file(&imported_path, ARCH, &TestProvider::new())
+                .await
+                .expect("load imported");
         assert!(has_valid_lock);
         imported
             .set_build_script(Some("base"), Some("echo updated\n".to_string()))
@@ -1818,9 +1832,10 @@ fn stale_import_requires_update_before_store_and_refreshes_on_update() {
             .expect("resolve import");
         imported.store().await.expect("store import");
 
-        let (mut stale, has_valid_lock) = Manifest::from_file(&downstream_path, ARCH)
-            .await
-            .expect("load downstream with stale import");
+        let (mut stale, has_valid_lock) =
+            Manifest::from_file(&downstream_path, ARCH, &TestProvider::new())
+                .await
+                .expect("load downstream with stale import");
         assert!(!has_valid_lock);
         let err = stale
             .store()
@@ -1834,9 +1849,10 @@ fn stale_import_requires_update_before_store_and_refreshes_on_update() {
             .expect("refresh import");
         stale.store().await.expect("store refreshed downstream");
 
-        let (reloaded, has_valid_lock) = Manifest::from_file(&downstream_path, ARCH)
-            .await
-            .expect("reload downstream");
+        let (reloaded, has_valid_lock) =
+            Manifest::from_file(&downstream_path, ARCH, &TestProvider::new())
+                .await
+                .expect("reload downstream");
         assert!(has_valid_lock);
         assert!(reloaded.spec_ids().next().is_none());
     });
@@ -1861,7 +1877,7 @@ fn set_import_rejects_conflicting_local_spec_and_missing_requested_spec() {
 
     let conflict = smol::block_on(async {
         manifest
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect_err("conflicting spec name must fail")
     });
@@ -1872,7 +1888,11 @@ fn set_import_rejects_conflicting_local_spec_and_missing_requested_spec() {
     let mut manifest = Manifest::new(&path, ARCH, None);
     let missing = smol::block_on(async {
         manifest
-            .set_import(Path::new("imported.toml"), ["missing"])
+            .set_import(
+                Path::new("imported.toml"),
+                ["missing"],
+                &TestProvider::new(),
+            )
             .await
             .expect_err("missing imported spec must fail")
     });
@@ -1895,7 +1915,7 @@ fn from_file_rejects_circular_imports() {
 
         let mut downstream = Manifest::new(&downstream_path, ARCH, None);
         downstream
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
         downstream.resolve(one(), &provider).await.expect("resolve");
@@ -1915,7 +1935,11 @@ fn from_file_rejects_circular_imports() {
         doc["import"]["specs"] = toml_edit::Item::Value(specs.into());
     });
 
-    let err = match smol::block_on(Manifest::from_file(&downstream_path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(
+        &downstream_path,
+        ARCH,
+        &TestProvider::new(),
+    )) {
         Ok(_) => panic!("circular import must fail"),
         Err(err) => err,
     };
@@ -1959,7 +1983,7 @@ fn spec_graph_public_apis_cover_order_and_ancestors() {
     .expect("write manifest");
 
     let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     assert!(!has_valid_lock);
     assert_eq!(
         manifest
@@ -2007,7 +2031,7 @@ fn child_spec_cannot_exclude_a_locked_parent_package() {
     let provider = FixtureProvider::local();
 
     let mut manifest = smol::block_on(async {
-        let (manifest, _) = Manifest::from_file(&path, ARCH)
+        let (manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
             .await
             .expect("load manifest");
         manifest
@@ -2054,7 +2078,7 @@ fn from_file_rejects_spec_cycles_and_missing_parents() {
         ),
     )
     .expect("write cycle manifest");
-    let err = match smol::block_on(Manifest::from_file(&cycle_path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(&cycle_path, ARCH, &TestProvider::new())) {
         Ok(_) => panic!("cycle must fail"),
         Err(err) => err,
     };
@@ -2066,7 +2090,11 @@ fn from_file_rejects_spec_cycles_and_missing_parents() {
         concat!("[spec.child]\n", "extends = \"missing\"\n",),
     )
     .expect("write missing-parent manifest");
-    let err = match smol::block_on(Manifest::from_file(&missing_path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(
+        &missing_path,
+        ARCH,
+        &TestProvider::new(),
+    )) {
         Ok(_) => panic!("missing parent must fail"),
         Err(err) => err,
     };
@@ -2269,7 +2297,9 @@ fn local_package_update_requires_force_locals_to_refresh_changed_fixture() {
     });
 
     smol::block_on(async {
-        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (mut loaded, has_valid_lock) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("load");
         assert!(!has_valid_lock);
         let err = loaded
             .update(false, false, true, one(), &provider)
@@ -2406,7 +2436,8 @@ fn multi_parent_extends_parses_string_and_array_forms() {
     // String form (existing single-parent shape)
     let single = dir.path().join("single.toml");
     std::fs::write(&single, "[spec.base]\n[spec.child]\nextends = \"base\"\n").expect("write");
-    let (m, _) = smol::block_on(Manifest::from_file(&single, ARCH)).expect("load");
+    let (m, _) =
+        smol::block_on(Manifest::from_file(&single, ARCH, &TestProvider::new())).expect("load");
     let child = m.lookup_spec(Some("child")).expect("child");
     let parents = child.parents().expect("parents");
     assert_eq!(parents.len(), 1);
@@ -2419,7 +2450,8 @@ fn multi_parent_extends_parses_string_and_array_forms() {
         "[spec.a]\n[spec.b]\n[spec.c]\nextends = [\"a\", \"b\"]\n",
     )
     .expect("write");
-    let (m, _) = smol::block_on(Manifest::from_file(&multi, ARCH)).expect("load");
+    let (m, _) =
+        smol::block_on(Manifest::from_file(&multi, ARCH, &TestProvider::new())).expect("load");
     let c = m.lookup_spec(Some("c")).expect("c spec");
     let parents = c.parents().expect("parents");
     assert_eq!(parents.len(), 2);
@@ -2446,7 +2478,8 @@ fn multi_parent_ancestors_in_topological_order_with_diamond_dedup() {
         ),
     )
     .expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let leaf = manifest.lookup_spec(Some("leaf")).expect("leaf");
     let names: Vec<String> = leaf
         .ancestors()
@@ -2463,7 +2496,7 @@ fn multi_parent_self_extend_and_cycle_rejected() {
     // Self-extend
     let self_path = dir.path().join("self.toml");
     std::fs::write(&self_path, "[spec.a]\nextends = [\"a\"]\n").expect("write");
-    let err = match smol::block_on(Manifest::from_file(&self_path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(&self_path, ARCH, &TestProvider::new())) {
         Ok(_) => panic!("self-extend must fail"),
         Err(err) => err,
     };
@@ -2480,7 +2513,7 @@ fn multi_parent_self_extend_and_cycle_rejected() {
         ),
     )
     .expect("write");
-    let err = match smol::block_on(Manifest::from_file(&cycle_path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(&cycle_path, ARCH, &TestProvider::new())) {
         Ok(_) => panic!("cycle must fail"),
         Err(err) => err,
     };
@@ -2503,7 +2536,8 @@ fn multi_parent_effective_build_env_conflict_errors_unless_child_overrides() {
         ),
     )
     .expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let c = manifest.lookup_spec(Some("c")).expect("c");
     let err = c.effective_build_env().expect_err("must conflict");
     assert!(
@@ -2523,7 +2557,8 @@ fn multi_parent_effective_build_env_conflict_errors_unless_child_overrides() {
         ),
     )
     .expect("write");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let c = manifest.lookup_spec(Some("c")).expect("c");
     let env = c.effective_build_env().expect("env");
     assert_eq!(env, vec![("FOO".to_string(), "c".to_string())]);
@@ -2542,7 +2577,8 @@ fn multi_parent_effective_meta_conflict_errors_unless_child_overrides() {
         ),
     )
     .expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let c = manifest.lookup_spec(Some("c")).expect("c");
     let err = c.effective_meta().expect_err("must conflict");
     assert!(err.to_string().contains("conflicting meta"), "got: {err}");
@@ -2558,7 +2594,8 @@ fn multi_parent_effective_meta_conflict_errors_unless_child_overrides() {
         ),
     )
     .expect("write");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let c = manifest.lookup_spec(Some("c")).expect("c");
     let meta = c.effective_meta().expect("meta");
     assert_eq!(meta, vec![("layout", "rootfs")]);
@@ -2578,7 +2615,8 @@ fn multi_parent_build_script_runs_each_unique_ancestor_once_in_topo_order() {
         ),
     )
     .expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let leaf = manifest.lookup_spec(Some("leaf")).expect("leaf");
     // Topo order ancestors-first: base -> a -> b -> leaf.  Diamond ancestor
     // base appears exactly once.
@@ -2608,7 +2646,8 @@ fn multi_parent_descendant_spec_ids_walks_dag() {
         ),
     )
     .expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(&path, ARCH)).expect("load");
+    let (manifest, _) =
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())).expect("load");
     let mut descendants = manifest.descendant_spec_ids(spec_id(&manifest, Some("base")));
     descendants.sort();
     let mut expected = vec![
@@ -2649,7 +2688,9 @@ fn multi_parent_set_extends_persists_array_form() {
     // Now reduce to a single parent and confirm it goes back to the
     // string form.
     smol::block_on(async {
-        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("load");
         manifest
             .set_extends(Some("c"), &["a"])
             .expect("set single parent");
@@ -2725,7 +2766,9 @@ fn multi_parent_install_union_blocks_child_from_dropping_either_parent_pkg() {
     let provider = FixtureProvider::local();
 
     let pkg_name = smol::block_on(async {
-        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("load");
         let (file, ctrl) = provider
             .ensure_deb("base.deb", &pkg_path)
             .await
@@ -2760,7 +2803,9 @@ fn multi_parent_install_union_blocks_child_from_dropping_either_parent_pkg() {
     // Now try to drop the package via c.exclude -- the additive constraint
     // must reject it.
     smol::block_on(async {
-        let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("reload");
+        let (mut manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("reload");
         manifest
             .add_constraints(Some("c"), [pkg_name.as_str()], None)
             .expect("forbid in child");
@@ -2802,7 +2847,9 @@ fn multi_parent_hash_stability_for_single_parent_chain() {
         )
         .expect("write");
         smol::block_on(async {
-            let (mut manifest, _) = Manifest::from_file(&path, ARCH).await.expect("load");
+            let (mut manifest, _) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+                .await
+                .expect("load");
             let (file, ctrl) = provider
                 .ensure_deb("base.deb", &pkg_path)
                 .await

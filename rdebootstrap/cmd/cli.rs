@@ -1,14 +1,79 @@
 use {
     clap::Parser,
     debrepo::{
-        auth::AuthProvider, cli as deb_cli, content::HostCache, HostFileSystem, HttpTransport,
-        Manifest, DEFAULT_ARCH,
+        auth::AuthProvider,
+        cli as deb_cli,
+        content::{HostCache, HostCacheOptions},
+        HostFileSystem, Manifest, DEFAULT_ARCH,
     },
     std::{
         num::NonZero,
         path::{Path, PathBuf},
+        sync::Arc,
     },
 };
+
+impl App {
+    fn manifest_dir(&self) -> std::io::Result<PathBuf> {
+        let base = self
+            .manifest
+            .parent()
+            .map(|s| {
+                if s.as_os_str().is_empty() {
+                    Path::new(".")
+                } else {
+                    s
+                }
+            })
+            .ok_or_else(|| {
+                std::io::Error::other(format!(
+                    "invalid manifest file path: {}",
+                    self.manifest.display()
+                ))
+            })?;
+        std::fs::canonicalize(base).map_err(|err| {
+            std::io::Error::other(format!(
+                "failed to find manifest file parent directory {}: {}",
+                self.manifest.parent().unwrap_or(Path::new(".")).display(),
+                err
+            ))
+        })
+    }
+
+    fn ensure_auth(&self) -> std::io::Result<&Arc<AuthProvider>> {
+        static AUTH: once_cell::sync::OnceCell<Arc<AuthProvider>> =
+            once_cell::sync::OnceCell::new();
+        AUTH.get_or_try_init(|| {
+            let base = self.manifest_dir()?;
+            let auth_file = base.join("auth.toml");
+            let auth_file = std::fs::canonicalize(&auth_file)
+                .ok()
+                .and_then(|p| p.into_os_string().into_string().ok());
+            let provider = AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?;
+            Ok(Arc::new(provider))
+        })
+    }
+
+    fn cache_root(&self) -> std::io::Result<PathBuf> {
+        if let Some(path) = self.cache_dir.as_deref() {
+            std::fs::create_dir_all(path)?;
+            return std::fs::canonicalize(path);
+        }
+        if self.no_cache {
+            return Ok(std::env::temp_dir().join("rdebootstrap-nocache"));
+        }
+        let base = if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
+            PathBuf::from(xdg)
+        } else if let Some(home) = std::env::var_os("HOME") {
+            PathBuf::from(home).join(".cache")
+        } else {
+            std::env::temp_dir()
+        };
+        let dir = base.join("rdebootstrap");
+        std::fs::create_dir_all(&dir)?;
+        Ok(dir)
+    }
+}
 
 impl deb_cli::Config for App {
     type FS = HostFileSystem;
@@ -32,50 +97,17 @@ impl deb_cli::Config for App {
     fn fetcher(&self) -> std::io::Result<&HostCache> {
         static PROVIDER: once_cell::sync::OnceCell<HostCache> = once_cell::sync::OnceCell::new();
         PROVIDER.get_or_try_init(|| {
-            let base = self
-                .manifest
-                .parent()
-                .map(|s| {
-                    if s.as_os_str().is_empty() {
-                        Path::new(".")
-                    } else {
-                        s
-                    }
-                })
-                .ok_or_else(|| {
-                    std::io::Error::other(format!(
-                        "invalid manifest file path: {}",
-                        self.manifest.display()
-                    ))
-                })?;
-            let base = std::fs::canonicalize(base).map_err(|err| {
-                std::io::Error::other(format!(
-                    "failed to find manifest file parent directory {}: {}",
-                    self.manifest.parent().unwrap_or(Path::new(".")).display(),
-                    err
-                ))
-            })?;
-            if let Some(path) = self.cache_dir.as_deref() {
-                std::fs::create_dir_all(path).map_err(|err| {
-                    std::io::Error::other(format!(
-                        "failed to create cache directory {}: {}",
-                        path.display(),
-                        err
-                    ))
-                })?;
-            }
-            let auth_file = base.join("auth.toml");
-            let auth_file = std::fs::canonicalize(&auth_file)
-                .ok()
-                .and_then(|p| p.into_os_string().into_string().ok());
+            let auth = Arc::clone(self.ensure_auth()?);
+            let cache_root = self.cache_root()?;
             Ok(HostCache::new(
-                HttpTransport::new(
-                    AuthProvider::new(self.auth.as_deref().or(auth_file.as_deref()))?,
-                    self.insecure,
-                    self.http11,
-                    self.timeout.map(std::time::Duration::from_secs),
-                ),
-                self.cache_dir.as_deref(),
+                cache_root,
+                auth,
+                HostCacheOptions {
+                    cache_http: !self.no_cache,
+                    insecure: self.insecure,
+                    force_http11: self.http11,
+                    timeout: self.timeout.map(std::time::Duration::from_secs),
+                },
             ))
         })
     }

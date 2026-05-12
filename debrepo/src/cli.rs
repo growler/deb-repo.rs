@@ -157,6 +157,7 @@ pub mod cmd {
             builder::ExecutorKind,
             comp::is_comp_ext,
             content::{ContentProviderGuard, HostCache},
+            git::{parse_import_target, ImportTarget},
             hash::{Hash, HashAlgo},
             manifest::Manifest,
             staging::HostFileSystem,
@@ -178,10 +179,19 @@ pub mod cmd {
         about = "Create a new manifest file",
         long_about = r#"Create a new manifest file from an archive definition, vendor preset, or imported manifest.
 If a vendor name is provided as the archive URL, default archives and packages are derived from it.
-Use --import PATH to bootstrap from another already-locked manifest instead of defining local archives.
+Use --import to bootstrap from another already-locked manifest.  The target can be a local
+path or a `git+<scheme>://...` URL referencing a manifest hosted in a git repository.
+Accepted --import shapes:
+    path/to/manifest.toml
+    file:///absolute/path/manifest.toml
+    git+ssh://[git@]host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+https://host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+http://host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+file:///absolute/path/to/repo?rev=<sha>|ref=<name>#path/to/manifest.toml
 Examples:
     rdebootstrap init debian --package mc --package libcom-err2
-    rdebootstrap init --import ../base/Manifest.toml --spec base"#
+    rdebootstrap init --import ../base/Manifest.toml --spec base
+    rdebootstrap init --import 'git+https://gitlab.com/org/sys.git?rev=v1.2.3#sys/Manifest.toml' --spec base"#
     )]
     /// CLI command: initialize a new repository manifest.
     pub struct Init {
@@ -206,10 +216,13 @@ Examples:
         )]
         meta: Vec<String>,
 
-        /// Import another already-locked manifest instead of defining local archives
+        /// Import another already-locked manifest from a local path or
+        /// from a git-hosted manifest (`git+ssh://`, `git+https://`,
+        /// `git+http://`, `git+file://`).  See the long help for the
+        /// exact accepted shapes.
         #[arg(
             long = "import",
-            value_name = "PATH",
+            value_name = "PATH-OR-URL",
             conflicts_with_all = [
                 "url",
                 "arch",
@@ -223,7 +236,7 @@ Examples:
                 "priority",
             ]
         )]
-        import: Option<PathBuf>,
+        import: Option<String>,
 
         /// Spec name to export from the imported manifest (repeatable, optional)
         #[arg(
@@ -250,15 +263,33 @@ Examples:
     impl<C: Config> Command<C> for Init {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let mut mf = if let Some(path) = self.import.as_deref() {
+                let mut mf = if let Some(target_str) = self.import.as_deref() {
+                    let target = parse_import_target(target_str)?;
+                    let fetcher = conf.fetcher()?;
                     let mut mf =
                         Manifest::new(conf.manifest(), conf.arch(), self.comment.as_deref());
-                    let path = rebase_pathbuf_input(path, conf.manifest())?;
-                    mf.set_import(&path, &self.specs).await?;
+                    match target {
+                        ImportTarget::LocalPath(path) => {
+                            let path = rebase_pathbuf_input(&path, conf.manifest())?;
+                            mf.set_import(&path, &self.specs, fetcher).await?;
+                        }
+                        ImportTarget::Git(arg) => {
+                            mf.set_import_git(
+                                fetcher,
+                                arg.repo.remote,
+                                arg.repo.revspec,
+                                &arg.path,
+                                &self.specs,
+                            )
+                            .await?;
+                        }
+                    }
                     mf
                 } else {
                     let mut archive = self.archive.to_archive().ok_or_else(|| {
-                        anyhow!("either an archive/vendor template or --import PATH is required")
+                        anyhow!(
+                            "either an archive/vendor template or --import PATH-OR-URL is required"
+                        )
                     })?;
                     archive.signed_by =
                         rebase_signed_by_input(&archive.signed_by, conf.manifest())?;
@@ -335,7 +366,7 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -383,7 +414,7 @@ Examples:
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let path = rebase_cli_local_input(path, conf.manifest())?;
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -426,7 +457,7 @@ Examples:
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -498,7 +529,8 @@ Examples:
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 let archive = Archive::from(&self.archive);
                 if let Some((archives, _)) = archive.as_vendor() {
                     for archive in archives {
@@ -535,7 +567,8 @@ Examples:
                     .as_str()
                     .map_err(|err| anyhow!("invalid path: {}", err))?;
                 let path = rebase_cli_local_input(path, conf.manifest())?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.drop_local_package(&path)?;
                 mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
@@ -583,7 +616,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 if !self.constraints_only {
                     mf.remove_requirements(self.spec.as_deref(), self.cons.iter())?;
                 }
@@ -622,7 +656,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -665,7 +699,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -715,7 +749,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.add_requirements(
                     self.spec.as_deref(),
                     self.reqs.iter(),
@@ -756,7 +791,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.add_constraints(
                     self.spec.as_deref(),
                     self.reqs.iter(),
@@ -799,10 +835,14 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 let force_archives = self.archives || self.snapshot.is_some();
                 let force = force_archives || self.locals;
-                if has_valid_lock && !force {
+                let mut git_refreshed = false;
+                if self.locals {
+                    git_refreshed = mf.refresh_git_import(fetcher).await?;
+                }
+                if has_valid_lock && !force && !git_refreshed {
                     tracing::debug!("Lock file is up to date, nothing to do");
                     return Ok(());
                 }
@@ -827,13 +867,32 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     #[derive(Parser)]
     #[command(
         about = "Add or replace an imported manifest",
-        long_about = "Configure a manifest import: validates an already-locked imported manifest, optionally exports selected named specs for downstream extends, and writes [import] to the downstream manifest."
+        long_about = r#"Configure a manifest import: validates an already-locked imported manifest, optionally
+exports selected named specs for downstream extends, and writes [import] to the
+downstream manifest.
+
+The first positional argument is either a local manifest path or a `git+<scheme>://`
+URL referencing a manifest hosted in a git repository.  When a git URL is given the
+manifest is fetched, validated, and pinned with the resolved commit SHA.
+
+Accepted shapes (identical to `init --import`):
+    path/to/manifest.toml
+    file:///absolute/path/manifest.toml
+    git+ssh://[git@]host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+https://host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+http://host/repo[.git]?rev=<sha>|ref=<name>#path/to/manifest.toml
+    git+file:///absolute/path/to/repo?rev=<sha>|ref=<name>#path/to/manifest.toml
+
+Examples:
+    rdebootstrap import ../base/Manifest.toml --spec base
+    rdebootstrap import 'git+https://gitlab.com/org/sys.git?rev=v1.2.3#sys/Manifest.toml' --spec base
+    rdebootstrap import 'git+ssh://git@gitlab.com/org/sys.git?ref=main#sys/Manifest.toml' --spec base"#
     )]
     /// CLI command: configure a manifest import.
     pub struct ImportCmd {
-        /// Path to the manifest file to import (absolute or relative to current working directory)
-        #[arg(value_name = "PATH")]
-        path: PathBuf,
+        /// Local path or git URL of the manifest to import
+        #[arg(value_name = "PATH-OR-URL")]
+        target: String,
 
         /// Spec name to export from the imported manifest (repeatable, optional)
         #[arg(long = "spec", value_name = "SPEC", value_delimiter = ',')]
@@ -843,12 +902,28 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for ImportCmd {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
-                let path = rebase_pathbuf_input(&self.path, conf.manifest())?;
-                mf.set_import(&path, &self.specs).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
+                let target = parse_import_target(&self.target)?;
                 let fetcher = conf.fetcher()?;
+                match target {
+                    ImportTarget::Git(arg) => {
+                        mf.set_import_git(
+                            fetcher,
+                            arg.repo.remote,
+                            arg.repo.revspec,
+                            &arg.path,
+                            &self.specs,
+                        )
+                        .await?;
+                    }
+                    ImportTarget::LocalPath(path) => {
+                        let path = rebase_pathbuf_input(&path, conf.manifest())?;
+                        mf.set_import(&path, &self.specs, fetcher).await?;
+                    }
+                }
                 let guard = fetcher.init().await?;
-                mf.resolve(conf.concurrency(), conf.fetcher()?).await?;
+                mf.resolve(conf.concurrency(), fetcher).await?;
                 mf.store().await?;
                 guard.commit().await?;
                 Ok(())
@@ -876,7 +951,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let res = self
@@ -963,7 +1039,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -1012,7 +1088,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecList {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 for spec in mf.specs() {
                     println!("{}", spec.display_name());
                 }
@@ -1138,7 +1215,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
     impl<C: Config> Command<C> for SpecGetMeta {
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
-                let (mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 let spec = mf.lookup_spec(self.spec.as_deref())?;
                 match spec.get_meta(&self.name)? {
                     Some(value) => {
@@ -1174,7 +1252,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -1233,7 +1311,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             }
             smol::block_on(async move {
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -1317,7 +1395,7 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
         fn exec(&self, conf: &C) -> Result<()> {
             smol::block_on(async move {
                 let (mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -1349,7 +1427,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
             smol::block_on(async move {
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.load_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let pkg = mf.universe_packages()?.find(|p| self.package == p.name());
@@ -1387,7 +1466,8 @@ Use --requirements-only or --constraints-only to limit the operation scope."#
                 })?;
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
-                let (mut mf, _) = Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                let (mut mf, _) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 mf.load_source_universe(conf.concurrency(), fetcher).await?;
                 guard.commit().await?;
                 let found = mf.find_source(&name)?;
@@ -1747,7 +1827,7 @@ hash = \"{}\"
                 let fetcher = conf.fetcher()?;
                 let guard = fetcher.init().await?;
                 let (mut mf, has_valid_lock) =
-                    Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher).await?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }
@@ -1806,15 +1886,16 @@ hash = \"{}\"
                             err
                         )
                     })?;
-                let (manifest, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch())
-                    .await
-                    .map_err(|err| {
-                        anyhow!(
-                            "failed to load manifest from {}: {}",
-                            conf.manifest().display(),
-                            err
-                        )
-                    })?;
+                let (manifest, has_valid_lock) =
+                    Manifest::from_file(conf.manifest(), conf.arch(), fetcher)
+                        .await
+                        .map_err(|err| {
+                            anyhow!(
+                                "failed to load manifest from {}: {}",
+                                conf.manifest().display(),
+                                err
+                            )
+                        })?;
                 if !has_valid_lock {
                     return Err(anyhow!("manifest lock is not live; run update first"));
                 }

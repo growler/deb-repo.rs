@@ -6,9 +6,9 @@ use {
         cli,
         content::{ContentProvider, ContentProviderGuard, DebLocation, IndexFile, UniverseFiles},
         control::MutableControlStanza,
+        git::{GitRepo, MaterializedGitRepo},
         hash::Hash,
         HostFileSystem, Manifest, Packages, RepositoryFile, Sources, Stage, StagingFileSystem,
-        TransportProvider,
     },
     std::{
         future::Future,
@@ -140,18 +140,6 @@ pub fn write_executable(path: &Path, body: &str) {
     std::fs::set_permissions(path, perms).expect("set permissions");
 }
 
-#[derive(Default)]
-struct TestTransport;
-
-impl TransportProvider for TestTransport {
-    async fn open(
-        &self,
-        _url: &str,
-    ) -> io::Result<(Pin<Box<dyn smol::io::AsyncRead + Send>>, Option<u64>)> {
-        Err(io::Error::other("transport disabled in tests"))
-    }
-}
-
 pub struct TestGuard;
 
 impl ContentProviderGuard<'_> for TestGuard {
@@ -190,7 +178,6 @@ pub const REQUIREMENTS_PACKAGES: &str = concat!(
 );
 
 pub struct TestProvider {
-    transport: TestTransport,
     package_source: Option<String>,
     release_fetches: Option<Arc<AtomicUsize>>,
     release_urls: Option<Arc<Mutex<Vec<String>>>>,
@@ -199,7 +186,6 @@ pub struct TestProvider {
 impl TestProvider {
     pub fn new() -> Self {
         Self {
-            transport: TestTransport,
             package_source: None,
             release_fetches: None,
             release_urls: None,
@@ -208,7 +194,6 @@ impl TestProvider {
 
     pub fn with_packages(source: &str) -> Self {
         Self {
-            transport: TestTransport,
             package_source: Some(source.to_string()),
             release_fetches: None,
             release_urls: None,
@@ -217,7 +202,6 @@ impl TestProvider {
 
     pub fn with_release_counter(release_fetches: Arc<AtomicUsize>) -> Self {
         Self {
-            transport: TestTransport,
             package_source: None,
             release_fetches: Some(release_fetches),
             release_urls: None,
@@ -226,7 +210,6 @@ impl TestProvider {
 
     pub fn with_release_urls(release_urls: Arc<Mutex<Vec<String>>>) -> Self {
         Self {
-            transport: TestTransport,
             package_source: None,
             release_fetches: None,
             release_urls: Some(release_urls),
@@ -373,8 +356,16 @@ impl ContentProvider for TestProvider {
         Err(io::Error::other("unused in tests"))
     }
 
-    fn transport(&self) -> &impl TransportProvider {
-        &self.transport
+    async fn fetch_git_repo(&self, _repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        Err(io::Error::other("git imports disabled in tests"))
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        _m: &MaterializedGitRepo,
+        _paths: &[PathBuf],
+    ) -> io::Result<()> {
+        Err(io::Error::other("git imports disabled in tests"))
     }
 }
 

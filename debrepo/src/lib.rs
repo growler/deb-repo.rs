@@ -23,6 +23,8 @@ pub mod deb;
 pub mod error;
 /// Execution helpers for running external tools.
 pub mod exec;
+/// Git transport for `[import.git]` manifests.
+pub mod git;
 /// Hashing helpers and digest encodings.
 pub mod hash;
 mod idmap;
@@ -57,7 +59,7 @@ pub use {
     release::{Release, ReleaseIndexFile},
     sources::{Source, SourceUniverse, Sources},
     staging::{FileList, HostFileSystem, Stage, StagingFile, StagingFileSystem},
-    transport::{HttpTransport, TransportProvider},
+    transport::HttpTransport,
     version::{Constraint, Dependency, Version, VersionSet},
 };
 pub(crate) type LocalPackagesHash = sha2::Sha256;

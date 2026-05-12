@@ -9,15 +9,11 @@ use {
         HttpClient, Request,
     },
     smol::io::{self, AsyncRead},
-    std::{future::Future, pin::Pin},
+    std::{pin::Pin, sync::Arc},
 };
 
 type TransportReader = Pin<Box<dyn AsyncRead + Send>>;
 type OpenResult = io::Result<(TransportReader, Option<u64>)>;
-
-pub trait TransportProvider: Sync + Send {
-    fn open(&self, url: &str) -> impl Future<Output = OpenResult>;
-}
 
 async fn build_http_request(
     auth: &AuthProvider,
@@ -97,15 +93,15 @@ fn build_client(
 /// HTTP/HTTPS transport with optional auth and insecure mode.
 pub struct HttpTransport {
     client: once_cell::sync::OnceCell<HttpClient>,
-    auth: AuthProvider,
+    auth: Arc<AuthProvider>,
     insecure: bool,
     force_http11: bool,
     timeout: Option<std::time::Duration>,
 }
 
 impl HttpTransport {
-    pub fn new(
-        auth: AuthProvider,
+    pub fn new<A: Into<Arc<AuthProvider>>>(
+        auth: A,
         insecure: bool,
         force_http11: bool,
         timeout: Option<std::time::Duration>,
@@ -113,7 +109,7 @@ impl HttpTransport {
         Self {
             insecure,
             force_http11,
-            auth,
+            auth: auth.into(),
             client: once_cell::sync::OnceCell::new(),
             timeout,
         }
@@ -124,8 +120,8 @@ impl HttpTransport {
     }
 }
 
-impl TransportProvider for HttpTransport {
-    async fn open(&self, url: &str) -> OpenResult {
+impl HttpTransport {
+    pub async fn open(&self, url: &str) -> OpenResult {
         const TIMEOUT_RETRIES: usize = 3;
         let url = to_url(url)?;
         let scheme = url.scheme();

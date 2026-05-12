@@ -1,11 +1,13 @@
 mod common;
 
 use {
-    common::{one, ARCH},
+    common::{one, TestProvider, ARCH},
     debrepo::{
         artifact::Artifact,
         auth::AuthProvider,
-        content::{ContentProvider, ContentProviderGuard, DebLocation, HostCache},
+        content::{
+            ContentProvider, ContentProviderGuard, DebLocation, HostCache, HostCacheOptions,
+        },
         hash::Hash,
         Archive, HostFileSystem, Manifest, Stage,
     },
@@ -14,6 +16,7 @@ use {
     std::{
         fs, io,
         path::{Path, PathBuf},
+        sync::Arc,
     },
 };
 
@@ -23,15 +26,17 @@ fn fixture_path(name: &str) -> PathBuf {
         .join(name)
 }
 
-fn host_cache(cache: Option<&Path>) -> HostCache {
+fn host_cache(cache: &Path, cache_http: bool) -> HostCache {
+    let auth = Arc::new(AuthProvider::new::<&str>(None).expect("auth"));
     HostCache::new(
-        debrepo::HttpTransport::new(
-            AuthProvider::new::<&str>(None).expect("auth"),
-            false,
-            false,
-            None,
-        ),
         cache,
+        auth,
+        HostCacheOptions {
+            cache_http,
+            insecure: false,
+            force_http11: false,
+            timeout: None,
+        },
     )
 }
 
@@ -87,7 +92,8 @@ fn artifact_manifest_text(key: &str, body: &str) -> String {
 
 fn load_artifact(path: &Path, key: &str, body: &str) -> Artifact {
     fs::write(path, artifact_manifest_text(key, body)).expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(path, ARCH)).expect("load manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(path, ARCH, &TestProvider::new()))
+        .expect("load manifest");
     manifest.artifact(key).expect("artifact").clone()
 }
 
@@ -196,8 +202,9 @@ fn deblocation_display_and_hostcache_init_commit_cover_public_helpers() {
     );
 
     let cache_dir = tempfile::tempdir().expect("cache tempdir");
-    let cached = host_cache(Some(cache_dir.path()));
-    let uncached = host_cache(None);
+    let cached = host_cache(cache_dir.path(), true);
+    let _cache_dir_1 = tempfile::tempdir().expect("cache tempdir");
+    let uncached = host_cache(_cache_dir_1.path(), false);
 
     smol::block_on(async {
         let guard = cached.init().await.expect("init cached");
@@ -216,7 +223,8 @@ fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
         .file_name()
         .and_then(|name| name.to_str())
         .expect("fixture file name");
-    let cache = host_cache(None);
+    let _cache_dir_2 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_2.path(), false);
 
     let (repo_file, ctrl) =
         smol::block_on(cache.ensure_deb("pool/main/f/fixture-rich.deb", &fixture))
@@ -273,7 +281,7 @@ fn ensure_deb_and_fetch_deb_cover_local_remote_and_cache_paths() {
     assert!(remote_root.path().join("usr/bin/fixture-rich").exists());
 
     let cache_dir = tempfile::tempdir().expect("deb cache");
-    let cached = host_cache(Some(cache_dir.path()));
+    let cached = host_cache(cache_dir.path(), true);
     let cached_root = tempfile::tempdir().expect("cached root");
     smol::block_on(async {
         let stage = cached
@@ -338,7 +346,8 @@ fn ensure_and_fetch_artifact_cover_text_and_local_paths() {
             zero_sha256_sri()
         ),
     );
-    let cache = host_cache(None);
+    let _cache_dir_3 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_3.path(), false);
 
     smol::block_on(async {
         cache
@@ -408,7 +417,8 @@ fn ensure_and_fetch_artifact_cover_remote_paths_and_cache() {
             zero_sha256_sri()
         ),
     );
-    let cache = host_cache(None);
+    let _cache_dir_4 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_4.path(), false);
 
     smol::block_on(async {
         cache
@@ -432,7 +442,7 @@ fn ensure_and_fetch_artifact_cover_remote_paths_and_cache() {
     );
 
     let cache_dir = tempfile::tempdir().expect("artifact cache");
-    let cached = host_cache(Some(cache_dir.path()));
+    let cached = host_cache(cache_dir.path(), true);
     let cached_manifest_path = dir.path().join("CachedManifest.toml");
     let cached_artifact = load_artifact(
         &cached_manifest_path,
@@ -489,7 +499,8 @@ fn fetch_artifact_reports_remote_open_errors_with_context() {
             zero_sha256_sri()
         ),
     );
-    let cache = host_cache(None);
+    let _cache_dir_5 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_5.path(), false);
 
     let err = match smol::block_on(cache.fetch_artifact(&artifact, None)) {
         Ok(_) => panic!("fetch should fail"),
@@ -517,7 +528,8 @@ fn fetch_index_and_release_files_cover_cache_and_plain_text() {
     let index_hash = Hash::from_hex("SHA256", &index_hash_hex).expect("index hash");
     let index_url = file_url(&index_path);
 
-    let uncached = host_cache(None);
+    let _cache_dir_6 = tempfile::tempdir().expect("cache tempdir");
+    let uncached = host_cache(_cache_dir_6.path(), false);
     let index = smol::block_on(uncached.fetch_index_file(
         index_hash.clone(),
         index_size,
@@ -532,7 +544,7 @@ fn fetch_index_and_release_files_cover_cache_and_plain_text() {
     assert_eq!(release.as_str(), release_text);
 
     let cache_dir = tempfile::tempdir().expect("index cache");
-    let cached = host_cache(Some(cache_dir.path()));
+    let cached = host_cache(cache_dir.path(), true);
     let first = smol::block_on(cached.fetch_index_file(
         index_hash.clone(),
         index_size,
@@ -554,7 +566,8 @@ fn fetch_index_and_release_files_cover_cache_and_plain_text() {
 #[test]
 fn manifest_archive_flow_stages_apt_lists_when_opted_in() {
     let fixture = fixture_path("rich-xz.deb");
-    let cache = host_cache(None);
+    let _cache_dir_7 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_7.path(), false);
     let (repo_file, ctrl) =
         smol::block_on(cache.ensure_deb("pool/main/f/fixture-rich.deb", &fixture))
             .expect("ensure fixture deb");
@@ -642,7 +655,8 @@ fn manifest_archive_flow_stages_apt_lists_when_opted_in() {
 #[test]
 fn manifest_archive_flow_skips_staging_apt_lists_without_opt_in() {
     let fixture = fixture_path("rich-xz.deb");
-    let cache = host_cache(None);
+    let _cache_dir_8 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_8.path(), false);
     let (repo_file, ctrl) =
         smol::block_on(cache.ensure_deb("pool/main/f/fixture-rich.deb", &fixture))
             .expect("ensure fixture deb");
@@ -720,7 +734,8 @@ fn manifest_archive_flow_skips_staging_apt_lists_without_opt_in() {
 
 #[test]
 fn manifest_archive_flow_reports_invalid_packages_and_sources() {
-    let cache = host_cache(None);
+    let _cache_dir_9 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_9.path(), false);
 
     let (_bad_repo, bad_archive, package_name) = smol::block_on(build_archive_repo(
         "not a packages index\n",

@@ -7,7 +7,7 @@ use {
         artifact::{Artifact, ArtifactArg},
         auth::AuthProvider,
         cli::Command,
-        content::HostCache,
+        content::{HostCache, HostCacheOptions},
         hash::Hash,
         CompressionLevel, HostFileSystem, Manifest, Stage,
     },
@@ -20,6 +20,7 @@ use {
             fs::{symlink, MetadataExt, PermissionsExt},
         },
         path::{Path, PathBuf},
+        sync::Arc,
     },
 };
 
@@ -35,7 +36,8 @@ fn artifact_manifest_text(key: &str, body: &str) -> String {
 
 fn load_artifact(path: &Path, key: &str, body: &str) -> Artifact {
     fs::write(path, artifact_manifest_text(key, body)).expect("write manifest");
-    let (manifest, _) = smol::block_on(Manifest::from_file(path, ARCH)).expect("load manifest");
+    let (manifest, _) = smol::block_on(Manifest::from_file(path, ARCH, &TestProvider::new()))
+        .expect("load manifest");
     manifest.artifact(key).expect("artifact").clone()
 }
 
@@ -45,15 +47,17 @@ fn file_url(path: &Path) -> String {
         .to_string()
 }
 
-fn host_cache(cache: Option<&Path>) -> HostCache {
+fn host_cache(cache: &Path, cache_http: bool) -> HostCache {
+    let auth = Arc::new(AuthProvider::new::<&str>(None).expect("auth"));
     HostCache::new(
-        debrepo::HttpTransport::new(
-            AuthProvider::new::<&str>(None).expect("auth"),
-            false,
-            false,
-            None,
-        ),
         cache,
+        auth,
+        HostCacheOptions {
+            cache_http,
+            insecure: false,
+            force_http11: false,
+            timeout: None,
+        },
     )
 }
 
@@ -382,7 +386,8 @@ fn manifest_add_artifact_classifies_remote_inputs() {
     .expect("write remote tar");
     let remote_file_url = file_url(&remote_file);
     let tar_url = file_url(&remote_tar);
-    let cache = host_cache(None);
+    let _cache_dir_1 = tempfile::tempdir().expect("cache tempdir");
+    let cache = host_cache(_cache_dir_1.path(), false);
 
     let mut manifest = Manifest::new(&path, ARCH, None);
     smol::block_on(async {

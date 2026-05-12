@@ -1,3 +1,14 @@
+rdebootstrap (0.3.7) unstable; urgency=medium
+
+  * Add git-sourced manifest imports
+    Implements `[import.git]` support: a manifest can now import another
+    manifest hosted in a git repository by storing a full transport URL
+    (`https://`, `ssh://`, `http://`, `file:///`), a pinned 40-hex commit
+    SHA, and an optional symbolic ref for `update --locals` to re-pin.
+  * Consolidate ContentProvider API
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Tue, 12 May 2026 22:32:50 +0200
+
 rdebootstrap (0.3.6) unstable; urgency=medium
 
   * Allow specs to extend multiple parents; inheritance remains strictly additive. 

@@ -8,9 +8,9 @@ use {
         content::{ContentProvider, DebLocation, IndexFile, UniverseFiles},
         control::MutableControlStanza,
         deb::{DebReader, DebStage},
+        git::{GitRepo, MaterializedGitRepo},
         hash::{Hash, HashingReader},
         HostFileSystem, Manifest, PackageOrigin, Packages, RepositoryFile, Sources, Stage,
-        TransportProvider,
     },
     smol::io::AsyncRead,
     std::{
@@ -234,8 +234,16 @@ impl ContentProvider for StageProvider {
         Ok(Vec::new())
     }
 
-    fn transport(&self) -> &impl TransportProvider {
-        self.inner.transport()
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.inner.fetch_git_repo(repo).await
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.inner.materialize_git_paths(m, paths).await
     }
 }
 

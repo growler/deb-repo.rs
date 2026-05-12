@@ -3,17 +3,19 @@ use {
     crate::{
         archive::{Archive, RepositoryFile},
         artifact::Artifact,
+        auth::AuthProvider,
         comp::{comp_reader, strip_comp_ext},
         control::{MutableControlFile, MutableControlStanza},
         deb::DebReader,
         deb::DebStage,
+        git::{GitFetcher, GitRepo, MaterializedGitRepo},
         hash::{Hash, HashAlgo, HashingReader},
         packages::{PackageOrigin, Packages},
         sources::Sources,
         spec::LockedArchive,
         staging::Stage,
         staging::{HostFileSystem, StagingFile, StagingFileSystem},
-        transport::{HttpTransport, TransportProvider},
+        transport::HttpTransport,
     },
     futures::{stream, TryStreamExt},
     itertools::Itertools,
@@ -21,7 +23,13 @@ use {
         fs,
         io::{self, AsyncRead, AsyncReadExt},
     },
-    std::{future::Future, num::NonZero, path::Path, pin::Pin, sync::Arc},
+    std::{
+        future::Future,
+        num::NonZero,
+        path::{Path, PathBuf},
+        pin::Pin,
+        sync::Arc,
+    },
 };
 
 pub trait ContentProviderGuard<'a> {
@@ -101,7 +109,22 @@ pub trait ContentProvider {
         archives: UniverseFiles<'_>,
         concurrency: NonZero<usize>,
     ) -> impl Future<Output = io::Result<Vec<Sources>>>;
-    fn transport(&self) -> &impl TransportProvider;
+    /// Ensures the bare clone for `repo` is up to date, resolves its
+    /// revspec to a SHA, and returns a handle whose `tree_root()` is
+    /// an empty directory where follow-up `materialize_git_paths`
+    /// calls will write blobs.
+    fn fetch_git_repo(
+        &self,
+        repo: &GitRepo,
+    ) -> impl Future<Output = io::Result<MaterializedGitRepo>>;
+    /// Materialises the given in-repo paths under `m.tree_root()`.
+    /// Each path must exist; missing paths return `NotFound`.
+    /// Directory paths return `Unsupported` (future enhancement).
+    fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> impl Future<Output = io::Result<()>>;
 }
 
 /// View of archive/suite files used to fetch package universes.
@@ -315,15 +338,55 @@ impl<FS: StagingFileSystem + ?Sized> Stage for UniverseFilesStage<FS> {
 }
 
 /// Host-side on-disk cache for fetched repository content.
+///
+/// Owns the HTTP transport and the git fetcher; both share the same
+/// auth provider and root cache directory.
 pub struct HostCache {
     transport: HttpTransport,
-    cache: Option<Arc<Path>>,
+    cache: Arc<Path>,
+    cache_http: bool,
+    git: GitFetcher,
 }
+
+/// Construction options for [`HostCache`].  HTTP caching can be
+/// disabled independently of git caching: `cache_http = false` means
+/// HTTP downloads stream directly without persisting in the cache,
+/// while the git bare clones always live under the cache directory.
+pub struct HostCacheOptions {
+    pub cache_http: bool,
+    pub insecure: bool,
+    pub force_http11: bool,
+    pub timeout: Option<std::time::Duration>,
+}
+
+impl Default for HostCacheOptions {
+    fn default() -> Self {
+        Self {
+            cache_http: true,
+            insecure: false,
+            force_http11: false,
+            timeout: None,
+        }
+    }
+}
+
 impl HostCache {
-    pub fn new<P: AsRef<Path>>(transport: HttpTransport, cache: Option<P>) -> Self {
+    /// Constructs a `HostCache` rooted at `cache`.  Both `HttpTransport`
+    /// and the embedded `GitFetcher` share the supplied `AuthProvider`.
+    pub fn new<P: AsRef<Path>>(cache: P, auth: Arc<AuthProvider>, opts: HostCacheOptions) -> Self {
+        let cache: Arc<Path> = Arc::from(cache.as_ref().to_path_buf().into_boxed_path());
+        let transport = HttpTransport::new(
+            Arc::clone(&auth),
+            opts.insecure,
+            opts.force_http11,
+            opts.timeout,
+        );
+        let git = GitFetcher::new(cache.join("git"), auth);
         Self {
             transport,
-            cache: cache.map(|p| p.as_ref().to_owned().into()),
+            cache,
+            cache_http: opts.cache_http,
+            git,
         }
     }
 }
@@ -348,10 +411,8 @@ impl ContentProvider for HostCache {
     where
         Self: 'a;
     async fn init(&self) -> io::Result<Self::Guard<'_>> {
-        if let Some(path) = self.cache.as_ref() {
-            tracing::debug!("Initializing cache at {}", path.display());
-            smol::fs::create_dir_all(path).await?;
-        }
+        tracing::debug!("Initializing cache at {}", self.cache.display());
+        smol::fs::create_dir_all(self.cache.as_ref()).await?;
         Ok(HostCacheGuard {
             phantom: std::marker::PhantomData,
         })
@@ -377,8 +438,9 @@ impl ContentProvider for HostCache {
                     >)
             }
             DebLocation::Repository { url, path } => {
-                if let Some(cache) = self.cache.as_ref() {
-                    let cache_path = hash.store_name(Some(cache.as_ref()), Some("deb"), 1);
+                if self.cache_http {
+                    let cache = self.cache.as_ref();
+                    let cache_path = hash.store_name(Some(cache), Some("deb"), 1);
                     if let Ok(file) = fs::File::open(&cache_path).await {
                         tracing::debug!("Using cached {} at {}", url, cache_path.display());
                         return Ok(Box::new(DebStage::new(
@@ -392,9 +454,7 @@ impl ContentProvider for HostCache {
                     }
                     let (inp, _) = self.transport.open(&format!("{}/{}", url, path)).await?;
                     let mut src = hash.verifying_reader(size, inp);
-                    let (dst, path) = tempfile::Builder::new()
-                        .tempfile_in(cache.as_ref())?
-                        .into_parts();
+                    let (dst, path) = tempfile::Builder::new().tempfile_in(cache)?.into_parts();
                     let mut dst: smol::fs::File = dst.into();
                     io::copy(&mut src, &mut dst).await?;
                     dst.sync_data().await?;
@@ -466,15 +526,14 @@ impl ContentProvider for HostCache {
             let _ = artifact.hash_local(&path).await;
         } else {
             let (mut src, _) = self.transport.open(artifact.uri()).await?;
-            if let Some(cache) = self.cache.as_ref() {
-                let (dst, path) = tempfile::Builder::new()
-                    .tempfile_in(cache.as_ref())?
-                    .into_parts();
+            if self.cache_http {
+                let cache = self.cache.as_ref();
+                let (dst, path) = tempfile::Builder::new().tempfile_in(cache)?.into_parts();
                 let mut dst: smol::fs::File = dst.into();
                 io::copy(&mut src, &mut dst).await?;
                 dst.sync_data().await?;
                 let (hash, _) = artifact.hash_local(&path).await?;
-                let cache_path = hash.store_name(Some(cache.as_ref()), Some("file"), 1);
+                let cache_path = hash.store_name(Some(cache), Some("file"), 1);
                 smol::fs::create_dir_all(cache_path.parent().unwrap()).await?;
                 path.persist(&cache_path)?;
                 tracing::debug!("Cached {} at {}", artifact.uri(), cache_path.display());
@@ -501,11 +560,10 @@ impl ContentProvider for HostCache {
                 ))
             })?;
             return artifact.local(path).await;
-        } else if let Some(cache) = self.cache.as_ref() {
+        } else if self.cache_http {
+            let cache = self.cache.as_ref();
             let url = artifact.uri();
-            let cache_path = artifact
-                .hash()
-                .store_name(Some(cache.as_ref()), Some("file"), 1);
+            let cache_path = artifact.hash().store_name(Some(cache), Some("file"), 1);
             let file = if let Ok(file) = fs::File::open(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 file
@@ -517,9 +575,7 @@ impl ContentProvider for HostCache {
                     )
                 })?;
                 let mut src = artifact.hash().verifying_reader(artifact.size(), src);
-                let (dst, path) = tempfile::Builder::new()
-                    .tempfile_in(cache.as_ref())?
-                    .into_parts();
+                let (dst, path) = tempfile::Builder::new().tempfile_in(cache)?.into_parts();
                 let mut dst: smol::fs::File = dst.into();
                 io::copy(&mut src, &mut dst).await?;
                 dst.sync_data().await?;
@@ -631,17 +687,16 @@ impl ContentProvider for HostCache {
         url: &str,
         ext: &str,
     ) -> io::Result<IndexFile> {
-        if let Some(cache) = self.cache.as_ref() {
-            let cache_path = hash.store_name(Some(cache.as_ref()), Some("idx"), 1);
+        if self.cache_http {
+            let cache = self.cache.as_ref();
+            let cache_path = hash.store_name(Some(cache), Some("idx"), 1);
             if let Ok(file) = IndexFile::from_file(&cache_path).await {
                 tracing::debug!("Using cached {} at {}", url, cache_path.display());
                 return Ok(file);
             }
             let (inp, _) = self.transport.open(url).await?;
             let mut src = hash.verifying_reader(size, inp);
-            let (dst, path) = tempfile::Builder::new()
-                .tempfile_in(cache.as_ref())?
-                .into_parts();
+            let (dst, path) = tempfile::Builder::new().tempfile_in(cache)?.into_parts();
             let mut dst: smol::fs::File = dst.into();
             io::copy(comp_reader(ext, &mut src), &mut dst).await?;
             dst.sync_data().await?;
@@ -691,8 +746,15 @@ impl ContentProvider for HostCache {
             .try_collect::<Vec<_>>()
             .await
     }
-    fn transport(&self) -> &impl TransportProvider {
-        &self.transport
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.git.fetch_repo(repo).await
+    }
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.git.materialize_paths(m, paths).await
     }
 }
 
@@ -700,7 +762,8 @@ impl ContentProvider for HostCache {
 mod tests {
     use {
         super::{
-            strip_comp_ext, ContentProvider, HostCache, HostFileSystem, IndexFile, UniverseFiles,
+            strip_comp_ext, ContentProvider, HostCache, HostCacheOptions, HostFileSystem,
+            IndexFile, UniverseFiles,
         },
         crate::{
             auth::AuthProvider,
@@ -709,7 +772,7 @@ mod tests {
         },
         sha2::{Digest, Sha256},
         smol::io::AsyncWriteExt,
-        std::{fs, num::NonZero},
+        std::{fs, num::NonZero, sync::Arc},
     };
 
     fn sha256_hex(data: &[u8]) -> String {
@@ -778,14 +841,17 @@ mod tests {
         })];
         let archives = vec![archive];
         let universe = UniverseFiles::new("amd64", 0, &archives, &locked);
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let auth = Arc::new(AuthProvider::new::<&str>(None).expect("auth"));
         let cache = HostCache::new(
-            crate::HttpTransport::new(
-                AuthProvider::new::<&str>(None).expect("auth"),
-                false,
-                false,
-                None,
-            ),
-            Option::<&std::path::Path>::None,
+            cache_dir.path(),
+            auth,
+            HostCacheOptions {
+                cache_http: false,
+                insecure: false,
+                force_http11: false,
+                timeout: None,
+            },
         );
 
         smol::block_on(async {

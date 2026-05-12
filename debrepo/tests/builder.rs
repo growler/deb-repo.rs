@@ -6,10 +6,13 @@ use {
     debrepo::{
         auth::AuthProvider,
         cli::{cmd, Command},
-        content::{ContentProvider, HostCache},
-        HttpTransport, Manifest,
+        content::{ContentProvider, HostCache, HostCacheOptions},
+        Manifest,
     },
-    std::path::{Path, PathBuf},
+    std::{
+        path::{Path, PathBuf},
+        sync::Arc,
+    },
 };
 
 fn fixture_path(name: &str) -> PathBuf {
@@ -21,14 +24,19 @@ fn fixture_path(name: &str) -> PathBuf {
 }
 
 fn new_host_cache() -> HostCache {
+    // Tempdir leaked intentionally: the cache must outlive the call
+    // and the test process is short-lived.
+    let cache_dir = tempfile::tempdir().expect("cache tempdir").keep();
+    let auth = Arc::new(AuthProvider::new::<&str>(None).expect("auth"));
     HostCache::new(
-        HttpTransport::new(
-            AuthProvider::new::<&str>(None).expect("auth"),
-            false,
-            false,
-            None,
-        ),
-        Option::<&Path>::None,
+        &cache_dir,
+        auth,
+        HostCacheOptions {
+            cache_http: false,
+            insecure: false,
+            force_http11: false,
+            timeout: None,
+        },
     )
 }
 

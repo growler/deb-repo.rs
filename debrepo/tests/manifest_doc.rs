@@ -59,11 +59,11 @@ fn set_import_roundtrips_manifest_doc_and_reloads_with_valid_lock() {
 
         let mut manifest = Manifest::new(&path, ARCH, None);
         manifest
-            .set_import(Path::new("imported.toml"), ["base"])
+            .set_import(Path::new("imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("set import");
         manifest
-            .set_import(Path::new("./imported.toml"), ["base"])
+            .set_import(Path::new("./imported.toml"), ["base"], &TestProvider::new())
             .await
             .expect("replace import");
         manifest
@@ -72,7 +72,9 @@ fn set_import_roundtrips_manifest_doc_and_reloads_with_valid_lock() {
             .expect("resolve");
         manifest.store().await.expect("store");
 
-        let (loaded, has_valid_lock) = Manifest::from_file(&path, ARCH).await.expect("reload");
+        let (loaded, has_valid_lock) = Manifest::from_file(&path, ARCH, &TestProvider::new())
+            .await
+            .expect("reload");
         assert!(has_valid_lock);
         assert!(loaded.spec_ids().next().is_none());
     });
@@ -123,7 +125,8 @@ fn from_file_loads_default_spec_and_artifacts_from_handwritten_manifest() {
     .expect("write manifest");
 
     let (manifest, has_valid_lock) =
-        smol::block_on(Manifest::from_file(&path, ARCH)).expect("load manifest");
+        smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new()))
+            .expect("load manifest");
     assert!(!has_valid_lock);
     let spec = manifest.lookup_spec(None).expect("default spec");
     assert_eq!(spec.build_env().get("FOO").map(String::as_str), Some("bar"));
@@ -138,7 +141,7 @@ fn from_file_rejects_non_utf8_manifest_bytes() {
     let path = dir.path().join("Manifest.toml");
     std::fs::write(&path, [0xff, 0xfe, 0xfd]).expect("write invalid utf8");
 
-    let err = match smol::block_on(Manifest::from_file(&path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())) {
         Ok(_) => panic!("reject invalid utf8"),
         Err(err) => err,
     };
@@ -151,7 +154,7 @@ fn from_file_rejects_invalid_default_spec_meta_entry() {
     let path = dir.path().join("Manifest.toml");
     std::fs::write(&path, "[spec]\nmeta = [\"owner\"]\n").expect("write manifest");
 
-    let err = match smol::block_on(Manifest::from_file(&path, ARCH)) {
+    let err = match smol::block_on(Manifest::from_file(&path, ARCH, &TestProvider::new())) {
         Ok(_) => panic!("reject invalid meta"),
         Err(err) => err,
     };

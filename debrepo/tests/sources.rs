@@ -8,12 +8,16 @@ use {
         cli::{cmd, Command},
         content::{ContentProvider, DebLocation, IndexFile, UniverseFiles},
         control::{Field, MutableControlFile, MutableControlStanza},
+        git::{GitRepo, MaterializedGitRepo},
         hash::Hash,
         HostFileSystem, Manifest, RepositoryFile, SourceUniverse, Sources, Stage,
-        TransportProvider,
     },
     smol::io::Cursor,
-    std::{io, num::NonZero, path::Path},
+    std::{
+        io,
+        num::NonZero,
+        path::{Path, PathBuf},
+    },
 };
 
 fn hex(ch: char, len: usize) -> String {
@@ -338,8 +342,16 @@ impl ContentProvider for SourceProvider {
         Ok(self.sources.clone())
     }
 
-    fn transport(&self) -> &impl TransportProvider {
-        self.inner.transport()
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.inner.fetch_git_repo(repo).await
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.inner.materialize_git_paths(m, paths).await
     }
 }
 

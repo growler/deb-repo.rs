@@ -94,7 +94,7 @@ impl<C: Config> Command<C> for Edit {
             }
             let cmd = cmd.unwrap();
             let (mut manifest, has_valid_lock) =
-                Manifest::from_file(conf.manifest(), conf.arch()).await?;
+                Manifest::from_file(conf.manifest(), conf.arch(), conf.fetcher()?).await?;
             if !has_valid_lock {
                 return Err(anyhow!("manifest lock is not live; run update first"));
             }
@@ -165,7 +165,8 @@ async fn edit_manifest<C: Config>(
 ) -> Result<()> {
     let path = smol::fs::canonicalize(conf.manifest()).await?;
     editor.run(&path)?;
-    let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch())
+    let fetcher = conf.fetcher()?;
+    let (mut mf, has_valid_lock) = Manifest::from_file(conf.manifest(), conf.arch(), fetcher)
         .await
         .map_err(|err| {
             anyhow!("failed to load manifest after editing: {err}; manifest may be malformed",)
@@ -174,7 +175,6 @@ async fn edit_manifest<C: Config>(
         // nothing changed
         return Ok(());
     }
-    let fetcher = conf.fetcher()?;
     let guard = fetcher.init().await?;
     mf.update(false, false, insecure_release, conf.concurrency(), fetcher)
         .await

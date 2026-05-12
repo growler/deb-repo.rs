@@ -62,25 +62,109 @@ pub(crate) fn spec_display_name(name: &str) -> &str {
     }
 }
 
+/// Git-sourced import description.
+///
+/// `[import.git]` carries the full URL of an upstream repository plus a
+/// pinned commit and the path of the imported manifest inside that repository.
+/// The transport is encoded in the URL itself (`https://`, `http://`,
+/// `ssh://`, or `file:///` for local sources).
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ImportGit {
+    /// Full git URL of the repository.  Stored as the wire form of a
+    /// `GitRemote`: `https://host/path`, `ssh://[user@]host/path`,
+    /// `http://host/path`, or `file:///abs/path` for a local source.
+    pub(crate) remote: String,
+    /// Resolved 40-hex commit SHA.  Always concrete in the on-disk manifest.
+    pub(crate) rev: String,
+    /// Optional symbolic ref (branch or tag) tracked by `update`.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "ref")]
+    pub(crate) ref_: Option<String>,
+    /// Path of the imported manifest inside the repository at `rev`.
+    pub(crate) path: PathBuf,
+}
+
+impl ImportGit {
+    pub fn new(
+        remote: crate::git::GitRemote,
+        rev: String,
+        ref_: Option<String>,
+        path: PathBuf,
+    ) -> Self {
+        Self {
+            remote: remote.as_wire().into_owned(),
+            rev,
+            ref_,
+            path,
+        }
+    }
+    /// Raw wire form of the remote identifier (`host/path` or
+    /// `file:///abs/path`).
+    pub fn remote(&self) -> &str {
+        &self.remote
+    }
+    /// Parsed `GitRemote` value.  Re-runs `GitRemote::parse`, which
+    /// canonicalises `file://` paths if the source still exists.
+    pub fn remote_parsed(&self) -> io::Result<crate::git::GitRemote> {
+        crate::git::GitRemote::parse(&self.remote)
+    }
+    pub fn rev(&self) -> &str {
+        &self.rev
+    }
+    pub fn ref_(&self) -> Option<&str> {
+        self.ref_.as_deref()
+    }
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+}
+
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 /// Manifest import configuration.
+///
+/// Exactly one of `path` (local-filesystem import, the legacy form) or
+/// `git` (remote git-sourced import) must be set.  The constraint is
+/// validated at manifest load time.
 pub struct Import {
-    path: PathBuf,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    path: Option<PathBuf>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    git: Option<ImportGit>,
     hash: Hash,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     specs: Vec<String>,
 }
 
 impl Import {
-    pub(crate) fn path(&self) -> &Path {
-        &self.path
+    /// Returns the local-filesystem path of the imported manifest, when this
+    /// is a local import.  Returns `None` for git-sourced imports.
+    pub(crate) fn path(&self) -> Option<&Path> {
+        self.path.as_deref()
+    }
+    /// Returns the git-sourced import description, when this is a git import.
+    pub(crate) fn git(&self) -> Option<&ImportGit> {
+        self.git.as_ref()
     }
     pub(crate) fn hash(&self) -> &Hash {
         &self.hash
     }
     pub(crate) fn specs(&self) -> impl Iterator<Item = &str> {
         self.specs.iter().map(String::as_str)
+    }
+    /// Validates that exactly one of `path` or `git` is set.
+    pub(crate) fn validate(&self) -> io::Result<()> {
+        match (self.path.is_some(), self.git.is_some()) {
+            (true, true) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "[import] cannot set both `path` and `git`",
+            )),
+            (false, false) => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "[import] requires either `path` or `git`",
+            )),
+            _ => Ok(()),
+        }
     }
 }
 
@@ -179,7 +263,24 @@ impl ManifestFile {
     ) {
         let specs = specs.into_iter().map(|s| s.to_string()).collect();
         let import = Import {
-            path: path.into(),
+            path: Some(path.into()),
+            git: None,
+            hash,
+            specs,
+        };
+        self.doc.upsert_import(&import);
+        self.import = Some(import);
+    }
+    pub(crate) fn set_import_git<S: ToString, I: IntoIterator<Item = S>>(
+        &mut self,
+        git: ImportGit,
+        hash: Hash,
+        specs: I,
+    ) {
+        let specs = specs.into_iter().map(|s| s.to_string()).collect();
+        let import = Import {
+            path: None,
+            git: Some(git),
             hash,
             specs,
         };
@@ -204,6 +305,14 @@ impl ManifestFile {
                 format!("failed to parse manifest: {}", err),
             )
         })?;
+        if let Some(import) = manifest.import.as_ref() {
+            import.validate().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid [import] section: {}", err),
+                )
+            })?;
+        }
         for (name, spec) in manifest.specs.iter() {
             for entry in &spec.meta {
                 parse_meta_entry(entry).map_err(|err| {
@@ -937,7 +1046,7 @@ pub(crate) struct LockFile {
 }
 
 impl LockFile {
-    pub const FORMAT_VERSION: u64 = 1;
+    pub const FORMAT_VERSION: u64 = 2;
     pub const MAX_SIZE: u64 = 10 * 1024 * 1024; // 10 MiB
     pub(crate) fn new() -> Self {
         LockFile {
@@ -1650,9 +1759,28 @@ impl ManifestDoc for toml_edit::DocumentMut {
         self
     }
     fn upsert_import(&mut self, import: &Import) {
-        let table = toml_edit::ser::to_document(import)
+        // Serialise to a flat table first so we get the right value
+        // representations (Hash via SRI, paths via string), then promote
+        // the nested git block to a separate `[import.git]` sub-table so
+        // the on-disk shape matches the documented schema.
+        let mut table = toml_edit::ser::to_document(import)
             .expect("failed to serialize import")
             .into_table();
+        if let Some(item) = table.remove("git") {
+            let git_table = match item {
+                toml_edit::Item::Value(toml_edit::Value::InlineTable(inline)) => {
+                    let mut t = toml_edit::Table::new();
+                    for (key, value) in inline.into_iter() {
+                        t.insert(&key, toml_edit::Item::Value(value));
+                    }
+                    t.set_implicit(false);
+                    t
+                }
+                toml_edit::Item::Table(t) => t,
+                other => panic!("[import.git] must serialise to a table, got {:?}", other),
+            };
+            table.insert("git", toml_edit::Item::Table(git_table));
+        }
         match self.entry("import") {
             toml_edit::Entry::Vacant(e) => {
                 e.insert(toml_edit::Item::Table(table));

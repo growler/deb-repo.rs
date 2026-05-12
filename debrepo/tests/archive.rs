@@ -11,6 +11,7 @@ use {
         cli::{cmd, Command},
         content::{ContentProvider, ContentProviderGuard, DebLocation, IndexFile, UniverseFiles},
         control::MutableControlStanza,
+        git::{GitRepo, MaterializedGitRepo},
         hash::Hash,
         Archive, HostFileSystem, Manifest, Packages, RepositoryFile, SignedBy, Snapshot,
         SnapshotId, Stage,
@@ -187,8 +188,16 @@ impl ContentProvider for SignedReleaseProvider {
             .await
     }
 
-    fn transport(&self) -> &impl debrepo::TransportProvider {
-        self.inner.transport()
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.inner.fetch_git_repo(repo).await
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.inner.materialize_git_paths(m, paths).await
     }
 }
 

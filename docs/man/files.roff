@@ -11,6 +11,20 @@ When a manifest uses \fB[import]\fR, commands that load the effective package
 or source universe must be able to read the imported manifest and its same-arch
 lock file.
 .TP
+\fB[import.git]\fR
+A git-sourced import stores a full URL (e.g.\& \fBhttps://host/repo\fR or
+\fBssh://git@host/repo\fR) plus a resolved commit SHA and an in-repo path.
+The transport is explicit in the URL and never rewritten at fetch time.
+For HTTPS git, \fB[[auth]]\fR entries in \fBauth.toml\fR keyed by hostname
+supply Basic/Token/Cert credentials, applied via \fBGIT_CONFIG_*\fR environment
+variables so secrets never appear on argv.  SSH auth delegates to the
+system \fBssh\fR (\fB~/.ssh/config\fR, ssh-agent, etc.).  To remap a URL to
+a different base use git\(cqs own \fBurl.<base>.insteadOf\fR in
+\fB~/.gitconfig\fR or \fBGIT_CONFIG_GLOBAL\fR.
+Requires \fBgit\fR (\(>= 2.30) on \fBPATH\fR.  Bare repos are cached under
+\fI<cache>/git/<sha256(url)>/repo.git\fR and partial-checkout subtrees under
+\fI<cache>/git/<sha256>/revs/<sha>/\fR.
+.TP
 \fBauth.toml\fR
 Optional auth file in the manifest directory (when \fB--auth\fR is omitted).
 .TP

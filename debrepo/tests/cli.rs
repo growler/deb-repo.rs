@@ -14,6 +14,7 @@ use {
         },
         content::{ContentProvider, DebLocation, IndexFile, UniverseFiles},
         control::MutableControlStanza,
+        git::{GitRepo, MaterializedGitRepo},
         hash::Hash,
         HostFileSystem, Manifest, Packages, RepositoryFile, Sources, Stage,
     },
@@ -179,8 +180,16 @@ impl ContentProvider for SourceProvider {
         ])
     }
 
-    fn transport(&self) -> &impl debrepo::TransportProvider {
-        self.inner.transport()
+    async fn fetch_git_repo(&self, repo: &GitRepo) -> io::Result<MaterializedGitRepo> {
+        self.inner.fetch_git_repo(repo).await
+    }
+
+    async fn materialize_git_paths(
+        &self,
+        m: &MaterializedGitRepo,
+        paths: &[PathBuf],
+    ) -> io::Result<()> {
+        self.inner.materialize_git_paths(m, paths).await
     }
 }
 
@@ -261,7 +270,7 @@ fn init_import_exports_requested_specs() {
     });
 
     smol::block_on(async {
-        let (mut manifest, _) = Manifest::from_file(&manifest_path, ARCH)
+        let (mut manifest, _) = Manifest::from_file(&manifest_path, ARCH, &TestProvider::new())
             .await
             .expect("load manifest");
         manifest

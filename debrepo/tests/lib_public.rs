@@ -3,8 +3,8 @@ use {
     debrepo::{
         auth::AuthProvider,
         cli::{Command, Config},
-        content::HostCache,
-        HostFileSystem, HttpTransport, Packages,
+        content::{HostCache, HostCacheOptions},
+        HostFileSystem, Packages,
     },
     smol::io::{AsyncReadExt, AsyncWriteExt, Cursor},
     std::{
@@ -39,22 +39,28 @@ struct TestConfig {
     manifest: PathBuf,
     cache: HostCache,
     concurrency: NonZero<usize>,
+    _cache_dir: tempfile::TempDir,
 }
 
 impl TestConfig {
     fn new() -> Self {
+        let cache_dir = tempfile::tempdir().expect("cache tempdir");
+        let auth = Arc::new(AuthProvider::new::<&str>(None).expect("auth"));
+        let cache = HostCache::new(
+            cache_dir.path(),
+            auth,
+            HostCacheOptions {
+                cache_http: false,
+                insecure: false,
+                force_http11: false,
+                timeout: None,
+            },
+        );
         Self {
             manifest: PathBuf::from("Manifest.toml"),
-            cache: HostCache::new(
-                HttpTransport::new(
-                    AuthProvider::new::<&str>(None).expect("auth"),
-                    false,
-                    false,
-                    None,
-                ),
-                None::<&Path>,
-            ),
+            cache,
             concurrency: NonZero::new(1).expect("nonzero"),
+            _cache_dir: cache_dir,
         }
     }
 }

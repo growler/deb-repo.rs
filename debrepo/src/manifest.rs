@@ -5,11 +5,14 @@ use {
         cli::StageProgress,
         content::{ContentProvider, UniverseFiles},
         control::{ControlFile, MutableControlFile, MutableControlStanza},
+        git::{GitRemote, GitRepo, GitRevSpec},
         hash::{Hash, HashAlgo},
         idmap::IntoId,
         is_url,
         kvlist::KVList,
-        manifest_doc::{spec_display_name, valid_spec_name, LockFile, ManifestFile, UpdateResult},
+        manifest_doc::{
+            spec_display_name, valid_spec_name, ImportGit, LockFile, ManifestFile, UpdateResult,
+        },
         packages::{Package, PackageOrigin},
         spec::{
             parse_meta_entry, validate_meta_name, validate_meta_value, LockedArchive,
@@ -863,11 +866,12 @@ impl Manifest {
     // recursively loads manifest and its imports, returning the top-level manifest and whether it
     // has a valid lock file. Fails if any import is not locked. Does not fail
     // it is the requested manifest is not locked.
-    fn from_file_rec(
+    fn from_file_rec<'a, C: ContentProvider>(
         path: PathBuf,
         arch: String,
-        import_stack: &mut Vec<PathBuf>,
-    ) -> ManifestLoadFuture<'_> {
+        fetcher: &'a C,
+        import_stack: &'a mut Vec<PathBuf>,
+    ) -> ManifestLoadFuture<'a> {
         async move {
             let path = smol::fs::canonicalize(&path).await?;
             if import_stack.contains(&path) {
@@ -882,36 +886,107 @@ impl Manifest {
             import_stack.push(path.clone());
             let (manifest, hash) = ManifestFile::from_file(&path).await?;
             let (import, stale_import) = if let Some(import) = manifest.import() {
-                let import_path = path
-                    .parent()
-                    .unwrap_or_else(|| Path::new("."))
-                    .join(import.path());
-                let (import_manifest, import_lock_valid) =
-                    Manifest::from_file_rec(import_path.clone(), arch.clone(), import_stack)
+                if let Some(git_import) = import.git() {
+                    if !crate::git::is_full_sha1(git_import.rev()) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "manifest {} has [import.git].rev = `{}` which is not a 40-hex commit SHA; run 'update' to refresh",
+                                path.display(),
+                                git_import.rev()
+                            ),
+                        ));
+                    }
+                    let remote = git_import.remote_parsed()?;
+                    let repo = GitRepo {
+                        remote,
+                        revspec: GitRevSpec::Sha(git_import.rev().to_lowercase()),
+                    };
+                    let materialized = fetcher.fetch_git_repo(&repo).await?;
+                    let in_repo_path = git_import.path().to_path_buf();
+                    let lock_in_repo = lock_path_for(&in_repo_path, &arch);
+                    fetcher
+                        .materialize_git_paths(
+                            &materialized,
+                            &[in_repo_path.clone(), lock_in_repo],
+                        )
                         .await?;
-                if !import_lock_valid {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "imported manifest {} is not locked; lock if first\n{}",
-                            import_path.display(),
-                            import_stack
-                                .iter()
-                                .map(|p| p.display().to_string())
-                                .join("\n")
-                        ),
-                    ));
-                }
-                let stale_import = import_manifest.hash.as_ref().ok_or_else(|| {
-                    io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "imported manifest {} is missing hash",
-                            import_path.display()
-                        ),
+                    let import_path = materialized.tree_root().join(&in_repo_path);
+                    let (mut import_manifest, import_lock_valid) = Manifest::from_file_rec(
+                        import_path.clone(),
+                        arch.clone(),
+                        fetcher,
+                        import_stack,
                     )
-                })? != import.hash();
-                (Some(Box::new(import_manifest)), stale_import)
+                    .await?;
+                    // Lazily fetch any [[local]] / local-artifact paths the
+                    // imported manifest references, so subsequent build /
+                    // update passes can read them through the standard
+                    // `local_path` resolver.
+                    let extras = import_manifest.git_extra_blob_paths();
+                    if !extras.is_empty() {
+                        fetcher
+                            .materialize_git_paths(&materialized, &extras)
+                            .await?;
+                    }
+                    if !import_lock_valid {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "imported manifest {} (git {} @ {}) is not locked; lock it first",
+                                git_import.path().display(),
+                                git_import.remote(),
+                                git_import.rev(),
+                            ),
+                        ));
+                    }
+                    let stale_import = import_manifest.hash.as_ref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "imported manifest {} is missing hash",
+                                import_path.display()
+                            ),
+                        )
+                    })? != import.hash();
+                    let _ = &mut import_manifest; // silence unused-mut warning when extras=[]
+                    (Some(Box::new(import_manifest)), stale_import)
+                } else {
+                    let import_path = path
+                        .parent()
+                        .unwrap_or_else(|| Path::new("."))
+                        .join(import.path().expect("local import has path"));
+                    let (import_manifest, import_lock_valid) = Manifest::from_file_rec(
+                        import_path.clone(),
+                        arch.clone(),
+                        fetcher,
+                        import_stack,
+                    )
+                    .await?;
+                    if !import_lock_valid {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "imported manifest {} is not locked; lock if first\n{}",
+                                import_path.display(),
+                                import_stack
+                                    .iter()
+                                    .map(|p| p.display().to_string())
+                                    .join("\n")
+                            ),
+                        ));
+                    }
+                    let stale_import = import_manifest.hash.as_ref().ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!(
+                                "imported manifest {} is missing hash",
+                                import_path.display()
+                            ),
+                        )
+                    })? != import.hash();
+                    (Some(Box::new(import_manifest)), stale_import)
+                }
             } else {
                 (None, false)
             };
@@ -920,13 +995,20 @@ impl Manifest {
                 .and_then(|import| import.lock.universe_hash());
             let lock_path = lock_path_for(&path, &arch);
             let lock = if !stale_import {
-                LockFile::from_file(&lock_path, &arch, &hash, imported_universe_hash).await
+                LockFile::from_file(
+                    &lock_path,
+                    &arch,
+                    &hash,
+                    imported_universe_hash,
+                )
+                .await
             } else {
                 None
             };
             let has_valid_lock = lock.is_some();
-            let lock = lock
-                .unwrap_or_else(|| manifest.unlocked_lock_file(imported_universe_hash.cloned()));
+            let lock = lock.unwrap_or_else(|| {
+                manifest.unlocked_lock_file(imported_universe_hash.cloned())
+            });
             let manifest = Manifest {
                 arch,
                 path,
@@ -944,18 +1026,40 @@ impl Manifest {
         }
         .boxed_local()
     }
-    /// Loads from the given path. Fail if import is stale.
-    pub async fn from_file<A: ToString, P: AsRef<Path>>(
+    /// Loads a manifest from the given path.  `fetcher` is used to fetch
+    /// `[import.git]` references on demand.
+    pub async fn from_file<A: ToString, P: AsRef<Path>, C: ContentProvider>(
         path: P,
         arch: A,
+        fetcher: &C,
     ) -> io::Result<(Self, bool)> {
         let mut import_stack = Vec::new();
         Manifest::from_file_rec(
             path.as_ref().to_path_buf(),
             arch.to_string(),
+            fetcher,
             &mut import_stack,
         )
         .await
+    }
+    /// Returns paths inside this manifest's directory referenced by
+    /// `[[local]]` packages and local file artifacts.  Used by the git
+    /// provider to materialise extra blobs after the initial parse.
+    fn git_extra_blob_paths(&self) -> Vec<PathBuf> {
+        let mut paths: Vec<PathBuf> = self
+            .file
+            .local_pkgs()
+            .iter()
+            .map(|pkg| PathBuf::from(&pkg.path))
+            .collect();
+        for artifact in self.file.artifacts() {
+            if artifact.is_local() && !matches!(artifact, Artifact::Text(_)) {
+                paths.push(PathBuf::from(artifact.uri()));
+            }
+        }
+        paths.sort();
+        paths.dedup();
+        paths
     }
 
     fn mark_file_updated(&mut self) {
@@ -1182,33 +1286,23 @@ impl Manifest {
             _ => None,
         }
     }
-    pub async fn set_import<P: AsRef<Path>, S: ToString, I: IntoIterator<Item = S>>(
+    pub async fn set_import<
+        P: AsRef<Path>,
+        S: ToString,
+        I: IntoIterator<Item = S>,
+        C: ContentProvider,
+    >(
         &mut self,
         path: P,
         specs: I,
+        fetcher: &C,
     ) -> io::Result<()> {
-        let specs = specs
-            .into_iter()
-            .map(|s| s.to_string())
-            .map(|s| {
-                let name = valid_spec_name(&s).map_err(io::Error::other)?;
-                if self.file.contains_spec(name) {
-                    Err(io::Error::new(
-                        io::ErrorKind::InvalidInput,
-                        format!(
-                            "spec name {} conflicts with existing spec in manifest",
-                            name
-                        ),
-                    ))
-                } else {
-                    Ok(s)
-                }
-            })
-            .collect::<io::Result<Vec<_>>>()?;
+        let specs = self.validate_import_specs(specs)?;
         let mut import_stack = vec![self.path.clone()];
         let (imported, import_has_valid_lock) = Manifest::from_file_rec(
             self.local_path(path.as_ref()),
             self.arch.clone(),
+            fetcher,
             &mut import_stack,
         )
         .await?;
@@ -1221,30 +1315,8 @@ impl Manifest {
                 ),
             ));
         }
-        // valid lock means there is universe hash locked,
-        // so this is just to catch unexpected internal errors
-        let imported_universe_hash = imported
-            .lock
-            .universe_hash()
-            .ok_or_else(|| {
-                io::Error::other(format!(
-                    "[internal error] imported manifest {} lock lacks universe hash",
-                    path.as_ref().display(),
-                ))
-            })?
-            .clone();
-        for spec in &specs {
-            if !imported.file.contains_spec(spec) {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    format!(
-                        "imported manifest {} does not contain spec {}",
-                        path.as_ref().display(),
-                        spec
-                    ),
-                ));
-            }
-        }
+        let imported_universe_hash = self.expect_imported_universe_hash(&imported)?;
+        Self::ensure_imported_specs(&imported, &specs, &path.as_ref().display().to_string())?;
         self.file.set_import(
             path.as_ref(),
             imported.hash.clone().ok_or_else(|| {
@@ -1263,6 +1335,198 @@ impl Manifest {
             .for_each(|(_, r)| r.invalidate_solution());
         self.mark_lock_invalid();
         Ok(())
+    }
+    /// Configure a git-sourced `[import.git]`.  Resolves the symbolic ref
+    /// (when given), fetches the imported manifest tree via the supplied
+    /// content provider, validates and pins it.  Always writes a
+    /// fully-resolved commit SHA to disk; the original symbolic name
+    /// (when present) is recorded in `[import.git].ref` so `update`
+    /// can re-resolve later.
+    pub async fn set_import_git<C: ContentProvider, S: ToString, I: IntoIterator<Item = S>>(
+        &mut self,
+        fetcher: &C,
+        remote: GitRemote,
+        revspec: GitRevSpec,
+        in_repo_path: &Path,
+        specs: I,
+    ) -> io::Result<()> {
+        crate::git::url::check_in_repo_path(in_repo_path)?;
+        let specs = self.validate_import_specs(specs)?;
+        let symbolic_ref = match &revspec {
+            GitRevSpec::Sha(_) => None,
+            GitRevSpec::Symbolic(name) => Some(name.clone()),
+        };
+        let repo = GitRepo {
+            remote: remote.clone(),
+            revspec,
+        };
+        let materialized = fetcher.fetch_git_repo(&repo).await?;
+        let in_repo_path_buf = in_repo_path.to_path_buf();
+        let lock_in_repo = lock_path_for(&in_repo_path_buf, &self.arch);
+        fetcher
+            .materialize_git_paths(&materialized, &[in_repo_path_buf.clone(), lock_in_repo])
+            .await?;
+        let imported_path = materialized.tree_root().join(&in_repo_path_buf);
+        let mut import_stack = vec![self.path.clone()];
+        let (imported, import_has_valid_lock) = Manifest::from_file_rec(
+            imported_path.clone(),
+            self.arch.clone(),
+            fetcher,
+            &mut import_stack,
+        )
+        .await?;
+        let extras = imported.git_extra_blob_paths();
+        if !extras.is_empty() {
+            fetcher
+                .materialize_git_paths(&materialized, &extras)
+                .await?;
+        }
+        let remote_label = remote.display_label().into_owned();
+        if !import_has_valid_lock {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "imported manifest {} (git {} @ {}) is not locked; lock it first",
+                    in_repo_path.display(),
+                    remote_label,
+                    materialized.rev(),
+                ),
+            ));
+        }
+        let imported_universe_hash = self.expect_imported_universe_hash(&imported)?;
+        let label = format!(
+            "{} ({} @ {})",
+            in_repo_path.display(),
+            remote_label,
+            materialized.rev()
+        );
+        Self::ensure_imported_specs(&imported, &specs, &label)?;
+        let import_git = ImportGit::new(
+            remote,
+            materialized.rev().to_string(),
+            symbolic_ref,
+            in_repo_path.to_path_buf(),
+        );
+        self.file.set_import_git(
+            import_git,
+            imported.hash.clone().ok_or_else(|| {
+                io::Error::other(format!(
+                    "imported manifest {} lacks hash",
+                    imported.path.display()
+                ))
+            })?,
+            specs,
+        );
+        self.import = Some(Box::new(imported));
+        self.mark_file_updated();
+        self.lock.set_imported_universe_hash(imported_universe_hash);
+        self.lock
+            .iter_specs_mut()
+            .for_each(|(_, r)| r.invalidate_solution());
+        self.mark_lock_invalid();
+        Ok(())
+    }
+    fn validate_import_specs<S: ToString, I: IntoIterator<Item = S>>(
+        &self,
+        specs: I,
+    ) -> io::Result<Vec<String>> {
+        specs
+            .into_iter()
+            .map(|s| s.to_string())
+            .map(|s| {
+                let name = valid_spec_name(&s).map_err(io::Error::other)?;
+                if self.file.contains_spec(name) {
+                    Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "spec name {} conflicts with existing spec in manifest",
+                            name
+                        ),
+                    ))
+                } else {
+                    Ok(s)
+                }
+            })
+            .collect()
+    }
+    fn expect_imported_universe_hash(&self, imported: &Manifest) -> io::Result<Hash> {
+        imported.lock.universe_hash().cloned().ok_or_else(|| {
+            io::Error::other(format!(
+                "[internal error] imported manifest {} lock lacks universe hash",
+                imported.path.display(),
+            ))
+        })
+    }
+    fn ensure_imported_specs(imported: &Manifest, specs: &[String], label: &str) -> io::Result<()> {
+        for spec in specs {
+            if !imported.file.contains_spec(spec) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("imported manifest {} does not contain spec {}", label, spec),
+                ));
+            }
+        }
+        Ok(())
+    }
+    /// Re-resolves a symbolic git ref recorded in `[import.git].ref` and
+    /// refetches the imported manifest if upstream has moved.  No-op when
+    /// the import is local, when no symbolic ref is recorded, or when the
+    /// ref still points at the pinned commit.  Returns true when a refresh
+    /// actually happened.
+    pub async fn refresh_git_import<C: ContentProvider>(
+        &mut self,
+        fetcher: &C,
+    ) -> io::Result<bool> {
+        let (remote, sym_ref, in_repo_path, current_rev): (GitRemote, String, PathBuf, String) =
+            match self.file.import().and_then(|i| i.git()) {
+                Some(git) => match git.ref_() {
+                    Some(name) => (
+                        git.remote_parsed()?,
+                        name.to_string(),
+                        git.path().to_path_buf(),
+                        git.rev().to_string(),
+                    ),
+                    None => {
+                        tracing::debug!("refresh_git_import: no symbolic ref recorded; skipping");
+                        return Ok(false);
+                    }
+                },
+                None => return Ok(false),
+            };
+        tracing::debug!(
+            "refresh_git_import: re-resolving {} ref={} (current rev={})",
+            remote.display_label(),
+            sym_ref,
+            current_rev,
+        );
+        let specs: Vec<String> = self
+            .file
+            .import()
+            .map(|i| i.specs().map(|s| s.to_string()).collect())
+            .unwrap_or_default();
+        // Reuse `set_import_git` for the heavy lifting (fetch, validate,
+        // pin, refresh lock).
+        self.set_import_git(
+            fetcher,
+            remote,
+            GitRevSpec::Symbolic(sym_ref),
+            &in_repo_path,
+            specs,
+        )
+        .await?;
+        // Compare resolved rev with the previous one to report changes.
+        let new_rev = self
+            .file
+            .import()
+            .and_then(|i| i.git())
+            .map(|g| g.rev().to_string())
+            .unwrap_or_default();
+        tracing::debug!(
+            "refresh_git_import: resolved rev={} (changed={})",
+            new_rev,
+            new_rev != current_rev,
+        );
+        Ok(new_rev != current_rev)
     }
     fn update_import(&mut self) -> io::Result<bool> {
         if self.import.is_none() {
@@ -1298,27 +1562,37 @@ impl Manifest {
             // no change, skip
             return Ok(false);
         }
+        let label = match (import_desc.path(), import_desc.git()) {
+            (Some(path), _) => path.display().to_string(),
+            (_, Some(git)) => format!(
+                "{} ({} @ {})",
+                git.path().display(),
+                git.remote(),
+                git.rev()
+            ),
+            _ => "<unknown>".to_string(),
+        };
         for spec in import_desc.specs() {
             if !import.file.contains_spec(spec) {
                 return Err(io::Error::new(
                     io::ErrorKind::InvalidInput,
-                    format!(
-                        "imported manifest {} does not contain spec {}",
-                        import_desc.path().display(),
-                        spec
-                    ),
+                    format!("imported manifest {} does not contain spec {}", label, spec),
                 ));
             }
         }
         if imported_hash != import_desc.hash() {
-            self.file.set_import(
-                import_desc.path().to_path_buf(),
-                imported_hash.clone(),
-                import_desc
-                    .specs()
-                    .map(|s| s.to_string())
-                    .collect::<Vec<String>>(),
-            );
+            // Refresh the on-disk hash without changing the rest of the
+            // import descriptor.  Local and git imports use distinct
+            // setters because their schema is structurally different.
+            let new_hash = imported_hash.clone();
+            let specs: Vec<String> = import_desc.specs().map(|s| s.to_string()).collect();
+            if let Some(local_path) = import_desc.path() {
+                let path = local_path.to_path_buf();
+                self.file.set_import(path, new_hash, specs);
+            } else if let Some(git) = import_desc.git() {
+                let git = git.clone();
+                self.file.set_import_git(git, new_hash, specs);
+            }
             self.mark_file_updated();
         }
         self.lock.set_imported_universe_hash(imported_universe_hash);
@@ -2122,6 +2396,11 @@ impl Manifest {
             self.mark_lock_invalid();
         } else if self.lock.iter_specs().all(|(_, l)| l.is_locked()) {
             tracing::debug!("archives up-to-date, all specs locked, skipping resolve");
+            // Refresh the lock_valid flag in case an upstream caller
+            // (e.g. set_import_git for a refresh that needed no real
+            // re-solve) invalidated it but the lock is still structurally
+            // up-to-date.  Mirrors what resolve() does at its tail.
+            self.lock_valid = self.lock.is_uptodate();
             return Ok(());
         }
         self.resolve(concurrency, cache).await
@@ -2602,10 +2881,16 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("Manifest.toml");
 
+        let auth = std::sync::Arc::new(crate::auth::AuthProvider::new::<&str>(None).expect("auth"));
+        let cache = crate::content::HostCache::new(
+            dir.path().join("cache"),
+            auth,
+            crate::content::HostCacheOptions::default(),
+        );
         let mut manifest = smol::block_on(async {
             let file = ManifestFile::new(None);
             file.store(&path).await.expect("store manifest");
-            let (manifest, _) = Manifest::from_file(&path, ARCH)
+            let (manifest, _) = Manifest::from_file(&path, ARCH, &cache)
                 .await
                 .expect("load manifest");
             manifest
