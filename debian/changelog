@@ -21,6 +21,8 @@ rdebootstrap (0.4.0) unstable; urgency=medium
     a `dists/<suite>/<component>/` hierarchy. Thanks to NVidia for 
     an unexpected example.
 
+  * chore: cargo update
+
  -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 13 May 2026 18:05:40 +0200
 
 rdebootstrap (0.3.7) unstable; urgency=medium
