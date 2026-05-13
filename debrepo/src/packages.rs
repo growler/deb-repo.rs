@@ -537,7 +537,7 @@ impl<'a> Package<'a> {
         &self,
         other: &Package<'b>,
     ) -> std::result::Result<bool, (&'static str, &'a str, &'b str)> {
-        if self.name != other.name || self.version != other.version {
+        if self.name != other.name || self.version != other.version || self.arch != other.arch {
             return Ok(false);
         }
         if let Some((this, that)) = self
