@@ -115,7 +115,18 @@ stage = ["motd"]
 Key sections:
 
 - `[[archive]]` -- APT repositories with suites, components, optional snapshot
-  templates, trusted keys, and priorities.
+  templates, trusted keys, and priorities.  A suite name ending with `/`
+  selects flat-repository mode (no `dists/` hierarchy); use `"/"` for the
+  repository root or `"./"` as an equivalent alias.  `components` must be
+  omitted for flat repositories and is required (at least one entry) for
+  non-flat archives; vendor presets `debian`/`ubuntu`/`devuan` supply their
+  own component defaults.  Example (NVIDIA CUDA):
+  ```toml
+  [[archive]]
+  url = "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
+  suites = ["/"]
+  signed-by = "/usr/share/keyrings/cuda-archive-keyring.gpg"
+  ```
 - `[import]` -- Reuse archives, local packages, and selected named parent specs
   from another manifest. Imported parent specs keep their own staged artifact
   references. Either `path` (local-filesystem import) or a nested `git` table

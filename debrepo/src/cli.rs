@@ -307,6 +307,10 @@ Examples:
                         } else {
                             (vec![archive], self.requirements.clone(), None)
                         };
+                    for a in &archives {
+                        a.validate()
+                            .map_err(|err| anyhow!("invalid archive {}: {}", a.url, err))?;
+                    }
                     let mut mf = Manifest::from_archives(
                         conf.manifest(),
                         conf.arch(),

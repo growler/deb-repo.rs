@@ -20,7 +20,7 @@ use {
         parse_size,
     },
     chrono::{DateTime, Utc},
-    itertools::Itertools,
+    itertools::{Either, Itertools},
     ouroboros::self_referencing,
     smallvec::SmallVec,
 };
@@ -132,7 +132,13 @@ impl Release {
         let fetch_all_arch = self
             .field("No-Support-for-Architecture-all")
             .is_none_or(|v| v.trim_ascii() != "Packages");
-        let arch = if fetch_all_arch {
+        // For flat repositories the caller passes an empty `components`
+        // slice (per `Archive::validate`'s invariant: flat archives have no
+        // components).  A flat repo lists every architecture in a single
+        // `Packages` file with no separate `binary-all/` sub-tree, so we skip
+        // the `all` arch in that case to avoid returning duplicate entries
+        // for the same file.
+        let arch = if fetch_all_arch && !components.is_empty() {
             vec!["all", arch]
         } else {
             vec![arch]
@@ -140,38 +146,44 @@ impl Release {
         let files = self.files(components, hash_name)?.try_fold(
             arch.iter()
                 .flat_map(|arch| {
-                    components
-                        .iter()
-                        .map(move |c| (c.as_ref(), *arch, None::<ReleaseIndexFile<'a>>))
+                    (if components.is_empty() {
+                        Either::Left(std::iter::once(""))
+                    } else {
+                        Either::Right(components.iter().map(|c| c.as_ref()))
+                    })
+                    .into_iter()
+                    .map(move |c| (c, *arch, None::<ReleaseIndexFile<'a>>))
                 })
                 .collect::<Vec<_>>(),
             move |mut files, file| {
                 let (path, digest, size) = file?;
                 for (comp, arch, entry) in files.iter_mut() {
-                    if let Some(rest) = path.strip_prefix(*comp) {
-                        if let Some(rest) = rest.strip_prefix("/binary-") {
-                            if let Some(rest) = rest.strip_prefix(*arch) {
-                                if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
-                                    rest.strip_prefix("/Packages")
-                                {
-                                    if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
-                                        let hash =
-                                            Hash::from_hex(hash_name, digest).map_err(|err| {
-                                                ParseError::from(format!(
-                                                    "invalid hash: {} {}",
-                                                    digest, err
-                                                ))
-                                            })?;
-                                        *entry = Some(ReleaseIndexFile {
-                                            path,
-                                            fetch_path: use_by_hash
-                                                .then(|| Self::by_hash_path(path, digest)),
-                                            hash,
-                                            size,
-                                        });
-                                    }
-                                }
-                            }
+                    let pref = if comp.is_empty() {
+                        path
+                    } else {
+                        let Some(pref) = path
+                            .strip_prefix(*comp)
+                            .and_then(|r| r.strip_prefix("/binary-"))
+                            .and_then(|r| r.strip_prefix(*arch))
+                            .and_then(|r| r.strip_prefix('/'))
+                        else {
+                            continue;
+                        };
+                        pref
+                    };
+                    if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
+                        pref.strip_prefix("Packages")
+                    {
+                        if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
+                            let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
+                                ParseError::from(format!("invalid hash: {} {}", digest, err))
+                            })?;
+                            *entry = Some(ReleaseIndexFile {
+                                path,
+                                fetch_path: use_by_hash.then(|| Self::by_hash_path(path, digest)),
+                                hash,
+                                size,
+                            });
                         }
                     }
                 }
@@ -186,7 +198,12 @@ impl Release {
                 } else {
                     Some(Ok(file))
                 }
-            } else if entry.is_none() {
+            } else if entry.is_none() && arch != "all" && !comp.is_empty() {
+                // Non-flat archives must have a Packages file for every
+                // (component, arch) combination they declare.  Flat archives
+                // are intentionally allowed to omit Packages entirely — the
+                // matching `comp.is_empty()` arm above falls through to
+                // `None` rather than surfacing an error.
                 Some(Err(ParseError::from(format!(
                     "no Packages file found for component {} {}",
                     comp, arch,
@@ -204,35 +221,41 @@ impl Release {
         let use_by_hash =
             self.supports_acquire_by_hash() && hash_name.eq_ignore_ascii_case("SHA256");
         let files = self.files(components, hash_name)?.try_fold(
-            components
-                .iter()
-                .map(move |c| (c.as_ref(), None::<ReleaseIndexFile<'a>>))
-                .collect::<Vec<_>>(),
+            (if components.is_empty() {
+                Either::Left(std::iter::once(""))
+            } else {
+                Either::Right(components.iter().map(|c| c.as_ref()))
+            })
+            .into_iter()
+            .map(move |c| (c, None::<ReleaseIndexFile<'a>>))
+            .collect::<Vec<_>>(),
             move |mut files, file| {
                 let (path, digest, size) = file?;
                 for (comp, entry) in files.iter_mut() {
-                    if let Some(rest) = path.strip_prefix(*comp) {
-                        if let Some(rest) = rest.strip_prefix("/source") {
-                            if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
-                                rest.strip_prefix("/Sources")
-                            {
-                                if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
-                                    let hash =
-                                        Hash::from_hex(hash_name, digest).map_err(|err| {
-                                            ParseError::from(format!(
-                                                "invalid hash: {} {}",
-                                                digest, err
-                                            ))
-                                        })?;
-                                    *entry = Some(ReleaseIndexFile {
-                                        path,
-                                        fetch_path: use_by_hash
-                                            .then(|| Self::by_hash_path(path, digest)),
-                                        hash,
-                                        size,
-                                    });
-                                }
-                            }
+                    let pref = if comp.is_empty() {
+                        path
+                    } else {
+                        let Some(pref) = path
+                            .strip_prefix(*comp)
+                            .and_then(|r| r.strip_prefix("/source/"))
+                        else {
+                            continue;
+                        };
+                        pref
+                    };
+                    if let Some("" | ".gz" | ".xz" | ".bz2" | ".zst" | ".zstd") =
+                        pref.strip_prefix("Sources")
+                    {
+                        if size < entry.as_ref().map_or(u64::MAX, |file| file.size) {
+                            let hash = Hash::from_hex(hash_name, digest).map_err(|err| {
+                                ParseError::from(format!("invalid hash: {} {}", digest, err))
+                            })?;
+                            *entry = Some(ReleaseIndexFile {
+                                path,
+                                fetch_path: use_by_hash.then(|| Self::by_hash_path(path, digest)),
+                                hash,
+                                size,
+                            });
                         }
                     }
                 }

@@ -1,5 +1,10 @@
 use {
-    crate::{control::MutableControlStanza, hash::Hash, indexfile::IndexFile, release::Release},
+    crate::{
+        control::{MutableControlFile, MutableControlStanza},
+        hash::Hash,
+        indexfile::IndexFile,
+        release::Release,
+    },
     chrono::{DateTime, FixedOffset, Local, NaiveDateTime, Utc},
     clap::Args,
     futures::AsyncReadExt,
@@ -9,10 +14,6 @@ use {
 };
 
 pub const DEBIAN_KEYRING: &[u8] = include_bytes!("../keyring/keys.bin");
-
-fn default_components() -> Vec<String> {
-    vec!["main".to_string()]
-}
 
 #[derive(Default, Debug, Clone, PartialEq, Eq)]
 pub enum SignedBy {
@@ -443,6 +444,32 @@ impl<'de> serde::de::Deserialize<'de> for Snapshot {
     }
 }
 
+pub(crate) enum RepoPath<'a> {
+    Flat(&'a str),
+    Structured { suite: &'a str },
+}
+impl<'a> RepoPath<'a> {
+    /// Join the suite-prefix with a file path, producing the path
+    /// at which the file lives relative to the archive root.
+    ///
+    /// Three cases must round-trip correctly:
+    /// * Flat repo at the archive root (`suites = ["/"]` or `["./"]`):
+    ///   the prefix is empty, so the file name is returned verbatim
+    ///   without a leading separator (`"Packages.gz"`, not `"/Packages.gz"`).
+    /// * Flat repo at a sub-directory (`suites = ["extras/"]`):
+    ///   the prefix is the trimmed suite (`"extras"`), joined with `/`
+    ///   (`"extras/Packages.gz"`).
+    /// * Structured (`dists/...`) repo: the prefix is `dists/<suite>`,
+    ///   joined with `/` (`"dists/stable/main/binary-amd64/Packages.gz"`).
+    pub(crate) fn file(&self, f: &str) -> String {
+        match self {
+            RepoPath::Flat("") => f.to_string(),
+            RepoPath::Flat(suite) => format!("{}/{}", suite, f),
+            RepoPath::Structured { suite } => format!("dists/{}/{}", suite, f),
+        }
+    }
+}
+
 #[derive(Clone)]
 pub(crate) struct ClapSnapshotParser;
 
@@ -641,7 +668,8 @@ pub(crate) struct ArchiveOptionsArgs {
     #[arg(long = "snapshot", value_name = "SNAPSHOT", value_parser = ClapSnapshotParser)]
     pub snapshot: Option<Snapshot>,
 
-    /// Suite or codename; use a comma-separated list for multiple values (e.g. "stable", "noble", "trixie,trixie-updates")
+    /// Suite, codename or a single flat repository path;
+    /// use a comma-separated list for multiple values (e.g. "stable", "noble", "trixie,trixie-updates")
     #[arg(
         short = 's',
         long = "suite",
@@ -723,7 +751,7 @@ pub struct Archive {
 
     pub suites: Vec<String>,
 
-    #[serde(alias = "comp", default = "default_components")]
+    #[serde(alias = "comp", default, skip_serializing_if = "Vec::is_empty")]
     pub components: Vec<String>,
 
     #[serde(default, skip_serializing_if = "ArchiveHashKind::is_sha256")]
@@ -798,12 +826,85 @@ impl Archive {
         self.snapshots = Some(snapshots.as_ref().to_string());
         self
     }
-    pub(crate) fn release_path(&self, suite: &str) -> String {
-        if self.allow_insecure() {
-            format!("dists/{}/Release", suite)
+    /// Returns `true` when `suite` identifies a flat repository (ends with `/`).
+    ///
+    /// Debian flat repositories are indicated by a suite name that ends with
+    /// `/`, including the special cases `/` (repository root) and `./`
+    /// (repository root, relative notation).  The Release file and index files
+    /// live directly inside the directory named by the suite, not under a
+    /// `dists/` hierarchy.
+    fn is_flat_repo(suite: &str) -> bool {
+        suite.ends_with('/')
+    }
+
+    /// Returns `true` when this archive uses flat-repository layout.
+    ///
+    /// An archive is flat when every suite ends with `/`.  Validated archives
+    /// are guaranteed to be either all-flat or all-non-flat (no mixing).
+    pub fn is_flat(&self) -> bool {
+        !self.suites.is_empty() && self.suites.iter().all(|s| Self::is_flat_repo(s))
+    }
+    pub(crate) fn suite_path_prefix(suite: &str) -> RepoPath<'_> {
+        if Self::is_flat_repo(suite) {
+            RepoPath::Flat(
+                suite
+                    .strip_prefix("./")
+                    .unwrap_or(suite)
+                    .trim_end_matches('/'),
+            )
         } else {
-            format!("dists/{}/InRelease", suite)
+            RepoPath::Structured { suite }
         }
+    }
+    pub(crate) fn release_path(&self, suite: &str) -> String {
+        let name = if self.allow_insecure() {
+            "Release"
+        } else {
+            "InRelease"
+        };
+        Self::suite_path_prefix(suite).file(name)
+    }
+
+    /// Validate suites/components invariants.
+    ///
+    /// Rules enforced:
+    /// - `suites` must not be empty.  Use `suites = ["/"]` for a flat
+    ///   repository (no `dists/` hierarchy).
+    /// - All entries in `suites` must agree: either every suite ends with `/`
+    ///   (flat) or none does (non-flat).  Mixing is rejected.
+    /// - A flat archive must not set `components`.
+    /// - A non-flat archive must declare at least one component.  Vendor
+    ///   presets (`debian`, `ubuntu`, `devuan`) are expanded via
+    ///   [`Archive::as_vendor`] before validation and supply their own
+    ///   component defaults.
+    pub fn validate(&self) -> io::Result<()> {
+        if self.suites.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive: `suites` must not be empty; \
+                 use `suites = [\"/\"]` for a flat (no dists/ hierarchy) repository",
+            ));
+        }
+        let flat_count = self.suites.iter().filter(|s| Self::is_flat_repo(s)).count();
+        if flat_count != 0 && flat_count != self.suites.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive: suites must not mix flat entries (ending '/') with non-flat entries",
+            ));
+        }
+        if flat_count > 0 && !self.components.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive: flat repository suites cannot set `components`",
+            ));
+        }
+        if flat_count == 0 && self.components.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "archive: non-flat repository requires at least one component",
+            ));
+        }
+        Ok(())
     }
     pub(crate) async fn release_from_file(
         &self,
@@ -889,7 +990,6 @@ impl Archive {
     pub fn as_vendor(&self) -> Option<(Vec<Self>, Vec<String>)> {
         match self.url.to_ascii_lowercase().as_str() {
             "debian" => {
-                const DEFAULT_SUITE: &str = "trixie";
                 let mut archive = self.clone();
                 let mut security: Option<Archive> = None;
                 archive.url = "https://ftp.debian.org/debian/".to_string();
@@ -901,12 +1001,8 @@ impl Archive {
                 if self.components.is_empty() {
                     archive.components = vec!["main".to_string()];
                 }
-                if self.suites.len() < 2 {
-                    let s = if self.suites.is_empty() {
-                        DEFAULT_SUITE
-                    } else {
-                        self.suites[0].as_str()
-                    };
+                if !self.suites.is_empty() && self.suites.len() < 2 {
+                    let s = self.suites[0].as_str();
                     if s != "sid" && s != "unstable" {
                         archive.suites = ["", "-updates", "-backports"]
                             .iter()
@@ -928,7 +1024,6 @@ impl Archive {
                 Some((archives, vec!["debian-keyring".to_string()]))
             }
             "ubuntu" => {
-                const DEFAULT_SUITE: &str = "noble";
                 let mut archive = self.clone();
                 archive.url = "https://archive.ubuntu.com/ubuntu/".to_string();
                 if self.snapshot.is_none() {
@@ -938,12 +1033,8 @@ impl Archive {
                 if self.components.is_empty() {
                     archive.components = vec!["main".to_string(), "universe".to_string()];
                 }
-                if self.suites.len() < 2 {
-                    let s = if self.suites.is_empty() {
-                        DEFAULT_SUITE
-                    } else {
-                        self.suites[0].as_str()
-                    };
+                if !self.suites.is_empty() && self.suites.len() < 2 {
+                    let s = self.suites[0].as_str();
                     archive.suites = ["", "-updates", "-backports", "-security"]
                         .iter()
                         .map(|f| format!("{}{}", s, f))
@@ -952,19 +1043,14 @@ impl Archive {
                 Some((vec![archive], vec!["ubuntu-keyring".to_string()]))
             }
             "devuan" => {
-                const DEFAULT_SUITE: &str = "daedalus";
                 let mut archive = self.clone();
                 archive.url = "http://deb.devuan.org/merged/".to_string();
                 archive.snapshots = None;
                 if self.components.is_empty() {
                     archive.components = vec!["main".to_string()];
                 }
-                if self.suites.len() < 2 {
-                    let s = if self.suites.is_empty() {
-                        DEFAULT_SUITE
-                    } else {
-                        self.suites[0].as_str()
-                    };
+                if !self.suites.is_empty() && self.suites.len() < 2 {
+                    let s = self.suites[0].as_str();
                     if s != "ceres"
                         && s != "unstable"
                         && !s.chars().next().is_some_and(|c| c.is_ascii_digit())
@@ -982,21 +1068,43 @@ impl Archive {
     }
 }
 
-impl From<&Archive> for MutableControlStanza {
+impl From<&Archive> for MutableControlFile {
+    /// Render this archive as a deb822 sources block.
+    ///
+    /// Suite/codename archives are emitted as a single stanza whose `Suites`
+    /// and `Components` fields hold every entry space-joined.  Flat
+    /// repositories (every suite ends with `/`) are emitted as one stanza per
+    /// path, each with a single-valued `Suites` field and no `Components`
+    /// field, as recommended by `sources.list(5)` for portability across
+    /// APT versions.
     fn from(src: &Archive) -> Self {
-        let mut cs = MutableControlStanza::parse("Types: deb\n").unwrap();
-        cs.set("URIs", src.apt_uri());
-        cs.set("Suites", src.suites.join(" "));
-        cs.set("Components", src.components.join(" "));
-        if !src.arch.is_empty() {
-            cs.set("Architectures", src.arch.join(" "));
+        let make_base = || {
+            let mut cs = MutableControlStanza::parse("Types: deb\n").unwrap();
+            cs.set("URIs", src.apt_uri());
+            if !src.arch.is_empty() {
+                cs.set("Architectures", src.arch.join(" "));
+            }
+            if src.allow_insecure {
+                cs.set("Allow-Insecure", "yes");
+            }
+            if let Some(signed_by) = &src.signed_by {
+                cs.set("Signed-By", String::from(signed_by));
+            }
+            cs
+        };
+        let mut file = MutableControlFile::new();
+        if src.is_flat() {
+            for suite in &src.suites {
+                let mut cs = make_base();
+                cs.set("Suites", suite.clone());
+                file.add(cs);
+            }
+        } else {
+            let mut cs = make_base();
+            cs.set("Suites", src.suites.join(" "));
+            cs.set("Components", src.components.join(" "));
+            file.add(cs);
         }
-        if src.allow_insecure {
-            cs.set("Allow-Insecure", "yes");
-        }
-        if let Some(signed_by) = &src.signed_by {
-            cs.set("Signed-By", String::from(signed_by));
-        }
-        cs
+        file
     }
 }

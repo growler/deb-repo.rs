@@ -1684,6 +1684,7 @@ impl Manifest {
         Ok(())
     }
     pub fn add_archive(&mut self, archive: Archive, comment: Option<&str>) -> io::Result<()> {
+        archive.validate()?;
         match self.file.add_archive(archive, comment) {
             UpdateResult::None => return Ok(()),
             UpdateResult::Added => {

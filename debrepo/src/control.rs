@@ -572,6 +572,13 @@ impl std::iter::Extend<MutableControlStanza> for MutableControlFile {
         self.stanzas.extend(iter)
     }
 }
+impl IntoIterator for MutableControlFile {
+    type Item = MutableControlStanza;
+    type IntoIter = std::vec::IntoIter<MutableControlStanza>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.stanzas.into_iter()
+    }
+}
 
 impl std::fmt::Display for ControlFile<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::result::Result<(), std::fmt::Error> {

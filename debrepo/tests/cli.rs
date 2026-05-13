@@ -1188,7 +1188,7 @@ fn cli_additional_command_branches_cover_vendor_sri_and_unlocked_errors() {
     let unlocked = TestConfig::new(unlocked_path, TestProvider::new());
 
     assert!(
-        cmd::ArchiveAdd::try_parse_from(["archive-add", "debian", "-K"])
+        cmd::ArchiveAdd::try_parse_from(["archive-add", "debian", "--suite", "trixie", "-K"])
             .expect("parse unlocked archive add")
             .exec(&unlocked)
             .expect_err("archive add should reject unlocked manifest")
@@ -1209,7 +1209,7 @@ fn cli_additional_command_branches_cover_vendor_sri_and_unlocked_errors() {
         .expect("create locked manifest");
     let conf = TestConfig::new(manifest_path.clone(), TestProvider::new());
 
-    cmd::ArchiveCmd::try_parse_from(["archive", "add", "debian", "-K"])
+    cmd::ArchiveCmd::try_parse_from(["archive", "add", "debian", "--suite", "trixie", "-K"])
         .expect("parse vendor archive add")
         .exec(&conf)
         .expect("vendor archive add");
@@ -1234,6 +1234,56 @@ fn cli_additional_command_branches_cover_vendor_sri_and_unlocked_errors() {
             .expect_err("dot artifact should fail")
             .to_string()
             .contains("text artifact path has no filename")
+    );
+}
+
+#[test]
+fn cli_archive_add_without_components_is_rejected_for_non_vendor_url() {
+    // A non-vendor URL with no `--components` must be rejected: there is no
+    // implicit `["main"]` default.  Vendor presets (debian/ubuntu/devuan)
+    // still work without `--components` because `as_vendor` supplies them.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("Manifest.toml");
+    smol::block_on(create_locked_manifest(&manifest_path, &TestProvider::new()))
+        .expect("create locked manifest");
+    let conf = TestConfig::new(manifest_path, TestProvider::new());
+
+    let err = cmd::ArchiveCmd::try_parse_from([
+        "archive",
+        "add",
+        "https://example.invalid/repo/",
+        "--suite",
+        "stable",
+    ])
+    .expect("parse archive add without components")
+    .exec(&conf)
+    .expect_err("archive add without components must fail");
+    assert!(
+        err.to_string()
+            .contains("non-flat repository requires at least one component"),
+        "unexpected error: {}",
+        err
+    );
+}
+
+#[test]
+fn cli_init_without_components_is_rejected_for_non_vendor_url() {
+    // The same invariant must hold on `init` -- the validator fires before
+    // any network access.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let manifest_path = dir.path().join("Manifest.toml");
+    let conf = TestConfig::new(manifest_path, TestProvider::new());
+
+    let err =
+        cmd::Init::try_parse_from(["init", "https://example.invalid/repo/", "--suite", "stable"])
+            .expect("parse init without components")
+            .exec(&conf)
+            .expect_err("init without components must fail");
+    assert!(
+        err.to_string()
+            .contains("non-flat repository requires at least one component"),
+        "unexpected error: {}",
+        err
     );
 }
 

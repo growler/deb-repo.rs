@@ -337,7 +337,15 @@ impl ManifestFile {
             })?
             .init_manifest(None);
         manifest.doc = doc;
-        manifest.archives.iter_mut().for_each(|s| s.set_base());
+        for archive in manifest.archives.iter_mut() {
+            archive.validate().map_err(|err| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid archive {}: {}", archive.url, err),
+                )
+            })?;
+            archive.set_base();
+        }
         Ok((manifest, hash))
     }
 

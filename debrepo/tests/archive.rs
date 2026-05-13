@@ -10,7 +10,7 @@ use {
     debrepo::{
         cli::{cmd, Command},
         content::{ContentProvider, ContentProviderGuard, DebLocation, IndexFile, UniverseFiles},
-        control::MutableControlStanza,
+        control::{MutableControlFile, MutableControlStanza},
         git::{GitRepo, MaterializedGitRepo},
         hash::Hash,
         Archive, HostFileSystem, Manifest, Packages, RepositoryFile, SignedBy, Snapshot,
@@ -317,6 +317,10 @@ fn repository_file_accessors_and_archive_serde_cover_defaults_and_aliases() {
     assert_eq!(file.size(), 123);
     assert_eq!(file.hash(), &hash);
 
+    // Absent `components` deserializes as empty.  Non-flat archives must
+    // declare an explicit component list; `Archive::validate` rejects empty
+    // components for them.  Vendor presets (`debian`/`ubuntu`/`devuan`) are
+    // the only path that fills in defaults, and only via `as_vendor`.
     let default_archive: Archive = toml_edit::de::from_str(
         r#"
 url = "https://example.invalid/repo/"
@@ -324,7 +328,7 @@ suites = ["stable"]
 "#,
     )
     .unwrap();
-    assert_eq!(default_archive.components, vec!["main"]);
+    assert!(default_archive.components.is_empty());
     assert!(default_archive.hash.is_sha256());
     assert_eq!(default_archive.hash.name(), "SHA256");
     assert_eq!(default_archive.priority, None);
@@ -385,7 +389,10 @@ fn archive_public_helpers_cover_vendor_expansion_urls_and_control_conversion() {
         "https://alt-snapshot.example/20240305T123456Z/dists/stable/Release"
     );
 
-    let stanza = MutableControlStanza::from(&archive);
+    let file = MutableControlFile::from(&archive);
+    let stanzas: Vec<_> = file.stanzas().collect();
+    assert_eq!(stanzas.len(), 1);
+    let stanza = stanzas[0];
     assert_eq!(
         stanza.field("URIs"),
         Some("https://alt-snapshot.example/20240305T123456Z")
@@ -406,14 +413,17 @@ fn archive_public_helpers_cover_vendor_expansion_urls_and_control_conversion() {
         floating_snapshot.file_url("dists/stable/InRelease"),
         "https://example.invalid/repo/dists/stable/InRelease"
     );
-    let floating_stanza = MutableControlStanza::from(&floating_snapshot);
+    let floating_file = MutableControlFile::from(&floating_snapshot);
+    let floating_stanzas: Vec<_> = floating_file.stanzas().collect();
+    assert_eq!(floating_stanzas.len(), 1);
     assert_eq!(
-        floating_stanza.field("URIs"),
+        floating_stanzas[0].field("URIs"),
         Some("https://example.invalid/repo")
     );
 
     let mut debian = Archive::default();
     debian.url = "debian".into();
+    debian.suites = vec!["trixie".into()];
     let (archives, packages) = debian.as_vendor().unwrap();
     assert_eq!(packages, vec!["debian-keyring"]);
     assert_eq!(archives.len(), 2);
@@ -437,6 +447,7 @@ fn archive_public_helpers_cover_vendor_expansion_urls_and_control_conversion() {
 
     let mut ubuntu = Archive::default();
     ubuntu.url = "ubuntu".into();
+    ubuntu.suites = vec!["noble".into()];
     let (ubuntu_archives, ubuntu_packages) = ubuntu.as_vendor().unwrap();
     assert_eq!(ubuntu_packages, vec!["ubuntu-keyring"]);
     assert_eq!(ubuntu_archives.len(), 1);
@@ -454,6 +465,7 @@ fn archive_public_helpers_cover_vendor_expansion_urls_and_control_conversion() {
 
     let mut devuan = Archive::default();
     devuan.url = "devuan".into();
+    devuan.suites = vec!["daedalus".into()];
     let (devuan_archives, devuan_packages) = devuan.as_vendor().unwrap();
     assert_eq!(devuan_packages, vec!["devuan-keyring"]);
     assert_eq!(devuan_archives.len(), 1);
@@ -483,6 +495,176 @@ fn archive_public_helpers_cover_vendor_expansion_urls_and_control_conversion() {
     let mut custom = Archive::default();
     custom.url = "https://example.invalid/repo".into();
     assert!(custom.as_vendor().is_none());
+}
+
+#[test]
+fn flat_repo_archive_serde_and_apt_stanza() {
+    // "/" — root flat repo.
+    let archive: Archive = toml_edit::de::from_str(
+        r#"url = "https://developer.download.nvidia.com/compute/cuda/repos/debian12/x86_64/"
+suites = ["/"]
+"#,
+    )
+    .unwrap();
+    assert!(archive.is_flat(), "suites = [\"/\"] must be flat");
+    assert_eq!(archive.suites, vec!["/"]);
+    assert!(
+        archive.components.is_empty(),
+        "flat repo: components must be empty"
+    );
+
+    let encoded = toml_edit::ser::to_string(&archive).unwrap();
+    assert!(encoded.contains("suites"), "suites must be present");
+    assert!(
+        !encoded.contains("components"),
+        "components must be omitted"
+    );
+
+    // APT deb822 sources file: a single-suite flat archive yields a single
+    // stanza with the suite verbatim and no Components field.
+    let file = MutableControlFile::from(&archive);
+    let stanzas: Vec<_> = file.stanzas().collect();
+    assert_eq!(stanzas.len(), 1);
+    assert_eq!(stanzas[0].field("Suites"), Some("/"));
+    assert_eq!(stanzas[0].field("Components"), None);
+
+    // "./" is equivalent to "/".
+    let archive2: Archive = toml_edit::de::from_str(
+        r#"url = "https://example.invalid/flat/"
+suites = ["./"]
+"#,
+    )
+    .unwrap();
+    assert!(archive2.is_flat());
+    let file2 = MutableControlFile::from(&archive2);
+    let stanzas2: Vec<_> = file2.stanzas().collect();
+    assert_eq!(stanzas2.len(), 1);
+    assert_eq!(stanzas2[0].field("Suites"), Some("./"));
+    assert_eq!(stanzas2[0].field("Components"), None);
+
+    // Sub-directory flat suite.
+    let archive3: Archive = toml_edit::de::from_str(
+        r#"url = "https://example.invalid/repo/"
+suites = ["extras/"]
+"#,
+    )
+    .unwrap();
+    assert!(archive3.is_flat());
+    let file3 = MutableControlFile::from(&archive3);
+    let stanzas3: Vec<_> = file3.stanzas().collect();
+    assert_eq!(stanzas3.len(), 1);
+    assert_eq!(stanzas3[0].field("Suites"), Some("extras/"));
+    assert_eq!(stanzas3[0].field("Components"), None);
+}
+
+#[test]
+fn flat_repo_multi_path_emits_one_stanza_per_path() {
+    let archive: Archive = toml_edit::de::from_str(
+        r#"url = "https://example.invalid/flat/"
+suites = ["./", "extras/"]
+signed-by = "/usr/share/keyrings/example.gpg"
+"#,
+    )
+    .unwrap();
+    assert!(archive.is_flat());
+    assert!(archive.components.is_empty());
+
+    // One stanza per flat path: `sources.list(5)` documents flat repos
+    // with a single path per Suites field, so multi-path flat archives
+    // expand into separate stanzas rather than being space-joined.
+    let file = MutableControlFile::from(&archive);
+    let stanzas: Vec<_> = file.stanzas().collect();
+    assert_eq!(stanzas.len(), 2);
+
+    assert_eq!(stanzas[0].field("Suites"), Some("./"));
+    assert_eq!(stanzas[1].field("Suites"), Some("extras/"));
+
+    for stanza in &stanzas {
+        assert_eq!(stanza.field("Types"), Some("deb"));
+        assert_eq!(stanza.field("Components"), None);
+        assert_eq!(
+            stanza.field("URIs"),
+            Some("https://example.invalid/flat"),
+            "URIs must be identical across the per-path stanzas",
+        );
+        assert_eq!(
+            stanza.field("Signed-By"),
+            Some("/usr/share/keyrings/example.gpg"),
+        );
+    }
+}
+
+#[test]
+fn non_flat_archive_emits_single_stanza_with_multiple_suites() {
+    let archive: Archive = toml_edit::de::from_str(
+        r#"url = "https://deb.debian.org/debian/"
+suites = ["trixie", "trixie-updates"]
+components = ["main", "contrib"]
+"#,
+    )
+    .unwrap();
+    assert!(!archive.is_flat());
+
+    let file = MutableControlFile::from(&archive);
+    let stanzas: Vec<_> = file.stanzas().collect();
+    assert_eq!(stanzas.len(), 1);
+    assert_eq!(stanzas[0].field("Suites"), Some("trixie trixie-updates"));
+    assert_eq!(stanzas[0].field("Components"), Some("main contrib"));
+    assert_eq!(stanzas[0].field("Types"), Some("deb"));
+    assert_eq!(
+        stanzas[0].field("URIs"),
+        Some("https://deb.debian.org/debian")
+    );
+}
+
+#[test]
+fn flat_repo_validate_rejects_invalid_configurations() {
+    // Empty suites is always an error.
+    let mut archive = Archive::default();
+    archive.url = "https://example.invalid/flat/".into();
+    let err = archive.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("suites` must not be empty"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Flat suite + components is an error.
+    let mut archive = Archive::default();
+    archive.url = "https://example.invalid/flat/".into();
+    archive.suites = vec!["/".into()];
+    archive.components = vec!["main".into()];
+    let err = archive.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("flat repository suites cannot set `components`"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Mixing flat and non-flat suites is an error.
+    let mut archive = Archive::default();
+    archive.url = "https://example.invalid/mixed/".into();
+    archive.suites = vec!["/".into(), "stable".into()];
+    let err = archive.validate().unwrap_err();
+    assert!(
+        err.to_string().contains("must not mix flat entries"),
+        "unexpected error: {}",
+        err
+    );
+
+    // Non-flat suite without components is an error: there is no implicit
+    // `["main"]` default; vendor presets supply theirs via `as_vendor`.
+    let mut archive = Archive::default();
+    archive.url = "https://example.invalid/repo/".into();
+    archive.suites = vec!["stable".into()];
+    let err = archive.validate().unwrap_err();
+    assert!(
+        err.to_string()
+            .contains("non-flat repository requires at least one component"),
+        "unexpected error: {}",
+        err
+    );
 }
 
 #[test]

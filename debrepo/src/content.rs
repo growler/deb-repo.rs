@@ -203,6 +203,7 @@ impl<'a> UniverseFiles<'a> {
             .flatten_ok()
             .map_ok(
                 move |(manifest_id, archive_idx, archive, suite_name, suite)| {
+                    let prefix = Archive::suite_path_prefix(suite_name);
                     suite
                         .rel
                         .package_files(&archive.components, archive.hash.name(), self.arch)
@@ -213,10 +214,8 @@ impl<'a> UniverseFiles<'a> {
                                     archive_idx,
                                     archive,
                                     RepositoryFile {
-                                        path: format!("dists/{}/{}", suite_name, file.path),
-                                        fetch_path: file
-                                            .fetch_path
-                                            .map(|path| format!("dists/{}/{}", suite_name, path)),
+                                        path: prefix.file(file.path),
+                                        fetch_path: file.fetch_path.map(|path| prefix.file(&path)),
                                         hash: file.hash,
                                         size: file.size,
                                     },
@@ -248,13 +247,14 @@ impl<'a> UniverseFiles<'a> {
                     .map(move |locked| {
                         archive.suites.iter().zip(locked.suites.iter()).map(
                             move |(suite_name, suite)| {
-                                (archive_idx as u32, archive, suite_name, suite)
+                                (archive_idx as u32, archive, suite_name.as_str(), suite)
                             },
                         )
                     })
             })
             .flatten_ok()
             .map_ok(move |(archive_idx, archive, suite_name, suite)| {
+                let prefix = Archive::suite_path_prefix(suite_name);
                 suite
                     .rel
                     .source_files(&archive.components, archive.hash.name())
@@ -264,10 +264,8 @@ impl<'a> UniverseFiles<'a> {
                                 archive_idx,
                                 archive,
                                 RepositoryFile {
-                                    path: format!("dists/{}/{}", suite_name, file.path),
-                                    fetch_path: file
-                                        .fetch_path
-                                        .map(|path| format!("dists/{}/{}", suite_name, path)),
+                                    path: prefix.file(file.path),
+                                    fetch_path: file.fetch_path.map(|path| prefix.file(&path)),
                                     hash: file.hash,
                                     size: file.size,
                                 },
@@ -282,10 +280,8 @@ impl<'a> UniverseFiles<'a> {
     pub fn apt_sources(&self) -> MutableControlFile {
         self.archives
             .iter()
-            .fold(MutableControlFile::new(), |mut ctrl, src| {
-                ctrl.add(Into::<MutableControlStanza>::into(src));
-                ctrl
-            })
+            .flat_map(MutableControlFile::from)
+            .collect()
     }
     pub fn apt_sources_hash(&self) -> io::Result<(MutableControlFile, Hash)> {
         let mut digester = blake3::Hasher::new();
@@ -888,6 +884,50 @@ mod tests {
         assert_eq!(
             fs::read_to_string(canonical_path).expect("read staged package index"),
             String::from_utf8(package_data.to_vec()).expect("package data utf8")
+        );
+    }
+
+    /// Verify that a flat-repo archive (suites = ["/"]) yields RepositoryFile
+    /// paths without any "dists/" prefix.
+    #[test]
+    fn flat_repo_package_files_path_has_no_dists_prefix() {
+        let gz_digest = sha256_hex(b"fake-packages-gz-data");
+        let release_text = format!(
+            "Suite: /\nArchitectures: amd64\nSHA256:\n {digest} 50 Packages.gz\n",
+            digest = gz_digest,
+        );
+        let release = Release::try_from(release_text.clone()).expect("parse flat release");
+
+        let mut archive = Archive::default();
+        archive.url = "https://example.invalid/flat/".into();
+        archive.allow_insecure = true;
+        archive.suites = vec!["/".to_string()];
+        // components stays empty for flat repo
+
+        let locked = vec![Some(LockedArchive {
+            suites: vec![LockedSuite {
+                path: "InRelease".to_string(),
+                file: IndexFile::from_string(release_text),
+                rel: release,
+            }],
+        })];
+        let archives = vec![archive];
+        let universe = UniverseFiles::new("amd64", 0, &archives, &locked);
+
+        let files: Vec<_> = universe
+            .package_files()
+            .collect::<Result<Vec<_>, _>>()
+            .expect("package_files");
+
+        assert_eq!(files.len(), 1, "expected exactly one Packages file");
+        let path = &files[0].3.path;
+        assert_eq!(
+            path, "Packages.gz",
+            "flat repo path must not start with dists/"
+        );
+        assert!(
+            !path.starts_with("dists/"),
+            "flat repo path must not start with dists/"
         );
     }
 }

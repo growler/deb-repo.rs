@@ -1,3 +1,28 @@
+rdebootstrap (0.4.0) unstable; urgency=medium
+
+  * BREAKING API CHANGES (mostly introduced in 0.3.7):
+
+    - ContentProvider trait now includes `fetch_git_repo(&GitRepo)` and
+     `materialize_git_paths(&MaterializedGitRepo, &[PathBuf])`.
+     `transport()` has been removed.
+    - Manifest::from_file now requires `&C: ContentProvider` to resolve 
+      git imports.
+    - Init command `--import` field type changes from `Option<PathBuf>` 
+      to `Option<String>` to accept git URLs.
+    - Init and ArchiveAdd commands now explicitly require `--suite`
+      unless archive URI is a vendor name, in that case the vendor 
+      default suits are used.
+
+  * feat: support Debian flat-repository archives
+
+    Add first-class support for Debian flat repositories
+    (`sources.list(5)` "flat repository format"), where Release / Packages /
+    Sources files live directly inside a suite directory rather than under
+    a `dists/<suite>/<component>/` hierarchy. Thanks to NVidia for 
+    an unexpected example.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Wed, 13 May 2026 18:05:40 +0200
+
 rdebootstrap (0.3.7) unstable; urgency=medium
 
   * Add git-sourced manifest imports

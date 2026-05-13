@@ -324,3 +324,78 @@ fn release_reports_package_and_source_errors_through_public_api() {
     };
     assert!(err.to_string().contains("invalid hash: zzzz"));
 }
+
+#[test]
+fn flat_repo_package_files_picks_smallest_root_level_packages() {
+    let pkg_digest = hex('a', 64);
+    let pkg_gz_digest = hex('b', 64);
+    // Flat Release: no Components field; Packages files at the root.
+    // The plain Packages (size 200) is larger than Packages.gz (size 50), so
+    // package_files should prefer the .gz variant.
+    let release = parse_release(format!(
+        concat!(
+            "Suite: /\n",
+            "Architectures: amd64\n",
+            "SHA256:\n",
+            " {pkg} 200 Packages\n",
+            " {gz} 50 Packages.gz\n",
+            // A non-root entry must be ignored.
+            " {pkg} 1 subdir/Packages\n",
+        ),
+        pkg = pkg_digest,
+        gz = pkg_gz_digest,
+    ));
+
+    let files: Vec<_> = release
+        .package_files(&[] as &[&str], "SHA256", "amd64")
+        .expect("package_files ok")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("no errors");
+
+    assert_eq!(files.len(), 1, "expected exactly one Packages file");
+    assert_eq!(files[0].path, "Packages.gz");
+    assert_eq!(files[0].size, 50);
+}
+
+#[test]
+fn flat_repo_package_files_returns_empty_when_no_packages_present() {
+    let sha256 = hex('a', 64);
+    // Flat Release with only a Sources entry — no binary packages.
+    let release = parse_release(format!("Suite: /\nSHA256:\n {sha256} 10 Sources\n",));
+
+    let files: Vec<_> = release
+        .package_files(&[] as &[&str], "SHA256", "amd64")
+        .expect("package_files ok")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("no errors");
+
+    assert!(files.is_empty(), "expected no Packages files");
+}
+
+#[test]
+fn flat_repo_source_files_picks_smallest_root_level_sources() {
+    let src_digest = hex('c', 64);
+    let src_xz_digest = hex('d', 64);
+    let release = parse_release(format!(
+        concat!(
+            "Suite: /\n",
+            "SHA256:\n",
+            " {src} 300 Sources\n",
+            " {xz} 30 Sources.xz\n",
+            // A non-root entry must be ignored.
+            " {src} 1 subdir/Sources\n",
+        ),
+        src = src_digest,
+        xz = src_xz_digest,
+    ));
+
+    let files: Vec<_> = release
+        .source_files(&[] as &[&str], "SHA256")
+        .expect("source_files ok")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("no errors");
+
+    assert_eq!(files.len(), 1, "expected exactly one Sources file");
+    assert_eq!(files[0].path, "Sources.xz");
+    assert_eq!(files[0].size, 30);
+}
